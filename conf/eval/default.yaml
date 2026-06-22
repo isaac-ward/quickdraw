@@ -1,0 +1,6 @@
+horizon: 2048              # long-horizon / ood rollout length (capped by episode length)
+
+# evals that run *during training* (train/val happen normally regardless)
+during_train:
+  every_epochs: 5          # run the subscribed routines every N epochs (0 disables)
+  run: [long_horizon]      # subscribe to any subset of: long_horizon, ood, control
