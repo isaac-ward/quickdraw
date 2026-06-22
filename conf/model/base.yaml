@@ -1,0 +1,8 @@
+name: base
+d: 128
+depth: 4
+heads: 4
+window: 64
+mlp_ratio: 4.0
+rope_theta: 10000.0
+p_tf: 0.0                # teacher-forcing prob per step: 0 = pure autoregression, 1 = parallel TF

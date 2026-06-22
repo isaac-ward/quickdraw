@@ -1,0 +1,7 @@
+.git
+logs/
+datasets/
+caches/
+**/__pycache__/
+*.ckpt
+wandb/

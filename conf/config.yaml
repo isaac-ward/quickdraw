@@ -1,0 +1,20 @@
+defaults:
+  - model: base
+  - data: torus
+  - optim: adamw
+  - trainer: default
+  - environments: torus
+  - logging: wandb
+  - eval: default
+  - control: mppi
+  - _self_
+
+# short experiment summary -> run dir is logs/<timestamp>_<experiment> (override on CLI)
+experiment: base
+
+# checkpoint path for the eval/control entrypoints (override on CLI)
+checkpoint: null
+
+hydra:
+  job:
+    chdir: false

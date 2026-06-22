@@ -1,0 +1,21 @@
+root: null     # set to the data_generation run dir, e.g. data.root=logs/data_generation_<ts>_<exp>
+P: 32          # past context window
+F: 32          # future horizon (training)
+batch: 172
+workers: 4
+n_plot_trajectories: 3     # how many sample trajectories to draw per split plot
+fpv_fov: 90                # egocentric camera field of view (deg); VTK default is 30
+
+# All splits + every OOD change live here (env overrides applied on top of `environments/torus.yaml`).
+# Each OOD axis changes exactly ONE thing:
+#   visual    -> texture only (hsv -> hsv + grey squares)
+#   geometric -> shape only (R, r), scaled to the base torus size
+#   dynamics  -> motion only (gamma, a_max)
+splits:
+  train:    {n_traj: 256, steps: 256,  seed: 0, coloring: hsv, env: {}}
+  val:      {n_traj: 64,  steps: 256,  seed: 1, coloring: hsv, env: {}}
+  eval_ind: {n_traj: 64,  steps: 1024, seed: 2, coloring: hsv, env: {}}
+
+  eval_ood_visual:    {n_traj: 64, steps: 1024, seed: 5, coloring: squares, env: {}}
+  eval_ood_geometric: {n_traj: 64, steps: 1024, seed: 3, coloring: hsv, env: {R: 1.1, r: 0.13}}
+  eval_ood_dynamics:  {n_traj: 64, steps: 1024, seed: 4, coloring: hsv, env: {gamma: 0.0, a_max: 3.25, mass: 0.9}}

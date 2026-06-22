@@ -1,0 +1,23 @@
+services:
+  app:
+    build: .
+    runtime: nvidia
+    gpus: all                        # expose all GPUs (Compose v2)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: all
+    env_file: .env
+    shm_size: "16gb"               # DataLoader workers need it
+    volumes:
+      - ./conf:/app/conf           # edit configs without rebuilding
+      - ./datasets:/app/datasets   # generated once, reused
+      - ./logs:/app/logs           # run folders, checkpoints, media
+      - caches:/caches             # persist torch.compile + HF caches across runs
+    # bring the container up idle; run steps yourself via `docker compose exec app bash`
+    command: sleep infinity
+
+volumes:
+  caches:
