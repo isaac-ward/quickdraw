@@ -21,7 +21,7 @@ from .logging import viz
 from .training.setup import env_cfg
 from .utils.logging import make_run_dir
 
-N_FPV = 3  # egocentric sample videos per split
+N_FPV = 4  # egocentric sample videos per split
 
 
 def _render_split(task: dict):
