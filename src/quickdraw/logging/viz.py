@@ -21,7 +21,7 @@ from matplotlib.lines import Line2D  # noqa: E402
 DPI = 220
 _PAD = 1.3
 N_SEG = 16          # discrete hue bands around the ring
-FPV_FOV = 90.0      # egocentric camera FOV (deg); VTK default is 30
+FPV_FOV = 103.5     # egocentric camera FOV (deg); VTK default is 30
 _N_THETA, _N_PHI = 420, 210   # torus face density (smooth even up close in FPV)
 _TEX: dict = {}
 
@@ -71,11 +71,14 @@ def _texture_array(coloring, w=1024, h=512):
     U, V = np.meshgrid(u, v)
     seg = np.floor(U * N_SEG) / N_SEG
     rgb = plt.cm.hsv(seg)[..., :3]
-    if coloring == "squares":
-        nt, npp = 24, 8
-        insq = ((U * nt) % 1 < 0.6) & ((V * npp) % 1 < 0.6)
+    if coloring == "circles":  # black circles centered in each color band, all the way around the tube
+        Rb, rb, M, rho = 0.75, 0.25, 8, 0.06  # base aspect -> circles look round on the base surface
+        cu = (np.floor(U * N_SEG) + 0.5) / N_SEG  # band (color-ring) centers in theta
+        cv = (np.floor(V * M) + 0.5) / M          # evenly around the tube in phi
+        du = (U - cu) * 2 * math.pi * Rb
+        dv = (V - cv) * 2 * math.pi * rb
         rgb = rgb.copy()
-        rgb[insq] = rgb[insq] * 0.3 + 0.5 * 0.7
+        rgb[du * du + dv * dv < rho * rho] = 0.0
     arr = (rgb * 255).astype(np.uint8)
     _TEX[key] = arr
     return arr
