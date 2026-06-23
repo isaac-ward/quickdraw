@@ -22,7 +22,6 @@ from .training.setup import env_cfg
 from .utils.logging import make_run_dir
 
 N_FPV = 4  # egocentric sample videos per split
-SAMPLE_SEED = 7  # fixed across splits: ind/visual share identical motion, so OOD differs in ONE way only
 
 
 def _render_split(task: dict):
@@ -32,7 +31,7 @@ def _render_split(task: dict):
     t = task
     scfg = TorusConfig(R=t["R"], r=t["r"], dt=t["dt"], gamma=t["gamma"], a_max=t["a_max"], init_speed=t["init_speed"])
     name, steps, coloring = t["name"], t["steps"], t["coloring"]
-    obs, act = generate_episodes(scfg, max(t["n_plot"], N_FPV), steps, SAMPLE_SEED)
+    obs, act = generate_episodes(scfg, max(t["n_plot"], N_FPV), steps, t["seed"])
     avec = viz.action_ambient(obs[:, :, :3], act, scfg.R, scfg.r)
     trajs = [{"xyz": obs[i, :, :3], "avec": avec[i], "color": "k"} for i in range(t["n_plot"])]
     title = f"{name} (samples)"
