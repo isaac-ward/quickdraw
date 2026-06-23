@@ -124,7 +124,7 @@ def _add_trajs(pl, pv, R, r, trajs, markers=True):
 def _add_arrows(pl, pv, R, r, arrows):
     """Black applied-action arrows. arrows: list of (point3, action_ambient3). FIXED absolute size
     (same on every torus); raised slightly along the normal to avoid z-fighting. Only LENGTH varies."""
-    shaft_r, tip_r, tip_len = 0.02, 0.05, 0.14  # absolute world units, identical across all toruses
+    shaft_r, tip_r, tip_len = 0.01, 0.028, 0.14  # thinner diameter; length unchanged
     for pt, vel in arrows:
         vel = np.asarray(vel, float)
         s = float(np.linalg.norm(vel))
@@ -237,7 +237,7 @@ def animate_frames(R, r, coloring, trajs, title="", n_frames=10000):
     """Each frame is the SAME `fig_torus_atlas` as the static plot (identical layout/title), with a
     growing black trail + particle + a smoothed (tweened) applied-action arrow. One frame per sim
     step (n_frames is just a safety cap) -> played at a constant 60 fps = real time."""
-    tail = 30  # only the last 30 steps (~0.5 s) of trail are drawn, so it doesn't linger
+    tail = 60  # only the last 60 steps (~1 s) of trail are drawn, so it doesn't linger
     data = [(np.asarray(t["xyz"]),
              _smooth_seq(np.asarray(t["avec"])) if t.get("avec") is not None else None,
              t.get("color", "k")) for t in trajs]
