@@ -62,7 +62,7 @@ def _offset_out(xyz, R, r, frac=0.02):
     return np.stack([x + eps * nx / n, y + eps * ny / n, z + eps * nz / n], axis=1)
 
 
-def _texture_array(coloring, w=1024, h=512):
+def _texture_array(coloring, w=2048, h=1024):
     key = (coloring, w, h)
     if key in _TEX:
         return _TEX[key]
@@ -71,14 +71,15 @@ def _texture_array(coloring, w=1024, h=512):
     U, V = np.meshgrid(u, v)
     seg = np.floor(U * N_SEG) / N_SEG
     rgb = plt.cm.hsv(seg)[..., :3]
-    if coloring == "circles":  # black circles centered in each color band, all the way around the tube
+    if coloring == "circles":  # grey circles centered in each color band, all the way around the tube
         Rb, rb, M, rho = 0.75, 0.25, 8, 0.06  # base aspect -> circles look round on the base surface
         cu = (np.floor(U * N_SEG) + 0.5) / N_SEG  # band (color-ring) centers in theta
         cv = (np.floor(V * M) + 0.5) / M          # evenly around the tube in phi
         du = (U - cu) * 2 * math.pi * Rb
         dv = (V - cv) * 2 * math.pi * rb
-        rgb = rgb.copy()
-        rgb[du * du + dv * dv < rho * rho] = 0.0
+        d = np.sqrt(du * du + dv * dv)
+        alpha = np.clip((rho - d) / 0.006, 0.0, 1.0)[..., None]  # smooth (anti-aliased) rim
+        rgb = rgb * (1 - alpha) + 0.5 * alpha                    # blend toward grey
     arr = (rgb * 255).astype(np.uint8)
     _TEX[key] = arr
     return arr
@@ -108,36 +109,42 @@ def _add_torus(pl, pv, R, r, coloring):
     pl.add_mesh(grid, texture=pv.Texture(_texture_array(coloring)), show_scalar_bar=False)
 
 
-def _add_trajs(pl, pv, R, r, trajs):
+def _add_trajs(pl, pv, R, r, trajs, markers=True):
+    sc = R + r
     for t in trajs:
         p = _offset_out(np.asarray(t["xyz"]), R, r)
         c = t.get("color", "k")
         if len(p) >= 2:
             pl.add_mesh(pv.lines_from_points(p), color=c, line_width=3)
-        pl.add_mesh(pv.Sphere(radius=0.10 * r, center=p[0]), color=c)
-        pl.add_mesh(pv.Sphere(radius=0.16 * r, center=p[-1]), color=c)
+        if markers:  # start/end markers only in the static summary plot, not the videos
+            pl.add_mesh(pv.Sphere(radius=0.035 * sc, center=p[0]), color=c)
+            pl.add_mesh(pv.Sphere(radius=0.055 * sc, center=p[-1]), color=c)
 
 
 def _add_arrows(pl, pv, R, r, arrows):
-    """Black arrows for net velocity. arrows: list of (point3, vel3)."""
+    """Black applied-action arrows. arrows: list of (point3, action_ambient3). FIXED absolute size
+    (same on every torus); raised slightly along the normal to avoid z-fighting. Only LENGTH varies."""
+    shaft_r, tip_r, tip_len = 0.02, 0.05, 0.14  # absolute world units, identical across all toruses
     for pt, vel in arrows:
         vel = np.asarray(vel, float)
         s = float(np.linalg.norm(vel))
         if s < 1e-6:
             continue
-        length = float(np.clip(s * 0.3, 0.4 * r, 2.0 * r))  # only the LENGTH varies
-        # absolute (constant) head + thickness: divide by `length` so scale cancels it back to absolute
-        shaft_r, tip_r, tip_len = 0.025 * r, 0.06 * r, 0.16 * r
-        pl.add_mesh(pv.Arrow(start=np.asarray(pt, float), direction=vel / s, scale=length,
+        pt = np.asarray(pt, float)
+        n = _normal_from_point(pt[None], R)[0]
+        n = n / (np.linalg.norm(n) + 1e-9)
+        pt = pt + 0.02 * n  # SLIGHTLY above the surface
+        length = float(np.clip(s * 0.15, 0.2, 0.6))
+        pl.add_mesh(pv.Arrow(start=pt, direction=vel / s, scale=length,
                              tip_length=tip_len / length, tip_radius=tip_r / length,
                              shaft_radius=shaft_r / length), color="black")
 
 
-def _render(pv, R, r, coloring, trajs, targets, arrows, view, size):
+def _render(pv, R, r, coloring, trajs, targets, arrows, view, size, markers=True):
     pl = pv.Plotter(off_screen=True, window_size=(size, size))
     pl.set_background("white")
     _add_torus(pl, pv, R, r, coloring)
-    _add_trajs(pl, pv, R, r, trajs)
+    _add_trajs(pl, pv, R, r, trajs, markers=markers)
     _add_arrows(pl, pv, R, r, arrows)
     if targets:
         tp = np.array([np.asarray(pp, float) for _, pp in targets])
@@ -178,10 +185,10 @@ def _smooth_seq(seq, alpha=0.12):
 
 
 def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", title="", legend=False,
-                    iso_size=860, ax_size=580):
+                    markers=True, iso_size=860, ax_size=580):
     pv = _pv()
     L = (R + r) * _PAD
-    iso = _render(pv, R, r, coloring, trajs, targets, arrows, "iso", iso_size)
+    iso = _render(pv, R, r, coloring, trajs, targets, arrows, "iso", iso_size, markers=markers)
     fig = plt.figure(figsize=(13, 15))
     gs = GridSpec(4, 3, figure=fig, wspace=0.5, hspace=0.25)
     axm = fig.add_subplot(gs[0:3, :])
@@ -191,7 +198,7 @@ def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", tit
         axm.legend(handles=[Line2D([0], [0], color=t["color"], label=t["label"])
                             for t in trajs if t.get("label")], loc="upper right")
     for col, (view, xl, yl) in enumerate(_AXIAL_VIEWS):
-        img = _render(pv, R, r, coloring, trajs, targets, arrows, view, ax_size)
+        img = _render(pv, R, r, coloring, trajs, targets, arrows, view, ax_size, markers=markers)
         axp = fig.add_subplot(gs[3, col])
         axp.imshow(img, extent=[-L, L, -L, L])
         axp.set_aspect("equal")
@@ -230,6 +237,7 @@ def animate_frames(R, r, coloring, trajs, title="", n_frames=10000):
     """Each frame is the SAME `fig_torus_atlas` as the static plot (identical layout/title), with a
     growing black trail + particle + a smoothed (tweened) applied-action arrow. One frame per sim
     step (n_frames is just a safety cap) -> played at a constant 60 fps = real time."""
+    tail = 30  # only the last 30 steps (~0.5 s) of trail are drawn, so it doesn't linger
     data = [(np.asarray(t["xyz"]),
              _smooth_seq(np.asarray(t["avec"])) if t.get("avec") is not None else None,
              t.get("color", "k")) for t in trajs]
@@ -238,9 +246,11 @@ def animate_frames(R, r, coloring, trajs, title="", n_frames=10000):
     frames = []
     for ti in idx:
         k = int(ti)
-        pt = [{"xyz": x[:k], "color": c} for x, _, c in data]
+        lo = max(0, k - tail)
+        pt = [{"xyz": x[lo:k], "color": c} for x, _, c in data]
         arrows = [(x[k - 1], av[k - 1]) for x, av, _ in data if av is not None]
-        fig = fig_torus_atlas(R, r, trajs=pt, arrows=arrows, coloring=coloring, title=title)  # same sizes
+        fig = fig_torus_atlas(R, r, trajs=pt, arrows=arrows, coloring=coloring, title=title,
+                              markers=False)  # no start/end markers in videos
         fig.set_dpi(90)
         frames.append(_fig_rgb(fig))
         plt.close(fig)

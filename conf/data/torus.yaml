@@ -3,7 +3,7 @@ P: 32          # past context window
 F: 32          # future horizon (training)
 batch: 172
 workers: 4
-n_plot_trajectories: 3     # how many sample trajectories to draw per split plot
+n_plot_trajectories: 4     # how many sample trajectories to draw per split plot
 fpv_fov: 103.5             # egocentric camera field of view (deg); VTK default is 30
 
 # All splits + every OOD change live here (env overrides applied on top of `environments/torus.yaml`).
