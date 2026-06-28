@@ -21,19 +21,17 @@ cd "$(dirname "$0")/../../.." || exit 1   # -> repo root (this script lives in s
 
 DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"  # v8: base gamma0.3 (calmer), slower OOD (g0.5/m2.0), only ood_horizon long, eval@[20,40]
 
-# 5-point run summary (plain words + periods only; Hydra's override grammar rejects ; , - : = etc.)
-# REWRITE THESE EVERY CAMPAIGN: train.py rejects a run_summary identical to any previous run's. The note
-# must speak to THIS launch's current hypothesis + what changed since last time. The per-variant `trying`
-# (built in launch() with the run name) also tags each run so the 6 are unique. No stale copy-pastes.
-P="Long horizon rollouts drift off the torus. We compare data space versus latent space world models and which anti collapse mechanism best holds the manifold."
-T="DSAR refactor verified bit identical. LSAR with five collapse mechanisms implemented and smoke tested. Memory probed so batch 256 fits three per GPU at full BPTT."
-Y="Six way shoot out. DSAR plus LSAR naked recon ema sigreg vicreg. Full BPTT F64 batch 256. Three per GPU on the regen dataset."
-D="Shared backbone d96 dz16 window64. In loop eval ood horizon and control every ten epochs. Standalone ood splits at best checkpoints later."
-R="Real training reaches full rollout where collapse appears. Collapse panel and long horizon eval show which mechanisms hold the manifold."
+# RUN SUMMARY IS NOT HARDCODED HERE. The operator (the LLM driving the session) supplies the 5-point
+# note FRESH each launch via env vars, authored to reflect the CURRENT dev cycle — a baked-in note goes
+# stale and train.py rejects duplicates anyway. Plain words + periods only (Hydra rejects ; , - : = etc.).
+# Required env: RS_PROBLEM RS_TRIED RS_TRYING RS_DETAIL RS_RATIONALE.
+: "${RS_PROBLEM:?author + export the 5-point run_summary fresh, not hardcoded; missing RS_PROBLEM}"
+: "${RS_TRIED:?missing RS_TRIED}"; : "${RS_TRYING:?missing RS_TRYING}"
+: "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
 
-COMMON=( data.root="$DATA" data.batch=256 model.detach_every=0 )  # eval at conf/eval at_epochs=[20,40]
+COMMON=( data.root="$DATA" data.batch=256 model.detach_every=0 )  # eval at conf/eval at_epochs
 # `trying` is set per-variant in launch() (appends the run name) so each of the 6 notes is unique.
-RS=( run_summary.problem="$P" run_summary.tried="$T" run_summary.trying_detail="$D" run_summary.rationale="$R" )
+RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED" run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )
 
 echo "[shootout] killing any existing so_ runs..."
 docker compose exec -T app pkill -9 -f "experiment=so_" 2>/dev/null || true
@@ -52,7 +50,7 @@ launch () {  # $1=gpu  $2=experiment-name  $3..=model overrides
   docker compose exec -T -d -e CUDA_VISIBLE_DEVICES="$gpu" -e TORCHINDUCTOR_COMPILE_THREADS=1 \
     -e TORCHINDUCTOR_CACHE_DIR="/tmp/inductor_$name" -e TRITON_CACHE_DIR="/tmp/triton_$name" app \
     uv run python -m quickdraw.train "$@" "${COMMON[@]}" experiment="$name" "${RS[@]}" \
-      run_summary.trying="$Y This run is the $name variant."
+      run_summary.trying="$RS_TRYING This run is the $name variant."
 }
 
 # Light stagger (interleaving GPUs). The FlexAttention per-shape recompile thrash that used to stall
