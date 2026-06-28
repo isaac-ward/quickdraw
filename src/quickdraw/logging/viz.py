@@ -206,48 +206,105 @@ def _add_fan(pl, pv, R, r, fan, opacity=0.5, max_show=48):
                 show_scalar_bar=False, lighting=False, opacity=opacity)
 
 
-def _render(pv, R, r, coloring, trajs, targets, arrows, view, size, markers=True, current=False,
-            view_l=None, torus_opacity=1.0, fan=None):
-    pl = pv.Plotter(off_screen=True, window_size=(size, size))
-    pl.set_background("white")
-    _add_torus(pl, pv, R, r, coloring, opacity=torus_opacity)
-    if fan is not None:  # draw the candidate fan BENEATH the trails/arrows so the agents stay on top
-        _add_fan(pl, pv, R, r, fan)
-    _add_trajs(pl, pv, R, r, trajs, markers=markers, current=current)
-    _add_arrows(pl, pv, R, r, arrows)
-    if targets:
-        tp = np.array([np.asarray(pp, float) for _, pp in targets])
-        for pp in tp:
-            pl.add_mesh(pv.Sphere(radius=0.12 * max(r, 0.12), center=pp), color="black", lighting=False)
-        pl.add_point_labels(tp, [n for n, _ in targets], font_size=10, text_color="black",
-                            shape=None, show_points=False, always_visible=True)
-    L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
-    vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)
-    # orthographic everywhere + an explicit parallel_scale => framing is fixed, never auto-fit/rescaled
-    pl.enable_parallel_projection()
-    if view == "iso":
-        # back-of-cube only: front faces culled so their edges don't cross the torus; white faces
-        # (no lighting) blend into the background, leaving just the black back edges.
-        pl.add_mesh(pv.Box(bounds=(-L, L, -L, L, -L, L)), color="white", show_edges=True,
-                    edge_color="black", line_width=1.4, culling="front", lighting=False)
-        # x/y/z labels at the axis-end CORNERS (world-aligned, so they agree with the axial views)
-        c = 1.12 * L
-        pl.add_point_labels(np.array([(c, -L, -L), (-L, c, -L), (-L, -L, c)]), ["x", "y", "z"],
-                            font_size=18, text_color="black", shape=None, show_points=False,
-                            always_visible=True)
-        pl.camera_position = [(4 * vl, 4 * vl, 4 * vl), (0, 0, 0), (0, 0, 1)]  # fixed iso direction
-        # in the iso projection the cube's top/bottom corners reach ~1.63L and the z label ~1.73L
-        # *vertically*, so frame to 2.0L (with text margin) — tighter clips the top & bottom
-        pl.camera.parallel_scale = max(vl, 2.0 * L)
-    else:
-        # right = +first label axis, up = +second (no mirror) so axial labels match the world
-        pos = {"z": (0, 0, 4 * vl), "y": (0, 4 * vl, 0), "x": (-4 * vl, 0, 0)}[view]
-        up = {"z": (0, 1, 0), "y": (0, 0, 1), "x": (0, 0, 1)}[view]
-        pl.camera_position = [pos, (0, 0, 0), up]
-        pl.camera.parallel_scale = vl  # set AFTER camera_position so it isn't overwritten by auto-fit
-    img = pl.screenshot(return_img=True)
-    pl.close()
-    return img
+class TorusRenderer:
+    """ONE persistent off-screen renderer shared by every video/figure producer. The legacy `_render`
+    created a fresh `pv.Plotter` AND rebuilt the 88k-vertex torus mesh + texture on EVERY view of EVERY
+    frame (4 views/frame for the atlas) — the dominant cost.
+
+    This builds, ONCE per (view, size), a persistent plotter whose STATIC scene (torus mesh + texture +
+    lights + the iso bounding box & x/y/z labels + the fixed camera/parallel-scale) is set up a single
+    time. Per frame `view()` adds only the cheap DYNAMIC actors (fan, trajectory tubes, arrows, current
+    sphere), screenshots, then removes exactly those — leaving the static scene untouched. Output is
+    BYTE-IDENTICAL to the legacy code (proven by smoke/render_golden); only the per-frame plotter
+    creation + mesh/box/label rebuild are skipped. (One plotter per VIEW, not just per size: reusing one
+    plotter across different cameras leaves VTK state and breaks identity; a per-view plotter only ever
+    renders its own fixed camera. Static actor ORDER vs the dynamic actors is irrelevant — verified.)"""
+
+    def __init__(self, R, r, coloring, sizes=(860, 580), reuse=True):
+        self.pv = _pv()
+        self.R, self.r = R, r
+        self.reuse = reuse   # True: persist a plotter per view + only swap dynamic actors (fast). False:
+        #                      fresh plotter per view (legacy), still with the cached mesh. The reuse path
+        #                      is byte-identical for trails/arrows; the ONE exception is control's stack of
+        #                      overlapping translucent actors (agents + colored fan), where reuse leaves a
+        #                      single-pixel +1/255 blend LSB — so control uses reuse=False to stay exact.
+        grid, thf, phf = _torus(self.pv, R, r)   # cache the mesh + tex coords + texture (built once)
+        grid.active_texture_coordinates = np.c_[thf / (2 * math.pi), phf / (2 * math.pi)].astype(np.float32)
+        self._grid = grid
+        self._tex = self.pv.Texture(_texture_array(coloring))
+        self._cache = {}    # (view, size) -> (plotter, static_actor_names) when reuse=True
+
+    def _add_torus(self, pl, opacity):
+        pl.add_mesh(self._grid, texture=self._tex, show_scalar_bar=False, opacity=opacity)
+
+    def _build(self, view, size, view_l, torus_opacity):
+        """Build a plotter with the STATIC scene (torus + iso box/labels). Returns (plotter,
+        static-actor-names, camera-params). The CAMERA is NOT set here — it's applied in view() AFTER the
+        dynamic actors, exactly like the legacy code, so the clipping range is computed with all actors
+        present (the off-manifold fan extends past the torus; setting the camera with only the torus in
+        scene clips it ~1px differently). Per-video constants (view_l, torus_opacity) are baked in."""
+        pv, R, r = self.pv, self.R, self.r
+        pl = pv.Plotter(off_screen=True, window_size=(int(size), int(size)))
+        pl.set_background("white")
+        self._add_torus(pl, torus_opacity)
+        L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
+        vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)
+        # orthographic everywhere + an explicit parallel_scale => framing is fixed, never auto-fit/rescaled
+        pl.enable_parallel_projection()
+        if view == "iso":
+            # back-of-cube only: front faces culled so their edges don't cross the torus; white faces
+            # (no lighting) blend into the background, leaving just the black back edges.
+            pl.add_mesh(pv.Box(bounds=(-L, L, -L, L, -L, L)), color="white", show_edges=True,
+                        edge_color="black", line_width=1.4, culling="front", lighting=False)
+            # x/y/z labels at the axis-end CORNERS (world-aligned, so they agree with the axial views)
+            c = 1.12 * L
+            pl.add_point_labels(np.array([(c, -L, -L), (-L, c, -L), (-L, -L, c)]), ["x", "y", "z"],
+                                font_size=18, text_color="black", shape=None, show_points=False,
+                                always_visible=True)
+            # in the iso projection the cube's top/bottom corners reach ~1.63L and the z label ~1.73L
+            # *vertically*, so frame to 2.0L (with text margin) — tighter clips the top & bottom
+            cam = ([(4 * vl, 4 * vl, 4 * vl), (0, 0, 0), (0, 0, 1)], max(vl, 2.0 * L))  # fixed iso dir
+        else:
+            # right = +first label axis, up = +second (no mirror) so axial labels match the world
+            pos = {"z": (0, 0, 4 * vl), "y": (0, 4 * vl, 0), "x": (-4 * vl, 0, 0)}[view]
+            up = {"z": (0, 1, 0), "y": (0, 0, 1), "x": (0, 0, 1)}[view]
+            cam = ([pos, (0, 0, 0), up], vl)
+        return pl, set(pl.actors.keys()), cam   # torus + box/labels are static
+
+    def view(self, trajs, targets, arrows, view, size, markers=True, current=False, view_l=None,
+             torus_opacity=1.0, fan=None):
+        pv, R, r = self.pv, self.R, self.r
+        key = (view, int(size))
+        if self.reuse:
+            if key not in self._cache:
+                self._cache[key] = self._build(view, int(size), view_l, torus_opacity)
+            pl, static, cam = self._cache[key]
+        else:
+            pl, static, cam = self._build(view, int(size), view_l, torus_opacity)
+        # per-frame DYNAMIC actors only (fan BENEATH trails/arrows so the agents stay on top)
+        if fan is not None:
+            _add_fan(pl, pv, R, r, fan)
+        _add_trajs(pl, pv, R, r, trajs, markers=markers, current=current)
+        _add_arrows(pl, pv, R, r, arrows)
+        if targets:
+            tp = np.array([np.asarray(pp, float) for _, pp in targets])
+            for pp in tp:
+                pl.add_mesh(pv.Sphere(radius=0.12 * max(r, 0.12), center=pp), color="black", lighting=False)
+            pl.add_point_labels(tp, [n for n, _ in targets], font_size=10, text_color="black",
+                                shape=None, show_points=False, always_visible=True)
+        pl.camera_position = cam[0]            # camera LAST (after all actors) -> clipping includes the
+        pl.camera.parallel_scale = cam[1]      # off-manifold fan, byte-matching the legacy _render
+        img = pl.screenshot(return_img=True)
+        if self.reuse:
+            for name in set(pl.actors.keys()) - static:   # remove ONLY this frame's dynamic actors
+                pl.remove_actor(name, render=False)
+        else:
+            pl.close()
+        return img
+
+    def close(self):
+        for entry in self._cache.values():
+            entry[0].close()
 
 
 # ------------------------- public: static atlas -------------------------
@@ -272,11 +329,14 @@ def _moving_avg(seq, win=ACTION_SMOOTH_WINDOW):
 
 def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", title="", legend=False,
                     markers=True, current=False, iso_size=860, ax_size=580, view_pad=_PAD, torus_opacity=1.0,
-                    fan=None):
-    pv = _pv()
+                    fan=None, renderer=None):
+    # renderer: pass a persistent TorusRenderer to reuse across frames (videos); None -> make + close one
+    # for this single figure (static plots). Either way the per-view output is identical.
+    own = renderer is None
+    rend = renderer if renderer is not None else TorusRenderer(R, r, coloring, sizes=(iso_size, ax_size))
     vl = (R + r) * view_pad  # fixed view half-extent (shared by the render camera and the axial ticks)
-    iso = _render(pv, R, r, coloring, trajs, targets, arrows, "iso", iso_size, markers=markers,
-                  current=current, view_l=vl, torus_opacity=torus_opacity, fan=fan)
+    iso = rend.view(trajs, targets, arrows, "iso", iso_size, markers=markers,
+                    current=current, view_l=vl, torus_opacity=torus_opacity, fan=fan)
     fig = plt.figure(figsize=(13, 15))
     gs = GridSpec(4, 3, figure=fig, wspace=0.5, hspace=0.25)
     axm = fig.add_subplot(gs[0:3, :])
@@ -286,13 +346,15 @@ def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", tit
         axm.legend(handles=[Line2D([0], [0], color=t["color"], label=t["label"])
                             for t in trajs if t.get("label")], loc="upper right")
     for col, (view, xl, yl) in enumerate(_AXIAL_VIEWS):
-        img = _render(pv, R, r, coloring, trajs, targets, arrows, view, ax_size, markers=markers,
-                      current=current, view_l=vl, torus_opacity=torus_opacity, fan=fan)  # fan in all views
+        img = rend.view(trajs, targets, arrows, view, ax_size, markers=markers,
+                        current=current, view_l=vl, torus_opacity=torus_opacity, fan=fan)  # fan in all views
         axp = fig.add_subplot(gs[3, col])
         axp.imshow(img, extent=[-vl, vl, -vl, vl])
         axp.set_aspect("equal")
         axp.set_xlabel(xl)
         axp.set_ylabel(yl)
+    if own:
+        rend.close()
     return fig
 
 
@@ -376,18 +438,22 @@ def animate_frames(R, r, coloring, trajs, title="", n_frames=10000, smooth_windo
     idx = np.linspace(2, T, min(n_frames, T)).astype(int)
     frames = []
     every = max(1, len(idx) // 8)  # progress ~every 12% of frames
-    for fi, ti in enumerate(idx):
-        if log is not None and fi % every == 0:
-            log(f"rendered {fi}/{len(idx)} frames")
-        k = int(ti)
-        lo = max(0, k - tail)
-        pt = [{"xyz": x[lo:k], "color": c} for x, _, c in data]
-        arrows = [(x[k - 1], av[k - 1]) for x, av, _ in data if av is not None]
-        fig = fig_torus_atlas(R, r, trajs=pt, arrows=arrows, coloring=coloring, title=title,
-                              markers=False, current=True, torus_opacity=torus_opacity)  # current-position sphere only
-        fig.set_dpi(VIDEO_DPI)
-        frames.append(_fig_rgb(fig))
-        plt.close(fig)
+    rend = TorusRenderer(R, r, coloring)  # one persistent renderer reused across all frames
+    try:
+        for fi, ti in enumerate(idx):
+            if log is not None and fi % every == 0:
+                log(f"rendered {fi}/{len(idx)} frames")
+            k = int(ti)
+            lo = max(0, k - tail)
+            pt = [{"xyz": x[lo:k], "color": c} for x, _, c in data]
+            arrows = [(x[k - 1], av[k - 1]) for x, av, _ in data if av is not None]
+            fig = fig_torus_atlas(R, r, trajs=pt, arrows=arrows, coloring=coloring, title=title,
+                                  markers=False, current=True, torus_opacity=torus_opacity, renderer=rend)  # current-position sphere only
+            fig.set_dpi(VIDEO_DPI)
+            frames.append(_fig_rgb(fig))
+            plt.close(fig)
+    finally:
+        rend.close()
     return np.stack(frames)
 
 
@@ -405,21 +471,25 @@ def traj_compare_frames(R, r, coloring, true_full, pred_full, avec_true, P, n_fr
     idx = np.linspace(2, T, min(n_frames, T)).astype(int)
     frames = []
     every = max(1, len(idx) // 10)  # progress every ~10% of frames
-    for fi, ti in enumerate(idx):
-        if log is not None and fi % every == 0:
-            log(f"rendered {fi}/{len(idx)} frames")
-        k, lo = int(ti), max(0, int(ti) - tail)
-        trajs = [{"xyz": true_full[lo:k], "color": "black", "tip": {"color": "black"}}]  # truth: black + arrow
-        arrows = [(true_full[k - 1], avec[k - 1])]
-        if k >= P:  # after the fork: predicted in dark grey, flat-shaded (no specular), no arrow
-            trajs.append({"xyz": pred_full[max(lo, P - 1) : k], "color": "dimgray",
-                          "tip": {"color": "dimgray", "lighting": False}})
-        fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
-                              markers=False, view_pad=EVAL_VIEW_PAD,  # wide fixed view: red drift stays visible
-                              torus_opacity=torus_opacity)
-        fig.set_dpi(VIDEO_DPI)
-        frames.append(_fig_rgb(fig))
-        plt.close(fig)
+    rend = TorusRenderer(R, r, coloring)  # one persistent renderer reused across all frames
+    try:
+        for fi, ti in enumerate(idx):
+            if log is not None and fi % every == 0:
+                log(f"rendered {fi}/{len(idx)} frames")
+            k, lo = int(ti), max(0, int(ti) - tail)
+            trajs = [{"xyz": true_full[lo:k], "color": "black", "tip": {"color": "black"}}]  # truth: black + arrow
+            arrows = [(true_full[k - 1], avec[k - 1])]
+            if k >= P:  # after the fork: predicted in dark grey, flat-shaded (no specular), no arrow
+                trajs.append({"xyz": pred_full[max(lo, P - 1) : k], "color": "dimgray",
+                              "tip": {"color": "dimgray", "lighting": False}})
+            fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
+                                  markers=False, view_pad=EVAL_VIEW_PAD,  # wide fixed view: red drift stays visible
+                                  torus_opacity=torus_opacity, renderer=rend)
+            fig.set_dpi(VIDEO_DPI)
+            frames.append(_fig_rgb(fig))
+            plt.close(fig)
+    finally:
+        rend.close()
     return np.stack(frames)
 
 
@@ -437,52 +507,65 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
     idx = np.linspace(2, T, min(n_frames, T)).astype(int)
     frames = []
     every = max(1, len(idx) // 10)  # progress every ~10% of frames
-    for fi, ti in enumerate(idx):
-        if log is not None and fi % every == 0:
-            log(f"rendered {fi}/{len(idx)} frames")
-        k, lo = int(ti), max(0, int(ti) - tail)
-        trajs, arrows = [], []
-        for a in agents:
-            c = a["color"]
-            gi = min(k - 1, len(a["goal_seq"]) - 1)  # goal_seq/avec have one fewer entry than path
-            ai = min(k - 1, len(a["avec"]) - 1)
-            trajs.append({"xyz": a["path"][lo:k], "color": c, "tip": {"color": c, "lighting": False}})
-            trajs.append({"xyz": a["goal_seq"][gi][None], "color": c, "marker_color": c,
-                          "start_sphere": True, "end_sphere": False, "start_scale": 0.5})  # small goal marker
-            arrows.append((a["path"][k - 1], a["avec"][ai], c))
-        fan = fan_seq[min(k - 1, len(fan_seq) - 1)] if fan_seq else None  # this step's candidate fan
-        fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
-                              markers=False, view_pad=EVAL_VIEW_PAD, torus_opacity=torus_opacity, fan=fan)
-        fig.set_dpi(VIDEO_DPI)
-        frames.append(_fig_rgb(fig))
-        plt.close(fig)
+    rend = TorusRenderer(R, r, coloring)  # one persistent renderer reused across all frames
+    try:
+        for fi, ti in enumerate(idx):
+            if log is not None and fi % every == 0:
+                log(f"rendered {fi}/{len(idx)} frames")
+            k, lo = int(ti), max(0, int(ti) - tail)
+            trajs, arrows = [], []
+            for a in agents:
+                c = a["color"]
+                gi = min(k - 1, len(a["goal_seq"]) - 1)  # goal_seq/avec have one fewer entry than path
+                ai = min(k - 1, len(a["avec"]) - 1)
+                trajs.append({"xyz": a["path"][lo:k], "color": c, "tip": {"color": c, "lighting": False}})
+                trajs.append({"xyz": a["goal_seq"][gi][None], "color": c, "marker_color": c,
+                              "start_sphere": True, "end_sphere": False, "start_scale": 0.5})  # small goal marker
+                arrows.append((a["path"][k - 1], a["avec"][ai], c))
+            fan = fan_seq[min(k - 1, len(fan_seq) - 1)] if fan_seq else None  # this step's candidate fan
+            fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
+                                  markers=False, view_pad=EVAL_VIEW_PAD, torus_opacity=torus_opacity,
+                                  fan=fan, renderer=rend)
+            fig.set_dpi(VIDEO_DPI)
+            frames.append(_fig_rgb(fig))
+            plt.close(fig)
+    finally:
+        rend.close()
     return np.stack(frames)
 
 
 def fpv_frames(R, r, coloring, obs, n_frames=10000, fov=FPV_FOV, size=FPV_SIZE):
     """Egocentric observation_image: camera at the particle, smoothed heading along tangential
     velocity, up = surface normal, configurable FOV. No velocity arrow here."""
-    pv = _pv()
     obs = np.asarray(obs)
     T = len(obs)
     # one frame per timestep (aligned 1:1 with obs, as the lerobot image observation needs); n_frames
     # only downsamples if explicitly smaller than T
     idx = np.arange(T) if n_frames >= T else np.linspace(0, T - 1, n_frames).astype(int)
     frames, sm = [], None
-    for t in idx:
-        p, v = obs[t, :3], obs[t, 3:]
-        n = _normal_from_point(p[None], R)[0]
-        n = n / (np.linalg.norm(n) + 1e-9)
-        fwd = v - np.dot(v, n) * n
-        nf = np.linalg.norm(fwd)
-        cur = fwd / nf if nf > 1e-6 else (sm if sm is not None else np.array([1.0, 0.0, 0.0]))
-        sm = cur if sm is None else (0.85 * sm + 0.15 * cur)
-        sm = sm / (np.linalg.norm(sm) + 1e-9)
-        pl = pv.Plotter(off_screen=True, window_size=(size, size))
-        pl.set_background("white")
-        _add_torus(pl, pv, R, r, coloring)
-        pl.camera_position = [tuple(p + 0.06 * r * n), tuple(p + sm * 2 * r), tuple(n)]
-        pl.camera.view_angle = float(fov)
-        frames.append(pl.screenshot(return_img=True))
-        pl.close()
+    # FPV camera moves EVERY frame; reusing one plotter across changing cameras leaves VTK state (not
+    # pixel-identical), so use a FRESH plotter per frame — but with the renderer's CACHED torus mesh +
+    # texture so we still skip the per-frame 88k-vertex rebuild. (FPV is 256px + the dataset render is
+    # already process-parallel, so per-frame plotter creation here is acceptable.)
+    rend = TorusRenderer(R, r, coloring)
+    pv = rend.pv
+    try:
+        for t in idx:
+            p, v = obs[t, :3], obs[t, 3:]
+            n = _normal_from_point(p[None], R)[0]
+            n = n / (np.linalg.norm(n) + 1e-9)
+            fwd = v - np.dot(v, n) * n
+            nf = np.linalg.norm(fwd)
+            cur = fwd / nf if nf > 1e-6 else (sm if sm is not None else np.array([1.0, 0.0, 0.0]))
+            sm = cur if sm is None else (0.85 * sm + 0.15 * cur)
+            sm = sm / (np.linalg.norm(sm) + 1e-9)
+            pl = pv.Plotter(off_screen=True, window_size=(int(size), int(size)))
+            pl.set_background("white")
+            rend._add_torus(pl, 1.0)
+            pl.camera_position = [tuple(p + 0.06 * r * n), tuple(p + sm * 2 * r), tuple(n)]
+            pl.camera.view_angle = float(fov)
+            frames.append(pl.screenshot(return_img=True))
+            pl.close()
+    finally:
+        rend.close()
     return np.stack(frames)

@@ -65,18 +65,24 @@ class LitWorldModel(L.LightningModule):
             objective = loss_total
         else:                                       # JEPA variants: obs term is a decoder-only readout probe
             objective = loss_total + lam * obs_mse
-        # train-time shaping variations (noise already applied to inputs above; here the loss terms):
-        # add their penalties to the objective and log everything under {variation_name}/.
-        if training and self.variations:
+        # train-time shaping variations (noise already applied to inputs above; here the loss terms).
+        # Computed on BOTH train and val so every optimized loss component shows in the {tag}/loss/*
+        # breakdown. enable_grad: the contraction term builds a Jacobian graph and val runs under no_grad.
+        if self.variations:
             ctx = VarContext(self.model, preds, future_obs, obs_seq, act_seq,
                              self.norm, self.R, self.r, self.v_scale, self.dt, training)
-            extra, v_logs = self.variations.losses(ctx)
+            with torch.enable_grad():
+                extra, comps, diags = self.variations.losses(ctx)
             if extra is not None:
+                loss_total = loss_total + extra   # so {tag}/loss/total includes the variation components
                 objective = objective + extra
-            for k, val in {**t_logs, **v_logs}.items():
-                self.log(k, val)
+            for k, val in comps.items():          # {tag}/loss/{physical,contraction} on BOTH train + val
+                self.log(f"{tag}/loss/{k}", val)
+            if training:                          # diagnostics + the noise sigma are train-only
+                for k, val in {**t_logs, **diags}.items():
+                    self.log(k, val)
         # logging: loss/* are RAW (pre-scaling, comparable across methods); loss/total is the actual
-        # scaled objective. obs_error is the decoded-rollout obs MSE logged for ALL methods (one plot).
+        # scaled objective (incl. any variation components). obs_error = decoded-rollout obs MSE (all methods).
         self.log(f"{tag}/loss/total", loss_total, prog_bar=(tag == "train"))
         for k, v in raw.items():
             self.log(f"{tag}/loss/{k}", v)

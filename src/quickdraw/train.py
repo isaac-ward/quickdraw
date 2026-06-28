@@ -145,7 +145,9 @@ def main(cfg):
     # enable_progress_bar=False: no tqdm; ProgressPrinter emits plain per-epoch lines instead.
     trainer = L.Trainer(max_epochs=cfg.trainer.max_epochs, precision=cfg.trainer.precision,
                         accelerator="gpu", devices=1, gradient_clip_val=1.0, enable_progress_bar=False,
-                        check_val_every_n_epoch=1, callbacks=callbacks, logger=False)
+                        check_val_every_n_epoch=1, callbacks=callbacks, logger=False,
+                        inference_mode=False)  # val runs under no_grad (not inference_mode) so the
+    #                    contraction variation can build its Jacobian graph for the val/loss breakdown.
     trainer.fit(lit, loaders["train"], loaders["val"])
 
     # stable name for the best checkpoint, used by eval_ood / eval_control

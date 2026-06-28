@@ -8,21 +8,22 @@
 # the main rollout/eval stay on compiled FlexAttention. See launch_shootout.sh banner for the full why.
 # ============================================================================================
 #
-# RUN SUMMARY IS NOT HARDCODED HERE. The operator (the LLM driving the session) supplies the 5-point note
-# FRESH each launch via env vars, authored to reflect the CURRENT dev cycle — a baked-in note goes stale
-# and train.py rejects duplicates anyway. Plain words + periods only (Hydra rejects ; , - : = etc.).
-# Required env: RS_PROBLEM RS_TRIED RS_TRYING RS_DETAIL RS_RATIONALE.
+# RUN SUMMARY IS NOT HARDCODED HERE. The operator (the LLM driving the session) supplies the note FRESH
+# each launch via env vars, authored to reflect the CURRENT dev cycle (a baked-in note goes stale and
+# train.py rejects duplicates). Plain words + periods only (Hydra rejects ; , - : = etc.). The shared
+# fields come from RS_PROBLEM/RS_TRIED/RS_DETAIL/RS_RATIONALE; the per-run `trying` (what THIS run tests)
+# comes from RS_TRYING_<short> (e.g. RS_TRYING_physical), so every run's summary is distinct + run-specific.
 #
-# Usage:  RS_PROBLEM=... RS_TRIED=... RS_TRYING=... RS_DETAIL=... RS_RATIONALE=... \
-#           bash src/quickdraw/scripts/launch_variations.sh
+# Usage: RS_PROBLEM=.. RS_TRIED=.. RS_DETAIL=.. RS_RATIONALE=.. RS_TRYING_baseline=.. RS_TRYING_physical=.. \
+#          RS_TRYING_noise10=.. RS_TRYING_noise30=.. RS_TRYING_contract_soft=.. RS_TRYING_contract_hard=.. \
+#          bash src/quickdraw/scripts/launch_variations.sh
 set -uo pipefail
 cd "$(dirname "$0")/../../.." || exit 1   # -> repo root (this script lives in src/quickdraw/scripts/)
 
 DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 
-: "${RS_PROBLEM:?author + export the 5-point run_summary fresh, not hardcoded; missing RS_PROBLEM}"
-: "${RS_TRIED:?missing RS_TRIED}"; : "${RS_TRYING:?missing RS_TRYING}"
-: "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
+: "${RS_PROBLEM:?author + export the run_summary fresh, not hardcoded; missing RS_PROBLEM}"
+: "${RS_TRIED:?missing RS_TRIED}"; : "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
 
 # fixed across all 6: recon LSAR, full BPTT, batch 256, v8 data. Per-run variation overrides are passed
 # to launch(). All variations default OFF, so var_recon_baseline is a clean (unmodified) recon run.
@@ -37,13 +38,16 @@ sleep 4
 
 launch () {  # $1=gpu  $2=experiment-name  $3..=variation overrides
   local gpu="$1" name="$2"; shift 2
+  local short="${name#var_recon_}" tvar
+  tvar="RS_TRYING_${short}"                       # per-run `trying` note (operator-supplied, run-specific)
+  local trying="${!tvar:?missing $tvar the run-specific trying note}"
   echo "[variations] launching $name on GPU $gpu"
   # isolated compile caches per run (concurrent runs sharing the default cache contend + stall) +
   # in-process inductor compile (fork-after-CUDA deadlock otherwise). See launch_shootout.sh.
   docker compose exec -T -d -e CUDA_VISIBLE_DEVICES="$gpu" -e TORCHINDUCTOR_COMPILE_THREADS=1 \
     -e TORCHINDUCTOR_CACHE_DIR="/tmp/inductor_$name" -e TRITON_CACHE_DIR="/tmp/triton_$name" app \
     uv run python -m quickdraw.train "${COMMON[@]}" "$@" experiment="$name" "${RS[@]}" \
-      run_summary.trying="$RS_TRYING This run is the $name variant."
+      run_summary.trying="$trying"
 }
 
 STAGGER=45

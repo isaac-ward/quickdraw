@@ -44,9 +44,12 @@ class VarContext:
 
 class Variation:
     """Base toggle. A variation implements `transform_obs` (input augmentation) and/or `loss` (extra
-    objective term). Both default to no-ops, so a subclass only overrides what it needs. Logs are
-    returned as plain dicts; the suite namespaces them under `{name}/`."""
+    objective term). Both default to no-ops, so a subclass only overrides what it needs. `loss` returns
+    (weighted_term_or_None, diag_dict): the weighted term is added to the objective AND logged under
+    `{tag}/loss/<loss_name>` (so it sits with the other optimized loss components on both train and val);
+    diag_dict holds sub-diagnostics, namespaced by the suite under `{name}/`."""
     name: str = "variation"
+    loss_name: str | None = None   # key under {tag}/loss/ for this variation's additive term (None = none)
 
     def transform_obs(self, obs: Tensor, training: bool) -> tuple[Tensor, dict]:
         return obs, {}
@@ -82,6 +85,7 @@ class PhysicalLoss(Variation):
         algebraic terms are per-step and can't see it). Ambient coords are continuous through angle
         wraps, so the position difference is always well-defined."""
     name = "physical_loss"
+    loss_name = "physical"
 
     def __init__(self, weight: float, continuity: float = 0.0):
         self.weight = float(weight)
@@ -98,13 +102,13 @@ class PhysicalLoss(Variation):
         v_off = (obs_phys[..., 3:] * T.normal(th, ph)).sum(-1) / ctx.v_scale
         alg = d_off.pow(2).mean() + v_off.pow(2).mean()              # algebraic: on-surface + tangent
         total = self.weight * alg
-        logs = {"loss": alg.detach(), "d_off": d_off.abs().mean().detach(), "v_off": v_off.abs().mean().detach()}
+        diag = {"d_off": d_off.abs().mean().detach(), "v_off": v_off.abs().mean().detach()}
         if self.continuity > 0.0 and obs_phys.shape[1] >= 3 and ctx.dt:   # kinematic continuity v = dp/dt
             sec = (p_hat[:, 2:] - p_hat[:, :-2]) / (2.0 * ctx.dt)         # central-diff velocity, interior t
             cont = ((obs_phys[:, 1:-1, 3:] - sec) / ctx.v_scale).pow(2).sum(-1).mean()
             total = total + self.continuity * cont
-            logs["continuity"] = cont.detach()
-        return total, logs
+            diag["continuity"] = cont.detach()
+        return total, diag
 
 
 class Contraction(Variation):
@@ -116,6 +120,7 @@ class Contraction(Variation):
     double-vjp trick (pure autograd double-backward — needs the eager sdpa(MATH) attention path, which
     FlexAttention can't double-back through). Runs in fp32 (autocast off) for a stable second-order."""
     name = "contraction"
+    loss_name = "contraction"
 
     def __init__(self, weight: float, target: float, power_iters: int = 2, n_sample_steps: int = 4):
         self.weight = float(weight)
@@ -175,7 +180,7 @@ class Contraction(Variation):
                 sigmas.append(self._sigma_max(model, states, act[:, s:s + win].float()))
             sigma_max = torch.stack(sigmas).mean()
         L = torch.relu(sigma_max - self.target).pow(2)
-        return self.weight * L, {"loss": L.detach(), "sigma_max": sigma_max.detach()}
+        return self.weight * L, {"sigma_max": sigma_max.detach()}
 
 
 class VariationSuite:
@@ -195,15 +200,20 @@ class VariationSuite:
             logs.update({f"{v.name}/{k}": val for k, val in l.items()})
         return obs, logs
 
-    def losses(self, ctx: VarContext) -> tuple[Tensor | None, dict]:
+    def losses(self, ctx: VarContext) -> tuple[Tensor | None, dict, dict]:
+        """Returns (summed weighted term for the objective, {loss_name: term} for {tag}/loss/ logging,
+        {name/diagkey: value} for diagnostics)."""
         total: Tensor | None = None
-        logs: dict = {}
+        comps: dict = {}
+        diags: dict = {}
         for v in self.variations:
-            term, l = v.loss(ctx)
+            term, diag = v.loss(ctx)
             if term is not None:
                 total = term if total is None else total + term
-            logs.update({f"{v.name}/{k}": val for k, val in l.items()})
-        return total, logs
+                if v.loss_name:
+                    comps[v.loss_name] = term.detach()
+            diags.update({f"{v.name}/{k}": val for k, val in diag.items()})
+        return total, comps, diags
 
 
 def make_variation_suite(cfg) -> VariationSuite:

@@ -140,8 +140,9 @@ def test_integration():
         with torch.autocast(device_type=DEV, dtype=torch.bfloat16, enabled=(DEV == "cuda")):
             obj = lit._step(batch, "train")
         want = {"noise_injection/sigma_desired", "noise_injection/sigma_measured",
-                "physical_loss/loss", "physical_loss/d_off", "physical_loss/v_off", "physical_loss/continuity",
-                "contraction/loss", "contraction/sigma_max"}
+                "train/loss/physical", "train/loss/contraction",   # loss components in the {tag}/loss/ breakdown
+                "physical_loss/d_off", "physical_loss/v_off", "physical_loss/continuity",
+                "contraction/sigma_max"}
         missing = want - set(keys)
         check(f"{name} finite objective (bf16 autocast)", bool(torch.isfinite(obj)), f"obj={float(obj.detach()):.3e}")
         check(f"{name} all variation log keys present", not missing, f"missing={missing or 'none'}")
