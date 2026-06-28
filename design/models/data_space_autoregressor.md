@@ -1,16 +1,46 @@
-# Base Model — Causal Transformer, Data-Space Prediction
+# DSAR — Data-Space Autoregressor (Causal Transformer, Direct Observation Prediction)
 
 The control model for the shoot-out: a decoder-only transformer that predicts `observation_vector`
 **directly** (no latent world model, unlike seamstress's RSSM), action-conditioned, autoregressive
 to arbitrary horizon. PyTorch + Lightning + Hydra. Inspired by `architecture_old`'s transformer
 block; differs by being causal, pre-norm, temporal, and data-space.
 
+See `high_level.md` for the shoot-out overview, comparison table, and taxonomy. The sibling
+`latent_space_autoregressor.md` (LSAR) predicts in a learned latent space; both descend from the
+same `SequenceWorldModel` ancestor (below). In teacher-forced mode DSAR and LSAR share the **entire
+forward pass up to the prediction head** — identical encoder, fuser, transformer, hidden `hₜ`; they
+diverge only at the head/loss and in free-running rollout (DSAR feeds back the observation and
+re-encodes it; LSAR feeds back the latent and never re-encodes). That divergence *is* the
+data-space/latent-space distinction.
+
+## Shared ancestor — `SequenceWorldModel`
+
+DSAR and LSAR are subclasses of one ancestor that owns everything common: the action encoder
+`enc_a (2→d)`, the observation encoder `enc (6→dz)` (shared with LSAR; the fuser up-projects `dz→d`),
+the `TokenStreamFuser`, the causal `Transformer`
+(RoPE + sliding window `W`), and **one** autoregressive rollout loop (the `p_tf` teacher-forcing
+curriculum + truncated BPTT). The rollout is written against four hooks the subclass fills in:
+
+| Hook | DSAR (this model) | LSAR (sibling) |
+|---|---|---|
+| `seed_state(o)` | obs as-is (carried state = obs) | `enc(o)` (carried state = latent) |
+| `to_token(state, a)` | `fuse(enc(o), enc_a(a))` | `fuse(z, enc_a(a))` |
+| `next_state(h, prev)` | `prev + delta_head(h)` | `prev + predictor(h)` |
+| `to_obs(state)` | as-is | `dec(state)` |
+
+Only `seed_state`/`to_obs` are identity for DSAR — and only because the carried state already *is*
+the observation. `enc`/`delta_head` are real layers running inside `to_token`/`next_state`. Keeping
+the rollout, curriculum, and BPTT in the ancestor means the eval and MPPI control code never changes
+when swapping DSAR ↔ LSAR.
+
 ## Tokenization — full fusion, one token per timestep
 
 Every input is a **stream** with its own encoder; one fuser collapses them to a single step-token.
 
-- Encoders → a `d`-vector per stream: `observation_vector` → `MLP(6→d)`; `action` → `MLP(2→d)`;
-  later `observation_image` → ViT (`architecture_old`) pooled to one vector; lidar → its encoder.
+- Encoders → a per-stream feature vector: `observation_vector` → `MLP(6→dz)` (the latent `z`, shared
+  with LSAR); `action` → `MLP(2→d)`; later `observation_image` → ViT (`architecture_old`) pooled to
+  one vector; lidar → its encoder. The fuser's per-stream `Linear(·→d)` projects each up to token
+  width `d`.
 - Fuse (seamstress `TokenStreamFuser`): per-stream `LayerNorm → Linear(·→d)`, concat, `MLP → d`.
   Per-stream norm absorbs differing scales (action vs obs).
 - Result: stream `x₀, x₁, …`, **one fused token per timestep** `xₜ = fuse(oₜ, aₜ)`.
@@ -42,6 +72,12 @@ This is plain next-token prediction (position `t` predicts `t+1`).
   also break the chain).
 - Windows from the `delta_timestamps` loader (`P=32` past, `F=32` future).
 
+## Cross-cutting variations
+
+Two optional toggles apply to DSAR (and every other model) — **physical loss** (`λ_phys`) and **noise
+injection** (`σ`) — specified in `variations.md`. DSAR's only model-specific detail: the physical loss
+penalizes its prediction `ô` directly (no decode step needed).
+
 ## Rollout / eval
 
 Seed with `P` context steps, feed the true `action` sequence, predict `Δ` autoregressively for
@@ -59,7 +95,9 @@ Seed with `P` context steps, feed the true `action` sequence, predict `Δ` autor
 
 ## Implementation
 
-- `BaseWorldModel(nn.Module)`: stream encoders + `TokenStreamFuser` + `nn.ModuleList` of blocks +
-  delta head. Hydra-configured (`d, depth, heads, W, p_tf`).
-- Lightning `LightningModule` owns the `p_tf` rollout loop, truncated BPTT, and the `logging.md`
+- `DataSpaceAR(SequenceWorldModel)`: inherits stream encoders + `TokenStreamFuser` + `Transformer` +
+  the shared rollout; adds the `delta_head (d→6)` and fills the four hooks above. Hydra-configured
+  (`d, depth, heads, W, p_tf`). (Refactor note: this generalizes today's `BaseWorldModel` — the
+  rollout loop currently in `BaseWorldModel._rollout` moves up into `SequenceWorldModel`.)
+- Lightning `LightningModule` owns the `p_tf` curriculum, truncated BPTT, and the `logging.md`
   metrics. Metric functions imported from the env — single source of truth.

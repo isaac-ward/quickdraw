@@ -1,0 +1,4 @@
+name: sigreg     # LeJEPA: push latents toward isotropic Gaussian via random 1-D sketches + Epps-Pulley
+n_sketches: 64   # number of random projection directions per step
+n_grid: 17       # frequency-grid points for the Epps-Pulley characteristic-function integral
+t_max: 5.0       # grid spans [-t_max, t_max]

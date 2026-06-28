@@ -15,6 +15,15 @@ experiment: base
 # checkpoint path for the eval/control entrypoints (override on CLI)
 checkpoint: null
 
+# REQUIRED before any training run (train.py asserts all 5 are set): a 5-point experiment note,
+# written to <run_dir>/auto_run_summary.txt and printed to the logs (so it's in the wandb console).
+run_summary:
+  problem: null          # 1. the problem we are facing
+  tried: null            # 2. what we have tried so far
+  trying: null           # 3. what we are trying in this run
+  trying_detail: null    # 4. what we are trying, in more detail
+  rationale: null        # 5. why we expect it to solve the existing problem
+
 hydra:
   job:
     chdir: false

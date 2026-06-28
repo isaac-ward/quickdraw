@@ -1,8 +1,10 @@
 """Dataset generation: roll out TorusEnv -> LeRobotDataset splits (design/data.md).
 
-Splits: train, val, eval_ind, eval_ood_visual, eval_ood_geometric, eval_ood_dynamics.
-Low-dim only for the vector stage (observation_vector, action); images join at the image stage
-through the same lerobot writer with no schema change.
+Splits: train, val, eval_ood_horizon, eval_ood_visual, eval_ood_geometric, eval_ood_dynamics.
+Each split stores `observation_vector`, `action`, and `observation.images.fpv` (the egocentric video,
+the lerobot-standard image observation). The FPV frames are rendered SEPARATELY at full parallelism
+(see data_generation.py) and only INGESTED here, so the lerobot writing (one dataset per split) is
+not the parallelism bottleneck.
 
 NOTE: the lerobot writer calls are isolated in `write_lerobot_split` — that is the one place to
 adjust if the installed lerobot API differs (it has drifted across versions).
@@ -12,8 +14,7 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict
 
 import numpy as np
 import torch
@@ -54,47 +55,51 @@ def compute_norm_stats(obs: np.ndarray, act: np.ndarray) -> dict:
     }
 
 
-def write_lerobot_split(root, repo_id: str, obs: np.ndarray, act: np.ndarray, fps: int):
-    """Write episodes to a LeRobotDataset on disk. ISOLATED lerobot API surface."""
+def _read_frames(path: str) -> np.ndarray:
+    """Read an mp4 back to (T,H,W,3) uint8 (the pre-rendered per-episode FPV clip)."""
+    import imageio.v2 as imageio
+
+    rd = imageio.get_reader(path)
+    frames = np.stack([f[..., :3] for f in rd])
+    rd.close()
+    return frames
+
+
+def write_lerobot_split(root, repo_id: str, obs: np.ndarray, act: np.ndarray, fps: int,
+                        fpv_dir: str | None = None, fpv_size: int = 256):
+    """Write episodes to a LeRobotDataset on disk. ISOLATED lerobot API surface.
+
+    When `fpv_dir` is given, each episode's pre-rendered clip `fpv_dir/ep_<i>.mp4` is read back and
+    stored as the lerobot-standard image observation `observation.images.fpv` (dtype=video), aligned
+    1:1 with the vector frames.
+    """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    video = fpv_dir is not None
     features = {
         "observation_vector": {"dtype": "float32", "shape": (obs.shape[-1],), "names": None},
         "action": {"dtype": "float32", "shape": (act.shape[-1],), "names": None},
     }
-    ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=root, features=features, use_videos=False)
+    if video:
+        features["observation.images.fpv"] = {"dtype": "video", "shape": (fpv_size, fpv_size, 3),
+                                              "names": ["height", "width", "channels"]}
+    ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=root, features=features, use_videos=video)
     n_traj, steps, _ = obs.shape
     for i in range(n_traj):
+        frames = _read_frames(os.path.join(fpv_dir, f"ep_{i:04d}.mp4")) if video else None
         for t in range(steps):
-            ds.add_frame({"observation_vector": obs[i, t], "action": act[i, t], "task": "torus"})
+            f = {"observation_vector": obs[i, t], "action": act[i, t], "task": "torus"}
+            if video:
+                f["observation.images.fpv"] = frames[t]
+            ds.add_frame(f)
         ds.save_episode()
     return ds
 
 
-def _gen_write_split(task: dict):
-    """Worker: generate one split's episodes and write the lerobot split. Returns metadata + (for
-    train) the normalization stats."""
-    cfg = replace(TorusConfig(**task["base"]), **task["env"])
-    obs, act = generate_episodes(cfg, task["n_traj"], task["steps"], task["seed"])
-    write_lerobot_split(task["root_split"], f"torus/{task['name']}", obs, act, task["fps"])
-    stats = compute_norm_stats(obs, act) if task["name"] == "train" else None
-    return task["name"], asdict(cfg), task["coloring"], stats
-
-
-def build_all(base_env: TorusConfig, root_dir: str, splits, fps: int = 30, device="cpu") -> dict:
-    """Generate every split from the config `splits` mapping (in parallel across processes); return
-    train-only norm stats. `splits[name]` has `n_traj, steps, seed, coloring, env`."""
-    tasks = [{"name": name, "base": asdict(base_env), "env": dict(s.get("env", {}) or {}),
-              "n_traj": int(s["n_traj"]), "steps": int(s["steps"]), "seed": int(s["seed"]),
-              "coloring": s.get("coloring", "hsv"), "fps": fps,
-              "root_split": os.path.join(root_dir, name)} for name, s in splits.items()]
-    stats, split_env, coloring = None, {}, {}
-    with ProcessPoolExecutor(max_workers=min(len(tasks), os.cpu_count() or 4)) as ex:
-        for nm, env_d, col, st in ex.map(_gen_write_split, tasks):
-            split_env[nm] = env_d        # resolved env so eval scores each split on ITS OWN manifold
-            coloring[nm] = col
-            if st is not None:
-                stats = st
+def write_meta(root_dir: str, base_env: TorusConfig, splits, split_env: dict, coloring: dict,
+               fps: int, stats: dict):
+    """Write normalization_stats.json + dataset_card.json (the split_env is the resolved env per
+    split, so eval scores each split on its OWN manifold)."""
     os.makedirs(root_dir, exist_ok=True)
     with open(os.path.join(root_dir, "normalization_stats.json"), "w") as f:
         json.dump(stats, f, indent=2)
@@ -102,4 +107,3 @@ def build_all(base_env: TorusConfig, root_dir: str, splits, fps: int = 30, devic
         json.dump({"base_env": asdict(base_env), "split_env": split_env, "coloring": coloring,
                    "splits": {k: {"n_traj": int(v["n_traj"]), "steps": int(v["steps"]), "seed": int(v["seed"])}
                               for k, v in splits.items()}, "fps": fps}, f, indent=2)
-    return stats

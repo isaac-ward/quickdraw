@@ -9,6 +9,7 @@ squares (visual-OOD). A black arrow at each particle shows its net velocity (all
 from __future__ import annotations
 
 import math
+import textwrap
 
 import matplotlib
 
@@ -19,16 +20,31 @@ from matplotlib.gridspec import GridSpec  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
 DPI = 220
-_PAD = 1.3
+VIDEO_DPI = 110     # atlas/compare animation frame dpi (was 45 -> blurry; this is sharp, ~half the PNG)
+_PAD = 1.3          # tight framing for summary plots (cube/torus fills the frame)
+EVAL_VIEW_PAD = _PAD  # eval plots use the same tight ~±1.3 framing as summaries (fixed, no rescale)
 N_SEG = 16          # discrete hue bands around the ring
 FPV_FOV = 103.5     # egocentric camera FOV (deg); VTK default is 30
+FPV_SIZE = 256      # egocentric video resolution (px, square)
+SURFACE_EPS = 0.02  # absolute outward lift for trajectory lines/arrows (no z-fighting, any R,r)
+ACTION_SMOOTH_WINDOW = 18  # default boxcar window for action-arrow smoothing (config can override)
+TORUS_OPACITY = 0.6  # torus alpha for atlas plots/videos (see prediction through it); FPV stays opaque
 _N_THETA, _N_PHI = 420, 210   # torus face density (smooth even up close in FPV)
 _TEX: dict = {}
 
 CAPTIONS = {
-    "manifold_distance_error": "|signed_dist(p̂)|  ·  how far the prediction floated off the torus (0 = on-manifold)",
-    "pointwise_error": "‖p̂ − p‖  ·  distance to the true point at the same step",
-    "tangent_velocity_error": "|⟨ṗ̂, n̂(p̂)⟩|  ·  predicted velocity pointing off the surface",
+    "obs_vector_mse":
+        "obs_vector_mse  ·  mean over the 6 obs dims of (ô − o)² (normalized — the training loss)  ·  "
+        "how large is the whole-state prediction error per step?  ·  [0, ∞)",
+    "manifold_distance_error":
+        "manifold_distance_error  ·  ρ=√(x²+y²),  |signed_dist(p̂)|/r = |√((ρ−R)² + z²) − r| / r  ·  how far the "
+        "predicted point floated off the torus surface, in tube-radii (dimensionless, ÷ this split's r)  ·  [0, ∞)",
+    "pointwise_error":
+        "pointwise_error  ·  ‖p̂ − p‖ (raw physical units)  ·  how far the predicted point is from the true point "
+        "at the same step?  ·  [0, ∞)",
+    "tangent_velocity_error":
+        "tangent_velocity_error  ·  |⟨ṗ̂, n̂(p̂)⟩| / v_scale  ·  the predicted velocity's off-surface (normal) "
+        "component, in characteristic speeds (dimensionless, ÷ this split's v_scale)  ·  [0, ‖ṗ̂‖/v_scale]",
 }
 _AXIAL_VIEWS = [("x", "y", "z"), ("y", "x", "z"), ("z", "x", "y")]  # (view axis, xlabel, ylabel)
 
@@ -53,12 +69,14 @@ def action_ambient(p, action, R, r):
     return action[..., 0:1] * dp_dth + action[..., 1:2] * dp_dph
 
 
-def _offset_out(xyz, R, r, frac=0.02):
+def _offset_out(xyz, R, r, eps=SURFACE_EPS):
+    # lift trajectory points a fixed ABSOLUTE distance along the outward normal so the line sits
+    # clearly outside the surface (no z-fighting) on every torus, incl. the thin geometric-OOD one
+    # (a frac*r offset would shrink to ~0.0016 at r=0.08 and sink into the tube).
     x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
     th = np.arctan2(y, x)
     nx, ny, nz = x - R * np.cos(th), y - R * np.sin(th), z
     n = np.sqrt(nx ** 2 + ny ** 2 + nz ** 2) + 1e-9
-    eps = frac * r
     return np.stack([x + eps * nx / n, y + eps * ny / n, z + eps * nz / n], axis=1)
 
 
@@ -90,6 +108,10 @@ def _pv():
     import pyvista as pv
 
     pv.OFF_SCREEN = True
+    # Empty meshes (e.g. a zero-length trajectory/arrow set on some eval frame) must be SKIPPED, not
+    # crash the whole training run. Newer pyvista raises on empty meshes by default; opt back into the
+    # old skip-silently behaviour. (Crashed eval_ood_horizon at epoch-0 eval after a pyvista bump.)
+    pv.global_theme.allow_empty_mesh = True
     return pv
 
 
@@ -103,29 +125,47 @@ def _torus(pv, R, r):
     return pv.StructuredGrid(X, Y, Z), TH.ravel(order="F"), PH.ravel(order="F")
 
 
-def _add_torus(pl, pv, R, r, coloring):
+def _add_torus(pl, pv, R, r, coloring, opacity=1.0):
     grid, thf, phf = _torus(pv, R, r)
     grid.active_texture_coordinates = np.c_[thf / (2 * math.pi), phf / (2 * math.pi)].astype(np.float32)
-    pl.add_mesh(grid, texture=pv.Texture(_texture_array(coloring)), show_scalar_bar=False)
+    pl.add_mesh(grid, texture=pv.Texture(_texture_array(coloring)), show_scalar_bar=False, opacity=opacity)
 
 
-def _add_trajs(pl, pv, R, r, trajs, markers=True):
+def _add_trajs(pl, pv, R, r, trajs, markers=True, current=False):
+    """Each traj: xyz (+ color, width). Markers: `markers` toggles the default start+end spheres; a
+    traj can override with start_sphere / end_sphere (+ marker_color), or set `tip` = {color,
+    lighting} for a sphere at the moving head (lighting=False -> flat, no specular)."""
     sc = R + r
     for t in trajs:
         p = _offset_out(np.asarray(t["xyz"]), R, r)
         c = t.get("color", "k")
         if len(p) >= 2:
-            pl.add_mesh(pv.lines_from_points(p), color=c, line_width=3)
-        if markers:  # start/end markers only in the static summary plot, not the videos
-            pl.add_mesh(pv.Sphere(radius=0.035 * sc, center=p[0]), color=c)
-            pl.add_mesh(pv.Sphere(radius=0.055 * sc, center=p[-1]), color=c)
+            # tube (real 3D cylinder) instead of a GL line: depth-correct, so it blends cleanly with
+            # the translucent torus (GL lines left white seams where they crossed the surface)
+            tube = pv.lines_from_points(p).tube(radius=t.get("radius", 0.008 * sc), n_sides=12)
+            pl.add_mesh(tube, color=c, lighting=False)  # flat, unlit -> uniform color, no specular
+        mc = t.get("marker_color", c)
+        if t.get("start_sphere", markers) and len(p):  # static summary plot defaults to both spheres
+            pl.add_mesh(pv.Sphere(radius=0.045 * sc * t.get("start_scale", 1.0), center=p[0]),
+                        color=mc, lighting=False)
+        if t.get("end_sphere", markers) and len(p):
+            pl.add_mesh(pv.Sphere(radius=0.045 * sc, center=p[-1]), color=mc, lighting=False)
+        tip = t.get("tip")
+        if tip and len(p):  # per-traj moving head sphere (compare video)
+            pl.add_mesh(pv.Sphere(radius=0.04125 * sc, center=p[-1]), color=tip.get("color", c), lighting=False)
+        if current and len(p):  # summary videos: a single sphere at the current position
+            pl.add_mesh(pv.Sphere(radius=0.04125 * sc, center=p[-1]), color=c, lighting=False)
 
 
 def _add_arrows(pl, pv, R, r, arrows):
-    """Black applied-action arrows. arrows: list of (point3, action_ambient3). FIXED absolute size
-    (same on every torus); raised slightly along the normal to avoid z-fighting. Only LENGTH varies."""
-    shaft_r, tip_r, tip_len = 0.01, 0.028, 0.14  # thinner diameter; length unchanged
-    for pt, vel in arrows:
+    """Applied-action arrows. arrows: list of (point3, action_ambient3) or (point3, action_ambient3,
+    color) -- color defaults to black. FIXED absolute size (same on every torus); raised slightly
+    along the normal to avoid z-fighting. Only the SHAFT length varies with action magnitude; the
+    head is a constant world-space length (tip_len/length cancels the scale)."""
+    shaft_r, tip_r, tip_len = 0.01, 0.028, 0.07  # thinner diameter; head half as long, constant length
+    for arr in arrows:
+        pt, vel = arr[0], arr[1]
+        color = arr[2] if len(arr) > 2 else "black"
         vel = np.asarray(vel, float)
         s = float(np.linalg.norm(vel))
         if s < 1e-6:
@@ -133,26 +173,58 @@ def _add_arrows(pl, pv, R, r, arrows):
         pt = np.asarray(pt, float)
         n = _normal_from_point(pt[None], R)[0]
         n = n / (np.linalg.norm(n) + 1e-9)
-        pt = pt + 0.02 * n  # SLIGHTLY above the surface
+        pt = pt + SURFACE_EPS * n  # SLIGHTLY above the surface
         length = float(np.clip(s * 0.15, 0.2, 0.6))
         pl.add_mesh(pv.Arrow(start=pt, direction=vel / s, scale=length,
                              tip_length=tip_len / length, tip_radius=tip_r / length,
-                             shaft_radius=shaft_r / length), color="black")
+                             shaft_radius=shaft_r / length), color=color)
 
 
-def _render(pv, R, r, coloring, trajs, targets, arrows, view, size, markers=True):
+def _add_fan(pl, pv, R, r, fan, opacity=0.5, max_show=48):
+    """MPPI candidate fan as thin TUBES (same primitive as the trail — depth-correct + blends cleanly,
+    unlike GL lines which can't sub-pixel and don't alpha-blend) colored by return via RdYlGn -> high
+    return = green = low cost. fan: {"pts": (K,H,3), "ret": (K,)}.
+    SUBSAMPLE to max_show: hundreds of overlapping candidates read as an opaque blob; a sparse subset is
+    what actually looks thin + transparent (the candidates are iid noise, so any subset is representative)."""
+    pts = np.asarray(fan["pts"], float)              # (K,H,3)
+    ret = np.asarray(fan["ret"], float)              # (K,)
+    K, H = pts.shape[:2]
+    if K == 0 or H < 2:
+        return
+    if K > max_show:                                 # evenly-spaced subset over the (unordered) candidates
+        idx = np.linspace(0, K - 1, max_show).astype(int)
+        pts, ret, K = pts[idx], ret[idx], max_show
+    conn = np.empty((K, H + 1), dtype=np.int64)      # VTK polyline connectivity: [H, i0..i_{H-1}] per line
+    conn[:, 0] = H
+    conn[:, 1:] = np.arange(K * H).reshape(K, H)
+    poly = pv.PolyData(pts.reshape(-1, 3))
+    poly.lines = conn.ravel()
+    poly["ret"] = np.repeat(ret, H).astype(np.float32)   # per-point scalar = its candidate's return
+    tube = poly.tube(radius=0.0035 * (R + r), n_sides=6)  # ~half the trail thickness; cheap (6 sides)
+    lo, hi = float(ret.min()), float(ret.max())
+    pl.add_mesh(tube, scalars="ret", cmap="RdYlGn", clim=[lo, hi if hi > lo else lo + 1e-6],
+                show_scalar_bar=False, lighting=False, opacity=opacity)
+
+
+def _render(pv, R, r, coloring, trajs, targets, arrows, view, size, markers=True, current=False,
+            view_l=None, torus_opacity=1.0, fan=None):
     pl = pv.Plotter(off_screen=True, window_size=(size, size))
     pl.set_background("white")
-    _add_torus(pl, pv, R, r, coloring)
-    _add_trajs(pl, pv, R, r, trajs, markers=markers)
+    _add_torus(pl, pv, R, r, coloring, opacity=torus_opacity)
+    if fan is not None:  # draw the candidate fan BENEATH the trails/arrows so the agents stay on top
+        _add_fan(pl, pv, R, r, fan)
+    _add_trajs(pl, pv, R, r, trajs, markers=markers, current=current)
     _add_arrows(pl, pv, R, r, arrows)
     if targets:
         tp = np.array([np.asarray(pp, float) for _, pp in targets])
         for pp in tp:
-            pl.add_mesh(pv.Sphere(radius=0.12 * max(r, 0.12), center=pp), color="black")
+            pl.add_mesh(pv.Sphere(radius=0.12 * max(r, 0.12), center=pp), color="black", lighting=False)
         pl.add_point_labels(tp, [n for n, _ in targets], font_size=10, text_color="black",
                             shape=None, show_points=False, always_visible=True)
-    L = (R + r) * _PAD
+    L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
+    vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)
+    # orthographic everywhere + an explicit parallel_scale => framing is fixed, never auto-fit/rescaled
+    pl.enable_parallel_projection()
     if view == "iso":
         # back-of-cube only: front faces culled so their edges don't cross the torus; white faces
         # (no lighting) blend into the background, leaving just the black back edges.
@@ -163,14 +235,16 @@ def _render(pv, R, r, coloring, trajs, targets, arrows, view, size, markers=True
         pl.add_point_labels(np.array([(c, -L, -L), (-L, c, -L), (-L, -L, c)]), ["x", "y", "z"],
                             font_size=18, text_color="black", shape=None, show_points=False,
                             always_visible=True)
-        pl.camera_position = "iso"
+        pl.camera_position = [(4 * vl, 4 * vl, 4 * vl), (0, 0, 0), (0, 0, 1)]  # fixed iso direction
+        # in the iso projection the cube's top/bottom corners reach ~1.63L and the z label ~1.73L
+        # *vertically*, so frame to 2.0L (with text margin) — tighter clips the top & bottom
+        pl.camera.parallel_scale = max(vl, 2.0 * L)
     else:
-        pl.enable_parallel_projection()
         # right = +first label axis, up = +second (no mirror) so axial labels match the world
-        pos = {"z": (0, 0, 4 * L), "y": (0, 4 * L, 0), "x": (-4 * L, 0, 0)}[view]
+        pos = {"z": (0, 0, 4 * vl), "y": (0, 4 * vl, 0), "x": (-4 * vl, 0, 0)}[view]
         up = {"z": (0, 1, 0), "y": (0, 0, 1), "x": (0, 0, 1)}[view]
         pl.camera_position = [pos, (0, 0, 0), up]
-        pl.camera.parallel_scale = L
+        pl.camera.parallel_scale = vl  # set AFTER camera_position so it isn't overwritten by auto-fit
     img = pl.screenshot(return_img=True)
     pl.close()
     return img
@@ -184,11 +258,25 @@ def _smooth_seq(seq, alpha=0.12):
     return out
 
 
+def _moving_avg(seq, win=ACTION_SMOOTH_WINDOW):
+    """Centered boxcar moving average (edge-padded) over a small window, per channel. Used to keep
+    the action arrows from whipping around frame-to-frame without adding the lag of a causal EMA."""
+    seq = np.asarray(seq, dtype=float)
+    if win <= 1 or len(seq) < 2:
+        return seq.copy()
+    k = win // 2
+    pad = np.pad(seq, ((k, k), (0, 0)), mode="edge")
+    kernel = np.ones(win) / win
+    return np.stack([np.convolve(pad[:, j], kernel, mode="valid") for j in range(seq.shape[1])], axis=1)
+
+
 def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", title="", legend=False,
-                    markers=True, iso_size=860, ax_size=580):
+                    markers=True, current=False, iso_size=860, ax_size=580, view_pad=_PAD, torus_opacity=1.0,
+                    fan=None):
     pv = _pv()
-    L = (R + r) * _PAD
-    iso = _render(pv, R, r, coloring, trajs, targets, arrows, "iso", iso_size, markers=markers)
+    vl = (R + r) * view_pad  # fixed view half-extent (shared by the render camera and the axial ticks)
+    iso = _render(pv, R, r, coloring, trajs, targets, arrows, "iso", iso_size, markers=markers,
+                  current=current, view_l=vl, torus_opacity=torus_opacity, fan=fan)
     fig = plt.figure(figsize=(13, 15))
     gs = GridSpec(4, 3, figure=fig, wspace=0.5, hspace=0.25)
     axm = fig.add_subplot(gs[0:3, :])
@@ -198,33 +286,75 @@ def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", tit
         axm.legend(handles=[Line2D([0], [0], color=t["color"], label=t["label"])
                             for t in trajs if t.get("label")], loc="upper right")
     for col, (view, xl, yl) in enumerate(_AXIAL_VIEWS):
-        img = _render(pv, R, r, coloring, trajs, targets, arrows, view, ax_size, markers=markers)
+        img = _render(pv, R, r, coloring, trajs, targets, arrows, view, ax_size, markers=markers,
+                      current=current, view_l=vl, torus_opacity=torus_opacity, fan=fan)  # fan in all views
         axp = fig.add_subplot(gs[3, col])
-        axp.imshow(img, extent=[-L, L, -L, L])
+        axp.imshow(img, extent=[-vl, vl, -vl, vl])
         axp.set_aspect("equal")
         axp.set_xlabel(xl)
         axp.set_ylabel(yl)
     return fig
 
 
-def fig_error_vs_step(errors: dict[str, np.ndarray]):
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | None = None, vlines=None,
+                      yscale: str = "log"):
+    fig, ax = plt.subplots(figsize=(11, 6))  # wide enough that the long metric captions don't clip
     for name, series in errors.items():
-        ax.plot(series, label=name)
+        ax.plot(series, label=name, color=(colors or {}).get(name))
+    # vlines: {color: [step indices]} -> dotted verticals marking events (e.g. goal switches). These
+    # explain the sharp jumps in dist-to-current-goal: the distance re-targets when the goal advances.
+    for color, steps in (vlines or {}).items():
+        for s in steps:
+            ax.axvline(float(s), color=color, linestyle=":", linewidth=1.0, alpha=0.6)
     ax.set_xlabel("rollout step")
-    ax.set_ylabel("error")
+    ax.set_ylabel(f"error ({yscale} scale)" if yscale == "log" else "distance")
+    ax.set_yscale(yscale)  # log spreads small early + late blow-up; linear for bounded curves (control dist)
+    ax.grid(True, which="both", alpha=0.3)
     ax.legend()
-    cap = "\n".join(CAPTIONS[k] for k in errors if k in CAPTIONS)
-    fig.text(0.01, -0.02, cap, fontsize=7, va="top")
-    fig.tight_layout()
+    # caption goes INSIDE the figure (reserve bottom margin) — wandb.Image ignores bbox_inches="tight",
+    # so anything placed below y=0 gets clipped in the wandb logs. Wrap each caption to the figure
+    # width so long lines fold onto new lines (readable in full) instead of running past the right edge;
+    # grow the bottom margin to fit however many wrapped lines result.
+    lines = []
+    for k in errors:
+        if k in CAPTIONS:
+            lines += textwrap.wrap(CAPTIONS[k], width=120, subsequent_indent="      ") or [CAPTIONS[k]]
+    fig.subplots_adjust(bottom=min(0.55, 0.10 + 0.028 * len(lines)))
+    fig.text(0.02, 0.02, "\n".join(lines), fontsize=7, va="bottom")
     return fig
 
 
 # ------------------------- public: videos -------------------------
-def save_mp4(path, frames, fps):
+def save_mp4(path, frames, fps, quality=9):
     import imageio.v2 as imageio
 
-    imageio.mimwrite(path, list(frames), fps=max(1, int(round(fps))), macro_block_size=1)
+    # macro_block_size=2: pad odd dims up to even (libx264 requires divisible-by-2), no 16-px padding.
+    # quality (0-10, higher = sharper/larger): default high so summary videos aren't mushy.
+    imageio.mimwrite(path, list(frames), fps=max(1, int(round(fps))), macro_block_size=2, quality=quality)
+
+
+def stitch_grid_video(paths, out_path, grid, fps):
+    """Tile `grid`x`grid` already-rendered mp4s into one composite, frame by frame (streaming, so it
+    never holds more than one frame per source in memory). All sources must share resolution; the
+    composite runs to the shortest source. Cells fill row-major; missing cells stay black."""
+    import imageio.v2 as imageio
+
+    paths = list(paths)[: grid * grid]
+    readers = [imageio.get_reader(p) for p in paths]
+    try:
+        probe = readers[0].get_data(0)
+        h, w = probe.shape[:2]
+        writer = imageio.get_writer(out_path, fps=max(1, int(round(fps))), macro_block_size=2)
+        for frames in zip(*(iter(rd) for rd in readers)):  # lockstep; stops at the shortest source
+            canvas = np.zeros((grid * h, grid * w, 3), np.uint8)
+            for i, fr in enumerate(frames):
+                rr, cc = divmod(i, grid)
+                canvas[rr * h : (rr + 1) * h, cc * w : (cc + 1) * w] = fr[..., :3]
+            writer.append_data(canvas)
+        writer.close()
+    finally:
+        for rd in readers:
+            rd.close()
 
 
 def _fig_rgb(fig):
@@ -233,42 +363,111 @@ def _fig_rgb(fig):
     return np.frombuffer(fig.canvas.buffer_rgba(), np.uint8).reshape(h, w, 4)[..., :3].copy()
 
 
-def animate_frames(R, r, coloring, trajs, title="", n_frames=10000):
+def animate_frames(R, r, coloring, trajs, title="", n_frames=10000, smooth_window=ACTION_SMOOTH_WINDOW,
+                   torus_opacity=TORUS_OPACITY, log=None):
     """Each frame is the SAME `fig_torus_atlas` as the static plot (identical layout/title), with a
     growing black trail + particle + a smoothed (tweened) applied-action arrow. One frame per sim
     step (n_frames is just a safety cap) -> played at a constant 60 fps = real time."""
     tail = 60  # only the last 60 steps (~1 s) of trail are drawn, so it doesn't linger
     data = [(np.asarray(t["xyz"]),
-             _smooth_seq(np.asarray(t["avec"])) if t.get("avec") is not None else None,
+             _moving_avg(np.asarray(t["avec"]), smooth_window) if t.get("avec") is not None else None,
              t.get("color", "k")) for t in trajs]
     T = max(len(x) for x, _, _ in data)
     idx = np.linspace(2, T, min(n_frames, T)).astype(int)
     frames = []
-    for ti in idx:
+    every = max(1, len(idx) // 8)  # progress ~every 12% of frames
+    for fi, ti in enumerate(idx):
+        if log is not None and fi % every == 0:
+            log(f"rendered {fi}/{len(idx)} frames")
         k = int(ti)
         lo = max(0, k - tail)
         pt = [{"xyz": x[lo:k], "color": c} for x, _, c in data]
         arrows = [(x[k - 1], av[k - 1]) for x, av, _ in data if av is not None]
         fig = fig_torus_atlas(R, r, trajs=pt, arrows=arrows, coloring=coloring, title=title,
-                              markers=False)  # no start/end markers in videos
-        fig.set_dpi(90)
+                              markers=False, current=True, torus_opacity=torus_opacity)  # current-position sphere only
+        fig.set_dpi(VIDEO_DPI)
         frames.append(_fig_rgb(fig))
         plt.close(fig)
     return np.stack(frames)
 
 
-def rollout_video(true_xyz, pred_xyz, R, r, coloring="hsv", n_frames=120):
-    return animate_frames(R, r, coloring,
-                          [{"xyz": true_xyz, "color": "tab:green"}, {"xyz": pred_xyz, "color": "tab:red"}], n_frames)
+def traj_compare_frames(R, r, coloring, true_full, pred_full, avec_true, P, n_frames=120, title="",
+                        smooth_window=ACTION_SMOOTH_WINDOW, torus_opacity=TORUS_OPACITY, log=None):
+    """Animated truth-vs-prediction. One black sphere (with the applied-action arrow) rides the TRUE
+    path (context then ground truth); at the fork (step P) a red sphere (no arrow, flat-shaded) splits
+    off along the PREDICTED path. Both carry a solid trailing tail (not persistent). Mirrors the PNG,
+    where the tails are instead persistent. true_full/pred_full: (T,3), identical for the first P
+    steps then diverging. avec_true: (T,2)->ambient applied action along the true path."""
+    tail = 60
+    true_full, pred_full = np.asarray(true_full), np.asarray(pred_full)
+    avec = _moving_avg(np.asarray(avec_true), smooth_window)
+    T = len(true_full)
+    idx = np.linspace(2, T, min(n_frames, T)).astype(int)
+    frames = []
+    every = max(1, len(idx) // 10)  # progress every ~10% of frames
+    for fi, ti in enumerate(idx):
+        if log is not None and fi % every == 0:
+            log(f"rendered {fi}/{len(idx)} frames")
+        k, lo = int(ti), max(0, int(ti) - tail)
+        trajs = [{"xyz": true_full[lo:k], "color": "black", "tip": {"color": "black"}}]  # truth: black + arrow
+        arrows = [(true_full[k - 1], avec[k - 1])]
+        if k >= P:  # after the fork: predicted in dark grey, flat-shaded (no specular), no arrow
+            trajs.append({"xyz": pred_full[max(lo, P - 1) : k], "color": "dimgray",
+                          "tip": {"color": "dimgray", "lighting": False}})
+        fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
+                              markers=False, view_pad=EVAL_VIEW_PAD,  # wide fixed view: red drift stays visible
+                              torus_opacity=torus_opacity)
+        fig.set_dpi(VIDEO_DPI)
+        frames.append(_fig_rgb(fig))
+        plt.close(fig)
+    return np.stack(frames)
 
 
-def fpv_frames(R, r, coloring, obs, n_frames=10000, fov=FPV_FOV, size=480):
+def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
+                           smooth_window=ACTION_SMOOTH_WINDOW, torus_opacity=TORUS_OPACITY, fan_seq=None, log=None):
+    """Animated dual-controller race (eval_control). Each agent = {path (T,3), avec (T,3) ambient
+    applied action, goal_seq (T,3) its current goal, color}. Per frame each agent gets a flat moving
+    head + trailing tail + a colored action arrow, plus a SMALL same-color sphere marking ITS current
+    goal (so it's clear who targets what). Reuses fig_torus_atlas exactly like traj_compare_frames, so
+    layout/sizing are unchanged. fan_seq (optional, len ~T): per-step pred candidate fan to overlay."""
+    tail = 60
+    agents = [{"color": a["color"], "path": np.asarray(a["path"]), "goal_seq": np.asarray(a["goal_seq"]),
+               "avec": _moving_avg(np.asarray(a["avec"]), smooth_window)} for a in agents]
+    T = min(len(a["path"]) for a in agents)
+    idx = np.linspace(2, T, min(n_frames, T)).astype(int)
+    frames = []
+    every = max(1, len(idx) // 10)  # progress every ~10% of frames
+    for fi, ti in enumerate(idx):
+        if log is not None and fi % every == 0:
+            log(f"rendered {fi}/{len(idx)} frames")
+        k, lo = int(ti), max(0, int(ti) - tail)
+        trajs, arrows = [], []
+        for a in agents:
+            c = a["color"]
+            gi = min(k - 1, len(a["goal_seq"]) - 1)  # goal_seq/avec have one fewer entry than path
+            ai = min(k - 1, len(a["avec"]) - 1)
+            trajs.append({"xyz": a["path"][lo:k], "color": c, "tip": {"color": c, "lighting": False}})
+            trajs.append({"xyz": a["goal_seq"][gi][None], "color": c, "marker_color": c,
+                          "start_sphere": True, "end_sphere": False, "start_scale": 0.5})  # small goal marker
+            arrows.append((a["path"][k - 1], a["avec"][ai], c))
+        fan = fan_seq[min(k - 1, len(fan_seq) - 1)] if fan_seq else None  # this step's candidate fan
+        fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
+                              markers=False, view_pad=EVAL_VIEW_PAD, torus_opacity=torus_opacity, fan=fan)
+        fig.set_dpi(VIDEO_DPI)
+        frames.append(_fig_rgb(fig))
+        plt.close(fig)
+    return np.stack(frames)
+
+
+def fpv_frames(R, r, coloring, obs, n_frames=10000, fov=FPV_FOV, size=FPV_SIZE):
     """Egocentric observation_image: camera at the particle, smoothed heading along tangential
     velocity, up = surface normal, configurable FOV. No velocity arrow here."""
     pv = _pv()
     obs = np.asarray(obs)
     T = len(obs)
-    idx = np.linspace(1, T - 1, min(n_frames, T - 1)).astype(int)
+    # one frame per timestep (aligned 1:1 with obs, as the lerobot image observation needs); n_frames
+    # only downsamples if explicitly smaller than T
+    idx = np.arange(T) if n_frames >= T else np.linspace(0, T - 1, n_frames).astype(int)
     frames, sm = [], None
     for t in idx:
         p, v = obs[t, :3], obs[t, 3:]

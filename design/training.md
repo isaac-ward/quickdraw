@@ -49,7 +49,7 @@ conf/
 ## Eval routines (defined once; subscribed in training AND runnable standalone)
 
 Three routines in `evaluation/routines.py`, registered by name:
-- **`long_horizon`** — in-distribution full-trajectory open-loop rollout (`eval_ind`).
+- **`long_horizon`** — in-distribution full-trajectory open-loop rollout (`eval_ood_horizon`).
 - **`ood`** — open-loop on the 3 OOD splits, each scored on its **own geometry** (from the dataset card).
 - **`control`** — MPPI with the world model as dynamics (below).
 

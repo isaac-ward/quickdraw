@@ -10,8 +10,13 @@ services:
             - capabilities: [gpu]
               count: all
     env_file: .env
+    environment:
+      # graphics: lets VTK use the NVIDIA EGL ICD to render on the GPU (default is compute,utility ONLY,
+      # which forces the slow OSMesa/llvmpipe CPU software renderer). compute,utility kept for training.
+      NVIDIA_DRIVER_CAPABILITIES: graphics,compute,utility
     shm_size: "16gb"               # DataLoader workers need it
     volumes:
+      - ./src:/app/src             # editable install -> code edits go live without rebuilding
       - ./conf:/app/conf           # edit configs without rebuilding
       - ./datasets:/app/datasets   # generated once, reused
       - ./logs:/app/logs           # run folders, checkpoints, media

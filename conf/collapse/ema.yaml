@@ -1,0 +1,2 @@
+name: ema   # BYOL/I-JEPA: target = slow EMA copy of enc (stop-grad); collapse blocked by asymmetry
+tau: 0.99   # EMA decay

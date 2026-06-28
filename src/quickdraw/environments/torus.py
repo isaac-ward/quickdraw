@@ -83,27 +83,33 @@ def signed_dist(p: Tensor, R: float, r: float) -> Tensor:
 
 # --------------------------------------------------------------------------------------
 # The three rollout errors (design/environment.md). o_* are observation_vectors (...,6).
+# manifold & tangent are made DIMENSIONLESS by normalizing per geometry (./r, ./v_scale) so they're
+# comparable across splits with different geometry/dynamics; pointwise stays in raw physical units.
 # --------------------------------------------------------------------------------------
 def split_obs(o: Tensor) -> tuple[Tensor, Tensor]:
     return o[..., :3], o[..., 3:]
 
 
 def manifold_distance_error(o_hat: Tensor, R: float, r: float) -> Tensor:
+    """Off-surface distance normalized by tube radius r -> dimensionless (in tube-radii)."""
     p_hat, _ = split_obs(o_hat)
-    return signed_dist(p_hat, R, r).abs()
+    return signed_dist(p_hat, R, r).abs() / r
 
 
 def pointwise_error(o_hat: Tensor, o_true: Tensor) -> Tensor:
+    """Position error in raw physical units (accuracy metric; not normalized)."""
     p_hat, _ = split_obs(o_hat)
     p_true, _ = split_obs(o_true)
     return (p_hat - p_true).norm(dim=-1)
 
 
-def tangent_velocity_error(o_hat: Tensor, R: float) -> Tensor:
+def tangent_velocity_error(o_hat: Tensor, R: float, v_scale: float) -> Tensor:
+    """Velocity's normal (off-surface) component normalized by characteristic speed v_scale ->
+    dimensionless (in characteristic speeds)."""
     p_hat, v_hat = split_obs(o_hat)
     th, ph = angles_from_point(p_hat, R)
     n = normal(th, ph)
-    return (v_hat * n).sum(dim=-1).abs()
+    return (v_hat * n).sum(dim=-1).abs() / v_scale
 
 
 def _wrap(a: Tensor) -> Tensor:
@@ -120,20 +126,23 @@ def phase_drift(o_hat: Tensor, o_true: Tensor, R: float) -> tuple[Tensor, Tensor
 
 
 # --------------------------------------------------------------------------------------
-# Targets: 4 poloidal rings x 4 toroidal compass directions = 16 named points
+# Control goals: 8 points = NESW (theta in {0,90,180,270}) on BOTH the outer ring (phi=0) and the
+# inner ring (phi=pi). All lie in the z=0 plane (outer radius R+r, inner radius R-r). The control eval
+# subsamples 3 of these 8 per episode (see run_control), for variety across episodes.
 # --------------------------------------------------------------------------------------
-_RINGS = {"outer": 0.0, "top": math.pi / 2, "inner": math.pi, "bottom": 3 * math.pi / 2}  # phi
-_COMPASS = {"E": 0.0, "N": math.pi / 2, "W": math.pi, "S": 3 * math.pi / 2}  # theta
+_GOAL_THETAS = (0.0, math.pi / 2, math.pi, 3 * math.pi / 2)  # E, N, W, S
+_GOAL_DIRS = ("E", "N", "W", "S")
+_GOAL_PHIS = ((0.0, "out"), (math.pi, "in"))                 # outer ring (phi=0), inner ring (phi=pi)
 
 
-def control_targets(R: float, r: float, device=None) -> list[tuple[str, Tensor]]:
-    """List of (name, target_point[3]) for the 16 control goals."""
+def control_goals(R: float, r: float, device=None) -> list[tuple[str, Tensor]]:
+    """List of (name, goal_point[3]) for the 8 control goals: {out,in} x {E,N,W,S}."""
     out = []
-    for ring, phi in _RINGS.items():
-        for comp, theta in _COMPASS.items():
+    for phi, ring in _GOAL_PHIS:
+        for theta, d in zip(_GOAL_THETAS, _GOAL_DIRS):
             th = torch.tensor(theta, device=device)
             ph = torch.tensor(phi, device=device)
-            out.append((f"{ring}-{comp}", point(th, ph, R, r)))
+            out.append((f"{ring}_{d}", point(th, ph, R, r)))
     return out
 
 

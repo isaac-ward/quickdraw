@@ -1,41 +1,103 @@
-"""Run MPPI control and log it (atlas + per-target scalars/videos). Shared by `eval` and `control`."""
+"""Run the dual MPPI control eval (oracle vs learned) and log it under eval_control/.
+
+Black = true-dynamics controller (oracle baseline), grey = learned-model controller, both executing
+on the true env through the same random 8-goal sequence. Shared by training-time eval and the
+standalone `eval_control` entrypoint.
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import time
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 from ..logging import viz
 from .mppi import MPPIConfig, run_control
 
 
-def run_and_log_control(cfg, model, normalizer, ecfg, run_dir: str, device, wandb_run=None) -> dict:
-    os.makedirs(os.path.join(run_dir, "plots"), exist_ok=True)
-    res = run_control(model, normalizer, ecfg, MPPIConfig(**cfg.control), device=device)
-    trajs = [{"xyz": res["paths"][n], "color": "k"} for n, _ in res["targets"]]
-    atlas = viz.fig_torus_atlas(ecfg.R, ecfg.r, trajs=trajs, targets=res["targets"],
-                                title="control targets + reached paths")
-    atlas.savefig(os.path.join(run_dir, "plots", "target_atlas.png"), bbox_inches="tight", dpi=viz.DPI)
-    with open(os.path.join(run_dir, "control_summary.json"), "w") as f:
-        json.dump({k: res[k] for k in ("hz", "success_rate", "mean_time_to_completion", "per_target")}, f, indent=2)
-    if wandb_run is not None:
-        import wandb
+def _plog(writer, msg: str):
+    """Append a progress line to the run's TOP-LEVEL progress.log (and stdout) so eval timing shows up
+    in the SAME file as ProgressPrinter's startup/epoch lines. writer.dir is run_dir/logs (see
+    make_writer), so its parent is the run_dir where progress.log lives."""
+    msg = f"[{time.strftime('%m-%d %H:%M:%S')}] {msg}"  # wall-clock stamp so durations are exact
+    print(msg, flush=True)
+    run_dir = os.path.dirname(writer.dir.rstrip("/"))  # writer.dir = run_dir/logs -> parent is run_dir
+    try:
+        with open(os.path.join(run_dir, "progress.log"), "a") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
 
-        wandb_run.log({
-            "eval/control/control_hz": res["hz"],
-            "eval/control/success_rate": res["success_rate"],
-            "eval/control/mean_time_to_completion": res["mean_time_to_completion"],
-            "eval/control/targets": wandb.Image(atlas),
-        })
-        for name, m in res["per_target"].items():
-            video = viz.rollout_video(res["paths"][name], res["paths"][name], ecfg.R, ecfg.r, n_frames=60)
-            wandb_run.log({
-                f"eval/control/{name}/time_to_completion": m["time_to_completion"],
-                f"eval/control/{name}/success": float(m["success"]),
-                f"eval/control/{name}/final_distance": m["final_distance"],
-                f"eval/control/{name}/control_video": wandb.Video(video.transpose(0, 3, 1, 2), fps=15),
-            })
-    plt.close(atlas)
-    return res
+
+def _agent(res, color, R, r):
+    """Build a control_compare_frames agent dict (pads actions to the path length for the arrow)."""
+    path, act = res["path"], res["actions"]               # (T,3), (T-1,2)
+    act = np.concatenate([act, act[-1:]], axis=0) if len(act) else np.zeros((len(path), 2))
+    return {"path": path, "goal_seq": res["goal_seq"], "color": color,
+            "avec": viz.action_ambient(path, act, R, r)}  # ambient applied action (T,3)
+
+
+def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) -> dict:
+    _plog(writer, f"[eval_control @ep{step}] start: MPPI {cfg.control.n_episodes} eps x 2 controllers, "
+                  f"{cfg.control.num_samples} samples, H={cfg.control.horizon}, max_steps={cfg.control.max_steps}")
+    t = time.perf_counter()
+    res, _ = run_control(model, normalizer, ecfg, MPPIConfig(**cfg.control), device=device,
+                         log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"))
+    t_ctrl = time.perf_counter() - t
+    # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers both controllers + chunk
+    # execution over n_chunks replans, so per-chunk wall time = t_ctrl / n_chunks.
+    mppi_chunk_s = t_ctrl / max(1, res["n_chunks"])
+    mppi_chunk_hz = 1.0 / mppi_chunk_s if mppi_chunk_s > 0 else 0.0
+    _plog(writer, f"[eval_control @ep{step}] MPPI done: {res['n_chunks']} replans over {res['n_steps']} steps "
+                  f"-> {mppi_chunk_s * 1000:.0f} ms/chunk ({mppi_chunk_hz:.1f} hz)")
+    R, r, fps = ecfg.R, ecfg.r, round(1.0 / ecfg.dt)
+
+    # one race video: true-dynamics oracle (black) vs learned controller (grey), each with its action
+    # arrow and a small current-goal marker in its own colour
+    t = time.perf_counter()
+    nf = len(res["true"]["path"])
+    _plog(writer, f"[eval_control @ep{step}] rendering control video ({nf} frames, GPU/EGL)...")
+    frames = viz.control_compare_frames(R, r, "hsv", [_agent(res["true"], "black", R, r),
+                                                      _agent(res["pred"], "dimgray", R, r)],
+                                        n_frames=nf, title="control: true vs pred",
+                                        fan_seq=res["fan_seq"],  # pred's MPPI candidate fan, colored by cost
+                                        log=lambda m: _plog(writer, f"[eval_control @ep{step}]   video {m}"))
+    writer.video("eval_control/control_video_0", frames, fps, step)  # _0: we show episode 0 only
+    t_video = time.perf_counter() - t
+    _plog(writer, f"[eval_control @ep{step}] video rendered in {t_video:.1f}s")
+
+    # realized cost over time: episode-0 distance to the current goal per control step
+    # colours match the race video: oracle = black, learned = dimgray. Dotted verticals mark the steps
+    # where episode-0's goal advances (explains the sharp jumps: distance re-targets to the next goal).
+    def _goal_changes(goal_seq):
+        g = np.asarray(goal_seq)
+        return (np.where(np.any(g[1:] != g[:-1], axis=-1))[0] + 1).tolist()
+    k_true, k_pred = "true (oracle): dist to current goal", "pred (learned): dist to current goal"
+    curve = viz.fig_error_vs_step({k_true: res["true"]["dist_curve"], k_pred: res["pred"]["dist_curve"]},
+                                  colors={k_true: "black", k_pred: "dimgray"},
+                                  vlines={"black": _goal_changes(res["true"]["goal_seq"]),
+                                          "dimgray": _goal_changes(res["pred"]["goal_seq"])},
+                                  yscale="linear")  # distance to goal is bounded -> linear reads better
+    writer.figure("eval_control/distance_to_goal_0", curve, step)  # _0: episode 0 only
+    plt.close(curve)
+
+    # only the MPPI-step timing matters (render times intentionally not logged); + n_steps for context.
+    summary = {"n_steps": res["n_steps"], "time/mppi_chunk_s": mppi_chunk_s, "time/mppi_chunk_hz": mppi_chunk_hz}
+    # {true,pred,diff}/{metric} (slash org; diff = true - pred). Only these — no underscore duplicates.
+    for m in ("success_rate", "mean_goals_reached", "mean_steps_to_complete", "mean_seconds_to_complete"):
+        summary[f"true/{m}"] = res["true"][m]
+        summary[f"pred/{m}"] = res["pred"][m]
+        summary[f"diff/{m}"] = res["true"][m] - res["pred"][m]
+    writer.scalars({f"eval_control/{k}": v for k, v in summary.items()}, step)
+    # goals-reached is meaningful even when seconds-to-complete is NaN (nothing settled all goals)
+    g8 = res["n_goals"]
+    _plog(writer, f"[eval_control @ep{step}] goals reached / {g8}: "
+                  f"oracle={res['true']['mean_goals_reached']:.2f} (success {res['true']['success_rate']:.2f}, "
+                  f"{res['true']['mean_seconds_to_complete']:.2f}s) "
+                  f"pred={res['pred']['mean_goals_reached']:.2f} (success {res['pred']['success_rate']:.2f})")
+    with open(os.path.join(writer.dir, "control_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    return summary

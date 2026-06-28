@@ -1,0 +1,5 @@
+name: vicreg   # variance hinge (per-dim std floor) + covariance decorrelation, on the expander embedding
+var_w: 25.0    # variance-term weight (paper: μ=25)
+cov_w: 1.0     # covariance-term weight (paper: ν=1)
+gamma: 1.0     # variance floor (target per-dim std)
+# invariance term = loss_pred_latent, weighted lambda_pred=25 by the strategy (paper: λ=25) -> 25/25/1

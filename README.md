@@ -2,6 +2,8 @@
 
 A world-models shoot-out: long-horizon consistency as staying on a torus data-manifold, with an MPPI control eval. Needs an NVIDIA GPU + the NVIDIA Container Toolkit.
 
+## Usage
+
 Bring the container up and shell in:
 
 ```bash
@@ -31,3 +33,8 @@ uv run python -m quickdraw.eval_control      experiment=$RUN data.root=$DATA che
 ```
 
 Override any Hydra field on the CLI.
+
+## Links
+
+- [Hugging Face Dataset](https://huggingface.co/datasets/isaac-ronald-ward/quickdraw-torus)
+- [GitHub](https://github.com/isaac-ward/quickdraw)

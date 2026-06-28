@@ -26,7 +26,7 @@ in-distribution and three OOD axes.
 |---|---|---|---|---|
 | `train` | A | 1000 | 256 | fit models (sliced into windows) |
 | `val` | A, new seeds | 128 | 256 | model selection |
-| `eval_ind` | A, new seeds | 32 | 2048 | long-horizon, no shift |
+| `eval_ood_horizon` | A, new seeds | 32 | 2048 | long-horizon, no shift |
 | `eval_ood_visual` | A + recolor | 32 | 2048 | image generalization |
 | `eval_ood_geometric` | new `(R,r)` | 32 | 2048 | manifold-shape generalization |
 | `eval_ood_dynamics` | new `γ,a_max` | 32 | 2048 | dynamics generalization |
@@ -72,6 +72,6 @@ reproducible from the record alone.
 1. `TorusEnv` + OU actions; verify every true trajectory has `manifold_distance_error ≈ 0`.
 2. Generation → `LeRobotDataset` for all splits; verify per-episode seed regenerates identical data.
 3. Train-only normalization + windowed `delta_timestamps` loader; verify train stats ≈ N(0,1).
-4. Full-trajectory eval loader + rollout scoring on `eval_ind`.
+4. Full-trajectory eval loader + rollout scoring on `eval_ood_horizon`.
 5. OOD splits (visual / geometric / dynamics).
 6. Image stage: render → MP4; torchcodec decode flows through the unchanged loader.

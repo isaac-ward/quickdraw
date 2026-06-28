@@ -49,6 +49,39 @@ cases, summary scalars added, losses dropped.
 Shoot-out: tag each run and group runs in W&B; the shared `eval/*/manifold_distance_error@*`
 scalars drive automatic comparison across runs × cases.
 
+## Collapse diagnostics (latent models only)
+
+A `collapse/` panel describing **this run's** latent health (one model — not a cross-model view).
+Logged **once per validation epoch** — never a per-step bar plot, and not worth a 50-step cadence.
+These read the run's latent batch stacked as `Z ∈ ℝ^{N×dz}` (`N` = batch × timesteps) **directly,
+bypassing the decoder**, so they reveal collapse the obs-space metrics can hide (a strong decoder can
+flatter a partially-collapsed latent — see `models/latent_space_autoregressor.md`). Each plot carries
+a caption = definition + one sentence, in the same style as the rollout report's `error_vs_step`.
+
+Let `C = (1/(N−1))·Z̄ᵀZ̄` be the latent covariance (`Z̄` = mean-centered `Z`), `σⱼ = std(Z[:,j])`.
+
+- `collapse/effective_rank` — participation ratio `PR = (Σλᵢ)² / Σλᵢ²` of `C` (`λᵢ` its eigenvalues),
+  vs epoch. Caption: *how many of the `dz` dims carry variance; `PR→1` = all variance in one direction
+  (collapse), `PR→dz` = fully used.*
+- `collapse/per_dim_std` — the per-dimension stds `σⱼ`, sorted (bar plot). If **this run's mechanism
+  defines a variance floor** (only VICReg's `γ`), draw it as a reference line; otherwise just the bars.
+  Caption: *std of each latent dim; dims pinned near 0 are dead.*
+- `collapse/offdiag_cov_mass` — mean absolute off-diagonal of the **correlation** matrix
+  `Corr_ij = C_ij/(σᵢσⱼ)` (diagonal = 1, entries in `[−1,1]`), i.e. `mean_{i≠j}|Corr_ij|`, vs epoch.
+  Caption: *redundancy between dims; →0 = decorrelated, high = dims duplicate each other (a precursor
+  to falling effective rank).*
+- `collapse/l_pred` — the (standardized) latent prediction loss vs epoch. Caption: *near-zero `L_pred`
+  alongside high obs-space error is the collapse signature — the target became trivially predictable.*
+
+The **collapse signature** across the panel: `L_pred ≈ 0` ∧ obs error high ∧ effective rank low.
+**Mechanism-specific extras** live under the mechanism's namespace (a run is one mechanism): EMA logs
+`collapse/ema/online_gap` (`‖enc − enc_ema‖`); RSSM (milestone 2) logs
+`collapse/rssm/{dyn_kl, rep_kl, posterior_entropy}`. Keys are stable, so overlaying several shoot-out
+runs later aligns the panels for free — but the spec above is for a single run.
+
+The **physical-loss variant** (`λ_phys`, see `models/data_space_autoregressor.md`) adds the scalar
+`train/loss_phys` (and `val/loss_phys`) — a loss term, not a collapse diagnostic.
+
 ## Rendering media cheaply
 
 Toroid visuals are matplotlib 3D — no game engine. Precompute the torus mesh once and reuse it.

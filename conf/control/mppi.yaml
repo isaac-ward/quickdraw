@@ -1,9 +1,18 @@
-horizon: 24
-num_samples: 512
-noise_sigma: 0.5
-lambda_: 1.0
+horizon: 64            # plan-ahead steps (~1.07s @60Hz). Long horizon self-penalizes overshoot (the
+                       # receding window sees the agent pass the goal), so it brakes WITHOUT a velocity term.
+chunk: 4               # execute this many steps of each plan before replanning (~chunk x fewer solves)
+num_samples: 512       # MPPI candidate action sequences per step
+noise_sigma: 2.0       # candidate exploration std (a_max=4.0, ~half). Higher -> more aggressive thrust tried.
+lambda_: 0.3           # softmax temperature. Lower -> sharper, commits harder to the best candidate.
 mean_decay: 1.0
-tol: 0.15
-max_steps: 400
-beta_vel: 0.3
-r_settle: 0.5
+tol: 0.15              # within this ambient distance of a goal counts as "at" it
+settle_steps: 30       # consecutive in-tol steps before advancing (~0.5s @60Hz dwell to confirm arrival)
+max_steps: 1000        # per-episode step budget for the whole goal sequence (ends early when all done);
+                       # ~200 steps/goal at 5 goals (settle=30/goal + travel). Early-break needs ALL
+                       # episodes of BOTH controllers done, so an imperfect pred runs ~to this cap.
+beta_vel: 0.0          # near-goal velocity penalty OFF: it made the controller stall at the gate boundary
+                       # (entering cost more in velocity than it gained in distance). Pure -distance + the
+                       # long horizon reach-and-stop reliably (oracle: 3/3 goals, ~4.8s). Knob kept at 0.
+r_settle: 0.5          # distance under which the velocity penalty would turn on (unused while beta_vel=0)
+n_episodes: 16         # parallel control episodes (random inits/orders); video is episode 0
+n_goals: 5             # goals visited per episode (random subset of the 8 NESW in/out goals)

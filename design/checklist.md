@@ -44,7 +44,7 @@ permanent; those files must be pulled into the repo at these steps or they're lo
 
 ## Phase 3 — Data (lerobot)
 - [ ] generation: `TorusEnv` → `LeRobotDataset.add_frame/save_episode`; splits
-      `train, val, eval_ind, eval_ood_{visual,geometric,dynamics}`.
+      `train, val, eval_ood_horizon, eval_ood_{visual,geometric,dynamics}`.
 - [ ] train-only normalization stats, applied to all splits (override lerobot per-dataset stats).
 - [ ] windowed loader (`delta_timestamps`, P=32,F=32) + full-trajectory eval loader.
 - [ ] verify: seed regenerates identical data; train stats ≈ N(0,1); OOD shows shift.

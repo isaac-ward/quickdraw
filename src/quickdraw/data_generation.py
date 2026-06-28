@@ -1,100 +1,173 @@
 """Step 1: generate all dataset splits + run outputs, all under one logs/ run folder.
 
-Everything (the lerobot dataset per split, normalization stats, dataset card, summary, media) is
-written under `logs/data_generation_<ts>_<experiment>/`. Point training at it with `data.root=<that>`.
-The per-split media (summary plot/video + FPV) render in parallel across processes.
+Pipeline (the heavy FPV render is decoupled from lerobot so it runs at FULL parallelism):
+  1. simulate every split's trajectories (vectors)
+  2. render the summary atlas plot + video per split FIRST (eyeball the physics before the long render)
+  3. render a 256x256 egocentric clip PER trajectory  -> media/fpv/<split>/ep_<i>.mp4   [80-way]
+  4. write each split's lerobot dataset, ingesting those clips as `observation.images.fpv` [per split]
+  5. write meta + summary.json, then stitch each eval case's clips into a grid composite
+Progress is streamed to stdout AND <run_dir>/progress.log. Point training at data.root=<run_dir>.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import hydra
 import matplotlib.pyplot as plt
 
-from .data.generate import build_all, generate_episodes
+from .data.generate import compute_norm_stats, generate_episodes, write_lerobot_split, write_meta
 from .environments.torus import TorusConfig
 from .logging import viz
 from .training.setup import env_cfg
 from .utils.logging import make_run_dir
 
-N_FPV = 4  # egocentric sample videos per split
+
+def _render_fpv(job: dict):
+    """One trajectory's 256x256 egocentric clip (rendered in parallel, ingested into lerobot later)."""
+    frames = viz.fpv_frames(job["R"], job["r"], job["coloring"], job["obs"], fov=job["fov"], size=job["size"])
+    viz.save_mp4(job["out"], frames, job["fps"])
+    return job["out"]
 
 
-def _render_split(task: dict):
-    """Render one split's media (atlas PNG, animated atlas MP4, N_FPV egocentric MP4s). Runs in a
-    worker process. The PNG and the video frames are produced by the SAME `fig_torus_atlas` call, so
-    their layout is identical."""
-    t = task
-    scfg = TorusConfig(R=t["R"], r=t["r"], dt=t["dt"], gamma=t["gamma"], a_max=t["a_max"], init_speed=t["init_speed"])
-    name, steps, coloring = t["name"], t["steps"], t["coloring"]
-    obs, act = generate_episodes(scfg, max(t["n_plot"], N_FPV), steps, t["seed"])
-    avec = viz.action_ambient(obs[:, :, :3], act, scfg.R, scfg.r)
-    trajs = [{"xyz": obs[i, :, :3], "avec": avec[i], "color": "k"} for i in range(t["n_plot"])]
-    title = f"{name} (samples)"
-    fps = round(1.0 / scfg.dt)  # constant 60 fps, one frame per sim step -> real time for every split
+def _write_lr(job: dict):
+    """One split's lerobot dataset (vectors + the pre-rendered FPV clips as observation.images.fpv)."""
+    write_lerobot_split(job["root_split"], job["repo_id"], job["obs"], job["act"], job["fps"],
+                        fpv_dir=job["fpv_dir"], fpv_size=job["size"])
+    return job["name"]
 
-    fig = viz.fig_torus_atlas(scfg.R, scfg.r, trajs=trajs, coloring=coloring, title=title)  # no arrow (static)
-    fig.savefig(os.path.join(t["sp"], f"{name}.png"), dpi=viz.DPI)  # no bbox=tight -> matches video frames
+
+def _render_summary(job: dict):
+    """Static atlas PNG + animated atlas MP4 for one split (first n_plot trajectories). Streams its own
+    frame progress to the shared progress.log (runs in a worker, so it appends directly)."""
+    def slog(msg):
+        line = f"[summary:{job['name']}] {msg}"
+        print(line, flush=True)
+        try:
+            with open(job["log_path"], "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+    scfg = TorusConfig(**job["scfg"])
+    trajs = [{"xyz": x, "avec": a, "color": "k", "start_scale": 0.5}
+             for x, a in zip(job["pos"], job["avec"])]  # start sphere half-size on summary plots
+    title = f"{job['name']} (samples)"
+    slog("plot...")
+    fig = viz.fig_torus_atlas(scfg.R, scfg.r, trajs=trajs[:2], coloring=job["coloring"], title=title,
+                              torus_opacity=viz.TORUS_OPACITY)  # static plot: just 2 particles (video keeps all)
+    fig.savefig(os.path.join(job["sp"], f"{job['name']}.png"), dpi=viz.DPI)
     plt.close(fig)
-
-    anim = viz.animate_frames(scfg.R, scfg.r, coloring, trajs, title=title)  # arrow = applied action (tweened)
-    viz.save_mp4(os.path.join(t["sv"], f"{name}.mp4"), anim, fps)
-    for i in range(N_FPV):
-        fpv = viz.fpv_frames(scfg.R, scfg.r, coloring, obs[i], fov=t["fov"])
-        viz.save_mp4(os.path.join(t["fp"], f"{name}_{i}.mp4"), fpv, fps)
-    return name
+    slog("video...")
+    frames = viz.animate_frames(scfg.R, scfg.r, job["coloring"], trajs, title=title,
+                                smooth_window=job["smooth"], log=slog)
+    viz.save_mp4(os.path.join(job["sv"], f"{job['name']}.mp4"), frames, job["fps"])
+    slog("done")
+    return job["name"]
 
 
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
 def main(cfg):
     run_dir = make_run_dir("data_generation", cfg.experiment)
-    ecfg = env_cfg(cfg)
-    stats = build_all(ecfg, run_dir, cfg.data.splits, fps=round(1.0 / ecfg.dt), device="cpu")
+    log_path = os.path.join(run_dir, "progress.log")
 
-    # summary: counts + simulated duration (at sim speed dt) per split
-    card = json.load(open(os.path.join(run_dir, "dataset_card.json")))
+    def log(msg):
+        print(msg, flush=True)
+        with open(log_path, "a") as f:
+            f.write(msg + "\n")
+
+    ecfg = env_cfg(cfg)
+    fps, size = round(1.0 / ecfg.dt), viz.FPV_SIZE
+    fov, grid, n_plot = float(cfg.data.fpv_fov), int(cfg.data.composite_grid), int(cfg.data.n_plot_trajectories)
+    n_cells = grid * grid
+    media = os.path.join(run_dir, "media")
+    sp, sv, fpv_root, comp = (os.path.join(media, d) for d in
+                              ("summary_plots", "summary_videos", "fpv", "composites"))
+    for d in (sp, sv, fpv_root, comp):
+        os.makedirs(d, exist_ok=True)
+    t0 = time.time()
+
+    # 1. simulate every split (cheap, vector only)
+    data = {}
+    for name, s in cfg.data.splits.items():
+        scfg = replace(ecfg, **dict(s.get("env", {}) or {}))
+        obs, act = generate_episodes(scfg, int(s["n_traj"]), int(s["steps"]), int(s["seed"]))
+        data[name] = (scfg, obs, act, s.get("coloring", "hsv"))
+        os.makedirs(os.path.join(fpv_root, name), exist_ok=True)
+    log(f"[gen] simulated {len(data)} splits, {sum(o.shape[0] for _, o, _, _ in data.values())} trajectories")
+
+    workers = os.cpu_count() or 4
+
+    # 2. SUMMARY atlas plot + video per split FIRST, so the new physics can be eyeballed before the long
+    # FPV render. Each runs in a worker and streams its own frame progress to progress.log.
+    summary_jobs = []
+    for name, (scfg, obs, act, coloring) in data.items():
+        pos = obs[:n_plot, :, :3]
+        avec = viz.action_ambient(pos, act[:n_plot], scfg.R, scfg.r)
+        summary_jobs.append({"name": name, "scfg": {"R": scfg.R, "r": scfg.r, "dt": scfg.dt,
+                             "gamma": scfg.gamma, "a_max": scfg.a_max, "init_speed": scfg.init_speed},
+                             "coloring": coloring, "fps": fps, "pos": pos, "avec": avec, "sp": sp, "sv": sv,
+                             "smooth": int(cfg.data.action_smooth_window), "log_path": log_path})
+    log(f"[summary] rendering {len(summary_jobs)} split summary plots+videos FIRST (check media/summary_*)...")
+    with ProcessPoolExecutor(max_workers=min(len(summary_jobs), workers)) as ex:
+        for k, done in enumerate(ex.map(_render_summary, summary_jobs), 1):
+            log(f"[summary] {k}/{len(summary_jobs)} complete: {done}  ({time.time() - t0:.0f}s)")
+
+    # 3. render every trajectory's FPV clip at full parallelism (the heavy step)
+    fpv_jobs = []
+    for name, (scfg, obs, _, coloring) in data.items():
+        for i in range(obs.shape[0]):
+            fpv_jobs.append({"R": scfg.R, "r": scfg.r, "coloring": coloring, "fov": fov, "fps": fps,
+                             "size": size, "obs": obs[i],
+                             "out": os.path.join(fpv_root, name, f"ep_{i:04d}.mp4")})
+    log(f"[fpv] rendering {len(fpv_jobs)} clips on {workers} workers...")
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for j, _ in enumerate(ex.map(_render_fpv, fpv_jobs), 1):
+            if j % 25 == 0 or j == len(fpv_jobs):  # doubled progress rate (was every 50)
+                log(f"[fpv] {j}/{len(fpv_jobs)}  ({time.time() - t0:.0f}s)")
+
+    # 4. write lerobot datasets, ingesting the rendered clips (one dataset per split, in parallel)
+    lr_jobs = [{"name": name, "root_split": os.path.join(run_dir, name), "repo_id": f"torus/{name}",
+                "obs": obs, "act": act, "fps": fps, "size": size,
+                "fpv_dir": os.path.join(fpv_root, name)} for name, (_, obs, act, _) in data.items()]
+    log(f"[lerobot] writing {len(lr_jobs)} split datasets (vectors + observation.images.fpv): "
+        + ", ".join(j["name"] for j in lr_jobs))
+    with ProcessPoolExecutor(max_workers=min(len(lr_jobs), workers)) as ex:
+        for k, done in enumerate(ex.map(_write_lr, lr_jobs), 1):
+            log(f"[lerobot] {k}/{len(lr_jobs)} wrote {done}  ({time.time() - t0:.0f}s)")
+    write_meta(run_dir, ecfg, cfg.data.splits, {n: asdict(scfg_) for n, (scfg_, _, _, _) in data.items()},
+               {n: c for n, (_, _, _, c) in data.items()}, fps, compute_norm_stats(*data["train"][1:3]))
+
+    # summary.json: counts + simulated duration per split
     P, F, dt = cfg.data.P, cfg.data.F, ecfg.dt
     counts = {}
-    for name, sp_ in card["splits"].items():
-        n, st = int(sp_["n_traj"]), int(sp_["steps"])
-        tr = n * st
-        sec = tr * dt
+    for name, (_, obs, _, _) in data.items():
+        n, st = obs.shape[0], obs.shape[1]
+        tr, sec = n * st, n * st * dt
         c = {"episodes": n, "steps_per_episode": st, "transitions": tr,
              "seconds": round(sec, 2), "minutes": round(sec / 60, 3), "hours": round(sec / 3600, 5)}
         if name in ("train", "val"):
-            c["training_windows"] = n * max(0, st - (P + F) + 1)  # sliced (P+F)-windows, stride 1
+            c["training_windows"] = n * max(0, st - (P + F) + 1)
         counts[name] = c
+    card = json.load(open(os.path.join(run_dir, "dataset_card.json")))
+    norm = json.load(open(os.path.join(run_dir, "normalization_stats.json")))
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump({"dataset_root": run_dir, "counts": counts, "splits": card["splits"],
                    "split_env": card["split_env"], "coloring": card["coloring"],
-                   "normalization_stats": stats}, f, indent=2)
+                   "normalization_stats": norm}, f, indent=2)
 
-    sp = os.path.join(run_dir, "media", "summary_plots")
-    sv = os.path.join(run_dir, "media", "summary_videos")
-    fp = os.path.join(run_dir, "media", "fpv")
-    for d in (sp, sv, fp):
-        os.makedirs(d, exist_ok=True)
+    # 4. composites: stitch every split's clips into one grid (reusing the rendered clips)
+    for name in data:
+        paths = sorted(glob.glob(os.path.join(fpv_root, name, "ep_*.mp4")))[:n_cells]
+        viz.stitch_grid_video(paths, os.path.join(comp, f"{name}.mp4"), grid, fps)
+        log(f"[composite] {name} ({len(paths)} cells)")
 
-    tasks = []
-    for name, s in cfg.data.splits.items():
-        scfg = replace(ecfg, **dict(s.get("env", {}) or {}))
-        tasks.append({"name": name, "R": scfg.R, "r": scfg.r, "dt": scfg.dt, "gamma": scfg.gamma,
-                      "a_max": scfg.a_max, "init_speed": scfg.init_speed,
-                      "steps": min(int(s["steps"]), 512), "seed": int(s["seed"]),
-                      "coloring": s.get("coloring", "hsv"), "n_plot": int(cfg.data.n_plot_trajectories),
-                      "fov": float(cfg.data.fpv_fov), "sp": sp, "sv": sv, "fp": fp})
-
-    workers = min(len(tasks), os.cpu_count() or 4)
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        for done in ex.map(_render_split, tasks):
-            print(f"[data_generation] rendered media for {done}")
-
-    print(f"[data_generation] dataset + outputs at {run_dir}")
-    print(f"[data_generation] now train with:  data.root={run_dir}")
+    log(f"[done] {run_dir}  ({time.time() - t0:.0f}s total)")
+    log(f"[done] now train with:  data.root={run_dir}")
 
 
 if __name__ == "__main__":

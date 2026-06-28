@@ -38,6 +38,9 @@ class Normalizer:
     def norm_act(self, a):
         return (a - self.a_mean.to(a)) / self.a_std.to(a)
 
+    def denorm_act(self, a):
+        return a * self.a_std.to(a) + self.a_mean.to(a)
+
 
 def load_split_episodes(root: str, split: str):
     """Return list of (obs (T,6), act (T,2)) float32 arrays. ISOLATED lerobot read."""
@@ -71,6 +74,41 @@ class WindowDataset(Dataset):
         obs = torch.from_numpy(o[s : s + self.L])
         act = torch.from_numpy(a[s : s + self.L])
         return {"obs_seq": self.norm.norm_obs(obs), "act_seq": self.norm.norm_act(act)}
+
+
+def stack_windows(episodes, P: int, F: int, normalizer: Normalizer):
+    """Pre-build ALL length-(P+F) windows into two normalized tensors (no per-item work later).
+    Returns obs_windows (N,L,6), act_windows (N,L,2). For the vector stage N*L*8 floats is tiny."""
+    L = P + F
+    obs_w, act_w = [], []
+    for o, a in episodes:
+        if len(o) < L:
+            continue
+        obs_w.append(torch.from_numpy(o).unfold(0, L, 1).permute(0, 2, 1).contiguous())  # (n,L,6)
+        act_w.append(torch.from_numpy(a).unfold(0, L, 1).permute(0, 2, 1).contiguous())  # (n,L,2)
+    obs, act = torch.cat(obs_w), torch.cat(act_w)
+    return normalizer.norm_obs(obs), normalizer.norm_act(act)
+
+
+class GPUWindowLoader:
+    """DataLoader-shaped iterable over windows held resident on `device`. Batches are produced by
+    on-device index_select, so there is no host->device copy and no worker IPC in the train loop.
+    Single-device only (no DistributedSampler); fine for one H100."""
+
+    def __init__(self, obs_windows, act_windows, batch: int, shuffle: bool, device):
+        self.obs = obs_windows.to(device)
+        self.act = act_windows.to(device)
+        self.N, self.batch, self.shuffle = self.obs.shape[0], batch, shuffle
+
+    def __len__(self):
+        return (self.N + self.batch - 1) // self.batch
+
+    def __iter__(self):
+        dev = self.obs.device
+        idx = torch.randperm(self.N, device=dev) if self.shuffle else torch.arange(self.N, device=dev)
+        for i in range(0, self.N, self.batch):
+            j = idx[i : i + self.batch]
+            yield {"obs_seq": self.obs.index_select(0, j), "act_seq": self.act.index_select(0, j)}
 
 
 class TrajectoryDataset(Dataset):
