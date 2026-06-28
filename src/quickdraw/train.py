@@ -50,6 +50,27 @@ def _run_summary_text(cfg) -> str:
     return "\n".join(lines + ["========================="])
 
 
+def _assert_summary_unique(summary_text, cfg, root="logs") -> None:
+    """A run_summary must NEVER duplicate a prior run's. Every launch describes THIS run's current
+    hypothesis + what changed since the last attempt — a reused note is a stale, meaningless note.
+    Escape hatch: run_summary.allow_duplicate=true for a deliberate exact rerun."""
+    import glob
+    if bool((cfg.get("run_summary") or {}).get("allow_duplicate", False)):
+        return
+    norm = " ".join(summary_text.split())
+    for f in sorted(glob.glob(os.path.join(root, "*", "auto_run_summary.txt"))):
+        try:
+            prev = " ".join(open(f).read().split())
+        except OSError:
+            continue
+        if prev == norm:
+            raise AssertionError(
+                f"run_summary is IDENTICAL to a previous run ({f}). Every run needs a UNIQUE 5-point note "
+                "describing THIS run's current hypothesis and what changed since the last attempt — never "
+                "copy-paste a prior summary. Rewrite run_summary.* (set run_summary.allow_duplicate=true "
+                "only for a deliberate exact rerun).")
+
+
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
 def main(cfg):
     torch.set_float32_matmul_precision("high")
@@ -64,6 +85,7 @@ def main(cfg):
     # a touch slower per kernel (~60s startup) but reliable; with 6 concurrent runs the CPU cost is fine.
     torch._inductor.config.compile_threads = 1
     summary_text = _run_summary_text(cfg)  # fail BEFORE any setup if the run note is missing
+    _assert_summary_unique(summary_text, cfg)  # ...and fail if it merely copies a previous run's note
     if not data_exists(cfg):
         raise FileNotFoundError(
             "No dataset found. Run `python -m quickdraw.data_generation` first, then pass its run "
@@ -99,7 +121,8 @@ def main(cfg):
     e = env_cfg(cfg)
     lit = LitWorldModel(model, norm, e.R, e.r, e.init_speed, cfg.data.P, cfg.data.F,
                         cfg.model.p_tf_start, cfg.model.p_tf_end, cfg.model.p_tf_warmup_epochs,
-                        cfg.optim.lr, cfg.optim.weight_decay, cfg.model.detach_every)
+                        cfg.optim.lr, cfg.optim.weight_decay, cfg.model.detach_every,
+                        variations=cfg.get("variations"))
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py). Lightning's own
     # logger is OFF; all logging flows through the writer via LoggingCallback.

@@ -115,6 +115,16 @@ class LatentSpaceAR(SequenceWorldModel):
     def to_obs(self, state: Tensor) -> Tensor:
         return self.dec(state)
 
+    def physical_state(self, pred: Tensor) -> Tensor:
+        # physical-loss seam: decode with FROZEN decoder params (functional_call), so the gradient flows
+        # to the latent/predictor but NOT the decoder weights -> dec stays a passive readout while the
+        # physics penalty shapes the representation. (A plain .detach() on the output would also kill the
+        # gradient to the latent, which we need.)
+        from torch.func import functional_call
+        pb = {n: p.detach() for n, p in self.dec.named_parameters()}
+        pb.update({n: b.detach() for n, b in self.dec.named_buffers()})
+        return functional_call(self.dec, pb, (pred,))
+
     # ---- model-specific losses: latent prediction (+ optional collapse regularizer). Returns RAW
     # (pre-scaling) terms + their weights; the LightningModule logs the raw terms (comparable across
     # methods) and minimizes sum(weight*term) (+ the unified obs term). No decoder/autoencoding term:

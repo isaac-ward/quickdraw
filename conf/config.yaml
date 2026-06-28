@@ -15,14 +15,28 @@ experiment: base
 # checkpoint path for the eval/control entrypoints (override on CLI)
 checkpoint: null
 
+# Train-time shaping variations (design/models/variations.md). An orthogonal axis: each composes with
+# ANY world model via the SequenceWorldModel hook contract (DSAR / any LSAR / future RSSM / vision).
+# All OFF by default (0) -> a baseline run is bit-identical. Enable on the CLI, e.g.
+#   variations.noise_injection.std=0.05   variations.physical_loss.weight=1.0
+#   variations.contraction.weight=1.0 variations.contraction.target=1.0
+variations:
+  noise_injection: { std: 0.0 }                  # sigma of Gaussian noise on the normalized obs INPUTS
+  physical_loss:   { weight: 0.0 }               # lambda on (d_off/r)^2 + (v_off/v_scale)^2 (on-manifold)
+  contraction:     { weight: 0.0, target: 1.02, power_iters: 2, n_sample_steps: 4 }  # hinge on sigma_max(one-step J)
+
 # REQUIRED before any training run (train.py asserts all 5 are set): a 5-point experiment note,
 # written to <run_dir>/auto_run_summary.txt and printed to the logs (so it's in the wandb console).
+# MUST BE UNIQUE PER RUN: train.py fails if this note is identical to any previous run's. Rewrite it
+# EVERY launch to describe THIS run's current hypothesis and what changed since the last attempt —
+# a reused note is a stale, meaningless note. Never copy-paste a prior summary.
 run_summary:
   problem: null          # 1. the problem we are facing
   tried: null            # 2. what we have tried so far
   trying: null           # 3. what we are trying in this run
   trying_detail: null    # 4. what we are trying, in more detail
   rationale: null        # 5. why we expect it to solve the existing problem
+  allow_duplicate: false # set true ONLY for a deliberate exact rerun (bypasses the uniqueness check)
 
 hydra:
   job:

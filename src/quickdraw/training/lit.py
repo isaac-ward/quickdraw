@@ -7,18 +7,21 @@ import torch
 
 from ..environments import torus as T
 from ..models.base import BaseWorldModel
+from .variations import VarContext, make_variation_suite
 
 
 class LitWorldModel(L.LightningModule):
     def __init__(self, model: BaseWorldModel, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
-                 lr: float, weight_decay: float, detach_every: int = 8):
+                 lr: float, weight_decay: float, detach_every: int = 8, variations=None):
         super().__init__()
         self.model = model
         self.norm = normalizer
         self.R, self.r, self.v_scale, self.P, self.F = R, r, v_scale, P, F
         self.p_tf_start, self.p_tf_end, self.p_tf_warmup = p_tf_start, p_tf_end, p_tf_warmup
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
+        # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
+        self.variations = make_variation_suite(variations)
 
     def _cur_p_tf(self) -> float:
         # curriculum: ramp from p_tf_start (e.g. 1.0, full teacher forcing) down to p_tf_end over warmup
@@ -28,20 +31,25 @@ class LitWorldModel(L.LightningModule):
         return self.p_tf_end + (self.p_tf_start - self.p_tf_end) * (1.0 - frac)
 
     # ---- shared: produce future predictions (normalized) for a batch window ----
-    def _future_preds(self, obs_seq, act_seq):
+    # obs_input feeds the model (may be noise-augmented); obs_target is the clean target/TF-source split.
+    def _future_preds(self, obs_input, act_seq, obs_target):
         P, L = self.P, self.P + self.F
         p_tf = self._cur_p_tf()
         if p_tf >= 1.0:  # parallel teacher forcing (one causal pass)
-            preds = self.model(obs_seq[:, :-1], act_seq[:, :-1])  # predict obs[:,1:]
-            return preds[:, P - 1 :], obs_seq[:, P:]
-        ctx, actions, future = obs_seq[:, :P], act_seq[:, : L - 1], obs_seq[:, P:]
-        preds = self.model.rollout_train(ctx, actions, future, p_tf, self.detach_every)
-        return preds, future
+            preds = self.model(obs_input[:, :-1], act_seq[:, :-1])  # predict obs[:,1:]
+            return preds[:, P - 1 :], obs_target[:, P:]
+        ctx, actions = obs_input[:, :P], act_seq[:, : L - 1]
+        tf_source = obs_input[:, P:]  # teacher-forcing feed is an INPUT (noised); loss target stays clean
+        preds = self.model.rollout_train(ctx, actions, tf_source, p_tf, self.detach_every)
+        return preds, obs_target[:, P:]
 
     def _step(self, batch, tag):
         obs_seq, act_seq = batch["obs_seq"], batch["act_seq"]
+        training = tag == "train"
         p_tf = self._cur_p_tf()
-        preds, future_obs = self._future_preds(obs_seq, act_seq)  # preds = predicted STATES (obs for DSAR, latent for LSAR)
+        # variations: perturb the obs INPUTS only (noise injection); targets/metrics use clean obs_seq.
+        obs_input, t_logs = self.variations.transform_obs(obs_seq, training)
+        preds, future_obs = self._future_preds(obs_input, act_seq, obs_seq)  # preds = STATES (obs for DSAR, latent for LSAR)
         # model-specific RAW terms + weights (DSAR: {}; LSAR: {pred_latent[, reg]}).
         raw, weights = self.model.loss_terms(preds, future_obs, obs_seq, p_tf)
         # unified obs-rollout error: decode the predicted rollout and compare to the true future obs.
@@ -56,6 +64,16 @@ class LitWorldModel(L.LightningModule):
             objective = loss_total
         else:                                       # JEPA variants: obs term is a decoder-only readout probe
             objective = loss_total + lam * obs_mse
+        # train-time shaping variations (noise already applied to inputs above; here the loss terms):
+        # add their penalties to the objective and log everything under {variation_name}/.
+        if training and self.variations:
+            ctx = VarContext(self.model, preds, future_obs, obs_seq, act_seq,
+                             self.norm, self.R, self.r, self.v_scale, training)
+            extra, v_logs = self.variations.losses(ctx)
+            if extra is not None:
+                objective = objective + extra
+            for k, val in {**t_logs, **v_logs}.items():
+                self.log(k, val)
         # logging: loss/* are RAW (pre-scaling, comparable across methods); loss/total is the actual
         # scaled objective. obs_error is the decoded-rollout obs MSE logged for ALL methods (one plot).
         self.log(f"{tag}/loss/total", loss_total, prog_bar=(tag == "train"))

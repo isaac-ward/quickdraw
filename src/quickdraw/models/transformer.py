@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 
@@ -87,6 +88,22 @@ def pad_block_mask(T: int, pad: int, device):
     return bm
 
 
+_EAGER_MASK_CACHE: dict = {}
+
+
+def eager_sliding_mask(window: int, T: int, device):
+    """Boolean causal + sliding-window mask (T,T), True = attend. For the EAGER sdpa(MATH) attention
+    path used only by the contraction penalty (it needs double-backward, which the FlexAttention kernel
+    doesn't support). Same admissible set as `_sliding_causal_mask_mod`. Cached (shape/window/device)."""
+    key = (window, T, str(device))
+    m = _EAGER_MASK_CACHE.get(key)
+    if m is None:
+        i = torch.arange(T, device=device)
+        m = (i[:, None] >= i[None, :]) & (i[:, None] - i[None, :] < window)
+        _EAGER_MASK_CACHE[key] = m
+    return m
+
+
 def _rope(T: int, head_dim: int, theta: float, device, dtype):
     key = (T, head_dim, theta, str(device), dtype)
     rc = _ROPE_CACHE.get(key)
@@ -108,7 +125,7 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim)
         self.out = nn.Linear(dim, dim)
 
-    def forward(self, x: Tensor, block_mask=None) -> Tensor:
+    def forward(self, x: Tensor, block_mask=None, attn_eager: bool = False) -> Tensor:
         B, T, _ = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, T, Dh)
@@ -117,9 +134,15 @@ class SelfAttention(nn.Module):
         cos, sin = _rope(T, self.head_dim, self.rope_theta, x.device, torch.float32)
         q = apply_rope(q.float(), cos, sin).to(v.dtype)
         k = apply_rope(k.float(), cos, sin).to(v.dtype)
-        if block_mask is None:  # default (parallel forward): build the sliding-causal mask for this T
-            block_mask = _block_mask(self.window, T, x.device)
-        o = flex_attention(q, k, v, block_mask=block_mask)
+        if attn_eager:  # differentiable backup path (contraction penalty only): plain sdpa(MATH), which
+            # supports double-backward / forward-over-reverse. FlexAttention stays the default everywhere.
+            mask = eager_sliding_mask(self.window, T, x.device)
+            with sdpa_kernel(SDPBackend.MATH):
+                o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            if block_mask is None:  # default (parallel forward): build the sliding-causal mask for this T
+                block_mask = _block_mask(self.window, T, x.device)
+            o = flex_attention(q, k, v, block_mask=block_mask)
         o = o.transpose(1, 2).reshape(B, T, self.heads * self.head_dim)
         return self.out(o)
 
@@ -145,8 +168,8 @@ class Block(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = FeedForward(dim, mlp_ratio)
 
-    def forward(self, x: Tensor, block_mask=None) -> Tensor:
-        x = x + self.attn(self.norm1(x), block_mask)
+    def forward(self, x: Tensor, block_mask=None, attn_eager: bool = False) -> Tensor:
+        x = x + self.attn(self.norm1(x), block_mask, attn_eager)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -159,7 +182,7 @@ class Transformer(nn.Module):
         )
         self.norm_out = nn.LayerNorm(dim)
 
-    def forward(self, x: Tensor, block_mask=None) -> Tensor:
+    def forward(self, x: Tensor, block_mask=None, attn_eager: bool = False) -> Tensor:
         for blk in self.blocks:
-            x = blk(x, block_mask)
+            x = blk(x, block_mask, attn_eager)
         return self.norm_out(x)

@@ -46,6 +46,27 @@ class SequenceWorldModel(nn.Module):
         """carried state -> observation (B,*,6). DSAR: identity; LSAR: dec(state)."""
         raise NotImplementedError
 
+    # ---- composability seams for the train-time variations (design/models/variations.md) ----
+    # These live on the ANCESTOR so every model (DSAR/LSAR/future RSSM/vision) gets them via the hooks,
+    # and the variation code never reaches into a concrete model.
+    def physical_state(self, pred: Tensor) -> Tensor | None:
+        """Physical 6-vector [p; p_dot] for the physical-loss variation. Default: `to_obs` (correct when
+        the observation IS the physical state, e.g. DSAR / vector LSAR). Models whose `to_obs` is a
+        learned decoder override to FREEZE it (grad to the state, not the decoder weights). A vision
+        model returns its physical-readout head's output, or None to signal "physics unavailable" ->
+        the variation auto-skips."""
+        return self.to_obs(pred)
+
+    def one_step_states(self, state_win: Tensor, act_win: Tensor, attn_eager: bool = False) -> Tensor:
+        """One advance of the shared rollout as a pure state->state map: (state_win (B,W,state),
+        act_win (B,W,2)) -> next state (B,state), predicted at the LAST position. Built only from the
+        hooks + backbone, so it is identical for every model. `attn_eager=True` routes the backbone
+        through the differentiable eager sdpa(MATH) attention path (FlexAttention can't double-back),
+        used by the contraction penalty's Jacobian power-iteration."""
+        x = self.to_token(state_win, act_win)
+        h = self.transformer(x, attn_eager=attn_eager)
+        return self.readout(h[:, -1], state_win[:, -1])
+
     # Whether the unified obs-rollout loss (loss_pred_obs, computed in the LightningModule) is a real
     # loss term that shapes this model (True: DSAR, LSAR-reconstruction) or a detached eval-only readout
     # probe that trains the decoder without shaping the representation (False: JEPA variants).
