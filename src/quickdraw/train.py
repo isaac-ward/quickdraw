@@ -122,7 +122,7 @@ def main(cfg):
     lit = LitWorldModel(model, norm, e.R, e.r, e.init_speed, cfg.data.P, cfg.data.F,
                         cfg.model.p_tf_start, cfg.model.p_tf_end, cfg.model.p_tf_warmup_epochs,
                         cfg.optim.lr, cfg.optim.weight_decay, cfg.model.detach_every,
-                        variations=cfg.get("variations"))
+                        variations=cfg.get("variations"), dt=e.dt)
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py). Lightning's own
     # logger is OFF; all logging flows through the writer via LoggingCallback.

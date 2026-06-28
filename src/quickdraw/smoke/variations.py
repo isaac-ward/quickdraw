@@ -20,7 +20,7 @@ from quickdraw.training.variations import (VarContext, NoiseInjection, PhysicalL
 from quickdraw.training.lit import LitWorldModel
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-R, r, VS = 0.75, 0.25, 1.0
+R, r, VS, DT = 0.75, 0.25, 1.0, 1.0 / 60.0
 NORM = Normalizer({"observation_vector": {"mean": [0.0] * 6, "std": [1.0] * 6},
                    "action": {"mean": [0.0, 0.0], "std": [1.0, 1.0]}})
 results = []
@@ -56,7 +56,7 @@ def test_noise():
 
 # ---------------------------------------------------------------- physical loss
 def _ctx(model, preds, obs, act):
-    return VarContext(model, preds, obs[:, 4:], obs, act, NORM, R, r, VS, True)
+    return VarContext(model, preds, obs[:, 4:], obs, act, NORM, R, r, VS, DT, True)
 
 
 def test_physical():
@@ -71,6 +71,14 @@ def test_physical():
     check("DSAR finite penalty + grad to prediction",
           torch.isfinite(L) and preds.grad is not None and torch.isfinite(preds.grad).all(),
           f"L={Lf:.3f}")
+    # continuity term (kinematic v = dp/dt): finite, logged, grad flows to the prediction.
+    m2 = dsar()
+    preds2 = torch.randn(3, 8, 6, device=DEV, requires_grad=True)
+    Lc, logs_c = PhysicalLoss(0.0, continuity=1.0).loss(_ctx(m2, preds2, obs, act))
+    Lc.backward()
+    check("continuity term finite + logged + grad",
+          "continuity" in logs_c and torch.isfinite(Lc) and preds2.grad is not None
+          and torch.isfinite(preds2.grad).all(), f"continuity={float(logs_c.get('continuity', float('nan'))):.3f}")
     # LSAR: decoder must stay FROZEN (no grad), but the latent/encoder must receive grad.
     m = lsar()
     obs = torch.randn(3, 12, 6, device=DEV)
@@ -120,7 +128,7 @@ def test_contract():
 # ---------------------------------------------------------------- integration via LitWorldModel
 def test_integration():
     print("integration (LitWorldModel, all variations on):")
-    varcfg = {"noise_injection": {"std": 0.1}, "physical_loss": {"weight": 1.0},
+    varcfg = {"noise_injection": {"std": 0.1}, "physical_loss": {"weight": 1.0, "continuity": 1.0},
               "contraction": {"weight": 1.0, "target": 1.0, "power_iters": 2, "n_sample_steps": 2}}
     for name, m in [("DSAR", dsar()), ("LSAR", lsar())]:
         lit = LitWorldModel(m, NORM, R, r, VS, 4, 8, 0.0, 0.0, 0, 1e-3, 0.0, 0, variations=varcfg).to(DEV)
@@ -132,7 +140,7 @@ def test_integration():
         with torch.autocast(device_type=DEV, dtype=torch.bfloat16, enabled=(DEV == "cuda")):
             obj = lit._step(batch, "train")
         want = {"noise_injection/sigma_desired", "noise_injection/sigma_measured",
-                "physical_loss/loss", "physical_loss/d_off", "physical_loss/v_off",
+                "physical_loss/loss", "physical_loss/d_off", "physical_loss/v_off", "physical_loss/continuity",
                 "contraction/loss", "contraction/sigma_max"}
         missing = want - set(keys)
         check(f"{name} finite objective (bf16 autocast)", bool(torch.isfinite(obj)), f"obj={float(obj.detach()):.3e}")

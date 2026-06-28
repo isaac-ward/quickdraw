@@ -13,11 +13,12 @@ from .variations import VarContext, make_variation_suite
 class LitWorldModel(L.LightningModule):
     def __init__(self, model: BaseWorldModel, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
-                 lr: float, weight_decay: float, detach_every: int = 8, variations=None):
+                 lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0):
         super().__init__()
         self.model = model
         self.norm = normalizer
         self.R, self.r, self.v_scale, self.P, self.F = R, r, v_scale, P, F
+        self.dt = dt
         self.p_tf_start, self.p_tf_end, self.p_tf_warmup = p_tf_start, p_tf_end, p_tf_warmup
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
         # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
@@ -68,7 +69,7 @@ class LitWorldModel(L.LightningModule):
         # add their penalties to the objective and log everything under {variation_name}/.
         if training and self.variations:
             ctx = VarContext(self.model, preds, future_obs, obs_seq, act_seq,
-                             self.norm, self.R, self.r, self.v_scale, training)
+                             self.norm, self.R, self.r, self.v_scale, self.dt, training)
             extra, v_logs = self.variations.losses(ctx)
             if extra is not None:
                 objective = objective + extra

@@ -38,6 +38,7 @@ class VarContext:
     R: float
     r: float
     v_scale: float
+    dt: float             # env timestep (physical seconds) — for the kinematic continuity term
     training: bool
 
 
@@ -72,17 +73,22 @@ class NoiseInjection(Variation):
 
 
 class PhysicalLoss(Variation):
-    """Physics-informed penalty: the predicted state should lie ON the torus with a TANGENT velocity.
-    L_phys = (d_off/r)^2 + (v_off/v_scale)^2, dimensionless. Operates on the physical 6-vector returned
-    by `model.physical_state(pred)` (decoder frozen for LSAR), so the physics math (torus.py, the single
-    geometry source) is fully decoupled from how each model produces that state."""
+    """Physics-informed penalty on the predicted state via `model.physical_state(pred)` (decoder frozen
+    for LSAR; physics math stays in torus.py). Three terms, each dimensionless:
+      - ALGEBRAIC (weight): on-surface (d_off/r)^2 + tangent-velocity (v_off/v_scale)^2 — per-step;
+      - CONTINUITY (continuity): the kinematic law v = dp/dt, as a central-difference residual over the
+        rollout, ||v_hat_t - (p_{t+1}-p_{t-1})/(2 dt)||^2 / v_scale^2. This is the DIFFERENTIAL physics
+        constraint linking the velocity channel to how the position actually moves across time (the
+        algebraic terms are per-step and can't see it). Ambient coords are continuous through angle
+        wraps, so the position difference is always well-defined."""
     name = "physical_loss"
 
-    def __init__(self, weight: float):
+    def __init__(self, weight: float, continuity: float = 0.0):
         self.weight = float(weight)
+        self.continuity = float(continuity)
 
     def loss(self, ctx: VarContext) -> tuple[Tensor | None, dict]:
-        state = ctx.model.physical_state(ctx.preds)        # (..., 6) physical readout, or None
+        state = ctx.model.physical_state(ctx.preds)        # (B, H, 6) physical readout, or None
         if state is None:                                  # e.g. a vision model with no physical head
             return None, {"skipped": 1.0}
         obs_phys = ctx.norm.denorm_obs(state)              # to PHYSICAL units (affine -> grad preserved)
@@ -90,9 +96,15 @@ class PhysicalLoss(Variation):
         d_off = T.signed_dist(p_hat, ctx.R, ctx.r) / ctx.r            # signed, smooth when squared
         th, ph = T.angles_from_point(p_hat, ctx.R)
         v_off = (obs_phys[..., 3:] * T.normal(th, ph)).sum(-1) / ctx.v_scale
-        L = d_off.pow(2).mean() + v_off.pow(2).mean()
-        logs = {"loss": L.detach(), "d_off": d_off.abs().mean().detach(), "v_off": v_off.abs().mean().detach()}
-        return self.weight * L, logs
+        alg = d_off.pow(2).mean() + v_off.pow(2).mean()              # algebraic: on-surface + tangent
+        total = self.weight * alg
+        logs = {"loss": alg.detach(), "d_off": d_off.abs().mean().detach(), "v_off": v_off.abs().mean().detach()}
+        if self.continuity > 0.0 and obs_phys.shape[1] >= 3 and ctx.dt:   # kinematic continuity v = dp/dt
+            sec = (p_hat[:, 2:] - p_hat[:, :-2]) / (2.0 * ctx.dt)         # central-diff velocity, interior t
+            cont = ((obs_phys[:, 1:-1, 3:] - sec) / ctx.v_scale).pow(2).sum(-1).mean()
+            total = total + self.continuity * cont
+            logs["continuity"] = cont.detach()
+        return total, logs
 
 
 class Contraction(Variation):
@@ -205,8 +217,10 @@ def make_variation_suite(cfg) -> VariationSuite:
     if float((ni.get("std", 0.0) if hasattr(ni, "get") else getattr(ni, "std", 0.0)) or 0.0) > 0.0:
         out.append(NoiseInjection(ni["std"]))
     pl = get("physical_loss") or {}
-    if float((pl.get("weight", 0.0) if hasattr(pl, "get") else getattr(pl, "weight", 0.0)) or 0.0) > 0.0:
-        out.append(PhysicalLoss(pl["weight"]))
+    plg = (lambda k, d: pl.get(k, d)) if hasattr(pl, "get") else (lambda k, d: getattr(pl, k, d))
+    plw, plc = float(plg("weight", 0.0) or 0.0), float(plg("continuity", 0.0) or 0.0)
+    if plw > 0.0 or plc > 0.0:           # enable if EITHER the algebraic or the continuity term is active
+        out.append(PhysicalLoss(plw, plc))
     ct = get("contraction") or {}
     ctw = float((ct.get("weight", 0.0) if hasattr(ct, "get") else getattr(ct, "weight", 0.0)) or 0.0)
     if ctw > 0.0:
