@@ -184,6 +184,13 @@ it sharpen across training epochs), we render two complementary views, each a **
 Cost is dominated by the *render*, not the flow (the field + decoder are tiny; a frame is a few hundred
 evals). 4 steps × 2 views is cheap enough to log every eval epoch.
 
+**What it looks like.** A funnel/teardrop: a diffuse cloud of decoded-noise points floating off the
+torus, ~16 threads arcing down and pinching to a tight knot at the next position (comets homing on a
+landing site), the bright committed path down its spine, and a ring at the true next spot. Beam *width*
+= confidence (tight = sure; split = multimodal); whether threads land *on* the skin vs float above it
+= on-manifold vs drift (the failure mode, made visible). Across epochs (steps are fixed) you watch the
+fat scattered funnel narrow into a clean on-surface beam that bullseyes the ring.
+
 ---
 
 ## Logging (wandb)
