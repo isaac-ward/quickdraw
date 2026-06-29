@@ -79,6 +79,10 @@ target, and it stops magnitude drift over the rollout.
 
 ## The flow field `v_θ` (the only new module)
 
+**Decision: the flow field is a separate small MLP** (the transformer is unchanged — it stays the
+deterministic context encoder → `h`). A unified transformer-as-denoiser is a future image-era option,
+not what we build (see "Could the field just *be* the transformer?" below).
+
 A small MLP, **shared across all rollout steps**:
 
 ```
@@ -146,8 +150,11 @@ conditioning) that unlocks K=1 (and therefore cheap in-rollout training). We wil
 ## Sampling / evaluation
 
 - **K Euler steps** per AR step: 4–8 for plain flow, 1 for shortcut.
-- **Deterministic ODE from a fixed noise seed** for the headline metrics (MDE/OOD/control) — a single
-  reproducible "best guess," directly comparable to the deterministic models, and golden-testable.
+- **Deterministic ODE from a FIXED starting noise** for the headline metrics (MDE/OOD/control) — the
+  *same* noise every eval (a fixed seed, or `ε=0` the noise-mean), **not a fresh random draw**. So it's a
+  single reproducible "best guess" (same input → same prediction each epoch), directly comparable to the
+  deterministic models and golden-testable. This *same* fixed-seed path is the one highlighted in the
+  streamline viz, so the picture shows exactly the prediction the metrics are computed on.
 - Optionally render a few **stochastic** samples (fresh noise) in the *video only*, to visualize the
   predicted spread / multimodality.
 
