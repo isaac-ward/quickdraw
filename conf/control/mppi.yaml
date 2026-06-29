@@ -10,6 +10,11 @@ settle_steps: 45       # consecutive in-tol steps before advancing (~0.75s @60Hz
 max_steps: 1000        # per-episode step budget for the whole goal sequence (ends early when all done);
                        # ~200 steps/goal at 5 goals (settle=30/goal + travel). Early-break needs ALL
                        # episodes of BOTH controllers done, so an imperfect pred runs ~to this cap.
+beta_ctrl: 0.005       # control (action-magnitude) cost: small penalty on sum_h ||a_h||^2 so the planner
+                       # prefers cheaper thrust and settles with less jitter. Applies to BOTH controllers
+                       # (shared cost). NOTE: was 0 (off) for the in-flight variation campaign, so absolute
+                       # control numbers across that boundary aren't directly comparable — but the
+                       # pred-vs-oracle gap (the meaningful quantity) stays fair since both share the cost.
 beta_vel: 0.0          # near-goal velocity penalty OFF: it made the controller stall at the gate boundary
                        # (entering cost more in velocity than it gained in distance). Pure -distance + the
                        # long horizon reach-and-stop reliably (oracle: 3/3 goals, ~4.8s). Knob kept at 0.

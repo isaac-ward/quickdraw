@@ -32,16 +32,22 @@ class MPPIConfig:
     max_steps: int = 800       # per-episode step budget for the whole goal sequence
     beta_vel: float = 0.3      # velocity penalty weight, gated to near-goal (encourages settling)
     r_settle: float = 0.5      # distance under which the velocity penalty turns on
+    beta_ctrl: float = 0.0     # control (action-magnitude) cost weight: penalizes sum_h ||a_h||^2 over the
+    #                            horizon, so the planner prefers cheaper thrust (and settles with less jitter).
+    #                            Applies to BOTH controllers (shared _score). 0 = off (no control cost).
     n_episodes: int = 16       # parallel control episodes (random inits/orders); video is episode 0
     n_goals: int = 5           # goals visited per episode (random subset of the 8 NESW in/out goals)
 
 
-def _score(p_xyz, v_xyz, goal, mppi):
-    """MPPI return for each candidate: -distance, plus a near-goal velocity penalty so it settles.
-    p_xyz/v_xyz: (G,K,H,3); goal: (G,3) -> returns (G,K)."""
+def _score(p_xyz, v_xyz, cand, goal, mppi):
+    """MPPI return for each candidate: -distance, a near-goal velocity penalty so it settles, and an
+    optional control (action-magnitude) cost. p_xyz/v_xyz: (G,K,H,3); cand: (G,K,H,2); goal: (G,3) -> (G,K)."""
     d = (p_xyz - goal[:, None, None]).norm(dim=-1)            # (G,K,H)
     gate = (d < mppi.r_settle).float()
-    return (-d - mppi.beta_vel * gate * v_xyz.norm(dim=-1)).sum(dim=-1)
+    ret = (-d - mppi.beta_vel * gate * v_xyz.norm(dim=-1)).sum(dim=-1)
+    if mppi.beta_ctrl > 0.0:                                   # cheaper thrust preferred (energy/jitter)
+        ret = ret - mppi.beta_ctrl * cand.pow(2).sum(dim=-1).sum(dim=-1)   # sum_h ||a_h||^2  (G,K)
+    return ret
 
 
 def _mppi_step(rollout_fn, mean, goal, mppi, a_max, g):
@@ -52,7 +58,7 @@ def _mppi_step(rollout_fn, mean, goal, mppi, a_max, g):
     noise = torch.randn(G, K, H, 2, device=mean.device, generator=g) * mppi.noise_sigma
     cand = (mean[:, None] + noise).clamp(-a_max, a_max)        # (G,K,H,2)
     p_xyz, v_xyz = rollout_fn(cand)
-    ret = _score(p_xyz, v_xyz, goal, mppi)                    # (G,K) higher = better (lower cost)
+    ret = _score(p_xyz, v_xyz, cand, goal, mppi)              # (G,K) higher = better (lower cost)
     w = torch.softmax(ret / max(mppi.lambda_, 1e-6), dim=1)   # (G,K)
     new_mean = (w[..., None, None] * cand).sum(dim=1)         # (G,H,2)
     return new_mean, new_mean[:, 0], p_xyz, ret               # p_xyz/ret expose the candidate fan
