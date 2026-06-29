@@ -38,8 +38,9 @@ class VarContext:
     R: float
     r: float
     v_scale: float
-    dt: float             # env timestep (physical seconds) — for the kinematic continuity term
+    dt: float              # env timestep (physical seconds) — for the kinematic continuity term
     training: bool
+    physical_ramp: float = 1.0   # warmup multiplier on the physical loss (1.0 = full; set by lit's schedule)
 
 
 class Variation:
@@ -50,6 +51,7 @@ class Variation:
     diag_dict holds sub-diagnostics, namespaced by the suite under `{name}/`."""
     name: str = "variation"
     loss_name: str | None = None   # key under {tag}/loss/ for this variation's additive term (None = none)
+    train_only: bool = False        # True -> skip on val (e.g. contraction needs autograd, blocked by inference_mode)
 
     def transform_obs(self, obs: Tensor, training: bool) -> tuple[Tensor, dict]:
         return obs, {}
@@ -108,7 +110,7 @@ class PhysicalLoss(Variation):
             cont = ((obs_phys[:, 1:-1, 3:] - sec) / ctx.v_scale).pow(2).sum(-1).mean()
             total = total + self.continuity * cont
             diag["continuity"] = cont.detach()
-        return total, diag
+        return ctx.physical_ramp * total, diag   # warmup ramp (0->1) avoids hitting the jittery early decode
 
 
 class Contraction(Variation):
@@ -120,7 +122,7 @@ class Contraction(Variation):
     double-vjp trick (pure autograd double-backward — needs the eager sdpa(MATH) attention path, which
     FlexAttention can't double-back through). Runs in fp32 (autocast off) for a stable second-order."""
     name = "contraction"
-    loss_name = "contraction"
+    loss_name = "contraction"   # runs on train AND val (val/loss/contraction); needs inference_mode=False
 
     def __init__(self, weight: float, target: float, power_iters: int = 2, n_sample_steps: int = 4):
         self.weight = float(weight)
@@ -207,6 +209,8 @@ class VariationSuite:
         comps: dict = {}
         diags: dict = {}
         for v in self.variations:
+            if v.train_only and not ctx.training:   # e.g. contraction (needs autograd) is skipped on val
+                continue
             term, diag = v.loss(ctx)
             if term is not None:
                 total = term if total is None else total + term

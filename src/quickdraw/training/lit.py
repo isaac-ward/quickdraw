@@ -7,7 +7,8 @@ import torch
 
 from ..environments import torus as T
 from ..models.base import BaseWorldModel
-from .variations import VarContext, make_variation_suite
+from .schedules import linear_schedule
+from .variations import VarContext, PhysicalLoss, make_variation_suite
 
 
 class LitWorldModel(L.LightningModule):
@@ -23,13 +24,22 @@ class LitWorldModel(L.LightningModule):
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
         # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
         self.variations = make_variation_suite(variations)
+        # physical-loss warmup: ramp its weight 0 -> 1 over warmup_epochs (same linear schedule as p_tf;
+        # logged under schedules/). Only when the physical variation is actually active. The early decode
+        # is jittery, so hitting it with full physical weight at epoch 0 destabilizes -> NaN; ramp avoids it.
+        self.has_physical = any(isinstance(v, PhysicalLoss) for v in self.variations.variations)
+        pl = (variations or {})
+        pl = (pl.get("physical_loss", {}) if hasattr(pl, "get") else getattr(pl, "physical_loss", {})) or {}
+        self.physical_warmup = float((pl.get("warmup_epochs", 0) if hasattr(pl, "get")
+                                      else getattr(pl, "warmup_epochs", 0)) or 0) if self.has_physical else 0.0
 
     def _cur_p_tf(self) -> float:
         # curriculum: ramp from p_tf_start (e.g. 1.0, full teacher forcing) down to p_tf_end over warmup
-        if self.p_tf_warmup <= 0:
-            return self.p_tf_end
-        frac = min(1.0, self.current_epoch / self.p_tf_warmup)
-        return self.p_tf_end + (self.p_tf_start - self.p_tf_end) * (1.0 - frac)
+        return linear_schedule(self.p_tf_start, self.p_tf_end, self.p_tf_warmup, self.current_epoch)
+
+    def _physical_ramp(self) -> float:
+        # physical-loss weight multiplier: 0 -> 1 over physical_warmup epochs (no ramp if warmup<=0)
+        return linear_schedule(0.0, 1.0, self.physical_warmup, self.current_epoch)
 
     # ---- shared: produce future predictions (normalized) for a batch window ----
     # obs_input feeds the model (may be noise-augmented); obs_target is the clean target/TF-source split.
@@ -69,9 +79,9 @@ class LitWorldModel(L.LightningModule):
         # Computed on BOTH train and val so every optimized loss component shows in the {tag}/loss/*
         # breakdown. enable_grad: the contraction term builds a Jacobian graph and val runs under no_grad.
         if self.variations:
-            ctx = VarContext(self.model, preds, future_obs, obs_seq, act_seq,
-                             self.norm, self.R, self.r, self.v_scale, self.dt, training)
-            with torch.enable_grad():
+            ctx = VarContext(self.model, preds, future_obs, obs_seq, act_seq, self.norm,
+                             self.R, self.r, self.v_scale, self.dt, training, self._physical_ramp())
+            with torch.enable_grad():   # contraction builds a Jacobian graph; val runs under no_grad
                 extra, comps, diags = self.variations.losses(ctx)
             if extra is not None:
                 loss_total = loss_total + extra   # so {tag}/loss/total includes the variation components
@@ -87,8 +97,10 @@ class LitWorldModel(L.LightningModule):
         for k, v in raw.items():
             self.log(f"{tag}/loss/{k}", v)
         self.log(f"{tag}/obs_error", obs_mse.detach())
-        if tag == "train":
-            self.log("diag/p_tf", p_tf)
+        if tag == "train":   # scheduled quantities grouped under schedules/
+            self.log("schedules/p_tf", p_tf)
+            if self.has_physical:
+                self.log("schedules/physical_loss_ramp", self._physical_ramp())
         with torch.no_grad():  # metrics in real (denormalized) obs space; LSAR decodes via to_obs
             p_hat = self.norm.denorm_obs(self.model.to_obs(preds))
             p_true = self.norm.denorm_obs(future_obs)

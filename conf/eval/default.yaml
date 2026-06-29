@@ -5,8 +5,8 @@ n_plot: 2                  # per-episode trajectory plots+videos+error curves to
 # evals that run *during training* (train/val happen normally regardless). flip any to true; the
 # enabled routines are cycled through on every eval epoch.
 during_train:
-  every_epochs: 4          # run the enabled routines every N epochs (0 disables); ignored if at_epochs set
-  at_epochs: [20, 40, 60, 80, 100]   # explicit benchmark epochs (takes precedence over every_epochs); null -> cadence
+  every_epochs: 10         # run the enabled routines every N epochs (0 disables); ignored if at_epochs set
+  at_epochs: null          # explicit benchmark epochs (takes precedence over every_epochs); null -> cadence
   evals:
     ood_horizon: true      # long-horizon open-loop rollout (OOD vs the short training horizon)
     ood_visual: false      # open-loop on the visual-OOD split (texture shift)

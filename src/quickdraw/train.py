@@ -146,8 +146,11 @@ def main(cfg):
     trainer = L.Trainer(max_epochs=cfg.trainer.max_epochs, precision=cfg.trainer.precision,
                         accelerator="gpu", devices=1, gradient_clip_val=1.0, enable_progress_bar=False,
                         check_val_every_n_epoch=1, callbacks=callbacks, logger=False,
-                        inference_mode=False)  # val runs under no_grad (not inference_mode) so the
-    #                    contraction variation can build its Jacobian graph for the val/loss breakdown.
+                        inference_mode=cfg.trainer.get("inference_mode", False),  # False (val under no_grad,
+                        #   not inference_mode) lets the contraction variation build its Jacobian graph on
+                        #   val for val/loss/contraction. Measured to have NO speed cost vs inference_mode.
+                        limit_train_batches=cfg.trainer.get("limit_train_batches", 1.0),
+                        limit_val_batches=cfg.trainer.get("limit_val_batches", 1.0))
     trainer.fit(lit, loaders["train"], loaders["val"])
 
     # stable name for the best checkpoint, used by eval_ood / eval_control

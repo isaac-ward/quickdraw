@@ -27,7 +27,8 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 
 # fixed across all 6: recon LSAR, full BPTT, batch 256, v8 data. Per-run variation overrides are passed
 # to launch(). All variations default OFF, so var_recon_baseline is a clean (unmodified) recon run.
-COMMON=( data.root="$DATA" data.batch=256 model.detach_every=0
+COMMON=( data.root="$DATA" data.batch=256 model.detach_every=16   # truncated BPTT (16-step chunks):
+         # ~4x faster than full BPTT (detach_every=0); near-Markov torus loses little long-range credit.
          model=latent_space_autoregressor +collapse=reconstruction )
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED"
      run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )

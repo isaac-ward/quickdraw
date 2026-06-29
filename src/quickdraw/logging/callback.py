@@ -109,7 +109,7 @@ class ProgressPrinter(L.Callback):
             f"[ep {trainer.current_epoch:>3}/{trainer.max_epochs}] "
             f"train_loss={g('train/loss/total'):.4f} val_loss={g('val/loss/total'):.4f} "
             f"val_MDE={g('val/manifold_distance_error'):.4f} val_pw={g('val/pointwise_error'):.4f} "
-            f"val_tv={g('val/tangent_velocity_error'):.4f} p_tf={g('diag/p_tf'):.2f} "
+            f"val_tv={g('val/tangent_velocity_error'):.4f} p_tf={g('schedules/p_tf'):.2f} "
             f"| {dt:.1f}s/ep  eta {_fmt_secs(avg * left)}"
         )
 

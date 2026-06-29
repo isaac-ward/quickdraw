@@ -1,7 +1,7 @@
-horizon: 64            # plan-ahead steps (~1.07s @60Hz). Long horizon self-penalizes overshoot (the
+horizon: 48            # plan-ahead steps (~0.8s @60Hz). Long horizon self-penalizes overshoot (the
                        # receding window sees the agent pass the goal), so it brakes WITHOUT a velocity term.
 chunk: 4               # execute this many steps of each plan before replanning (~chunk x fewer solves)
-num_samples: 512       # MPPI candidate action sequences per step
+num_samples: 256       # MPPI candidate action sequences per step (eval cost ~ max_steps x num_samples x horizon)
 noise_sigma: 2.0       # candidate exploration std (a_max=4.0, ~half). Higher -> more aggressive thrust tried.
 lambda_: 0.3           # softmax temperature. Lower -> sharper, commits harder to the best candidate.
 mean_decay: 1.0
