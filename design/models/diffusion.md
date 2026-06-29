@@ -265,11 +265,43 @@ diffusion:
 
 ---
 
-## Smoke tests (to write with the implementation)
+## Greenlight checklist — smoke tests that MUST pass before a training run
 
-- flow-matching loss is finite with a finite gradient; the sampler returns finite latents.
-- both training paths run: one-step (shortcut off) and in-rollout (shortcut on, K=1).
-- deterministic-ODE sampling is reproducible (same seed → identical sample); stochastic differs.
-- shortcut self-consistency: a 2d step ≈ two d steps within tolerance.
-- reconstruction grounding prevents collapse (effective_rank stays > 1 over training).
-- contraction + diffusion raises at construction.
+All of these are mechanical (tiny canned model + data, like `smoke/loss_refactor.py` /
+`smoke/variations.py`). When every box is green, the model is ready for a real training run.
+
+**A. Contract + construction**
+- builds and satisfies the `SequenceWorldModel` hook surface (`encode_state`/`to_token`/`readout`/`to_obs`);
+  `physical_state` returns a `[...,6]` vector; `one_step_states` exists.
+- **contraction + diffusion → raises at construction** (the documented hard error).
+
+**B. Flow loss + grounding**
+- flow-matching loss is finite with a finite gradient that reaches the flow field.
+- reconstruction grounding: the `pred_obs` full-grad reaches the **encoder**, and `effective_rank`
+  stays > 1 over a few canned train steps (the flow alone is not anti-collapse — this proves recon holds).
+
+**C. Sampling (the ODE loop)**
+- `readout`/sample returns finite latents of the right shape; the K-step Euler loop runs.
+- **deterministic: a fixed seed → byte-identical sample on two calls** (the reproducible committed prediction).
+- stochastic: fresh noise → different samples.
+
+**D. Rollout**
+- `imagine_eval` over a horizon returns finite obs; the shared `_rollout` works with a sampling `readout`.
+
+**E. Training modes**
+- one-step (`shortcut:false`): a train step backprops finitely.
+- in-rollout (`shortcut:true`, K=1): sampling-in-rollout backprops finitely and respects `detach_every`.
+- shortcut: self-consistency term finite; a 2d step ≈ two d steps within tolerance; K=1 sampling works.
+
+**F. Variations + logging**
+- noise + diffusion works; physical + diffusion works (acts on the decoded deterministic sample).
+- `{tag}/loss/{flow, pred_obs[, flow_consistency]}` present on **both** train and val.
+
+**G. Visualization**
+- the streamline + quiver renderers produce finite PNGs for a canned conditioning, with the
+  deterministic path overlaid; logged under `diffusion/{streamline,quiver}/example_{0..3}`.
+
+**H. Integration + regression**
+- a handful of real `LitWorldModel` steps (one-step AND in-rollout): finite objective, no NaN, all keys
+  present, end-to-end backward finite.
+- regression: existing `smoke/loss_refactor.py` + `smoke/variations.py` still pass (diffusion is additive).
