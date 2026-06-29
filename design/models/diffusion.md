@@ -92,6 +92,32 @@ v_θ : [ x_τ ‖ emb(τ) ‖ h ]  →  dz-dim velocity
   (per-block FiLM/AdaLN-zero modulation, the DiT/SD3 default; stronger but more params — an upgrade if
   concat underperforms).
 
+### Blocks, backbone vs diffusion-specific
+
+| Block | Function | Shared or diffusion-specific |
+|---|---|---|
+| obs encoder `enc` | obs → latent `z` (dz=16); the modality boundary (MLP now, CNN/ViT later) | **shared** |
+| action encoder `act_enc` | action → d-dim embedding | **shared** |
+| fuser `to_token` | (z, action) → step token (d) | **shared** |
+| transformer backbone | depth × [LN → sliding-window RoPE FlexAttention → LN → MLP] → context `h` (d) | **shared** |
+| time embedding | flow time `τ` → embedding (Fourier + small MLP) | **diffusion** |
+| **flow field `v_θ`** | MLP on `[x_τ ‖ emb(τ) ‖ h]` → latent velocity (dz→dz) | **diffusion** (only new net) |
+| decoder `dec` (`to_obs`) | latent `z` → obs (6 / image); reconstruction grounding **and** render | **shared** |
+
+### Could the field just *be* the transformer? (yes — but only for images)
+
+The field could be unified with the backbone — a "diffusion transformer": append the noisy next-latent
+as a token, condition the blocks on `τ` (AdaLN), read the velocity off that token, and KV-cache the
+(fixed) past so each of the K denoising steps is one cheap single-token pass. That's the modern, more
+powerful design, **but the deciding factor is latent dimensionality.** For a **16-d** latent the hard
+part — understanding the past + action — is already done by the transformer into `h`; denoising 16
+numbers given `h` needs almost no capacity, so a small MLP is plenty *and* keeps sampling cheap (K
+tiny-MLP evals, which matters because the sampler runs K×T times per rollout). The unified
+transformer-as-denoiser only earns its cost when the **latent is high-dimensional and tokenized — i.e.
+images**, where the denoiser needs attention. So: **separate small field now; the unified diffusion
+transformer is the natural upgrade when we move to image latents** — same modality-generality story as
+the rest of the model.
+
 ---
 
 ## Training
@@ -124,6 +150,52 @@ conditioning) that unlocks K=1 (and therefore cheap in-rollout training). We wil
   reproducible "best guess," directly comparable to the deterministic models, and golden-testable.
 - Optionally render a few **stochastic** samples (fresh noise) in the *video only*, to visualize the
   predicted spread / multimodality.
+
+---
+
+## Visualizing the flow field (the headline diffusion artifact)
+
+The field lives in the latent, but we render it **through the decoder into observation space** on the
+torus, so you can literally see the agent at a point on its arc with the field sweeping onto the surface
+and pinching to the next spot. The convergence is strongest at high noise level `τ` (far from the answer
+it pulls hard; near it, fine adjustments) and is **action-conditioned** (via `h`) — it points where the
+agent goes *given its action*. At **~4 fixed prediction steps** along episode 0 (fixed so you can watch
+it sharpen across training epochs), we render two complementary views, each a **PNG via the
+`TorusRenderer`** with the extra geometry drawn on top of the usual torus + current-dot + action-arrow:
+
+- **Streamlines** (`diffusion/streamline/example_{0,1,2,3}`): sample N≈16 noise vectors, integrate each
+  through `v_θ` (conditioned on this step's `h`, `z_t`), **decode every integration step** → N paths that
+  start off-manifold and flow *onto* the torus, converging to the predicted next position. Overlay the
+  **deterministic-ODE sample** (the single committed prediction used for metrics) as a highlighted path,
+  and mark the **true next position** — so you see the cloud of possibilities, the one it commits to, and
+  whether it aims true.
+- **Quiver** (`diffusion/quiver/example_{0,1,2,3}`): a small grid of candidate positions on/just-off the
+  torus near the agent; at each, evaluate `v_θ` at a fixed mid-`τ` and map the latent velocity to an
+  **obs-space arrow** by finite-difference through the decoder (`dec(z+δv) − dec(z)`). The arrows
+  converge on the next spot — the literal "field pointing where to go."
+
+Cost is dominated by the *render*, not the flow (the field + decoder are tiny; a frame is a few hundred
+evals). 4 steps × 2 views is cheap enough to log every eval epoch.
+
+---
+
+## Logging (wandb)
+
+**Losses** (train + val, in the `{tag}/loss/` breakdown):
+`{tag}/loss/total`, `{tag}/loss/flow` (flow-matching prediction), `{tag}/loss/pred_obs` (reconstruction
+grounding, full-grad), `{tag}/loss/flow_consistency` (shortcut mode only).
+
+**Metrics** (shared with all models, computed on the deterministic ODE sample):
+`val/manifold_distance_error`, `val/pointwise_error`, `val/tangent_velocity_error`, `val/obs_error`.
+
+**Collapse diagnostics** (confirm reconstruction grounding holds): `collapse/effective_rank`,
+`collapse/latent_norm`, … (reused).
+
+**Diffusion-specific scalar**: `diffusion/sample_spread` — std across stochastic samples of the predicted
+next-position (a read on predicted uncertainty / multimodality).
+
+**Flow-field PNGs**: `diffusion/streamline/example_{0,1,2,3}` and `diffusion/quiver/example_{0,1,2,3}`
+(above), on top of the usual `eval_control/control_video_0`, `eval_ood_horizon` videos, etc.
 
 ---
 
