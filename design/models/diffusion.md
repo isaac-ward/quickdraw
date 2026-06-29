@@ -182,14 +182,17 @@ it sharpen across training epochs), we render two complementary views, each a **
   converge on the next spot — the literal "field pointing where to go."
 
 **How the geometry is computed.**
-- *Streamlines* are recorded from the sampler: at each of the K Euler steps the in-progress residual is
-  `x_k`, and the path point is `dec(z_t + x_k)[:3]` — so each path runs from `dec(z_t + ε)` (decoded
-  noise, **off-surface**) to `dec(z_t + Δẑ)` (the predicted **next position on the torus**). They are
-  **curved** (the nonlinear decoder bends even near-straight latent paths into obs-space arcs). The swarm
-  = ~16 random `ε`; the bright committed path = the fixed `ε`.
-- *Quiver* arrows are straight vectors probed on a grid of positions `p` near the agent: at each,
-  `z=enc(p)`, `v=v_θ(z, τ_mid≈0.7, h)`, and the obs-space arrow direction is
-  `dec(z + δ·v)[:3] − dec(z)[:3]` (the latent velocity pushed through the decoder), drawn from `p`.
+- *Streamlines* are recorded from the sampler: at each integration step the in-progress residual is
+  `x_k`, and the path point is `dec(z_t + x_k)[:3]` — the intermediate positions ARE the per-step states
+  of the ODE loop (decode every step, not just the ends). Each path runs from `dec(z_t + ε)` (decoded
+  noise, **off-surface**) to `dec(z_t + Δẑ)` (the predicted **next position on the torus**), curved (the
+  nonlinear decoder bends even near-straight latent paths into obs-space arcs). For a smooth render the
+  viz may integrate FINER than the prediction's K (e.g. ~20 steps) — decoupled; it just wants a clean
+  arc. Swarm = ~16 random `ε`; bright committed path = the fixed `ε`.
+- *Quiver* is a snapshot of the field at ONE chosen noise level `τ` (≈0.7 — the field depends on `τ`, so
+  this is a single `τ`-slice, whereas a streamline integrates across all `τ`). Straight arrows probed on
+  a grid of positions `p` near the agent: `z=enc(p)`, `v=v_θ(z, τ, h)`, obs-space direction
+  `dec(z + δ·v)[:3] − dec(z)[:3]`, drawn from `p`.
 
 Cost is dominated by the *render*, not the flow (the field + decoder are tiny; a frame is a few hundred
 evals). 4 steps × 2 views is cheap enough to log every eval epoch.
