@@ -290,6 +290,36 @@ model runs in the shoot-out** (no extra head × grounding cells).
 
 ---
 
+## Implementation notes (as built — 2026-06-29)
+
+Files: `models/flow.py` (`FlowField`), `models/diffusion.py` (`Diffusion`), `conf/model/diffusion.yaml`,
+the `diffusion` branch of `training/setup.build_model`, the `eval_diffusion_field` routine + the
+`diffusion/{streamline,quiver}` viz producers in `logging/viz.py`, `smoke/diffusion.py` (greenlight A–H,
+all green). Shared code stayed bit-identical (loss_refactor / variations / collapse_validation pass;
+viz.py is append-only). Two faithful-to-spirit choices worth recording:
+
+- **The flow-matching LOSS is computed teacher-forced (the "one-step" training) in BOTH plain and
+  shortcut modes** — `loss_terms` re-runs the backbone over the true latent window to get the context
+  `h` at every transition and regresses the velocity toward the (detached) true transition. The spec's
+  *in-rollout* drift exposure is still achieved operationally: `readout` SAMPLES the ODE, so during the
+  `p_tf < 1` rollout the reconstruction grounding (`loss_pred_obs`, full-grad) backprops through the
+  sampler **and** the AR chain — the model is trained on its own drift via grounding. Shortcut remains
+  strictly additive: step-size conditioning on the field + the self-consistency loss term
+  (`{tag}/loss/flow_consistency`), which unlocks K=1 sampling. (A dedicated in-rollout *flow* loss, vs.
+  the teacher-forced one, is the one place the build is simpler than the doc; revisit only if the
+  one-step flow loss underperforms on the long-horizon metric.)
+- **Deterministic sample = `eps = 0` (the noise mean)**, not a fixed RNG seed — fully reproducible
+  (golden-able) and `to_obs(readout)` equals the committed streamline endpoint by construction.
+- `cond: adaln` is **not yet implemented** (raises); `concat` is the default and all tests use it. The
+  config also keeps `parameterization: flow` / `path: linear` as the only supported values (asserted).
+- One additive contract change: `SequenceWorldModel.loss_terms` gained an optional trailing
+  `act_seq=None` (diffusion needs actions to rebuild `h`; DSAR/LSAR ignore it → bit-identical).
+
+Launch (equivalent settings to the variation campaign): `scripts/launch_diffusion.sh` runs plain flow +
+shortcut as a 2-run mini-shootout (recon-equivalent backbone, `detach_every=16`, `diffusion_field` viz on).
+
+---
+
 ## Config
 
 ```yaml

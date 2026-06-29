@@ -24,6 +24,31 @@ import torch
 from torch import Tensor
 
 
+def latent_diagnostics(z: Tensor) -> dict:
+    """Collapse diagnostics for a batch of latents z (N, dz), shared by every latent model (LSAR +
+    diffusion) so the `collapse/*` logs are computed identically. Magnitude stats are always returned;
+    the rank/correlation stats are wrapped in try/except (a degenerate batch must never crash training).
+    Caller is responsible for fp32 + autocast-off (the linalg below has no bf16-CUDA kernel)."""
+    zc = z - z.mean(0, keepdim=True)
+    out = {"per_dim_std_mean": zc.std(0).mean(),
+           "latent_norm": z.norm(dim=-1).mean(),          # mean |z| per sample (magnitude drift)
+           "latent_abs_max": z.abs().max()}               # worst-case dim magnitude (blow-up watch)
+    try:
+        # eff_rank from SINGULAR values of the centered latents (participation ratio in [1, dz]):
+        # robust where eigvalsh on the covariance fails to converge on ill-conditioned/degenerate
+        # latents (e.g. the physical-loss runs drive repeated eigenvalues -> eigvalsh crashed val).
+        ev = torch.linalg.svdvals(zc) ** 2                # = (N-1)*eigenvalues; scale cancels in PR
+        out["effective_rank"] = (ev.sum() ** 2) / (ev.pow(2).sum() + 1e-12)
+        cov = (zc.t() @ zc) / max(1, zc.shape[0] - 1)
+        d = cov.diag().clamp_min(1e-12).sqrt()
+        corr = cov / (d[:, None] * d[None, :])
+        n = cov.shape[0]
+        out["offdiag_corr"] = (corr.abs().sum() - n) / (n * (n - 1))   # mean |off-diagonal corr|
+    except Exception:   # a degenerate batch must never crash training — just skip these two
+        pass
+    return out
+
+
 class CollapseStrategy:
     has_reg: bool = False
     needs_ema: bool = False

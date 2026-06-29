@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .collapse import CollapseStrategy, Reconstruction
+from .collapse import CollapseStrategy, Reconstruction, latent_diagnostics
 from .fuser import TokenStreamFuser
 from .sequence import SequenceWorldModel, mlp
 
@@ -129,7 +129,7 @@ class LatentSpaceAR(SequenceWorldModel):
     # (pre-scaling) terms + their weights; the LightningModule logs the raw terms (comparable across
     # methods) and minimizes sum(weight*term) (+ the unified obs term). No decoder/autoencoding term:
     # the decoder is grounded by loss_pred_obs (full grad for reconstruction, detached probe otherwise).
-    def loss_terms(self, pred_states, future_obs, obs_seq, p_tf):
+    def loss_terms(self, pred_states, future_obs, obs_seq, p_tf, act_seq=None):
         target = self.collapse.target_encoder(self)(future_obs)     # enc / enc_ema of the future obs
         if self.latent_norm:                                        # match the LN'd carried latent
             target = _ln(target)
@@ -155,22 +155,4 @@ class LatentSpaceAR(SequenceWorldModel):
         # no bf16-CUDA kernel (autocast downcasts matmuls even when the inputs are float()).
         with torch.autocast(device_type=obs_seq.device.type, enabled=False):
             z = self.enc(obs_seq).reshape(-1, self.cfg.dz).float()
-            zc = z - z.mean(0, keepdim=True)
-            # magnitude diagnostics need no linalg -> always available even if the decomposition fails
-            out = {"per_dim_std_mean": zc.std(0).mean(),
-                   "latent_norm": z.norm(dim=-1).mean(),          # mean |z| per sample (magnitude drift)
-                   "latent_abs_max": z.abs().max()}               # worst-case dim magnitude (blow-up watch)
-            try:
-                # eff_rank from SINGULAR values of the centered latents (participation ratio in [1, dz]):
-                # robust where eigvalsh on the covariance fails to converge on ill-conditioned/degenerate
-                # latents (e.g. the physical-loss runs drive repeated eigenvalues -> eigvalsh crashed val).
-                ev = torch.linalg.svdvals(zc) ** 2                # = (N-1)*eigenvalues; scale cancels in PR
-                out["effective_rank"] = (ev.sum() ** 2) / (ev.pow(2).sum() + 1e-12)
-                cov = (zc.t() @ zc) / max(1, zc.shape[0] - 1)
-                d = cov.diag().clamp_min(1e-12).sqrt()
-                corr = cov / (d[:, None] * d[None, :])
-                n = cov.shape[0]
-                out["offdiag_corr"] = (corr.abs().sum() - n) / (n * (n - 1))   # mean |off-diagonal corr|
-            except Exception:   # a degenerate batch must never crash training — just skip these two
-                pass
-            return out
+            return latent_diagnostics(z)   # shared with the diffusion model (models/collapse.py)

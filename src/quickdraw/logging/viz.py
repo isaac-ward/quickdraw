@@ -573,3 +573,49 @@ def fpv_frames(R, r, coloring, obs, n_frames=10000, fov=FPV_FOV, size=FPV_SIZE):
     finally:
         rend.close()
     return np.stack(frames)
+
+
+# ------------------------- diffusion: flow-field viz (design/models/diffusion.md) -------------------------
+def fig_diffusion_streamline(R, r, coloring, swarm, committed, current, action_amb, true_next,
+                             title="", view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY, renderer=None):
+    """Static PNG of the flow field as STREAMLINES: a swarm of decoded ODE paths starting off the torus
+    (decoded noise) and flowing ONTO it, converging to the predicted next position; the bright committed
+    path (the deterministic eps=0 prediction used for the metrics) overlaid; the current dot + applied-
+    action arrow; and the TRUE next position marked. All geometry is precomputed in obs space by the
+    caller (the routine runs the model + decodes); this only arranges it as torus trajectories."""
+    sc = R + r
+    trajs = [{"xyz": np.asarray(p), "color": "lightgray", "radius": 0.004 * sc,
+              "start_sphere": False, "end_sphere": False} for p in swarm]
+    trajs.append({"xyz": np.asarray(committed), "color": "red", "radius": 0.008 * sc,
+                  "start_sphere": False, "end_sphere": True, "marker_color": "red"})       # committed prediction
+    trajs.append({"xyz": np.asarray(current)[None], "color": "black", "start_sphere": True, "end_sphere": False})
+    trajs.append({"xyz": np.asarray(true_next)[None], "color": "lime", "start_sphere": True, "end_sphere": False})  # truth
+    arrows = [(np.asarray(current), np.asarray(action_amb))]
+    return fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title, markers=False,
+                           view_pad=view_pad, torus_opacity=torus_opacity, renderer=renderer)
+
+
+def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, title="",
+                            size=860, view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY):
+    """Short tau-sweep ANIMATION (tau 1->0, the denoising direction): the torus + current dot + action
+    arrow stay fixed while the field (a grid of arrows near the agent) evolves and the COMMITTED PARTICLE
+    rides its decoded ODE path from off-surface onto the torus, leaving a short trail. per_frame is a list
+    of {arrows: [(p3, v3), ...], particle: (3,), trail: (k,3)} computed by the caller. Returns RGB frames."""
+    rend = TorusRenderer(R, r, coloring, sizes=(size, size))
+    vl, frames = (R + r) * view_pad, []
+    cur, act = np.asarray(current), np.asarray(action_amb)
+    try:
+        for fr in per_frame:
+            trajs = [{"xyz": cur[None], "color": "black", "start_sphere": True, "end_sphere": False}]
+            trail = np.asarray(fr["trail"])
+            if len(trail) >= 2:   # the moving particle: a trail tube with a head sphere at its current end
+                trajs.append({"xyz": trail, "color": "red", "radius": 0.006 * (R + r),
+                              "start_sphere": False, "end_sphere": False, "tip": {"color": "red"}})
+            else:
+                trajs.append({"xyz": np.asarray(fr["particle"])[None], "color": "red", "start_sphere": True})
+            arrows = [(np.asarray(p), np.asarray(v)) for (p, v) in fr["arrows"]] + [(cur, act)]
+            frames.append(rend.view(trajs, None, arrows, "iso", size, markers=False, view_l=vl,
+                                    torus_opacity=torus_opacity))
+    finally:
+        rend.close()
+    return np.stack(frames)

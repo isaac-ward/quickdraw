@@ -37,6 +37,31 @@ def build_model(cfg):
             rope_theta=m.rope_theta, dec_hidden=m.get("dec_hidden", 64),
             lambda_pred_obs=m.get("lambda_pred_obs", 1.0), lambda_reg=m.get("lambda_reg", 1.0),
             expander_hidden=m.get("expander_hidden", 256), expander_dim=m.get("expander_dim", 256)), strat)
+    if name in ("diffusion",):
+        from ..models.diffusion import Diffusion, DiffusionConfig
+        df = m.get("diffusion", {}) or {}
+        dfg = (lambda k, d: df.get(k, d)) if hasattr(df, "get") else (lambda k, d: getattr(df, k, d))
+        # SUPPORTED parameterization/path: flow + linear only (rectified flow subsumes ddpm/ddim).
+        param, path = str(dfg("parameterization", "flow")), str(dfg("path", "linear"))
+        assert param == "flow", f"diffusion.parameterization={param!r} unsupported (only 'flow')"
+        assert path == "linear", f"diffusion.path={path!r} unsupported (only 'linear')"
+        # HARD ERROR: contraction + diffusion (design/models/diffusion.md) — the contraction penalty
+        # differentiates the one-step state map, which for diffusion runs through the ODE sampler.
+        cv = (cfg.get("variations") or {}).get("contraction", {}) or {}
+        cw = float((cv.get("weight", 0.0) if hasattr(cv, "get") else getattr(cv, "weight", 0.0)) or 0.0)
+        if cw > 0.0:
+            raise ValueError("variations.contraction is mutually exclusive with the diffusion model "
+                             "(it differentiates the one-step map, which runs through the ODE sampler). "
+                             "Disable contraction (variations.contraction.weight=0) to train diffusion.")
+        return Diffusion(DiffusionConfig(
+            d=m.d, dz=m.dz, depth=m.depth, heads=m.heads, window=m.window, mlp_ratio=m.mlp_ratio,
+            rope_theta=m.rope_theta, dec_hidden=m.get("dec_hidden", 64),
+            lambda_pred_obs=m.get("lambda_pred_obs", 1.0), lambda_flow=m.get("lambda_flow", 1.0),
+            lambda_consistency=m.get("lambda_consistency", 1.0),
+            cond=str(dfg("cond", "concat")), shortcut=bool(dfg("shortcut", False)),
+            sampling_steps=int(dfg("sampling_steps", 6)), predict=str(dfg("predict", "residual")),
+            stochastic_eval=bool(dfg("stochastic_eval", False)),
+            time_sampling=str(dfg("time_sampling", "uniform")), flow_hidden=int(dfg("flow_hidden", 0))))
     raise ValueError(f"unknown model.name: {name!r}")
 
 

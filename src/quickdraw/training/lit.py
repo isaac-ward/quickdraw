@@ -61,8 +61,9 @@ class LitWorldModel(L.LightningModule):
         # variations: perturb the obs INPUTS only (noise injection); targets/metrics use clean obs_seq.
         obs_input, t_logs = self.variations.transform_obs(obs_seq, training)
         preds, future_obs = self._future_preds(obs_input, act_seq, obs_seq)  # preds = STATES (obs for DSAR, latent for LSAR)
-        # model-specific RAW terms + weights (DSAR: {}; LSAR: {pred_latent[, reg]}).
-        raw, weights = self.model.loss_terms(preds, future_obs, obs_seq, p_tf)
+        # model-specific RAW terms + weights (DSAR: {}; LSAR: {pred_latent[, reg]}; diffusion: {flow[, ...]}).
+        # act_seq is forwarded for models that re-run the backbone teacher-forced (diffusion); others ignore it.
+        raw, weights = self.model.loss_terms(preds, future_obs, obs_seq, p_tf, act_seq)
         # unified obs-rollout error: decode the predicted rollout and compare to the true future obs.
         in_loss = getattr(self.model, "pred_obs_in_loss", True)   # True: DSAR/recon (shapes model); else probe
         lam = getattr(self.model, "lambda_pred_obs", 1.0)

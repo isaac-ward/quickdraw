@@ -73,10 +73,12 @@ class SequenceWorldModel(nn.Module):
     pred_obs_in_loss: bool = True
     lambda_pred_obs: float = 1.0
 
-    def loss_terms(self, pred_states: Tensor, future_obs: Tensor, obs_seq: Tensor, p_tf: float):
+    def loss_terms(self, pred_states: Tensor, future_obs: Tensor, obs_seq: Tensor, p_tf: float, act_seq: Tensor | None = None):
         """Model-SPECIFIC RAW loss terms + their weights, as (raw_dict, weight_dict). The LightningModule
         logs the raw terms (pre-scaling, comparable across methods) and minimizes sum(weight*term), then
-        adds the unified obs term. DSAR: ({}, {}) (its only term is loss_pred_obs); LSAR: pred_latent[, reg]."""
+        adds the unified obs term. DSAR: ({}, {}) (its only term is loss_pred_obs); LSAR: pred_latent[, reg].
+        `act_seq` (the action window) is supplied for models that re-run the backbone teacher-forced here
+        (diffusion's flow loss); DSAR/LSAR ignore it."""
         return {}, {}
 
     def on_optimizer_step(self) -> None:
