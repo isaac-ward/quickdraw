@@ -180,10 +180,18 @@ it sharpen across training epochs), we render two complementary views, each a **
 - **Quiver — a short τ-ANIMATION** (`diffusion/quiver/example_{0,1,2,3}`, a gif/mp4): the torus + dot +
   action-arrow stay fixed; sweep `τ` from 1→0 (the denoising direction) over ~12–16 frames, and each frame
   re-probe the field on a small grid of positions near the agent (`v=v_θ(enc(p), τ, h)`, obs-space arrow
-  `dec(z+δv)[:3] − dec(z)[:3]`). A single quiver is only a `τ`-slice, so animating shows how the field
-  evolves: big *global* pull at high `τ` → organizing toward the next spot at mid `τ` → shrinking to ~zero
-  near `τ=0` (on the surface). **Scale arrows consistently across frames** (no per-frame normalize) so the
-  calm-down is visible.
+  `dec(z+δv)[:3] − dec(z)[:3]`). **Critically, the prediction particle(s) MOVE each frame** — the committed
+  sample (and a few swarm samples) ride their decoded ODE path `dec(z_t + x_k)` from off-surface (τ=1)
+  onto the torus (τ=0), leaving a short trail. Without that motion the animation is just arrows rescaling
+  in place ("breathing"); with it, it's the streamline being traced live with the field as context. The
+  field also evolves: big *global* pull at high `τ` → organizing toward the next spot at mid `τ` →
+  ~zero near `τ=0`. **Scale arrows consistently across frames** (no per-frame normalize) so the calm-down
+  is visible.
+- **Shortcut models:** the viz uses the **fine** underlying field (small step size `d`, many τ frames) for
+  a smooth picture regardless of the prediction's K — a shortcut model still has that fine field (trained
+  on the flow-matching loss at small `d`). The **committed path** still reflects the real prediction: for
+  a shortcut model that's a 1-step **leap** (one straight segment) drawn over the smooth fine field, which
+  visualizes what shortcutting does.
 
 **How the geometry is computed.**
 - *Streamlines* are recorded from the sampler: at each integration step the in-progress residual is
@@ -223,8 +231,11 @@ grounding, full-grad), `{tag}/loss/flow_consistency` (shortcut mode only).
 **Collapse diagnostics** (confirm reconstruction grounding holds): `collapse/effective_rank`,
 `collapse/latent_norm`, … (reused).
 
-**Diffusion-specific scalar**: `diffusion/sample_spread` — std across stochastic samples of the predicted
-next-position (a read on predicted uncertainty / multimodality).
+**Diffusion-specific scalars**:
+- `diffusion/sample_spread` — std across stochastic samples of the predicted next-position (predicted
+  uncertainty / multimodality).
+- `diffusion/flow_endpoint_error` — mean over the viz steps of ‖committed prediction − true next
+  position‖ (tube-radii); the quantitative companion to the flow-field viz (should trend down).
 
 **Flow-field viz**: `diffusion/streamline/example_{0,1,2,3}` (static PNGs — full integrated path) and
 `diffusion/quiver/example_{0,1,2,3}` (short gif/mp4 — the field swept over `τ` 1→0), on top of the usual
@@ -317,9 +328,19 @@ All of these are mechanical (tiny canned model + data, like `smoke/loss_refactor
 - `{tag}/loss/{flow, pred_obs[, flow_consistency]}` present on **both** train and val.
 
 **G. Visualization**
-- the streamline renderer produces a finite PNG (with the committed path overlaid) and the quiver
-  renderer a finite τ-sweep gif/mp4, for a canned conditioning; logged under
-  `diffusion/{streamline,quiver}/example_{0..3}`.
+- streamline renderer → a finite PNG: N paths start off-surface and converge, committed path overlaid,
+  true-next marker present.
+- quiver renderer → a finite τ-sweep gif/mp4: **the committed particle's position changes across frames**
+  (assert frame-to-frame motion — not a static grid merely rescaling) and ends near the prediction; arrow
+  scale constant across frames.
+- **consistency**: the committed path's endpoint equals the deterministic prediction the metrics are
+  computed on (same fixed seed) — the picture matches the numbers.
+- **determinism**: with a fixed seed the whole viz is reproducible (identical frames on two calls) →
+  golden-testable.
+- shortcut: the fine-field viz renders smoothly at K=1; the committed path is the actual K-step leap.
+- **metric goal**: `diffusion/flow_endpoint_error` (mean over the 4 viz steps of ‖committed prediction −
+  true next position‖, in tube-radii) is logged and **trends down over training** — the quantitative
+  companion to "the funnel sharpens onto the ring."
 
 **H. Integration + regression**
 - a handful of real `LitWorldModel` steps (one-step AND in-rollout): finite objective, no NaN, all keys
