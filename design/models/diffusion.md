@@ -170,16 +170,20 @@ agent goes *given its action*. At **~4 fixed prediction steps** along episode 0 
 it sharpen across training epochs), we render two complementary views, each a **PNG via the
 `TorusRenderer`** with the extra geometry drawn on top of the usual torus + current-dot + action-arrow:
 
-- **Streamlines** (`diffusion/streamline/example_{0,1,2,3}`): sample N≈16 noise vectors, integrate each
-  through `v_θ` (conditioned on this step's `h`, `z_t`), **decode every integration step** → N paths that
-  start off-manifold and flow *onto* the torus, converging to the predicted next position. Overlay the
+- **Streamlines — a static IMAGE** (`diffusion/streamline/example_{0,1,2,3}`): sample N≈16 noise vectors,
+  integrate each through `v_θ` (conditioned on this step's `h`, `z_t`), **decode every integration step**
+  → N paths that start off-manifold and flow *onto* the torus, converging to the predicted next position.
+  A streamline already integrates over all `τ`, so one frame captures the whole journey. Overlay the
   **deterministic-ODE sample** (the single committed prediction used for metrics) as a highlighted path,
   and mark the **true next position** — so you see the cloud of possibilities, the one it commits to, and
   whether it aims true.
-- **Quiver** (`diffusion/quiver/example_{0,1,2,3}`): a small grid of candidate positions on/just-off the
-  torus near the agent; at each, evaluate `v_θ` at a fixed mid-`τ` and map the latent velocity to an
-  **obs-space arrow** by finite-difference through the decoder (`dec(z+δv) − dec(z)`). The arrows
-  converge on the next spot — the literal "field pointing where to go."
+- **Quiver — a short τ-ANIMATION** (`diffusion/quiver/example_{0,1,2,3}`, a gif/mp4): the torus + dot +
+  action-arrow stay fixed; sweep `τ` from 1→0 (the denoising direction) over ~12–16 frames, and each frame
+  re-probe the field on a small grid of positions near the agent (`v=v_θ(enc(p), τ, h)`, obs-space arrow
+  `dec(z+δv)[:3] − dec(z)[:3]`). A single quiver is only a `τ`-slice, so animating shows how the field
+  evolves: big *global* pull at high `τ` → organizing toward the next spot at mid `τ` → shrinking to ~zero
+  near `τ=0` (on the surface). **Scale arrows consistently across frames** (no per-frame normalize) so the
+  calm-down is visible.
 
 **How the geometry is computed.**
 - *Streamlines* are recorded from the sampler: at each integration step the in-progress residual is
@@ -189,10 +193,11 @@ it sharpen across training epochs), we render two complementary views, each a **
   nonlinear decoder bends even near-straight latent paths into obs-space arcs). For a smooth render the
   viz may integrate FINER than the prediction's K (e.g. ~20 steps) — decoupled; it just wants a clean
   arc. Swarm = ~16 random `ε`; bright committed path = the fixed `ε`.
-- *Quiver* is a snapshot of the field at ONE chosen noise level `τ` (≈0.7 — the field depends on `τ`, so
-  this is a single `τ`-slice, whereas a streamline integrates across all `τ`). Straight arrows probed on
-  a grid of positions `p` near the agent: `z=enc(p)`, `v=v_θ(z, τ, h)`, obs-space direction
-  `dec(z + δ·v)[:3] − dec(z)[:3]`, drawn from `p`.
+- *Quiver* is a short **τ-animation** (the field depends on `τ`, so one slice is incomplete; a streamline
+  integrates across all `τ`, the quiver instead *sweeps* them). Per frame, at `τ` from 1→0, straight
+  arrows probed on a fixed grid of positions `p` near the agent: `z=enc(p)`, `v=v_θ(z, τ, h)`, obs-space
+  direction `dec(z + δ·v)[:3] − dec(z)[:3]`, drawn from `p`. Arrow scale is held constant across frames
+  so the field's calm-down (big global pull → ~zero) is visible.
 
 Cost is dominated by the *render*, not the flow (the field + decoder are tiny; a frame is a few hundred
 evals). 4 steps × 2 views is cheap enough to log every eval epoch.
@@ -221,8 +226,9 @@ grounding, full-grad), `{tag}/loss/flow_consistency` (shortcut mode only).
 **Diffusion-specific scalar**: `diffusion/sample_spread` — std across stochastic samples of the predicted
 next-position (a read on predicted uncertainty / multimodality).
 
-**Flow-field PNGs**: `diffusion/streamline/example_{0,1,2,3}` and `diffusion/quiver/example_{0,1,2,3}`
-(above), on top of the usual `eval_control/control_video_0`, `eval_ood_horizon` videos, etc.
+**Flow-field viz**: `diffusion/streamline/example_{0,1,2,3}` (static PNGs — full integrated path) and
+`diffusion/quiver/example_{0,1,2,3}` (short gif/mp4 — the field swept over `τ` 1→0), on top of the usual
+`eval_control/control_video_0`, `eval_ood_horizon` videos, etc.
 
 ---
 
@@ -311,8 +317,9 @@ All of these are mechanical (tiny canned model + data, like `smoke/loss_refactor
 - `{tag}/loss/{flow, pred_obs[, flow_consistency]}` present on **both** train and val.
 
 **G. Visualization**
-- the streamline + quiver renderers produce finite PNGs for a canned conditioning, with the
-  deterministic path overlaid; logged under `diffusion/{streamline,quiver}/example_{0..3}`.
+- the streamline renderer produces a finite PNG (with the committed path overlaid) and the quiver
+  renderer a finite τ-sweep gif/mp4, for a canned conditioning; logged under
+  `diffusion/{streamline,quiver}/example_{0..3}`.
 
 **H. Integration + regression**
 - a handful of real `LitWorldModel` steps (one-step AND in-rollout): finite objective, no NaN, all keys
