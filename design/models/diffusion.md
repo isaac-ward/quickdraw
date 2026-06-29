@@ -108,6 +108,23 @@ v_θ : [ x_τ ‖ emb(τ) ‖ h ]  →  dz-dim velocity
 | **flow field `v_θ`** | MLP on `[x_τ ‖ emb(τ) ‖ h]` → latent velocity (dz→dz) | **diffusion** (only new net) |
 | decoder `dec` (`to_obs`) | latent `z` → obs (6 / image); reconstruction grounding **and** render | **shared** |
 
+### Why a separate field at all (vs "just use the transformer")?
+
+We *do* use the transformer — the field is **conditioned on its output `h`**. They're two different
+functions run at different *frequencies*:
+- **Transformer** = "read the (state, action) history → summarize what comes next" (`h`). A sequence
+  model, run **once** per prediction.
+- **Flow field** = "given a noisy guess `x_τ` at noise level `τ`, nudge it toward the answer." Takes the
+  *in-progress guess* + `τ` (which the transformer pass doesn't), and runs **K times** per prediction.
+
+The crux is compute frequency: "understand the past" is expensive and needed **once**; "refine the guess"
+is needed **K times**. A small dedicated denoiser keeps the K repetitions cheap. Folding denoising into
+the transformer means re-running the transformer K times (the history hasn't changed between denoising
+steps — wasted work) or adding KV-cache machinery — only worth it when the *denoising itself* is hard,
+i.e. high-dim tokenized (image) latents. For a 16-number latent the hard part (the past) is already in
+`h`, so a small MLP has ample capacity. Hence: **transformer for context (once) + cheap field for the K
+refinement steps.**
+
 ### Could the field just *be* the transformer? (yes — but only for images)
 
 The field could be unified with the backbone — a "diffusion transformer": append the noisy next-latent
