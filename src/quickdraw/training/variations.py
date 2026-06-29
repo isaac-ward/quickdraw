@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from ..environments import torus as T
@@ -102,15 +103,21 @@ class PhysicalLoss(Variation):
         d_off = T.signed_dist(p_hat, ctx.R, ctx.r) / ctx.r            # signed, smooth when squared
         th, ph = T.angles_from_point(p_hat, ctx.R)
         v_off = (obs_phys[..., 3:] * T.normal(th, ph)).sum(-1) / ctx.v_scale
-        alg = d_off.pow(2).mean() + v_off.pow(2).mean()              # algebraic: on-surface + tangent
-        total = self.weight * alg
+        # HUBER, not squared: residuals are normalized to ~O(1), so Huber(delta=1) is quadratic for
+        # normal jitter but LINEAR (bounded gradient) for large residuals -> a rollout jitter spike can't
+        # produce an explosive gradient that diverges the weights (the failure mode that NaN'd before).
+        hub = lambda x: F.huber_loss(x, torch.zeros_like(x), delta=1.0, reduction="none")
+        total = self.weight * (hub(d_off).mean() + hub(v_off).mean())   # algebraic: on-surface + tangent
         diag = {"d_off": d_off.abs().mean().detach(), "v_off": v_off.abs().mean().detach()}
         if self.continuity > 0.0 and obs_phys.shape[1] >= 3 and ctx.dt:   # kinematic continuity v = dp/dt
             sec = (p_hat[:, 2:] - p_hat[:, :-2]) / (2.0 * ctx.dt)         # central-diff velocity, interior t
-            cont = ((obs_phys[:, 1:-1, 3:] - sec) / ctx.v_scale).pow(2).sum(-1).mean()
+            cont = hub((obs_phys[:, 1:-1, 3:] - sec) / ctx.v_scale).sum(-1).mean()
             total = total + self.continuity * cont
             diag["continuity"] = cont.detach()
-        return ctx.physical_ramp * total, diag   # warmup ramp (0->1) avoids hitting the jittery early decode
+        total = ctx.physical_ramp * total   # warmup ramp (0->1) avoids hitting the jittery early decode
+        if not torch.isfinite(total):       # physical-scoped guard: drop ONLY this term if non-finite
+            return None, {"nonfinite": 1.0}  # (logged) -> the step proceeds on the other losses, not corrupted
+        return total, diag
 
 
 class Contraction(Variation):

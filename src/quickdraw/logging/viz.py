@@ -246,6 +246,10 @@ class TorusRenderer:
         pv, R, r = self.pv, self.R, self.r
         pl = pv.Plotter(off_screen=True, window_size=(int(size), int(size)))
         pl.set_background("white")
+        # order-independent transparency: without it VTK draws translucent actors in ADD order, so the
+        # fan/trajectories paint on top of the translucent torus even when they're behind it. Depth
+        # peeling blends everything by true depth (fan behind the torus is correctly occluded/dimmed).
+        pl.enable_depth_peeling(number_of_peels=4, occlusion_ratio=0.0)
         self._add_torus(pl, torus_opacity)
         L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
         vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)

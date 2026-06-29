@@ -6,7 +6,7 @@ noise_sigma: 2.0       # candidate exploration std (a_max=4.0, ~half). Higher ->
 lambda_: 0.3           # softmax temperature. Lower -> sharper, commits harder to the best candidate.
 mean_decay: 1.0
 tol: 0.15              # within this ambient distance of a goal counts as "at" it
-settle_steps: 30       # consecutive in-tol steps before advancing (~0.5s @60Hz dwell to confirm arrival)
+settle_steps: 45       # consecutive in-tol steps before advancing (~0.75s @60Hz dwell to confirm arrival)
 max_steps: 1000        # per-episode step budget for the whole goal sequence (ends early when all done);
                        # ~200 steps/goal at 5 goals (settle=30/goal + travel). Early-break needs ALL
                        # episodes of BOTH controllers done, so an imperfect pred runs ~to this cap.
