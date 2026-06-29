@@ -511,7 +511,13 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
     idx = np.linspace(2, T, min(n_frames, T)).astype(int)
     frames = []
     every = max(1, len(idx) // 10)  # progress every ~10% of frames
-    rend = TorusRenderer(R, r, coloring)  # one persistent renderer reused across all frames
+    # reuse=False (fresh plotter per frame, cached mesh): control's stack of overlapping translucent
+    # actors (two agents + the colored fan) over the iso view's depth-peeling is the one case where the
+    # reused plotter is NOT exact — it intermittently flickers the iso torus's blended opacity frame to
+    # frame (the fan present + iso diagonal stresses the peel state). A fresh plotter re-inits depth
+    # peeling cleanly each frame -> stable. (Matches this class's documented intent; the OOD-horizon
+    # producer has no fan, so it keeps reuse=True. Cost: control video render is a bit slower.)
+    rend = TorusRenderer(R, r, coloring, reuse=False)
     try:
         for fi, ti in enumerate(idx):
             if log is not None and fi % every == 0:

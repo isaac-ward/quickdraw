@@ -10,7 +10,7 @@ settle_steps: 45       # consecutive in-tol steps before advancing (~0.75s @60Hz
 max_steps: 1000        # per-episode step budget for the whole goal sequence (ends early when all done);
                        # ~200 steps/goal at 5 goals (settle=30/goal + travel). Early-break needs ALL
                        # episodes of BOTH controllers done, so an imperfect pred runs ~to this cap.
-beta_ctrl: 0.005       # control (action-magnitude) cost: small penalty on sum_h ||a_h||^2 so the planner
+beta_ctrl: 0.02        # control (action-magnitude) cost: penalty on sum_h ||a_h||^2 so the planner
                        # prefers cheaper thrust and settles with less jitter. Applies to BOTH controllers
                        # (shared cost). NOTE: was 0 (off) for the in-flight variation campaign, so absolute
                        # control numbers across that boundary aren't directly comparable — but the
