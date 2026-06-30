@@ -657,3 +657,30 @@ def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, agen
     finally:
         rend.close()
     return np.stack(frames)
+
+
+def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agent_tail, future_path, steps,
+                                       title="", size=860, view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY):
+    """N SEQUENTIAL swarms at a FIXED agent. The current dot, the action arrow, the black history tail and
+    the black future path are STATIC the whole time; each step's grey swarm denoises (converges) to its own
+    target ring — which advances along the fixed future line — one swarm after the next. steps: a list of
+    {per_frame: [{swarm: [{particle, trail}..]}, ...], true_next: (3,)} (one denoising sub-animation each)."""
+    sc = R + r
+    rend = TorusRenderer(R, r, coloring)
+    base = _quiver_static_trajs(current, agent_tail, future_path, None, R, sc)   # ring is per-step, added below
+    cur, act, frames = np.asarray(current), np.asarray(action_amb), []
+    try:
+        for s in steps:
+            ring = {"xyz": _tangent_ring(s["true_next"], R, 0.0225 * sc), "color": "black",
+                    "radius": 0.006 * sc, "start_sphere": False, "end_sphere": False}
+            for fr in s["per_frame"]:
+                fig = fig_torus_atlas(R, r, trajs=base + [ring] + _quiver_swarm_trajs(fr, sc),
+                                      arrows=[(cur, act)], coloring=coloring, title=title, markers=False,
+                                      iso_size=size, ax_size=int(round(size * 0.67)), view_pad=view_pad,
+                                      torus_opacity=torus_opacity, renderer=rend)
+                fig.set_dpi(VIDEO_DPI)
+                frames.append(_fig_rgb(fig))
+                plt.close(fig)
+    finally:
+        rend.close()
+    return np.stack(frames)
