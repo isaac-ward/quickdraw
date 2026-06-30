@@ -156,7 +156,7 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     traces the field), the agent's black history tail AND future path, and a black truth ring (no committed/
     red particle). ALSO a `quiver_multistep` (4 s): 16 consecutive denoising predictions as the agent walks
     forward. The metric uses the model's NATIVE sampling_steps K, so it matches the rollout. Logs
-    diffusion/quiver/example_{0..2} + diffusion/quiver_multistep + diffusion/{pointwise_error, sample_spread,
+    eval_diffusion/quiver/example_{0..2} + eval_diffusion/quiver_multistep + eval_diffusion/{pointwise_error, sample_spread,
     time/sample_s, time/sample_ms_per_euler_step}. Self-SKIPS (returns {}) for non-diffusion models."""
     from ..models.diffusion import Diffusion, _ln
     m = getattr(model, "_orig_mod", model)            # unwrap torch.compile
@@ -208,15 +208,16 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     endpoint_errs, spreads, sample_times = [], [], []
     for si, t in enumerate(steps_idx):                 # (a) the 3 single-step quivers (2 s denoising each)
         d = step_data(t)
-        endpoint_errs.append(float(np.linalg.norm(d["committed"][-1] - d["true_next"]) / r))   # tube-radii
+        mean_end = np.stack(d["ends"]).mean(axis=0)    # posterior-mean prediction: average over n_swarm fixed-seed
+        endpoint_errs.append(float(np.linalg.norm(mean_end - d["true_next"]) / r))   # samples (fairer than eps=0); tube-radii
         spreads.append(float(np.linalg.norm(np.stack(d["ends"]).std(axis=0))))
         sample_times.append(d["sample_s"])
         per_frame = _quiver_frames_data(d["committed"], swarm=d["swarm"])
         frames = viz.diffusion_quiver_frames(R, r, coloring, d["current"], d["action_amb"], per_frame,
                                              agent_tail=d["agent_tail"], future_path=d["future_path"],
                                              true_next=d["true_next"], title=f"diffusion quiver step {t}")
-        writer.video(f"diffusion/quiver/example_{si}", frames, 60, step)  # 120 frames @ 60 fps = 2 s
-        writer.scene(f"diffusion/quiver/example_{si}", {  # 3D geometry for Blender (plain-language keys)
+        writer.video(f"eval_diffusion/quiver/example_{si}", frames, 60, step)  # 120 frames @ 60 fps = 2 s
+        writer.scene(f"eval_diffusion/quiver/example_{si}", {  # 3D geometry for Blender (plain-language keys)
             "description": "Diffusion flow-field quiver at one fixed prediction step. The torus is the manifold "
                            "the agent moves on. The grey swarm are noise samples the model denoises ONTO the "
                            "surface; the committed path is the model's single best-guess prediction "
@@ -238,8 +239,8 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
                 for t in ms_ts]
     ms_frames = viz.diffusion_quiver_multistep_frames(R, r, coloring, ms_steps, frames_per_step=15,
                                                       title="diffusion quiver multistep")
-    writer.video("diffusion/quiver_multistep", ms_frames, 60, step)  # 16 x 15 = 240 frames @ 60 fps = 4 s
-    writer.scene("diffusion/quiver_multistep", {
+    writer.video("eval_diffusion/quiver_multistep", ms_frames, 60, step)  # 16 x 15 = 240 frames @ 60 fps = 4 s
+    writer.scene("eval_diffusion/quiver_multistep", {
         "description": "16 consecutive denoising predictions as the agent walks forward along its path; each "
                        "step shows the grey swarm denoising onto the surface to predict the next position.",
         "coordinate_system": "world xyz, same space as the torus",
@@ -250,16 +251,16 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
                    "swarm_paths_xyz": [np.asarray(sp) for sp in s["swarm"]]} for s in ms_steps],
     }, step)
 
-    writer.scalars({"diffusion/pointwise_error": float(np.mean(endpoint_errs)),
-                    "diffusion/sample_spread": float(np.mean(spreads)),
-                    "diffusion/time/sample_s": float(np.mean(sample_times)),               # wall time of one K-step prediction
-                    "diffusion/time/sample_ms_per_euler_step": float(1000.0 * np.mean(sample_times) / max(1, K))},
+    writer.scalars({"eval_diffusion/pointwise_error": float(np.mean(endpoint_errs)),
+                    "eval_diffusion/sample_spread": float(np.mean(spreads)),
+                    "eval_diffusion/time/sample_s": float(np.mean(sample_times)),               # wall time of one K-step prediction
+                    "eval_diffusion/time/sample_ms_per_euler_step": float(1000.0 * np.mean(sample_times) / max(1, K))},
                    step)
     if was:
         m.train()
     _plog(writer, f"[diffusion_field @ep{step}] done in {time.perf_counter() - t0:.1f}s "
                   f"endpoint_err={np.mean(endpoint_errs):.3f} spread={np.mean(spreads):.4f}")
-    return {"diffusion_pointwise_error": float(np.mean(endpoint_errs))}
+    return {"eval_diffusion_pointwise_error": float(np.mean(endpoint_errs))}
 
 
 REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,

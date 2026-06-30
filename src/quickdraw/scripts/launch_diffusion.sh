@@ -2,7 +2,7 @@
 # Diffusion mini-shootout: the latent flow-matching world model in TWO variants — plain flow + shortcut
 # (design/models/diffusion.md). Backbone/data/BPTT match the variation campaign (recon LSAR) so the
 # diffusion class is comparable to the rest of the shoot-out. In-loop eval = the shared OOD + control
-# routines PLUS the diffusion flow-field viz (diffusion/quiver + pointwise_error).
+# routines PLUS the diffusion flow-field viz (eval_diffusion/quiver + pointwise_error).
 # ============================================================================================
 # !!! DO NOT disable compile / DO NOT set TORCHDYNAMO_DISABLE=1 — FlexAttention REQUIRES torch.compile
 # to build its kernel. The diffusion forward (incl. the flow sampler) compiles fine. See launch_shootout.sh.

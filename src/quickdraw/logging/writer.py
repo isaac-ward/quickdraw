@@ -54,7 +54,7 @@ class LocalBackend(_Backend):
         viz.save_mp4(self._path(tag, step, "mp4"), frames, fps)
 
     def scene(self, tag, scene, step):
-        # Plain-language 3D scene geometry next to the media (e.g. epoch_0030/diffusion/quiver/example_0.json)
+        # Plain-language 3D scene geometry next to the media (e.g. epoch_0030/eval_diffusion/quiver/example_0.json)
         # so it can be reconstructed in Blender later. numpy arrays/scalars -> nested lists/floats.
         import numpy as np
 

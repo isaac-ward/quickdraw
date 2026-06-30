@@ -194,7 +194,7 @@ it sharpen across training epochs), we render two complementary views, each a **
   **deterministic-ODE sample** (the single committed prediction used for metrics) as a highlighted path,
   and mark the **true next position** — so you see the cloud of possibilities, the one it commits to, and
   whether it aims true.
-- **Quiver — a short τ-ANIMATION** (`diffusion/quiver/example_{0,1,2,3}`, a gif/mp4): the torus + dot +
+- **Quiver — a short τ-ANIMATION** (`eval_diffusion/quiver/example_{0,1,2,3}`, a gif/mp4): the torus + dot +
   action-arrow stay fixed; sweep `τ` from 1→0 (the denoising direction) over ~12–16 frames, and each frame
   re-probe the field on a small grid of positions near the agent (`v=v_θ(enc(p), τ, h)`, obs-space arrow
   `dec(z+δv)[:3] − dec(z)[:3]`). **Critically, the prediction particle(s) MOVE each frame** — the committed
@@ -249,13 +249,13 @@ grounding, full-grad), `{tag}/loss/flow_consistency` (shortcut mode only).
 `collapse/latent_norm`, … (reused).
 
 **Diffusion-specific scalars**:
-- `diffusion/sample_spread` — std across stochastic samples of the predicted next-position (predicted
+- `eval_diffusion/sample_spread` — std across stochastic samples of the predicted next-position (predicted
   uncertainty / multimodality).
-- `diffusion/pointwise_error` — mean over the viz steps of ‖committed prediction − true next
+- `eval_diffusion/pointwise_error` — mean over the viz steps of ‖committed prediction − true next
   position‖ (tube-radii); the quantitative companion to the flow-field viz (should trend down).
 
 **Flow-field viz**: `diffusion/streamline/example_{0,1,2,3}` (static PNGs — full integrated path) and
-`diffusion/quiver/example_{0,1,2,3}` (short gif/mp4 — the field swept over `τ` 1→0), on top of the usual
+`eval_diffusion/quiver/example_{0,1,2,3}` (short gif/mp4 — the field swept over `τ` 1→0), on top of the usual
 `eval_control/control_video_0`, `eval_ood_horizon` videos, etc.
 
 ---
@@ -385,7 +385,7 @@ All of these are mechanical (tiny canned model + data, like `smoke/loss_refactor
 - **determinism**: with a fixed seed the whole viz is reproducible (identical frames on two calls) →
   golden-testable.
 - shortcut: the fine-field viz renders smoothly at K=1; the committed path is the actual K-step leap.
-- **metric goal**: `diffusion/pointwise_error` (mean over the 3 viz steps of ‖committed prediction −
+- **metric goal**: `eval_diffusion/pointwise_error` (mean over the 3 viz steps of ‖committed prediction −
   true next position‖, in tube-radii) is logged and **trends down over training** — the quantitative
   companion to "the funnel sharpens onto the ring."
 
