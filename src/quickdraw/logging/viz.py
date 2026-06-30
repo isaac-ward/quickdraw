@@ -180,24 +180,17 @@ def _add_arrows(pl, pv, R, r, arrows):
                              shaft_radius=shaft_r / length), color=color)
 
 
-def _add_goal_arrows(pl, pv, R, r, goals):
-    """Per-goal 'go here' arrow: a FIXED-size arrow perpendicular to the surface, hovering one agent
-    diameter off it, with the HEAD nearest the surface (pointing IN at the goal point) and the tail
-    pointing away — 'the guy has to go here'. goals: list of (point3, color); color marks which
-    controller owns the goal. Same shaft/head proportions as the action arrows."""
-    sc = R + r
-    diam = 2 * 0.04125 * sc                 # moving-head sphere diameter (the agent size)
-    hover, length = diam, 2.0 * diam        # tip sits 1 diameter off the surface; shaft spans 2 outward
-    shaft_r, tip_r, tip_len = 0.01, 0.028, 0.07
-    for g in goals:
-        pt = np.asarray(g[0], float)
-        color = g[1] if len(g) > 1 else "black"
-        n = _normal_from_point(pt[None], R)[0]
-        n = n / (np.linalg.norm(n) + 1e-9)
-        start = pt + (hover + length) * n   # TAIL, far from the surface; arrow points back IN along -n
-        pl.add_mesh(pv.Arrow(start=start, direction=-n, scale=length,
-                             tip_length=tip_len / length, tip_radius=tip_r / length,
-                             shaft_radius=shaft_r / length), color=color)
+def _tangent_ring(center, R, radius, n=48):
+    """A closed loop of points in the tangent plane at `center` (on the torus), used as a target RING
+    marker (rendered as a tube). Neutral black ring reads on any hue and is shape-distinct from a dot."""
+    c = np.asarray(center, float)
+    nrm = _normal_from_point(c[None], R)[0]
+    nrm = nrm / (np.linalg.norm(nrm) + 1e-9)
+    a = np.array([1.0, 0.0, 0.0]) if abs(nrm[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(nrm, a); u = u / (np.linalg.norm(u) + 1e-9)
+    w = np.cross(nrm, u)
+    t = np.linspace(0, 2 * math.pi, n)
+    return c[None] + radius * (np.cos(t)[:, None] * u[None] + np.sin(t)[:, None] * w[None])
 
 
 def _add_fan(pl, pv, R, r, fan, opacity=0.5, max_show=48):
@@ -269,7 +262,12 @@ class TorusRenderer:
         # order-independent transparency: without it VTK draws translucent actors in ADD order, so the
         # fan/trajectories paint on top of the translucent torus even when they're behind it. Depth
         # peeling blends everything by true depth (fan behind the torus is correctly occluded/dimmed).
-        pl.enable_depth_peeling(number_of_peels=4, occlusion_ratio=0.0)
+        # number_of_peels=12 (was 4): the ISO diagonal sightline pierces the front translucent tube wall,
+        # the interior fan/trajectory tubes, AND the back wall — often >4 transparent layers at one pixel.
+        # With only 4 peels the leftover fragments blend in undefined order -> the one-frame saturation
+        # pop in the iso view (the axial views look down a principal axis = few layers, always within budget,
+        # so they never flickered). 12 covers the iso stack; render is a bit slower but stable.
+        pl.enable_depth_peeling(number_of_peels=12, occlusion_ratio=0.0)
         self._add_torus(pl, torus_opacity)
         L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
         vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)
@@ -296,7 +294,7 @@ class TorusRenderer:
         return pl, set(pl.actors.keys()), cam   # torus + box/labels are static
 
     def view(self, trajs, targets, arrows, view, size, markers=True, current=False, view_l=None,
-             torus_opacity=1.0, fan=None, goal_arrows=None):
+             torus_opacity=1.0, fan=None):
         pv, R, r = self.pv, self.R, self.r
         key = (view, int(size))
         if self.reuse:
@@ -310,8 +308,6 @@ class TorusRenderer:
             _add_fan(pl, pv, R, r, fan)
         _add_trajs(pl, pv, R, r, trajs, markers=markers, current=current)
         _add_arrows(pl, pv, R, r, arrows)
-        if goal_arrows:
-            _add_goal_arrows(pl, pv, R, r, goal_arrows)
         if targets:
             tp = np.array([np.asarray(pp, float) for _, pp in targets])
             for pp in tp:
@@ -355,14 +351,14 @@ def _moving_avg(seq, win=ACTION_SMOOTH_WINDOW):
 
 def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", title="", legend=False,
                     markers=True, current=False, iso_size=860, ax_size=580, view_pad=_PAD, torus_opacity=1.0,
-                    fan=None, renderer=None, goal_arrows=None):
+                    fan=None, renderer=None):
     # renderer: pass a persistent TorusRenderer to reuse across frames (videos); None -> make + close one
     # for this single figure (static plots). Either way the per-view output is identical.
     own = renderer is None
     rend = renderer if renderer is not None else TorusRenderer(R, r, coloring, sizes=(iso_size, ax_size))
     vl = (R + r) * view_pad  # fixed view half-extent (shared by the render camera and the axial ticks)
     iso = rend.view(trajs, targets, arrows, "iso", iso_size, markers=markers,
-                    current=current, view_l=vl, torus_opacity=torus_opacity, fan=fan, goal_arrows=goal_arrows)
+                    current=current, view_l=vl, torus_opacity=torus_opacity, fan=fan)
     fig = plt.figure(figsize=(13, 15))
     gs = GridSpec(4, 3, figure=fig, wspace=0.5, hspace=0.25)
     axm = fig.add_subplot(gs[0:3, :])
@@ -373,7 +369,7 @@ def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", tit
                             for t in trajs if t.get("label")], loc="upper right")
     for col, (view, xl, yl) in enumerate(_AXIAL_VIEWS):
         img = rend.view(trajs, targets, arrows, view, ax_size, markers=markers, current=current,
-                        view_l=vl, torus_opacity=torus_opacity, fan=fan, goal_arrows=goal_arrows)  # in all views
+                        view_l=vl, torus_opacity=torus_opacity, fan=fan)
         axp = fig.add_subplot(gs[3, col])
         axp.imshow(img, extent=[-vl, vl, -vl, vl])
         axp.set_aspect("equal")
@@ -524,8 +520,8 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
                            log=None, reuse=False):
     """Animated dual-controller race (eval_control). Each agent = {path (T,3), avec (T,3) ambient
     applied action, goal_seq (T,3) its current goal, color}. Per frame each agent gets a flat moving
-    head + trailing tail + a colored action arrow, plus a same-color arrow perpendicular to the surface
-    pointing IN at ITS current goal (so it's clear who targets what). Reuses fig_torus_atlas like traj_compare_frames, so
+    head + trailing tail + a colored action arrow, plus a same-color RING marking ITS current goal ZONE
+    on the surface (so it's clear who targets what). Reuses fig_torus_atlas like traj_compare_frames, so
     layout/sizing are unchanged. fan_seq (optional, len ~T): per-step pred candidate fan to overlay."""
     tail = 60
     agents = [{"color": a["color"], "path": np.asarray(a["path"]), "goal_seq": np.asarray(a["goal_seq"]),
@@ -534,30 +530,28 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
     idx = np.linspace(2, T, min(n_frames, T)).astype(int)
     frames = []
     every = max(1, len(idx) // 10)  # progress every ~10% of frames
-    # reuse=False (fresh plotter per frame, cached mesh): control's stack of overlapping translucent
-    # actors (two agents + the colored fan) over the iso view's depth-peeling is the one case where the
-    # reused plotter is NOT exact — it intermittently flickers the iso torus's blended opacity frame to
-    # frame (the fan present + iso diagonal stresses the peel state). A fresh plotter re-inits depth
-    # peeling cleanly each frame -> stable. (Matches this class's documented intent; the OOD-horizon
-    # producer has no fan, so it keeps reuse=True. Cost: control video render is a bit slower.)
+    sc = R + r
+    # reuse: the iso saturation flash is fixed at the source by number_of_peels=12 in _build (the iso
+    # diagonal pierces >4 translucent layers), so the FAST reuse=True path is stable even with the fan.
     rend = TorusRenderer(R, r, coloring, reuse=reuse)
     try:
         for fi, ti in enumerate(idx):
             if log is not None and fi % every == 0:
                 log(f"rendered {fi}/{len(idx)} frames")
             k, lo = int(ti), max(0, int(ti) - tail)
-            trajs, arrows, goal_arrows = [], [], []
+            trajs, arrows = [], []
             for a in agents:
                 c = a["color"]
                 gi = min(k - 1, len(a["goal_seq"]) - 1)  # goal_seq/avec have one fewer entry than path
                 ai = min(k - 1, len(a["avec"]) - 1)
                 trajs.append({"xyz": a["path"][lo:k], "color": c, "tip": {"color": c, "lighting": False}})
-                goal_arrows.append((a["goal_seq"][gi], c))  # perpendicular 'go here' arrow at ITS goal
+                trajs.append({"xyz": _tangent_ring(a["goal_seq"][gi], R, 0.0675 * sc), "color": c,
+                              "radius": 0.006 * sc, "start_sphere": False, "end_sphere": False})  # goal ring (1.5x agent diam)
                 arrows.append((a["path"][k - 1], a["avec"][ai], c))
             fan = fan_seq[min(k - 1, len(fan_seq) - 1)] if fan_seq else None  # this step's candidate fan
             fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
                                   markers=False, view_pad=EVAL_VIEW_PAD, torus_opacity=torus_opacity,
-                                  fan=fan, renderer=rend, goal_arrows=goal_arrows)
+                                  fan=fan, renderer=rend)
             fig.set_dpi(VIDEO_DPI)
             frames.append(_fig_rgb(fig))
             plt.close(fig)
@@ -604,49 +598,46 @@ def fpv_frames(R, r, coloring, obs, n_frames=10000, fov=FPV_FOV, size=FPV_SIZE):
 
 
 # ------------------------- diffusion: flow-field viz (design/models/diffusion.md) -------------------------
-def fig_diffusion_streamline(R, r, coloring, swarm, committed, current, action_amb, true_next,
-                             title="", view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY, renderer=None):
-    """Static PNG of the flow field as STREAMLINES: a swarm of decoded ODE paths starting off the torus
-    (decoded noise) and flowing ONTO it, converging to the predicted next position; the bright committed
-    path (the deterministic eps=0 prediction used for the metrics) overlaid; the current dot + applied-
-    action arrow; and the TRUE next position marked. All geometry is precomputed in obs space by the
-    caller (the routine runs the model + decodes); this only arranges it as torus trajectories."""
+def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, agent_tail=None,
+                            true_next=None, title="", size=860, view_pad=EVAL_VIEW_PAD,
+                            torus_opacity=TORUS_OPACITY):
+    """Short tau-sweep ANIMATION (tau 1->0, the denoising direction). The torus + moving-agent tail +
+    current dot + action arrow + a black TRUTH ring (the true next position) stay fixed; a GREY SWARM of
+    decoded ODE paths flows from off-surface noise onto the torus EACH leaving its own growing tail (so the
+    accumulating tails trace the flow field), and the RED committed particle rides its own path. per_frame
+    is a list of {particle: (3,), trail: (k,3), swarm: [{particle, trail}..]} from the caller."""
     sc = R + r
-    # NEUTRAL palette only — the rainbow torus already carries lots of hue, so coloured markers clash.
-    # The PREDICTION is all BLACK (current dot -> committed line -> predicted-next dot); the swarm is the
-    # light-grey streamline cloud; the TRUE next position is the one WHITE marker (the lone non-black thing).
-    trajs = [{"xyz": np.asarray(p), "color": "lightgray", "radius": 0.004 * sc,
-              "start_sphere": False, "end_sphere": False} for p in swarm]
-    trajs.append({"xyz": np.asarray(committed), "color": "black", "radius": 0.008 * sc,
-                  "start_sphere": False, "end_sphere": True, "marker_color": "black"})     # committed prediction line + end
-    trajs.append({"xyz": np.asarray(current)[None], "color": "black", "start_sphere": True, "end_sphere": False})
-    trajs.append({"xyz": np.asarray(true_next)[None], "color": "white", "marker_color": "white",
-                  "start_sphere": True, "end_sphere": False, "start_scale": 1.2})          # truth (slightly larger)
-    arrows = [(np.asarray(current), np.asarray(action_amb))]
-    return fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title, markers=False,
-                           view_pad=view_pad, torus_opacity=torus_opacity, renderer=renderer)
-
-
-def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, title="",
-                            size=860, view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY):
-    """Short tau-sweep ANIMATION (tau 1->0, the denoising direction): the torus + current dot + action
-    arrow stay fixed while the field (a grid of arrows near the agent) evolves and the COMMITTED PARTICLE
-    rides its decoded ODE path from off-surface onto the torus, leaving a short trail. per_frame is a list
-    of {arrows: [(p3, v3), ...], particle: (3,), trail: (k,3)} computed by the caller. Returns RGB frames."""
+    ring_r = 0.0225 * sc                                                 # ring diameter = 0.5x the agent diameter
     rend = TorusRenderer(R, r, coloring, sizes=(size, size))
-    vl, frames = (R + r) * view_pad, []
+    vl, frames = sc * view_pad, []
     cur, act = np.asarray(current), np.asarray(action_amb)
+    tail = np.asarray(agent_tail) if agent_tail is not None else None   # moving agent's trajectory tail (static)
+    ring = _tangent_ring(true_next, R, ring_r) if true_next is not None else None  # black truth ring (static)
     try:
         for fr in per_frame:
             trajs = [{"xyz": cur[None], "color": "black", "start_sphere": True, "end_sphere": False}]
-            trail = np.asarray(fr["trail"])
-            if len(trail) >= 2:   # the moving particle: a trail tube with a head sphere at its current end
-                trajs.append({"xyz": trail, "color": "red", "radius": 0.006 * (R + r),
-                              "start_sphere": False, "end_sphere": False, "tip": {"color": "red"}})
+            if tail is not None and len(tail) >= 2:              # the MOVING AGENT's path up to now (like other plots)
+                trajs.append({"xyz": tail, "color": "black", "radius": 0.008 * sc,
+                              "start_sphere": False, "end_sphere": False})
+            if ring is not None:                                 # ground-truth next position = small black ring
+                trajs.append({"xyz": ring, "color": "black", "radius": 0.006 * sc,
+                              "start_sphere": False, "end_sphere": False})
+            for sp in fr.get("swarm", []):                       # swarm: grey, EACH with its own growing tail
+                st = np.asarray(sp["trail"])                     # (traces the flow field as they accumulate)
+                if len(st) >= 2:
+                    trajs.append({"xyz": st, "color": "dimgray", "radius": 0.008 * sc,  # std line thickness
+                                  "start_sphere": False, "end_sphere": False})
+                else:
+                    trajs.append({"xyz": np.asarray(sp["particle"])[None], "color": "dimgray",
+                                  "start_sphere": True, "end_sphere": False, "start_scale": 0.35})
+            trail = np.asarray(fr["trail"])                      # MAIN particle: keeps its TAIL (the denoising-path
+            if len(trail) >= 2:                                  # history) + red head; std line thickness
+                trajs.append({"xyz": trail, "color": "red", "radius": 0.008 * sc, "start_sphere": False,
+                              "end_sphere": False, "tip": {"color": "red", "lighting": False}})
             else:
-                trajs.append({"xyz": np.asarray(fr["particle"])[None], "color": "red", "start_sphere": True})
-            arrows = [(np.asarray(p), np.asarray(v)) for (p, v) in fr["arrows"]] + [(cur, act)]
-            frames.append(rend.view(trajs, None, arrows, "iso", size, markers=False, view_l=vl,
+                trajs.append({"xyz": np.asarray(fr["particle"])[None], "color": "red",
+                              "start_sphere": True, "end_sphere": False})
+            frames.append(rend.view(trajs, None, [(cur, act)], "iso", size, markers=False, view_l=vl,
                                     torus_opacity=torus_opacity))
     finally:
         rend.close()

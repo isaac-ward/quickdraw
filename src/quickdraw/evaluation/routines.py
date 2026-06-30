@@ -15,7 +15,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from ..controller.run import _plog, run_and_log_control
-from ..environments import torus as T
 from ..logging import viz
 from ..training.setup import eval_episodes
 import torch
@@ -113,60 +112,28 @@ def eval_control(cfg, model, norm, ecfg, writer, device, step=0):
     return {"control": run_and_log_control(cfg, model, norm, ecfg, writer, device, step)}
 
 
-def _torus_point(th, ph, R, r):
-    rho = R + r * np.cos(ph)
-    return np.array([rho * np.cos(th), rho * np.sin(th), r * np.sin(ph)])
+def _quiver_frames_data(committed, swarm=None, n_frames=120):
+    """Per-frame geometry for the quiver animation (a denoising FLOW animation; no field arrows). Each
+    decoded ODE path is interpolated to `n_frames` so playback is smooth at 60 fps. The RED committed
+    particle rides its decoded path (`committed`, (k,3)) leaving a tail; the grey `swarm` (the streamline's
+    decoded stochastic paths, list of (k,3)) rides alongside as tail-less points so you watch the flow land
+    from off-surface noise onto the torus."""
+    committed = np.asarray(committed)
+    swarm = [np.asarray(s) for s in (swarm or [])]
 
+    def _along(path, s):                                              # interp position + growing trail at fraction s
+        Kp = path.shape[0] - 1
+        fc = s * Kp; i0 = int(np.floor(fc)); i1 = min(i0 + 1, Kp); w = fc - i0
+        p = (1 - w) * path[i0] + w * path[i1]
+        trail = np.vstack([path[: i0 + 1], p[None]]) if w > 1e-6 else path[: i0 + 1]
+        return {"particle": p, "trail": trail}
 
-def _quiver_frames_data(m, norm, h_t, z_t, cur_xyz, cur_vel, committed, R, r,
-                        n_anchors=4, n_frames=120, grid=(-1, 0, 1), delta=0.05):
-    """Per-frame geometry for the quiver animation. The field is genuinely evaluated at only `n_anchors`
-    tau slices (the expensive model calls); the arrow vectors AND the committed particle are then linearly
-    INTERPOLATED up to `n_frames` output frames, so playback is smooth at 60 fps without a model eval per
-    frame (the default 4 anchors -> 120 frames plays as 2 s @ 60 fps). At each anchor tau (1->0, the
-    denoising direction) we probe the field on a 3x3 grid of positions near the agent (v=v_theta(enc(p),
-    tau, h), obs-space arrow dec(z+delta*v) - dec(z)); the particle rides its decoded committed ODE path."""
-    from ..models.diffusion import _ln  # noqa: F401 (decode of z_p uses to_obs directly; no LN drift here)
-    import torch
-    device = z_t.device
-    th0, ph0 = T.angles_from_point(torch.as_tensor(cur_xyz, dtype=torch.float32)[None], R)
-    th0, ph0 = float(th0), float(ph0)
-    # grid of nearby positions on the surface (perturb the current angles), each encoded with the
-    # current velocity -> a latent "guess" z_p the field acts on.
-    zps, bases = [], []
-    for dth in grid:
-        for dph in grid:
-            p = _torus_point(th0 + 0.25 * dth, ph0 + 0.5 * dph, R, r)
-            obs_p = np.concatenate([p, cur_vel])                       # [position, current velocity]
-            zp = m.encode_state(norm.norm_obs(torch.as_tensor(obs_p, dtype=torch.float32, device=device))[None])
-            zps.append(zp)
-            bases.append(p)
-    zps = torch.cat(zps, dim=0)                                        # (G, dz)
-    bases = np.stack(bases)
-    d = (zps.new_full((zps.shape[0], 1), 1.0 / max(2, committed.shape[0] - 1))
-         if m.flow.shortcut else None)                                # shortcut viz uses the FINE field
-    h_g = h_t.expand(zps.shape[0], -1)
-    base = norm.denorm_obs(m.to_obs(zps))[:, :3].detach().cpu().numpy()  # tau-independent -> decode ONCE
-    anchor_vec = []                                                    # the only real model evals
-    for a in range(n_anchors):
-        tau = zps.new_full((zps.shape[0], 1), 1.0 - a / (n_anchors - 1))
-        v = m.flow.velocity(zps, tau, h_g, d)                         # (G, dz) latent velocity at this tau
-        tip = norm.denorm_obs(m.to_obs(zps + delta * v))[:, :3].detach().cpu().numpy()
-        anchor_vec.append(tip - base)                                 # (G, 3) obs-space arrow at this tau
-    anchor_vec = np.stack(anchor_vec)                                 # (n_anchors, G, 3)
-    K = committed.shape[0] - 1                                        # committed has K+1 decoded points
     per_frame = []
     for f in range(n_frames):
         s = f / (n_frames - 1) if n_frames > 1 else 0.0              # 0->1 as tau goes 1->0
-        fa = s * (n_anchors - 1)                                      # interpolate arrows between tau anchors
-        a0 = int(np.floor(fa)); a1 = min(a0 + 1, n_anchors - 1); w = fa - a0
-        vec = (1 - w) * anchor_vec[a0] + w * anchor_vec[a1]           # (G, 3)
-        arrows = [(bases[i], vec[i]) for i in range(bases.shape[0])]
-        fc = s * K                                                   # interpolate particle along committed path
-        i0 = int(np.floor(fc)); i1 = min(i0 + 1, K); w2 = fc - i0
-        particle = (1 - w2) * committed[i0] + w2 * committed[i1]      # smooth head
-        trail = np.vstack([committed[: i0 + 1], particle[None]]) if w2 > 1e-6 else committed[: i0 + 1]
-        per_frame.append({"arrows": arrows, "particle": particle, "trail": trail})
+        fr = _along(committed, s)                                     # red committed particle + trail
+        fr["swarm"] = [_along(sp, s) for sp in swarm]                 # grey swarm points
+        per_frame.append(fr)
     return per_frame
 
 
@@ -193,7 +160,7 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     act = ep["act_seq"].to(device)[None].float()      # (1, Tlen, 2) normalized
     Tlen, P, W, dz = obs.shape[1], cfg.data.P, m.window, m.cfg.dz
     z = m.encode_state(obs)                            # (1, Tlen, dz) LN'd
-    n_steps = 4
+    n_steps = 3
     lo, hi = P, Tlen - 2
     steps_idx = [int(round(lo + (hi - lo) * k / (n_steps - 1))) for k in range(n_steps)]  # fixed, comparable across epochs
     K, n_swarm = 16, 16                                # viz path resolution (decoupled from sampling_steps) + swarm size
@@ -210,8 +177,8 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
         h_t = m.transformer(m.to_token(s_win, a_win))[:, -1]            # (1, d) teacher-forced context
         z_t = z[:, t]                                                   # (1, dz)
         cur_xyz = norm.denorm_obs(obs[:, t])[0, :3].cpu().numpy()
-        cur_vel = norm.denorm_obs(obs[:, t])[0, 3:].cpu().numpy()
         nxt_xyz = norm.denorm_obs(obs[:, t + 1])[0, :3].cpu().numpy()
+        agent_tail = norm.denorm_obs(obs[0, max(0, t - 60):t + 1])[:, :3].cpu().numpy()  # agent's last ~60 steps (like other plots)
         act_amb = viz.action_ambient(cur_xyz, norm.denorm_act(act[:, t])[0].cpu().numpy(), R, r)
         _, cpath = m.flow.sample(h_t, steps=K, deterministic=True, record_path=True)
         committed = np.stack([decode_xyz(z_t, x)[0].cpu().numpy() for x in cpath])        # (K+1, 3)
@@ -224,13 +191,9 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
             ends.append(sp[-1])
         endpoint_errs.append(float(np.linalg.norm(committed[-1] - nxt_xyz) / r))          # tube-radii
         spreads.append(float(np.linalg.norm(np.stack(ends).std(axis=0))))
-        f_s = viz.fig_diffusion_streamline(R, r, coloring, swarm, committed, cur_xyz, act_amb, nxt_xyz,
-                                           title=f"diffusion flow  step {t}  @ep{step}")
-        writer.figure(f"diffusion/streamline/example_{si}", f_s, step)
-        plt.close(f_s)
-        per_frame = _quiver_frames_data(m, norm, h_t, z_t, cur_xyz, cur_vel, committed, R, r)
-        frames = viz.diffusion_quiver_frames(R, r, coloring, cur_xyz, act_amb, per_frame,
-                                             title=f"diffusion quiver step {t}")
+        per_frame = _quiver_frames_data(committed, swarm=swarm)
+        frames = viz.diffusion_quiver_frames(R, r, coloring, cur_xyz, act_amb, per_frame, agent_tail=agent_tail,
+                                             true_next=nxt_xyz, title=f"diffusion quiver step {t}")
         writer.video(f"diffusion/quiver/example_{si}", frames, 60, step)  # 120 frames @ 60 fps = 2 s
     writer.scalars({"diffusion/flow_endpoint_error": float(np.mean(endpoint_errs)),
                     "diffusion/sample_spread": float(np.mean(spreads))}, step)

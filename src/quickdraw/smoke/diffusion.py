@@ -198,14 +198,10 @@ with torch.no_grad():
 import matplotlib
 matplotlib.use("Agg")
 try:
-    f = viz.fig_diffusion_streamline(R, r, "rainbow", swarm, committed, cur, act_amb, nxt, title="smoke")
-    import matplotlib.pyplot as plt
-    plt.close(f)
-    check("G.streamline PNG renders (finite figure)", f is not None)
     from quickdraw.evaluation.routines import _quiver_frames_data
-    pf = _quiver_frames_data(m, norm, h_t, z_t, cur, cur_vel, committed, R, r, n_frames=6)
-    fr1 = viz.diffusion_quiver_frames(R, r, "rainbow", cur, act_amb, pf, size=240)
-    fr2 = viz.diffusion_quiver_frames(R, r, "rainbow", cur, act_amb, pf, size=240)
+    pf = _quiver_frames_data(committed, swarm=swarm, n_frames=6)
+    fr1 = viz.diffusion_quiver_frames(R, r, "rainbow", cur, act_amb, pf, true_next=nxt, size=240)
+    fr2 = viz.diffusion_quiver_frames(R, r, "rainbow", cur, act_amb, pf, true_next=nxt, size=240)
     moved = not np.array_equal(np.asarray(pf[0]["trail"]), np.asarray(pf[-1]["trail"]))
     check("G.quiver frames render finite", np.isfinite(fr1).all() and fr1.shape[0] == 6)
     check("G.committed particle MOVES across frames", moved)
