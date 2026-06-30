@@ -726,6 +726,28 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
     return fig
 
 
+def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label=""):
+    """The 2D analogue of fig_points_4view: a single scatter, same styling (no tick/axis labels, right-side
+    colorbar). The cloud is STRETCHED to fill the panel — intended for UMAP/embedding coordinates, which
+    are arbitrary (no metric aspect to preserve). pts: (N,2). lims: ((xlo,xhi),(ylo,yhi)) or None."""
+    from matplotlib.ticker import MaxNLocator
+    pts = np.asarray(pts)
+    fig = plt.figure(figsize=(10, 9))
+    ax = fig.add_subplot(1, 1, 1)
+    sc = ax.scatter(pts[:, 0], pts[:, 1], s=point_size, c=color, cmap=cmap, linewidths=0)
+    if lims is not None:
+        (xl, yl) = lims
+        ax.set_xlim(xl); ax.set_ylim(yl)
+    ax.xaxis.set_major_locator(MaxNLocator(5)); ax.yaxis.set_major_locator(MaxNLocator(5))
+    ax.set_xticklabels([]); ax.set_yticklabels([])
+    fig.subplots_adjust(left=0.03, right=0.88, top=0.93, bottom=0.03)  # axes fills the region (no letterbox)
+    if color is not None:
+        cax = fig.add_axes([0.905, 0.30, 0.015, 0.40])               # dedicated right-side colorbar
+        fig.colorbar(sc, cax=cax, label=cbar_label)
+    fig.suptitle(title, fontsize=11, y=0.98)
+    return fig
+
+
 def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
                            cmap="plasma", cbar_label="", depthshade=False, ease=True, dpi=110):
     """Animate a cloud collapsing onto the recovered manifold: paths (N, T, 3) are the per-point positions

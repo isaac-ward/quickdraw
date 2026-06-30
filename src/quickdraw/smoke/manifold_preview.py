@@ -23,7 +23,6 @@ from ..training.setup import build_model, env_cfg, eval_episodes, load_checkpoin
 OUT = "/app/logs/viz_preview"
 SPLIT, STRIDE, CUBE, N_POINTS = "train", 1, 3.0, 10000   # train contexts; 1 noise/context; SAME N for img+video
 POS_FRAMES, POS_FPS = 480, 60        # position collapse: 8 s @ 60 fps (smooth, eased)
-UMAP_FRAMES, UMAP_FPS = 240, 60      # umap collapse: 4 s @ 60 fps
 CBAR = "speed = |predicted next velocity|"
 
 
@@ -92,15 +91,8 @@ def main(cfg):
         def spd(c):
             return np.linalg.norm(c[:, 3:], axis=1)
 
-        def cube_union(arrs):                                      # shared lims over ALL clouds (drift never clips)
-            allp = np.vstack(arrs); out = []
-            for i in range(allp.shape[1]):
-                lo, hi = float(allp[:, i].min()), float(allp[:, i].max()); pad = 0.05 * (hi - lo + 1e-6)
-                out.append((lo - pad, hi + pad))
-            return tuple(out)
-
-        # position: START frame (seed) + an END frame per horizon, shared lims so drift is visible
-        pl = cube_union([clouds[k][:, :3] for k in clouds])
+        # position: START frame (seed) + an END frame per horizon, shared lims (over all clouds) so drift never clips
+        pl = pad_lims(np.vstack([clouds[k][:, :3] for k in clouds]))
 
         def save_pos(c, name, ttl):
             f = viz.fig_points_4view(c[:, :3], color=spd(c), lims=pl, point_size=2.0, cbar_label=CBAR, title=ttl)
@@ -118,7 +110,7 @@ def main(cfg):
         stacked = np.vstack([clouds[k] for k in keys])
         joint = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05).fit_transform(stacked)
         emb = dict(zip(keys, np.split(joint, len(keys))))                 # equal-size clouds -> clean split
-        el = cube_union([emb[k] for k in keys])
+        el = pad_lims(np.vstack([emb[k] for k in keys]))
         for h in HORIZONS:
             f = viz.fig_points_4view(emb[h], color=spd(clouds[h]), lims=el, point_size=2.5, cbar_label=CBAR,
                                      title=f"AR rollout — UMAP(3) full-6D (joint fit) after {h} step(s)\n{sub_r}")
@@ -128,9 +120,9 @@ def main(cfg):
 
     # one causal transformer pass per episode gives h at every step; denoise 1 noise/slice, keep the path
     # (shared with eval_diffusion_field via evaluation.manifold so the cloud is defined in one place)
-    from ..evaluation.manifold import manifold_clouds
-    paths6d, speed, _, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
-                                           seed=0, device=device)      # (N, K+1, 6) — SAME points for img + video
+    from ..evaluation.manifold import manifold_clouds, pad_lims, umap_reduce
+    paths6d, speed, latents, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
+                                                 seed=0, device=device)   # paths6d (N,K+1,6); latents (N,dz)
     N = paths6d.shape[0]
     sub = f"{model_name} (K={K}) — {N:,} denoised next-states, one per context (of {n_avail:,} {SPLIT} contexts)"
     print(f"[manifold:{tag}] {N} points; {sub}")
@@ -139,13 +131,6 @@ def main(cfg):
     if stage.startswith("embed_experiment"):
         expdir = f"{OUT}/embed_experiments"; os.makedirs(expdir, exist_ok=True)
         start, end, flat = paths6d[:, 0], paths6d[:, -1], paths6d.reshape(-1, 6)
-
-        def cube(a, b):                                  # shared per-axis lims covering both clouds
-            both = np.vstack([a, b]); out = []
-            for i in range(3):
-                lo, hi = float(both[:, i].min()), float(both[:, i].max()); pad = 0.05 * (hi - lo + 1e-6)
-                out.append((lo - pad, hi + pad))
-            return tuple(out)
 
         def save(pts, lims, name, ttl):
             f = viz.fig_points_4view(pts, color=speed, lims=lims, point_size=2.5, cbar_label=CBAR, title=ttl)
@@ -158,45 +143,35 @@ def main(cfg):
         mu, sd = flat.mean(0), flat.std(0) + 1e-6
         pca = PCA(n_components=3).fit((flat - mu) / sd)
         ps, pe = pca.transform((start - mu) / sd), pca.transform((end - mu) / sd)
-        pl = cube(ps, pe)
+        pl = pad_lims(np.vstack([ps, pe]))
         save(ps, pl, "pca_start", "PCA(3) std-6D, fit on all steps — START (noise)")
         save(pe, pl, "pca_end", "PCA(3) std-6D, fit on all steps — END (manifold)")
         return
 
-    # ---- A) position 3D ----  (flat torus -> per-axis lims so it fills)
+    # ---- the SAME artifact set eval_diffusion logs (shared helpers) ----  position still (3D, flat torus
+    # -> per-axis lims so it fills) + collapse video, and UMAP stills for {data 6D, latent dz} x {3D, 2D}.
     L, Z = (R + r) * 1.05, r * 1.6
     plims = ((-L, L), (-L, L), (-Z, Z))
     pos = paths6d[..., :3]
     if stage in ("images", "both"):
         f = viz.fig_points_4view(pos[:, -1], color=speed, lims=plims, point_size=2.0, cbar_label=CBAR,
                                  title=f"recovered manifold — position\n{sub}")
-        f.savefig(f"{OUT}/manifold_position_final_{tag}.png", dpi=110); plt.close(f)
-        print(f"[manifold:{tag}] wrote manifold_position_final_{tag}.png")
-
-    # ---- B) UMAP of the full 6D ----  fit on the END-points only (the manifold) -> keeps the clean
-    # hollow-shell shape; then transform every step for the video.
-    import umap
-    reducer = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05)
-    emb = reducer.fit_transform(paths6d[:, -1])                        # (N,3) end-points (manifold)
-    emb_all = reducer.transform(paths6d.reshape(-1, 6)).reshape(N, paths6d.shape[1], 3)  # all steps (video)
-    def _ax(a):
-        lo, hi = float(emb_all[..., a].min()), float(emb_all[..., a].max()); pad = 0.05 * (hi - lo + 1e-6)
-        return (lo - pad, hi + pad)
-    elims = (_ax(0), _ax(1), _ax(2))
-    if stage in ("images", "both"):
-        f = viz.fig_points_4view(emb, color=speed, lims=elims, point_size=2.5, cbar_label=CBAR,
-                                 title=f"recovered manifold — UMAP of full 6D (pos+vel), seed=0\n{sub}")
-        f.savefig(f"{OUT}/manifold_umap_final_{tag}.png", dpi=110); plt.close(f)
-        print(f"[manifold:{tag}] wrote manifold_umap_final_{tag}.png")
+        f.savefig(f"{OUT}/manifold_position_{tag}.png", dpi=110); plt.close(f)
+        for space, label, pts in (("data_space", "data space (full 6D pos+vel)", paths6d[:, -1]),
+                                  ("latent_space", f"latent space (full {latents.shape[1]}D z)", latents)):
+            for nd in (3, 2):
+                emb = umap_reduce(pts, n_components=nd, seed=0)
+                fig_fn = viz.fig_points_4view if nd == 3 else viz.fig_points_2d
+                f = fig_fn(emb, color=speed, lims=pad_lims(emb), point_size=2.5, cbar_label=CBAR,
+                           title=f"recovered manifold — UMAP of {label} to {nd}D, seed=0\n{sub}")
+                f.savefig(f"{OUT}/manifold_umap_{space}_to_{nd}d_{tag}.png", dpi=110); plt.close(f)
+        print(f"[manifold:{tag}] wrote position + 4 UMAP stills")
 
     if stage in ("videos", "both"):
         fa = viz.points_collapse_frames(pos, color=speed, lims=plims, n_frames=POS_FRAMES, point_size=2.0,
                                         cbar_label=CBAR, title=f"recovered manifold — position\n{sub}")
         imageio.mimwrite(f"{OUT}/manifold_position_collapse_{tag}.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
-        fb = viz.points_collapse_frames(emb_all, color=speed, lims=elims, n_frames=UMAP_FRAMES, point_size=2.5,
-                                        cbar_label=CBAR, title=f"recovered manifold — UMAP of full 6D (pos+vel)\n{sub}")
-        imageio.mimwrite(f"{OUT}/manifold_umap_collapse_{tag}.mp4", list(fb), fps=UMAP_FPS, macro_block_size=2, quality=8)
-        print(f"[manifold:{tag}] wrote collapse mp4s")
+        print(f"[manifold:{tag}] wrote position collapse mp4")
 
 
 if __name__ == "__main__":

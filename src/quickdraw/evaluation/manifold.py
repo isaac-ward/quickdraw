@@ -49,8 +49,19 @@ def manifold_clouds(m, norm, ds, *, P, n_points, cube, stride, seed, device):
     return paths6d, speed, latents, n_avail
 
 
-def umap3(pts, *, seed=0):
-    """UMAP(3) of any (N, D) cloud -> (N, 3). Used for both the decoded data space (6D) and the carried
-    latent space (dz). fit_transform directly (no out-of-sample transform), so the embedding is honest."""
+def umap_reduce(pts, *, n_components, seed=0):
+    """UMAP of any (N, D) cloud -> (N, n_components). Used for both the decoded data space (6D) and the
+    carried latent space (dz), at 2D or 3D. fit_transform directly (no out-of-sample transform), honest."""
     import umap
-    return umap.UMAP(n_components=3, random_state=seed, n_neighbors=30, min_dist=0.05).fit_transform(pts)
+    return umap.UMAP(n_components=n_components, random_state=seed, n_neighbors=30, min_dist=0.05).fit_transform(pts)
+
+
+def pad_lims(e, frac=0.05):
+    """Per-axis padded (lo, hi) extents of an (N, D) cloud -> tuple of D pairs; feeds the `lims` arg of
+    fig_points_4view / fig_points_2d so the box matches the data and the cloud fills each panel. Pass a
+    pre-stacked array (np.vstack of several clouds) to get shared lims across them."""
+    out = []
+    for a in range(e.shape[1]):
+        lo, hi = float(e[:, a].min()), float(e[:, a].max()); pad = frac * (hi - lo + 1e-6)
+        out.append((lo - pad, hi + pad))
+    return tuple(out)
