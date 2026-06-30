@@ -171,6 +171,13 @@ FPV + chase + top-down) without surgery. The discipline:
   no mask; temporal: plain 1-D causal. This **supersedes** the earlier "backbone untouched" sketch.
 - **Diffusion denoiser = DiT** over the token list (adaLN on flow-time τ and shortcut step dd, conditioned
   on backbone context h). Rectified-flow / shortcut math unchanged.
+- **No new `model.name`.** Vision is *not* a separate model — the existing `dsar`/`lsar`/`diffusion`
+  configs gain a `modalities:` list. A model is "vision" iff that list contains an image modality. With
+  only `proprio` (the default), every model behaves exactly as today (the token bag is a single proprio
+  token → identical to the current vector latent), so the non-vision path stays **bit-identical**. The
+  carried-token-bag generalization (and per-token `_ln`) lives in the shared `SequenceModel` base, so
+  DSAR/LSAR/diffusion all inherit it; `contraction`'s Jacobian is taken over the *flattened* token bag
+  (size `(1+num_tokens)·d`), still modality-blind.
 
 ## Losses (training objective)
 
