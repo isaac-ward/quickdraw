@@ -22,7 +22,9 @@ from ..training.setup import build_model, env_cfg, eval_episodes, load_checkpoin
 
 OUT = "/app/logs/viz_preview"
 SPLIT, STRIDE, CUBE, N_POINTS = "train", 1, 3.0, 30000   # train = most contexts; 1 noise/context; SAME N for img+video
-N_FRAMES = 40
+POS_FRAMES, POS_FPS = 96, 12         # position collapse video: 96 frames @ 12 fps = 8 s
+UMAP_FRAMES, UMAP_FPS = 40, 20       # umap collapse video: 2 s
+CBAR = "speed = |predicted next velocity|"
 
 
 @hydra.main(config_path="../../../conf", config_name="config", version_base=None)
@@ -75,7 +77,7 @@ def main(cfg):
     paths6d = np.stack(paths6d)                                          # (N, K+1, 6) — SAME points for img + video
     N = paths6d.shape[0]
     speed = np.linalg.norm(paths6d[:, -1, 3:], axis=1)                  # color = |predicted next velocity|
-    sub = f"{model_name} (K={K}) — {N} pts from {n_avail} {SPLIT} contexts"
+    sub = f"{model_name} (K={K}) — {N:,} denoised next-states, one per context (of {n_avail:,} {SPLIT} contexts)"
     print(f"[manifold:{tag}] {N} points; {sub}")
 
     # ---- A) position 3D ----  (flat torus -> per-axis lims so it fills)
@@ -83,8 +85,7 @@ def main(cfg):
     plims = ((-L, L), (-L, L), (-Z, Z))
     pos = paths6d[..., :3]
     if stage in ("images", "both"):
-        f = viz.fig_points_4view(pos[:, -1], color=speed, lims=plims, point_size=2.0,
-                                 cbar_label="speed = |predicted next velocity|",
+        f = viz.fig_points_4view(pos[:, -1], color=speed, lims=plims, point_size=2.0, cbar_label=CBAR,
                                  title=f"recovered manifold — position\n{sub}")
         f.savefig(f"{OUT}/manifold_position_final_{tag}.png", dpi=110); plt.close(f)
         print(f"[manifold:{tag}] wrote manifold_position_final_{tag}.png")
@@ -98,19 +99,19 @@ def main(cfg):
         return (lo - pad, hi + pad)
     elims = (_ax(0), _ax(1), _ax(2))
     if stage in ("images", "both"):
-        f = viz.fig_points_4view(emb, color=speed, lims=elims, point_size=2.5, cbar_label="speed",
+        f = viz.fig_points_4view(emb, color=speed, lims=elims, point_size=2.5, cbar_label=CBAR,
                                  title=f"recovered manifold — UMAP of full 6D (pos+vel), seed=0\n{sub}")
         f.savefig(f"{OUT}/manifold_umap_final_{tag}.png", dpi=110); plt.close(f)
         print(f"[manifold:{tag}] wrote manifold_umap_final_{tag}.png")
 
     if stage in ("videos", "both"):
-        fa = viz.points_collapse_frames(pos, color=speed, lims=plims, n_frames=N_FRAMES, point_size=2.0,
-                                        cbar_label="speed", title=f"manifold collapse — position\n{sub}")
-        imageio.mimwrite(f"{OUT}/manifold_position_collapse_{tag}.mp4", list(fa), fps=20, macro_block_size=2, quality=8)
+        fa = viz.points_collapse_frames(pos, color=speed, lims=plims, n_frames=POS_FRAMES, point_size=2.0,
+                                        cbar_label=CBAR, title=f"recovered manifold — position\n{sub}")
+        imageio.mimwrite(f"{OUT}/manifold_position_collapse_{tag}.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
         emb_p = reducer.transform(paths6d.reshape(-1, 6)).reshape(N, paths6d.shape[1], 3)
-        fb = viz.points_collapse_frames(emb_p, color=speed, lims=elims, n_frames=N_FRAMES, point_size=2.5,
-                                        cbar_label="speed", title=f"manifold collapse — UMAP 6D\n{sub}")
-        imageio.mimwrite(f"{OUT}/manifold_umap_collapse_{tag}.mp4", list(fb), fps=20, macro_block_size=2, quality=8)
+        fb = viz.points_collapse_frames(emb_p, color=speed, lims=elims, n_frames=UMAP_FRAMES, point_size=2.5,
+                                        cbar_label=CBAR, title=f"recovered manifold — UMAP of full 6D (pos+vel)\n{sub}")
+        imageio.mimwrite(f"{OUT}/manifold_umap_collapse_{tag}.mp4", list(fb), fps=UMAP_FPS, macro_block_size=2, quality=8)
         print(f"[manifold:{tag}] wrote collapse mp4s")
 
 

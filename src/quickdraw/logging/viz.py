@@ -687,7 +687,7 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
 
 
 # ------------------------- diffusion: recovered-manifold point clouds (matplotlib 3D) -------------------------
-def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap="viridis", cbar_label="",
+def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="",
                      depthshade=True):
     """A 3D point cloud from 4 ORTHOGRAPHIC views in a 2x2 GridSpec (plain matplotlib 3D scatter — no torus
     mesh, the POINTS are the surface). Views: side (x-z), top-down (x-y), and two obliques. pts: (N,3).
@@ -708,7 +708,6 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
         sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size, c=color, cmap=cmap,
                         depthshade=depthshade, linewidths=0)
         ax.view_init(elev=elev, azim=azim)
-        ax.text2D(0.04, 0.92, lbl, transform=ax.transAxes, fontsize=9)   # in-axes label (no suptitle collision)
         if lims is not None:
             (xl, yl, zl) = lims
             ax.set_xlim(xl); ax.set_ylim(yl); ax.set_zlim(zl)
@@ -716,9 +715,9 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
         else:
             ax.set_box_aspect((1, 1, 1))
         ax.set_xlabel("x", fontsize=7); ax.set_ylabel("y", fontsize=7); ax.set_zlabel("z", fontsize=7)
-        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-            axis.set_major_locator(MaxNLocator(4))
-        ax.tick_params(labelsize=6)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):    # keep the ticks (marks) but drop the numeric labels
+            axis.set_major_locator(MaxNLocator(5))
+        ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
     fig.subplots_adjust(left=0.0, right=0.88, top=0.93, bottom=0.0, wspace=0.0, hspace=0.0)  # use the whitespace
     if color is not None and sc is not None:
         cax = fig.add_axes([0.905, 0.30, 0.015, 0.40])             # dedicated right-side colorbar
@@ -728,7 +727,7 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
 
 
 def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
-                           cmap="viridis", cbar_label="", depthshade=False, dpi=110):
+                           cmap="plasma", cbar_label="", depthshade=False, dpi=110):
     """Animate a cloud collapsing onto the recovered manifold: paths (N, T, 3) are the per-point positions
     over the T denoising steps; each frame is fig_points_4view at an interpolated time. Returns RGB frames.
     depthshade defaults False here (much faster for the many-frame render)."""
