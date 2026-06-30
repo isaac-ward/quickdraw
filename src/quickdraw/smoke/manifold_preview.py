@@ -59,6 +59,73 @@ def main(cfg):
     for ei, t in slices[:N_POINTS]:
         by_ep[ei].append(t)
 
+    # ---- autoregressive-rollout test (a SEPARATE story): seed from real contexts, then roll the model
+    # forward under SAMPLED training actions. Does it stay on the torus as the horizon grows, or does
+    # compounding error drift it off? One deterministic H=64 rollout per seed -> slice every shorter
+    # horizon out of it (readout is deterministic, so the step-h state of a 64-rollout IS an h-rollout). ----
+    if stage == "rollout":
+        HORIZONS = [1, 2, 4, 8, 16, 32, 64]
+        MAXH = HORIZONS[-1]
+        rolldir = f"{OUT}/rollout"; os.makedirs(rolldir, exist_ok=True)
+        # pooled empirical training-action distribution (marginal; iid samples ignore temporal correlation)
+        act_pool = torch.cat([ds[ei]["act_seq"].float() for ei in range(n_ep)], dim=0).to(device)  # (M,2)
+        ctxs, racts = [], []                                       # context obs[t-P:t]; real ctx actions a[t-P:t-1]
+        for ei, ts in by_ep.items():
+            o, a = ds[ei]["obs_seq"].float(), ds[ei]["act_seq"].float()
+            for t in sorted(ts):
+                ctxs.append(o[t - P:t]); racts.append(a[t - P:t - 1])
+        ctx = torch.stack(ctxs).to(device)                         # (N,P,6) real context (normalized)
+        ract = torch.stack(racts).to(device)                       # (N,P-1,2) real context actions
+        Nr = ctx.shape[0]
+        idx = torch.randint(act_pool.shape[0], (Nr, MAXH), generator=g, device=device)
+        actions = torch.cat([ract, act_pool[idx]], dim=1)          # (N, P-1+MAXH, 2): real ctx + sampled future
+        rolls = []
+        with torch.no_grad():
+            for i in range(0, Nr, 2000):
+                rolls.append(norm.denorm_obs(m.imagine_eval(ctx[i:i + 2000], actions[i:i + 2000], MAXH)).cpu().numpy())
+        roll = np.concatenate(rolls, 0)                            # (N, MAXH, 6) physical units
+        clouds = {0: norm.denorm_obs(ctx[:, -1]).cpu().numpy()}    # step 0 = on-torus seed
+        for h in HORIZONS:
+            clouds[h] = roll[:, h - 1]                             # state after h autoregressive steps
+        sub_r = f"{model_name} (K={K}) — {Nr:,} seeds, sampled training actions, autoregressive"
+
+        def spd(c):
+            return np.linalg.norm(c[:, 3:], axis=1)
+
+        def cube_union(arrs):                                      # shared lims over ALL clouds (drift never clips)
+            allp = np.vstack(arrs); out = []
+            for i in range(allp.shape[1]):
+                lo, hi = float(allp[:, i].min()), float(allp[:, i].max()); pad = 0.05 * (hi - lo + 1e-6)
+                out.append((lo - pad, hi + pad))
+            return tuple(out)
+
+        # position: START frame (seed) + an END frame per horizon, shared lims so drift is visible
+        pl = cube_union([clouds[k][:, :3] for k in clouds])
+
+        def save_pos(c, name, ttl):
+            f = viz.fig_points_4view(c[:, :3], color=spd(c), lims=pl, point_size=2.0, cbar_label=CBAR, title=ttl)
+            f.savefig(f"{rolldir}/{name}.png", dpi=110); plt.close(f)
+            print(f"[manifold] wrote rollout/{name}.png")
+        save_pos(clouds[0], "pos_start", f"AR rollout — position START (seed, on-torus)\n{sub_r}")
+        for h in HORIZONS:
+            save_pos(clouds[h], f"pos_h{h:02d}", f"AR rollout — position after {h} step(s)\n{sub_r}")
+
+        # embedding: just the END frame per horizon. UMAP(3) of full 6D, fit_transform JOINTLY on the union
+        # of ALL clouds (every point is in the fit -> no transform() OOD-folding; drift gets its own region
+        # if it exists). One shared embedding + shared lims so frames are directly comparable.
+        import umap
+        keys = list(clouds)
+        stacked = np.vstack([clouds[k] for k in keys])
+        joint = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05).fit_transform(stacked)
+        emb = dict(zip(keys, np.split(joint, len(keys))))                 # equal-size clouds -> clean split
+        el = cube_union([emb[k] for k in keys])
+        for h in HORIZONS:
+            f = viz.fig_points_4view(emb[h], color=spd(clouds[h]), lims=el, point_size=2.5, cbar_label=CBAR,
+                                     title=f"AR rollout — UMAP(3) full-6D (joint fit) after {h} step(s)\n{sub_r}")
+            f.savefig(f"{rolldir}/umap_h{h:02d}.png", dpi=110); plt.close(f)
+            print(f"[manifold] wrote rollout/umap_h{h:02d}.png")
+        return
+
     # one causal transformer pass per episode gives h at every step; denoise 1 noise/slice, keep the path
     paths6d = []
     with torch.no_grad():
