@@ -140,15 +140,36 @@ def _quiver_frames_data(swarm, n_frames=120):
             for f in range(n_frames)]
 
 
+def _quiver_round_data(swarm, grow=10, collapse=5):
+    """One round of a sequential swarm: a GROW phase (swarm flows noise->surface, trails growing) then a
+    COLLAPSE phase (each tail RETRACTS onto its convergence endpoint, so the swarm ends as a tight knot at
+    the predicted point) before the next round begins. grow + collapse frames total."""
+    swarm = [np.asarray(s) for s in (swarm or [])]
+    if not swarm:
+        return [{"swarm": []}]
+    K = swarm[0].shape[0] - 1
+
+    def along(path, s):                                # particle at fraction s + growing trail
+        fc = s * K; i0 = int(np.floor(fc)); i1 = min(i0 + 1, K); w = fc - i0
+        p = (1 - w) * path[i0] + w * path[i1]
+        return {"particle": p, "trail": np.vstack([path[: i0 + 1], p[None]]) if w > 1e-6 else path[: i0 + 1]}
+
+    pf = [{"swarm": [along(sp, f / (grow - 1) if grow > 1 else 1.0) for sp in swarm]} for f in range(grow)]
+    for f in range(collapse):                          # retract each tail onto its endpoint (the convergence)
+        j = int(round((f + 1) / collapse * K))         # trail-start index advances 0 -> K (leaves a tight knot)
+        pf.append({"swarm": [{"particle": sp[K], "trail": sp[min(j, K):]} for sp in swarm]})
+    return pf
+
+
 @torch.no_grad()
 def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     """The headline diffusion artifact (design/models/diffusion.md). At 3 FIXED prediction steps of episode
     0, render the latent flow field through the decoder onto the torus as a quiver ATLAS animation (2 s):
     a grey swarm of decoded ODE paths flowing off-surface onto the manifold (each leaving a tail that
     traces the field), the agent's black history tail AND short future segment (current -> next, ending
-    where the denoising converges), and a black truth ring. ALSO a `quiver_multistep` (4 s): agent + history
-    + future lines all FIXED while 16 SEQUENTIAL swarms each denoise and converge to the next point along
-    the fixed future line, one after another. Diffusion-specific scalars:
+    where the denoising converges), and a black truth ring. ALSO a `quiver_multistep` (8 s): agent + history
+    + future lines all FIXED while 32 SEQUENTIAL swarms each denoise then collapse their tails onto the next
+    convergence point along the fixed future line, one after another. Diffusion-specific scalars:
     eval_diffusion/std_of_samples (std of the swarm's FINAL positions = predicted uncertainty) and
     eval_diffusion/time/{sample_s, sample_ms_per_euler_step}. (Pointwise accuracy lives in val/train
     pointwise_error — the shared rollout metric — so it's NOT duplicated here.) Self-SKIPS for non-diffusion."""
@@ -224,23 +245,25 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
                "model denoises ONTO the torus; the black ring marks the TRUE next position; the agent's black "
                "history tail and future path show where it came from and where it's going."), step)
 
-    # (b) multistep quiver: agent + history + future lines all STATIC; 16 SEQUENTIAL swarms — each predicts
-    # the next consecutive step and denoises (converges) to its target ring, which advances along the fixed
-    # future line, one swarm after another (each ~0.25 s -> 4 s for 16). The future line spans those 16 steps.
-    t0, n_ms = steps_idx[0], 16
+    # (b) multistep quiver: agent + history + future lines all STATIC; 32 SEQUENTIAL swarms — each predicts
+    # the next consecutive step and denoises, then COLLAPSES its tails onto the convergence point before the
+    # next swarm. The target advances along the fixed future line (which spans the 32 steps). 32 x 15 = 480
+    # frames @ 60 fps = 8 s.
+    t0, n_ms = steps_idx[0], 32
     n_ms = min(n_ms, Tlen - 2 - t0)                    # stay in-episode
     ms_cur = norm.denorm_obs(obs[:, t0])[0, :3].cpu().numpy()
     ms_tail = norm.denorm_obs(obs[0, max(0, t0 - 60):t0 + 1])[:, :3].cpu().numpy()
     ms_future = norm.denorm_obs(obs[0, t0:t0 + n_ms + 1])[:, :3].cpu().numpy()      # current -> t0+n_ms (fixed)
     ms_act = viz.action_ambient(ms_cur, norm.denorm_act(act[:, t0])[0].cpu().numpy(), R, r)
-    ms_steps = [{"per_frame": _quiver_frames_data(step_data(t0 + i)["swarm"], n_frames=15),  # predict t0+i+1
+    ms_steps = [{"per_frame": _quiver_round_data(step_data(t0 + i)["swarm"], grow=10, collapse=5),  # predict t0+i+1
                  "true_next": norm.denorm_obs(obs[:, t0 + i + 1])[0, :3].cpu().numpy()} for i in range(n_ms)]
     ms_frames = viz.diffusion_quiver_sequential_frames(R, r, coloring, ms_cur, ms_act, ms_tail, ms_future,
                                                        ms_steps, title="diffusion quiver multistep")
-    writer.video("eval_diffusion/quiver_multistep", ms_frames, 60, step)  # 16 swarms x 15 = 240 frames @ 60 fps = 4 s
+    writer.video("eval_diffusion/quiver_multistep", ms_frames, 60, step)  # 32 swarms x 15 = 480 frames @ 60 fps = 8 s
     writer.scene("eval_diffusion/quiver_multistep", {
-        "description": "16 sequential swarms at a FIXED agent: each swarm denoises and converges to the next "
-                       "point along the (fixed) black future line; agent, history and future do not move.",
+        "description": "32 sequential swarms at a FIXED agent: each swarm denoises, then its tails collapse "
+                       "onto the convergence point along the (fixed) black future line, before the next "
+                       "swarm; agent, history and future do not move.",
         "coordinate_system": "world xyz, same space as the torus",
         "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
         "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,

@@ -684,3 +684,48 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
     finally:
         rend.close()
     return np.stack(frames)
+
+
+# ------------------------- diffusion: recovered-manifold point clouds (matplotlib 3D) -------------------------
+def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap="viridis", cbar_label=""):
+    """A 3D point cloud from 4 angles in a 2x2 GridSpec (plain matplotlib 3D scatter — no torus mesh, the
+    POINTS are the surface). Views: side (x-z), top-down (x-y), and two obliques. pts: (N,3). color: (N,)
+    scalar or None. lims: (lo, hi) shared cube, or None to autoscale."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
+    pts = np.asarray(pts)
+    views = [(8, -90, "side  (x–z)"), (89, -90, "top-down  (x–y)"), (26, 45, "oblique A"), (26, 135, "oblique B")]
+    fig = plt.figure(figsize=(11, 11))
+    gs = GridSpec(2, 2, figure=fig, wspace=0.04, hspace=0.08)
+    sc = None
+    for i, (elev, azim, lbl) in enumerate(views):
+        ax = fig.add_subplot(gs[i // 2, i % 2], projection="3d")
+        sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size, c=color, cmap=cmap,
+                        depthshade=True, linewidths=0)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(lbl, fontsize=10)
+        if lims is not None:
+            ax.set_xlim(lims); ax.set_ylim(lims); ax.set_zlim(lims)
+        ax.set_box_aspect((1, 1, 1))
+        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    if color is not None and sc is not None:
+        fig.colorbar(sc, ax=fig.axes, shrink=0.5, pad=0.02, label=cbar_label)
+    fig.suptitle(title, fontsize=12)
+    return fig
+
+
+def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
+                           cmap="viridis", cbar_label="", dpi=110):
+    """Animate a cloud collapsing onto the recovered manifold: paths (N, T, 3) are the per-point positions
+    over the T denoising steps; each frame is fig_points_4view at an interpolated time. Returns RGB frames."""
+    paths = np.asarray(paths)
+    T = paths.shape[1]
+    frames = []
+    for f in np.linspace(0, T - 1, n_frames):
+        j0 = int(np.floor(f)); j1 = min(j0 + 1, T - 1); w = f - j0
+        pts = (1 - w) * paths[:, j0] + w * paths[:, j1]
+        fig = fig_points_4view(pts, color=color, title=title, lims=lims, point_size=point_size,
+                               cmap=cmap, cbar_label=cbar_label)
+        fig.set_dpi(dpi)
+        frames.append(_fig_rgb(fig))
+        plt.close(fig)
+    return np.stack(frames)
