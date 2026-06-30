@@ -28,12 +28,11 @@ FPV_FOV = 103.5     # egocentric camera FOV (deg); VTK default is 30
 FPV_SIZE = 256      # egocentric video resolution (px, square)
 SURFACE_EPS = 0.02  # absolute outward lift for trajectory lines/arrows (no z-fighting, any R,r)
 ACTION_SMOOTH_WINDOW = 18  # default boxcar window for action-arrow smoothing (config can override)
-TORUS_OPACITY = 0.6  # legacy default still passed by some callers; _build overrides it with ATLAS_TORUS_OPACITY
-ATLAS_TORUS_OPACITY = 0.3  # THE one knob: opacity of EVERY atlas torus — iso AND axial, the SAME — for every
-#                            plot (eval horizon, control, diffusion, summaries). Was 0.6 -> now 0.3 (2x more
-#                            transparent). The FAN is rendered OPAQUE (see _add_fan): a transparent fan over a
-#                            transparent torus was the iso depth-peeling flicker; an opaque fan is one solid
-#                            layer, so the iso can stay translucent (see-through) without the flash.
+TORUS_OPACITY = 0.6  # legacy default still passed by some callers; _build overrides it with the constants below
+ISO_TORUS_OPACITY = 0.45    # iso torus opacity for EVERY atlas plot (horizon, control, diffusion, summaries)
+AXIAL_TORUS_OPACITY = 0.3   # axial torus opacity (more see-through than iso). Both were 0.6 before.
+#   The FAN is rendered OPAQUE (see _add_fan): a transparent fan over a transparent torus was the iso
+#   depth-peeling flicker; an opaque fan is one solid layer, so the iso can stay translucent without the flash.
 _N_THETA, _N_PHI = 420, 210   # torus face density (smooth even up close in FPV)
 _TEX: dict = {}
 
@@ -269,11 +268,11 @@ class TorusRenderer:
         # ADD order, so the fan/trajectories paint on top of the translucent torus even when behind it.
         # Depth peeling blends by true depth (fan behind the torus correctly occluded/dimmed).
         pl.enable_depth_peeling(number_of_peels=4, occlusion_ratio=0.0)
-        # EVERY atlas torus (iso AND axial) uses the single ATLAS_TORUS_OPACITY knob — same transparency
-        # everywhere, regardless of the caller's torus_opacity. The iso saturation FLASH came from VTK
-        # depth-peeling mis-resolving a TRANSPARENT torus over a TRANSPARENT fan; making the FAN opaque
-        # (see _add_fan) removes that transparent-on-transparent stress, so the iso can stay translucent.
-        self._add_torus(pl, ATLAS_TORUS_OPACITY)
+        # Atlas torus opacity: iso 0.45, axial 0.3 (the axials stay more see-through). Same for every atlas
+        # plot, regardless of the caller's torus_opacity. The iso saturation FLASH came from VTK depth-peeling
+        # mis-resolving a TRANSPARENT torus over a TRANSPARENT fan; making the FAN opaque (see _add_fan)
+        # removes that transparent-on-transparent stress, so the iso can stay translucent.
+        self._add_torus(pl, ISO_TORUS_OPACITY if view == "iso" else AXIAL_TORUS_OPACITY)
         L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
         vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)
         # orthographic everywhere + an explicit parallel_scale => framing is fixed, never auto-fit/rescaled
@@ -604,52 +603,85 @@ def fpv_frames(R, r, coloring, obs, n_frames=10000, fov=FPV_FOV, size=FPV_SIZE):
 
 
 # ------------------------- diffusion: flow-field viz (design/models/diffusion.md) -------------------------
+def _quiver_static_trajs(cur, agent_tail, future_path, true_next, R, sc):
+    """The fixed (non-animated) trajs for a quiver frame: current dot + the agent's HISTORY tail and FUTURE
+    path (both black, std thickness) + a small black TRUTH ring. Shared by the single + multistep quivers."""
+    out = [{"xyz": np.asarray(cur)[None], "color": "black", "start_sphere": True, "end_sphere": False}]
+    for path in (agent_tail, future_path):
+        p = np.asarray(path) if path is not None else None
+        if p is not None and len(p) >= 2:
+            out.append({"xyz": p, "color": "black", "radius": 0.008 * sc,
+                        "start_sphere": False, "end_sphere": False})
+    if true_next is not None:
+        out.append({"xyz": _tangent_ring(true_next, R, 0.0225 * sc), "color": "black", "radius": 0.006 * sc,
+                    "start_sphere": False, "end_sphere": False})
+    return out
+
+
+def _quiver_swarm_trajs(fr, sc):
+    """The animated grey swarm trajs for one frame: each member a growing tail (tracing the flow field)."""
+    out = []
+    for sp in fr.get("swarm", []):
+        st = np.asarray(sp["trail"])
+        if len(st) >= 2:
+            out.append({"xyz": st, "color": "dimgray", "radius": 0.008 * sc,
+                        "start_sphere": False, "end_sphere": False})
+        else:
+            out.append({"xyz": np.asarray(sp["particle"])[None], "color": "dimgray",
+                        "start_sphere": True, "end_sphere": False, "start_scale": 0.35})
+    return out
+
+
 def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, agent_tail=None,
-                            true_next=None, title="", size=860, view_pad=EVAL_VIEW_PAD,
+                            future_path=None, true_next=None, title="", size=860, view_pad=EVAL_VIEW_PAD,
                             torus_opacity=TORUS_OPACITY):
     """Short tau-sweep ANIMATION (tau 1->0, the denoising direction), rendered as the FULL 4-panel atlas
-    (iso + 3 axial, like the control/OOD videos) so the see-through axial views are available. The torus +
-    moving-agent tail + current dot + action arrow + a black TRUTH ring (the true next position) stay fixed;
-    a GREY SWARM of decoded ODE paths flows from off-surface noise onto the torus EACH leaving its own
-    growing tail (so the accumulating tails trace the flow field), and the RED committed particle rides its
-    own path. per_frame is a list of {particle: (3,), trail: (k,3), swarm: [{particle, trail}..]}."""
+    (iso + 3 axial). Fixed across frames: the current dot, the action arrow, the moving-agent HISTORY tail
+    AND its FUTURE path (both black, same thickness — where it came from + where it's going), and a black
+    TRUTH ring (true next position). Animated: a GREY SWARM of decoded ODE paths flows from off-surface
+    noise onto the torus, each leaving its own growing tail (the accumulating tails trace the flow field).
+    No committed/red particle. per_frame is a list of {swarm: [{particle, trail}..]} (committed unused)."""
     sc = R + r
-    ring_r = 0.0225 * sc                                                 # truth ring diameter = 0.5x the agent diameter
     rend = TorusRenderer(R, r, coloring)                                 # reused across frames (atlas, like control)
-    frames = []
-    cur, act = np.asarray(current), np.asarray(action_amb)
-    tail = np.asarray(agent_tail) if agent_tail is not None else None   # moving agent's trajectory tail (static)
-    ring = _tangent_ring(true_next, R, ring_r) if true_next is not None else None  # black truth ring (static)
+    static = _quiver_static_trajs(current, agent_tail, future_path, true_next, R, sc)
+    cur, act, frames = np.asarray(current), np.asarray(action_amb), []
     try:
         for fr in per_frame:
-            trajs = [{"xyz": cur[None], "color": "black", "start_sphere": True, "end_sphere": False}]
-            if tail is not None and len(tail) >= 2:              # the MOVING AGENT's path up to now (like other plots)
-                trajs.append({"xyz": tail, "color": "black", "radius": 0.008 * sc,
-                              "start_sphere": False, "end_sphere": False})
-            if ring is not None:                                 # ground-truth next position = small black ring
-                trajs.append({"xyz": ring, "color": "black", "radius": 0.006 * sc,
-                              "start_sphere": False, "end_sphere": False})
-            for sp in fr.get("swarm", []):                       # swarm: grey, EACH with its own growing tail
-                st = np.asarray(sp["trail"])                     # (traces the flow field as they accumulate)
-                if len(st) >= 2:
-                    trajs.append({"xyz": st, "color": "dimgray", "radius": 0.008 * sc,  # std line thickness
-                                  "start_sphere": False, "end_sphere": False})
-                else:
-                    trajs.append({"xyz": np.asarray(sp["particle"])[None], "color": "dimgray",
-                                  "start_sphere": True, "end_sphere": False, "start_scale": 0.35})
-            trail = np.asarray(fr["trail"])                      # MAIN particle: keeps its TAIL (the denoising-path
-            if len(trail) >= 2:                                  # history) + red head; std line thickness
-                trajs.append({"xyz": trail, "color": "red", "radius": 0.008 * sc, "start_sphere": False,
-                              "end_sphere": False, "tip": {"color": "red", "lighting": False}})
-            else:
-                trajs.append({"xyz": np.asarray(fr["particle"])[None], "color": "red",
-                              "start_sphere": True, "end_sphere": False})
-            fig = fig_torus_atlas(R, r, trajs=trajs, arrows=[(cur, act)], coloring=coloring, title=title,
-                                  markers=False, iso_size=size, ax_size=int(round(size * 0.67)),
-                                  view_pad=view_pad, torus_opacity=torus_opacity, renderer=rend)
+            fig = fig_torus_atlas(R, r, trajs=static + _quiver_swarm_trajs(fr, sc), arrows=[(cur, act)],
+                                  coloring=coloring, title=title, markers=False, iso_size=size,
+                                  ax_size=int(round(size * 0.67)), view_pad=view_pad,
+                                  torus_opacity=torus_opacity, renderer=rend)
             fig.set_dpi(VIDEO_DPI)
             frames.append(_fig_rgb(fig))
             plt.close(fig)
+    finally:
+        rend.close()
+    return np.stack(frames)
+
+
+def diffusion_quiver_multistep_frames(R, r, coloring, steps, frames_per_step=15, title="", size=860,
+                                      view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY):
+    """16 consecutive denoising predictions played one after another (each ~`frames_per_step` frames =
+    0.25 s @ 60 fps -> 4 s for 16), as the agent walks forward along its path. `steps` is a list of per-step
+    dicts: {current, action_amb, agent_tail, future_path, true_next, per_frame} — per_frame is that step's
+    swarm denoising sub-animation, subsampled to frames_per_step. Same atlas + look as the single quiver."""
+    sc = R + r
+    rend = TorusRenderer(R, r, coloring)
+    frames = []
+    try:
+        for s in steps:
+            static = _quiver_static_trajs(s["current"], s["agent_tail"], s["future_path"], s["true_next"], R, sc)
+            cur, act = np.asarray(s["current"]), np.asarray(s["action_amb"])
+            pf = s["per_frame"]
+            idx = np.linspace(0, len(pf) - 1, frames_per_step).astype(int)   # compress this step's denoising
+            for j in idx:
+                fig = fig_torus_atlas(R, r, trajs=static + _quiver_swarm_trajs(pf[int(j)], sc),
+                                      arrows=[(cur, act)], coloring=coloring, title=title, markers=False,
+                                      iso_size=size, ax_size=int(round(size * 0.67)), view_pad=view_pad,
+                                      torus_opacity=torus_opacity, renderer=rend)
+                fig.set_dpi(VIDEO_DPI)
+                frames.append(_fig_rgb(fig))
+                plt.close(fig)
     finally:
         rend.close()
     return np.stack(frames)

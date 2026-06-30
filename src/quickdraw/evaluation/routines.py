@@ -150,13 +150,14 @@ def _quiver_frames_data(committed, swarm=None, n_frames=120):
 
 @torch.no_grad()
 def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
-    """The headline diffusion artifact (design/models/diffusion.md): at 3 FIXED prediction steps of
-    episode 0, render the latent flow field through the decoder onto the torus as a tau-sweep quiver
-    ATLAS animation — a grey swarm of decoded ODE paths flowing off-surface onto the manifold (each
-    leaving a tail), the red committed (eps=0, metric) particle riding its decoded path, the moving-agent
-    tail, and a black truth ring. The committed path and the metric use the model's NATIVE sampling_steps
-    K, so the numbers match the rollout. Logs diffusion/quiver/example_{0..2} + diffusion/{pointwise_error,
-    sample_spread}. Self-SKIPS (returns {}) for non-diffusion models."""
+    """The headline diffusion artifact (design/models/diffusion.md). At 3 FIXED prediction steps of episode
+    0, render the latent flow field through the decoder onto the torus as a tau-sweep quiver ATLAS animation
+    (2 s): a grey swarm of decoded ODE paths flowing off-surface onto the manifold (each leaving a tail that
+    traces the field), the agent's black history tail AND future path, and a black truth ring (no committed/
+    red particle). ALSO a `quiver_multistep` (4 s): 16 consecutive denoising predictions as the agent walks
+    forward. The metric uses the model's NATIVE sampling_steps K, so it matches the rollout. Logs
+    diffusion/quiver/example_{0..2} + diffusion/quiver_multistep + diffusion/{pointwise_error, sample_spread,
+    time/sample_s, time/sample_ms_per_euler_step}. Self-SKIPS (returns {}) for non-diffusion models."""
     from ..models.diffusion import Diffusion, _ln
     m = getattr(model, "_orig_mod", model)            # unwrap torch.compile
     if not isinstance(m, Diffusion):
@@ -181,47 +182,79 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     def decode_xyz(z_t, x):                            # latent residual x -> physical xyz (endpoint == committed metric pred)
         return norm.denorm_obs(m.to_obs(_ln(z_t + x)))[..., :3]
 
-    _plog(writer, f"[diffusion_field @ep{step}] {n_steps} steps {steps_idx}, K={K} swarm={n_swarm}")
-    endpoint_errs, spreads = [], []
-    for si, t in enumerate(steps_idx):
+    def step_data(t):                                  # all per-step geometry + the K-step sample wall time
         w = min(W, t + 1)
-        s_win, a_win = z[:, t - w + 1:t + 1], act[:, t - w + 1:t + 1]   # token i consumes a_i
-        h_t = m.transformer(m.to_token(s_win, a_win))[:, -1]            # (1, d) teacher-forced context
-        z_t = z[:, t]                                                   # (1, dz)
-        cur_xyz = norm.denorm_obs(obs[:, t])[0, :3].cpu().numpy()
-        nxt_xyz = norm.denorm_obs(obs[:, t + 1])[0, :3].cpu().numpy()
-        agent_tail = norm.denorm_obs(obs[0, max(0, t - 60):t + 1])[:, :3].cpu().numpy()  # agent's last ~60 steps (like other plots)
-        act_amb = viz.action_ambient(cur_xyz, norm.denorm_act(act[:, t])[0].cpu().numpy(), R, r)
-        _, cpath = m.flow.sample(h_t, steps=K, deterministic=True, record_path=True)
-        committed = np.stack([decode_xyz(z_t, x)[0].cpu().numpy() for x in cpath])        # (K+1, 3)
+        h_t = m.transformer(m.to_token(z[:, t - w + 1:t + 1], act[:, t - w + 1:t + 1]))[:, -1]
+        z_t = z[:, t]
+        cur = norm.denorm_obs(obs[:, t])[0, :3].cpu().numpy()
+        nxt = norm.denorm_obs(obs[:, t + 1])[0, :3].cpu().numpy()
+        a_tail = norm.denorm_obs(obs[0, max(0, t - 60):t + 1])[:, :3].cpu().numpy()        # history (last ~60)
+        a_fut = norm.denorm_obs(obs[0, t + 1:t + 61])[:, :3].cpu().numpy()                 # FUTURE (next ~60)
+        a_amb = viz.action_ambient(cur, norm.denorm_act(act[:, t])[0].cpu().numpy(), R, r)
+        ts = time.perf_counter()
+        _, cpath = m.flow.sample(h_t, steps=K, deterministic=True, record_path=True)       # the metric prediction
+        sample_s = time.perf_counter() - ts
+        committed = np.stack([decode_xyz(z_t, x)[0].cpu().numpy() for x in cpath])         # (K+1, 3)
         swarm, ends = [], []
         for _ in range(n_swarm):
             e = torch.randn(1, dz, generator=g, device=device)
             _, pth = m.flow.sample(h_t, steps=K, deterministic=False, eps=e, record_path=True)
             sp = np.stack([decode_xyz(z_t, x)[0].cpu().numpy() for x in pth])
-            swarm.append(sp)
-            ends.append(sp[-1])
-        endpoint_errs.append(float(np.linalg.norm(committed[-1] - nxt_xyz) / r))          # tube-radii
-        spreads.append(float(np.linalg.norm(np.stack(ends).std(axis=0))))
-        per_frame = _quiver_frames_data(committed, swarm=swarm)
-        frames = viz.diffusion_quiver_frames(R, r, coloring, cur_xyz, act_amb, per_frame, agent_tail=agent_tail,
-                                             true_next=nxt_xyz, title=f"diffusion quiver step {t}")
+            swarm.append(sp); ends.append(sp[-1])
+        return {"current": cur, "true_next": nxt, "agent_tail": a_tail, "future_path": a_fut,
+                "action_amb": a_amb, "committed": committed, "swarm": swarm, "ends": ends, "sample_s": sample_s}
+
+    _plog(writer, f"[diffusion_field @ep{step}] {n_steps} steps {steps_idx}, K={K} swarm={n_swarm}")
+    endpoint_errs, spreads, sample_times = [], [], []
+    for si, t in enumerate(steps_idx):                 # (a) the 3 single-step quivers (2 s denoising each)
+        d = step_data(t)
+        endpoint_errs.append(float(np.linalg.norm(d["committed"][-1] - d["true_next"]) / r))   # tube-radii
+        spreads.append(float(np.linalg.norm(np.stack(d["ends"]).std(axis=0))))
+        sample_times.append(d["sample_s"])
+        per_frame = _quiver_frames_data(d["committed"], swarm=d["swarm"])
+        frames = viz.diffusion_quiver_frames(R, r, coloring, d["current"], d["action_amb"], per_frame,
+                                             agent_tail=d["agent_tail"], future_path=d["future_path"],
+                                             true_next=d["true_next"], title=f"diffusion quiver step {t}")
         writer.video(f"diffusion/quiver/example_{si}", frames, 60, step)  # 120 frames @ 60 fps = 2 s
         writer.scene(f"diffusion/quiver/example_{si}", {  # 3D geometry for Blender (plain-language keys)
             "description": "Diffusion flow-field quiver at one fixed prediction step. The torus is the manifold "
                            "the agent moves on. The grey swarm are noise samples the model denoises ONTO the "
-                           "surface; the red committed path is the model's single best-guess prediction "
-                           "(current -> predicted next); the black ring marks the TRUE next position.",
+                           "surface; the committed path is the model's single best-guess prediction "
+                           "(current -> predicted next); the black ring marks the TRUE next position; the agent's "
+                           "history tail and future path are both black.",
             "coordinate_system": "world xyz, same space as the torus",
             "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
-            "moving_agent": {"recent_trajectory_tail_xyz": agent_tail, "current_position_xyz": cur_xyz},
-            "action_arrow": {"origin_xyz": cur_xyz, "vector_xyz": np.asarray(act_amb)},
-            "true_next_position_xyz": nxt_xyz,
-            "committed_prediction_path_xyz": committed,        # (K+1,3): current -> predicted next
-            "swarm_paths_xyz": [np.asarray(sp) for sp in swarm],  # each (K+1,3): decoded noise -> surface
+            "moving_agent": {"history_tail_xyz": d["agent_tail"], "future_path_xyz": d["future_path"],
+                             "current_position_xyz": d["current"]},
+            "action_arrow": {"origin_xyz": d["current"], "vector_xyz": np.asarray(d["action_amb"])},
+            "true_next_position_xyz": d["true_next"],
+            "committed_prediction_path_xyz": d["committed"],       # (K+1,3): current -> predicted next
+            "swarm_paths_xyz": [np.asarray(sp) for sp in d["swarm"]],  # each (K+1,3): decoded noise -> surface
         }, step)
+
+    # (b) multistep quiver: 16 CONSECUTIVE denoising predictions, each ~0.25 s @ 60 fps -> 4 s, agent walking
+    ms_ts = list(range(steps_idx[0], min(steps_idx[0] + 16, Tlen - 2)))
+    ms_steps = [{**(d := step_data(t)), "per_frame": _quiver_frames_data(d["committed"], swarm=d["swarm"])}
+                for t in ms_ts]
+    ms_frames = viz.diffusion_quiver_multistep_frames(R, r, coloring, ms_steps, frames_per_step=15,
+                                                      title="diffusion quiver multistep")
+    writer.video("diffusion/quiver_multistep", ms_frames, 60, step)  # 16 x 15 = 240 frames @ 60 fps = 4 s
+    writer.scene("diffusion/quiver_multistep", {
+        "description": "16 consecutive denoising predictions as the agent walks forward along its path; each "
+                       "step shows the grey swarm denoising onto the surface to predict the next position.",
+        "coordinate_system": "world xyz, same space as the torus",
+        "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
+        "steps": [{"current_position_xyz": s["current"], "history_tail_xyz": s["agent_tail"],
+                   "future_path_xyz": s["future_path"], "true_next_position_xyz": s["true_next"],
+                   "committed_prediction_path_xyz": s["committed"],
+                   "swarm_paths_xyz": [np.asarray(sp) for sp in s["swarm"]]} for s in ms_steps],
+    }, step)
+
     writer.scalars({"diffusion/pointwise_error": float(np.mean(endpoint_errs)),
-                    "diffusion/sample_spread": float(np.mean(spreads))}, step)
+                    "diffusion/sample_spread": float(np.mean(spreads)),
+                    "diffusion/time/sample_s": float(np.mean(sample_times)),               # wall time of one K-step prediction
+                    "diffusion/time/sample_ms_per_euler_step": float(1000.0 * np.mean(sample_times) / max(1, K))},
+                   step)
     if was:
         m.train()
     _plog(writer, f"[diffusion_field @ep{step}] done in {time.perf_counter() - t0:.1f}s "
