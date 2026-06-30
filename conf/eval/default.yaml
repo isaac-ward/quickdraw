@@ -13,4 +13,5 @@ during_train:
     ood_geometric: false   # open-loop on the geometric-OOD split (R, r shift)
     ood_dynamics: false    # open-loop on the dynamics-OOD split (gamma/a_max/mass shift)
     control: true          # dual MPPI control (oracle vs learned) through 8 goals (eval_control)
-    diffusion_field: false # diffusion ONLY: streamline + quiver flow-field viz (self-skips for other models)
+    diffusion_field: false # diffusion ONLY: quiver flow-field viz + aggregate_denoising (self-skips for other models)
+    manifold: true         # ANY method: recovered-manifold UMAPs (data + latent space, 2D + 3D)

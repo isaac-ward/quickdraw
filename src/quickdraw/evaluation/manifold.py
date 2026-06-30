@@ -1,8 +1,11 @@
-"""Recovered-manifold point clouds from a trained diffusion model: pool denoised next-state PATHS over
-many (episode, step) contexts; the union of the committed end-points traces the learned manifold. Shared
-by the standalone preview (smoke/manifold_preview.py) and the in-training eval (eval_diffusion_field) so
-the SAMPLING is defined in exactly one place; the LOOK lives in logging.viz (fig_points_4view /
-points_collapse_frames), which both callers use directly."""
+"""Recovered-manifold point clouds: pool the model's next-state predictions over many (episode, step)
+contexts; the union traces the learned manifold. Two sources, both seeded/deterministic given `seed`:
+  - manifold_predictions: the COMMITTED next-state via the shared forward() path — works for ANY model
+    (DSAR/LSAR/diffusion); for diffusion it's the eps=0 readout. Feeds the method-agnostic eval_manifold.
+  - manifold_clouds: diffusion-SPECIFIC — one denoised sample per context keeping the whole ODE path, for
+    the noise->manifold animation (eval_diffusion/aggregate_denoising).
+Shared by the standalone preview (smoke/manifold_preview.py) and the in-training evals so the SAMPLING is
+defined in one place; the LOOK lives in logging.viz (fig_points_*/points_collapse_frames)."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -11,24 +14,45 @@ import numpy as np
 import torch
 
 
-@torch.no_grad()
-def manifold_clouds(m, norm, ds, *, P, n_points, cube, stride, seed, device):
-    """One uniform-hypercube noise per context, denoised through the flow to the committed next-state,
-    keeping the whole ODE path. `m` is the unwrapped Diffusion model; `ds` a list of episodes with
-    obs_seq/act_seq. Returns (paths6d (N, K+1, 6) physical units, speed (N,) = |predicted next velocity|,
-    latents (N, dz) = the committed next-state latent _ln(z_t+Δẑ), n_avail). Deterministic given `seed`
-    (NumPy shuffle + torch noise both seeded with it)."""
-    from ..models.diffusion import _ln
-    dz, K = m.cfg.dz, m.sampling_steps
-    n_ep = len(ds)
-    rng = np.random.RandomState(seed)
-    g = torch.Generator(device=device).manual_seed(seed)
-    slices = [(ei, t) for ei in range(n_ep) for t in range(P, ds[ei]["obs_seq"].shape[0] - 1, stride)]
-    n_avail = len(slices)
-    rng.shuffle(slices)
+def _sample_contexts(ds, *, P, n_points, stride, seed):
+    """Pick n_points random (episode, step) contexts over `ds` (step in [P, len-2]), grouped as
+    {episode_idx: [steps]} for one transformer pass per episode. Returns (by_ep, n_avail)."""
+    slices = [(ei, t) for ei in range(len(ds)) for t in range(P, ds[ei]["obs_seq"].shape[0] - 1, stride)]
+    np.random.RandomState(seed).shuffle(slices)
     by_ep = defaultdict(list)
     for ei, t in slices[:n_points]:
         by_ep[ei].append(t)
+    return by_ep, len(slices)
+
+
+@torch.no_grad()
+def manifold_predictions(m, norm, ds, *, P, n_points, stride, seed, device):
+    """METHOD-AGNOSTIC recovered manifold: the model's COMMITTED (deterministic) next-state prediction over
+    many contexts, via the shared forward() path (encode -> transformer -> readout). Returns
+    (data6d (N, 6) physical units, latents (N, state_dim) the carried next-state, speed (N,), n_avail)."""
+    by_ep, n_avail = _sample_contexts(ds, P=P, n_points=n_points, stride=stride, seed=seed)
+    data6d, latents = [], []
+    for ei, ts in by_ep.items():
+        ep = ds[ei]
+        obs = ep["obs_seq"].to(device)[None].float()
+        act = ep["act_seq"].to(device)[None].float()
+        pred = m(obs, act)[0, np.array(sorted(ts))]                # (nt, state) committed next-state per context
+        latents.extend(pred.cpu().numpy())
+        data6d.extend(norm.denorm_obs(m.to_obs(pred)).cpu().numpy())
+    data6d, latents = np.stack(data6d), np.stack(latents)
+    speed = np.linalg.norm(data6d[:, 3:], axis=1)                 # color = |predicted next velocity|
+    return data6d, latents, speed, n_avail
+
+
+@torch.no_grad()
+def manifold_clouds(m, norm, ds, *, P, n_points, cube, stride, seed, device):
+    """Diffusion-SPECIFIC: one uniform-hypercube noise per context, denoised through the flow to the
+    committed next-state, keeping the whole ODE path. Returns (paths6d (N, K+1, 6) physical units,
+    speed (N,) = |predicted next velocity|, latents (N, dz) = committed latent _ln(z_t+Δẑ), n_avail)."""
+    from ..models.diffusion import _ln
+    dz, K = m.cfg.dz, m.sampling_steps
+    g = torch.Generator(device=device).manual_seed(seed)
+    by_ep, n_avail = _sample_contexts(ds, P=P, n_points=n_points, stride=stride, seed=seed)
     paths6d, latents = [], []
     for ei, ts in by_ep.items():
         ep = ds[ei]

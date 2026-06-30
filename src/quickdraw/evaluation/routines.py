@@ -162,6 +162,36 @@ def _quiver_round_data(swarm, grow=10, collapse=5):
 
 
 @torch.no_grad()
+def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
+    """Recovered-manifold UMAPs — works for ANY method. Pool the model's COMMITTED next-state prediction
+    (deterministic forward() readout; for diffusion the eps=0 prediction) over many VAL contexts, then UMAP
+    both the decoded DATA space (6D pos+vel) and the carried LATENT space to 3D and 2D (4 stills). The
+    union traces the learned manifold; speed colors |predicted next velocity|."""
+    from .manifold import manifold_predictions, pad_lims, umap_reduce
+    m = getattr(model, "_orig_mod", model)
+    was = m.training
+    m.eval()
+    t0 = time.perf_counter()
+    eps_ds = eval_episodes(cfg, norm, "val")
+    data6d, latents, speed, n_avail = manifold_predictions(m, norm, eps_ds, P=cfg.data.P, n_points=5000,
+                                                           stride=1, seed=0, device=device)
+    sub = f"{cfg.model.name} — {data6d.shape[0]:,} committed next-states (of {n_avail:,} val contexts)"
+    CBAR = "speed = |predicted next velocity|"
+    for space, label, pts in (("data_space", "data space (full 6D pos+vel)", data6d),
+                              ("latent_space", f"latent space (full {latents.shape[1]}D z)", latents)):
+        for nd in (3, 2):
+            e = umap_reduce(pts, n_components=nd, seed=0)
+            fig_fn = viz.fig_points_4view if nd == 3 else viz.fig_points_2d
+            f = fig_fn(e, color=speed, lims=pad_lims(e), point_size=2.5, cbar_label=CBAR,
+                       title=f"recovered manifold — UMAP of {label} to {nd}D, seed=0\n{sub}")
+            writer.figure(f"eval_manifold/umap_{space}_to_{nd}d", f, step); plt.close(f)
+    if was:
+        m.train()
+    _plog(writer, f"[manifold @ep{step}] done in {time.perf_counter() - t0:.1f}s")
+    return {}
+
+
+@torch.no_grad()
 def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     """The headline diffusion artifact (design/models/diffusion.md). At 3 FIXED prediction steps of episode
     0, render the latent flow field through the decoder onto the torus as a quiver ATLAS animation (2 s):
@@ -269,34 +299,21 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
         "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,
         "swarm_target_per_step_xyz": [s["true_next"] for s in ms_steps]}, step)
 
-    # (c) recovered-manifold clouds (SHARED with smoke/manifold_preview via evaluation.manifold): pool
-    # denoised next-states over many VAL contexts -> the union traces the learned manifold. Final stills for
-    # 3D position + full-6D UMAP, and a position collapse video (noise -> manifold). Self-contained.
-    from .manifold import manifold_clouds, umap_reduce, pad_lims
+    # (c) aggregate denoising (diffusion-SPECIFIC): pool the denoising ODE paths over many VAL contexts and
+    # animate the swarm collapsing from noise onto the recovered manifold. The static, method-agnostic
+    # manifold UMAPs live in the separate eval_manifold routine.
+    from .manifold import manifold_clouds
     MAN_N, MAN_VID = 5000, 240
-    paths6d, mspeed, mlat, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=MAN_N, cube=3.0,
-                                                     stride=1, seed=0, device=device)
+    paths6d, mspeed, _, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=MAN_N, cube=3.0,
+                                                  stride=1, seed=0, device=device)
     msub = (f"{'shortcut' if m.cfg.shortcut else 'rectified-flow'} (K={K}) — "
             f"{paths6d.shape[0]:,} next-states (of {n_avail:,} val contexts)")
     Lm, Zm = (R + r) * 1.05, r * 1.6
     plims = ((-Lm, Lm), (-Lm, Lm), (-Zm, Zm))
-    CBAR = "speed = |predicted next velocity|"
-
-    # position still (3D) + collapse video, then UMAP stills for {data 6D, latent dz} x {3D, 2D}
-    fp = viz.fig_points_4view(paths6d[:, -1, :3], color=mspeed, lims=plims, point_size=2.0, cbar_label=CBAR,
-                              title=f"recovered manifold — position\n{msub}")
-    writer.figure("eval_diffusion/manifold/position", fp, step); plt.close(fp)
     mframes = viz.points_collapse_frames(paths6d[..., :3], color=mspeed, lims=plims, n_frames=MAN_VID,
-                                         point_size=2.0, cbar_label=CBAR, title=f"recovered manifold — position\n{msub}")
-    writer.video("eval_diffusion/manifold/position_collapse", mframes, 60, step)  # 240 frames @ 60 fps = 4 s
-    for space, label, pts in (("data_space", "data space (full 6D pos+vel)", paths6d[:, -1]),
-                              ("latent_space", f"latent space (full {mlat.shape[1]}D z)", mlat)):
-        for nd in (3, 2):
-            e = umap_reduce(pts, n_components=nd, seed=0)
-            fig_fn = viz.fig_points_4view if nd == 3 else viz.fig_points_2d
-            fu = fig_fn(e, color=mspeed, lims=pad_lims(e), point_size=2.5, cbar_label=CBAR,
-                        title=f"recovered manifold — UMAP of {label} to {nd}D, seed=0\n{msub}")
-            writer.figure(f"eval_diffusion/manifold/umap_{space}_to_{nd}d", fu, step); plt.close(fu)
+                                         point_size=2.0, cbar_label="speed = |predicted next velocity|",
+                                         title=f"aggregate denoising — noise → manifold\n{msub}")
+    writer.video("eval_diffusion/aggregate_denoising", mframes, 60, step)  # 240 frames @ 60 fps = 4 s
 
     writer.scalars({"eval_diffusion/std_of_samples": float(np.mean(spreads)),   # uncertainty (no val equivalent)
                     "eval_diffusion/time/sample_s": float(np.mean(sample_times)),
@@ -311,4 +328,4 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
 
 REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
-            "control": eval_control, "diffusion_field": eval_diffusion_field}
+            "control": eval_control, "diffusion_field": eval_diffusion_field, "manifold": eval_manifold}

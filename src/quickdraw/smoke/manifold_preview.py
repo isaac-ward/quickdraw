@@ -49,6 +49,7 @@ def main(cfg):
     rng = np.random.RandomState(0)
     g = torch.Generator(device=device).manual_seed(0)
     os.makedirs(OUT, exist_ok=True)
+    from ..evaluation.manifold import manifold_clouds, manifold_predictions, pad_lims, umap_reduce
 
     # pick N_POINTS random (episode, step) context slices over the whole training split
     slices = [(ei, t) for ei in range(n_ep) for t in range(P, ds[ei]["obs_seq"].shape[0] - 1, STRIDE)]
@@ -118,18 +119,12 @@ def main(cfg):
             print(f"[manifold] wrote rollout/umap_h{h:02d}.png")
         return
 
-    # one causal transformer pass per episode gives h at every step; denoise 1 noise/slice, keep the path
-    # (shared with eval_diffusion_field via evaluation.manifold so the cloud is defined in one place)
-    from ..evaluation.manifold import manifold_clouds, pad_lims, umap_reduce
-    paths6d, speed, latents, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
-                                                 seed=0, device=device)   # paths6d (N,K+1,6); latents (N,dz)
-    N = paths6d.shape[0]
-    sub = f"{model_name} (K={K}) — {N:,} denoised next-states, one per context (of {n_avail:,} {SPLIT} contexts)"
-    print(f"[manifold:{tag}] {N} points; {sub}")
-
     # ---- 6D-embedding experiment: compare 3D reducers on the START (noise) vs END (manifold) frames ----
+    # (uses the diffusion-specific stochastic ODE paths: start = noise, end = manifold)
     if stage.startswith("embed_experiment"):
         expdir = f"{OUT}/embed_experiments"; os.makedirs(expdir, exist_ok=True)
+        paths6d, speed, _, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
+                                               seed=0, device=device)
         start, end, flat = paths6d[:, 0], paths6d[:, -1], paths6d.reshape(-1, 6)
 
         def save(pts, lims, name, ttl):
@@ -148,16 +143,13 @@ def main(cfg):
         save(pe, pl, "pca_end", "PCA(3) std-6D, fit on all steps — END (manifold)")
         return
 
-    # ---- the SAME artifact set eval_diffusion logs (shared helpers) ----  position still (3D, flat torus
-    # -> per-axis lims so it fills) + collapse video, and UMAP stills for {data 6D, latent dz} x {3D, 2D}.
-    L, Z = (R + r) * 1.05, r * 1.6
-    plims = ((-L, L), (-L, L), (-Z, Z))
-    pos = paths6d[..., :3]
+    # ---- the SAME artifact set the in-training evals log (shared helpers) ----
+    # images: the 4 eval_manifold UMAP stills, from DETERMINISTIC committed predictions (any-method path).
     if stage in ("images", "both"):
-        f = viz.fig_points_4view(pos[:, -1], color=speed, lims=plims, point_size=2.0, cbar_label=CBAR,
-                                 title=f"recovered manifold — position\n{sub}")
-        f.savefig(f"{OUT}/manifold_position_{tag}.png", dpi=110); plt.close(f)
-        for space, label, pts in (("data_space", "data space (full 6D pos+vel)", paths6d[:, -1]),
+        data6d, latents, speed, _ = manifold_predictions(m, norm, ds, P=P, n_points=N_POINTS, stride=STRIDE,
+                                                          seed=0, device=device)
+        sub = f"{model_name} — {data6d.shape[0]:,} committed next-states (of {n_avail:,} {SPLIT} contexts)"
+        for space, label, pts in (("data_space", "data space (full 6D pos+vel)", data6d),
                                   ("latent_space", f"latent space (full {latents.shape[1]}D z)", latents)):
             for nd in (3, 2):
                 emb = umap_reduce(pts, n_components=nd, seed=0)
@@ -165,13 +157,19 @@ def main(cfg):
                 f = fig_fn(emb, color=speed, lims=pad_lims(emb), point_size=2.5, cbar_label=CBAR,
                            title=f"recovered manifold — UMAP of {label} to {nd}D, seed=0\n{sub}")
                 f.savefig(f"{OUT}/manifold_umap_{space}_to_{nd}d_{tag}.png", dpi=110); plt.close(f)
-        print(f"[manifold:{tag}] wrote position + 4 UMAP stills")
+        print(f"[manifold:{tag}] wrote 4 UMAP stills")
 
+    # videos: the eval_diffusion/aggregate_denoising clip, from the stochastic denoising ODE paths.
     if stage in ("videos", "both"):
-        fa = viz.points_collapse_frames(pos, color=speed, lims=plims, n_frames=POS_FRAMES, point_size=2.0,
-                                        cbar_label=CBAR, title=f"recovered manifold — position\n{sub}")
-        imageio.mimwrite(f"{OUT}/manifold_position_collapse_{tag}.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
-        print(f"[manifold:{tag}] wrote position collapse mp4")
+        L, Z = (R + r) * 1.05, r * 1.6
+        plims = ((-L, L), (-L, L), (-Z, Z))
+        paths6d, speed, _, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
+                                               seed=0, device=device)
+        sub = f"{model_name} (K={K}) — {paths6d.shape[0]:,} denoised next-states (of {n_avail:,} {SPLIT} contexts)"
+        fa = viz.points_collapse_frames(paths6d[..., :3], color=speed, lims=plims, n_frames=POS_FRAMES, point_size=2.0,
+                                        cbar_label=CBAR, title=f"aggregate denoising — noise → manifold\n{sub}")
+        imageio.mimwrite(f"{OUT}/manifold_aggregate_denoising_{tag}.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
+        print(f"[manifold:{tag}] wrote aggregate_denoising mp4")
 
 
 if __name__ == "__main__":
