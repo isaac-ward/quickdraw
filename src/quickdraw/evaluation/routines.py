@@ -269,6 +269,33 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
         "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,
         "swarm_target_per_step_xyz": [s["true_next"] for s in ms_steps]}, step)
 
+    # (c) recovered-manifold clouds (SHARED with smoke/manifold_preview via evaluation.manifold): pool
+    # denoised next-states over many VAL contexts -> the union traces the learned manifold. Final stills for
+    # 3D position + full-6D UMAP, and a position collapse video (noise -> manifold). Self-contained.
+    from .manifold import manifold_clouds, umap_end
+    MAN_N, MAN_VID = 5000, 240
+    paths6d, mspeed, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=MAN_N, cube=3.0,
+                                               stride=1, seed=0, device=device)
+    msub = (f"{'shortcut' if m.cfg.shortcut else 'rectified-flow'} (K={K}) — "
+            f"{paths6d.shape[0]:,} next-states (of {n_avail:,} val contexts)")
+    Lm, Zm = (R + r) * 1.05, r * 1.6
+    plims = ((-Lm, Lm), (-Lm, Lm), (-Zm, Zm))
+    CBAR = "speed = |predicted next velocity|"
+    fp = viz.fig_points_4view(paths6d[:, -1, :3], color=mspeed, lims=plims, point_size=2.0, cbar_label=CBAR,
+                              title=f"recovered manifold — position\n{msub}")
+    writer.figure("eval_diffusion/manifold/position", fp, step); plt.close(fp)
+    emb = umap_end(paths6d[:, -1], seed=0)
+
+    def _ax(a):
+        lo, hi = float(emb[:, a].min()), float(emb[:, a].max()); pad = 0.05 * (hi - lo + 1e-6)
+        return (lo - pad, hi + pad)
+    fu = viz.fig_points_4view(emb, color=mspeed, lims=(_ax(0), _ax(1), _ax(2)), point_size=2.5,
+                              cbar_label=CBAR, title=f"recovered manifold — UMAP of full 6D (pos+vel), seed=0\n{msub}")
+    writer.figure("eval_diffusion/manifold/umap", fu, step); plt.close(fu)
+    mframes = viz.points_collapse_frames(paths6d[..., :3], color=mspeed, lims=plims, n_frames=MAN_VID,
+                                         point_size=2.0, cbar_label=CBAR, title=f"recovered manifold — position\n{msub}")
+    writer.video("eval_diffusion/manifold/position_collapse", mframes, 60, step)  # 240 frames @ 60 fps = 4 s
+
     writer.scalars({"eval_diffusion/std_of_samples": float(np.mean(spreads)),   # uncertainty (no val equivalent)
                     "eval_diffusion/time/sample_s": float(np.mean(sample_times)),
                     "eval_diffusion/time/sample_ms_per_euler_step": float(1000.0 * np.mean(sample_times) / max(1, K))},

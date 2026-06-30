@@ -32,7 +32,7 @@ def main(cfg):
     import imageio.v2 as imageio
     import matplotlib.pyplot as plt
 
-    from ..models.diffusion import Diffusion, _ln
+    from ..models.diffusion import Diffusion
     stage = os.environ.get("MANIFOLD_STAGE", "images")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(cfg).to(device)
@@ -41,7 +41,7 @@ def main(cfg):
     m = getattr(model, "_orig_mod", model)
     assert isinstance(m, Diffusion), "manifold preview needs a diffusion model"
     norm, ecfg = normalizer(cfg), env_cfg(cfg)
-    R, r, K, dz, P = ecfg.R, ecfg.r, m.sampling_steps, m.cfg.dz, cfg.data.P
+    R, r, K, P = ecfg.R, ecfg.r, m.sampling_steps, cfg.data.P
     shortcut = bool(m.cfg.shortcut)
     tag = "shortcut" if shortcut else "flow"
     model_name = "shortcut" if shortcut else "rectified-flow"
@@ -127,24 +127,11 @@ def main(cfg):
         return
 
     # one causal transformer pass per episode gives h at every step; denoise 1 noise/slice, keep the path
-    paths6d = []
-    with torch.no_grad():
-        for ei, ts in by_ep.items():
-            ep = ds[ei]
-            obs = ep["obs_seq"].to(device)[None].float()
-            act = ep["act_seq"].to(device)[None].float()
-            z = m.encode_state(obs)
-            h_all = m.transformer(m.to_token(z, act))
-            ts = np.array(sorted(ts))
-            h, zt = h_all[0, ts], z[0, ts]
-            eps = (torch.rand(len(ts), dz, generator=g, device=device) * 2 - 1) * CUBE   # uniform hypercube
-            _, path = m.flow.sample(h, steps=K, deterministic=False, eps=eps, record_path=True)
-            dec = np.stack([norm.denorm_obs(m.to_obs(_ln(zt + x))).cpu().numpy()
-                            for x in path])                                                       # (K+1, nt, 6)
-            paths6d.extend(np.transpose(dec, (1, 0, 2)))                                          # list of (K+1, 6)
-    paths6d = np.stack(paths6d)                                          # (N, K+1, 6) — SAME points for img + video
+    # (shared with eval_diffusion_field via evaluation.manifold so the cloud is defined in one place)
+    from ..evaluation.manifold import manifold_clouds
+    paths6d, speed, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
+                                        seed=0, device=device)         # (N, K+1, 6) — SAME points for img + video
     N = paths6d.shape[0]
-    speed = np.linalg.norm(paths6d[:, -1, 3:], axis=1)                  # color = |predicted next velocity|
     sub = f"{model_name} (K={K}) — {N:,} denoised next-states, one per context (of {n_avail:,} {SPLIT} contexts)"
     print(f"[manifold:{tag}] {N} points; {sub}")
 
