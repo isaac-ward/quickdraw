@@ -139,12 +139,13 @@ def _quiver_frames_data(committed, swarm=None, n_frames=120):
 
 @torch.no_grad()
 def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
-    """The headline diffusion artifact (design/models/diffusion.md): at ~4 FIXED prediction steps of
-    episode 0, render the latent flow field through the decoder onto the torus as (a) streamline PNGs —
-    a swarm of decoded ODE paths flowing off-surface onto the manifold, the bright committed (eps=0,
-    metric) path, and the true-next marker — and (b) a tau-sweep quiver animation with the committed
-    particle riding its decoded path. Logs diffusion/{streamline,quiver}/example_{0..3} +
-    diffusion/{flow_endpoint_error, sample_spread}. Self-SKIPS (returns {}) for non-diffusion models."""
+    """The headline diffusion artifact (design/models/diffusion.md): at 3 FIXED prediction steps of
+    episode 0, render the latent flow field through the decoder onto the torus as a tau-sweep quiver
+    ATLAS animation — a grey swarm of decoded ODE paths flowing off-surface onto the manifold (each
+    leaving a tail), the red committed (eps=0, metric) particle riding its decoded path, the moving-agent
+    tail, and a black truth ring. The committed path and the metric use the model's NATIVE sampling_steps
+    K, so the numbers match the rollout. Logs diffusion/quiver/example_{0..2} + diffusion/{pointwise_error,
+    sample_spread}. Self-SKIPS (returns {}) for non-diffusion models."""
     from ..models.diffusion import Diffusion, _ln
     m = getattr(model, "_orig_mod", model)            # unwrap torch.compile
     if not isinstance(m, Diffusion):
@@ -163,7 +164,7 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     n_steps = 3
     lo, hi = P, Tlen - 2
     steps_idx = [int(round(lo + (hi - lo) * k / (n_steps - 1))) for k in range(n_steps)]  # fixed, comparable across epochs
-    K, n_swarm = 16, 16                                # viz path resolution (decoupled from sampling_steps) + swarm size
+    K, n_swarm = m.sampling_steps, 16                  # SAME K as the model's real inference (fair metric) + swarm size
     g = torch.Generator(device=device).manual_seed(1234)   # reproducible swarm -> golden-able
 
     def decode_xyz(z_t, x):                            # latent residual x -> physical xyz (endpoint == committed metric pred)
@@ -195,13 +196,13 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
         frames = viz.diffusion_quiver_frames(R, r, coloring, cur_xyz, act_amb, per_frame, agent_tail=agent_tail,
                                              true_next=nxt_xyz, title=f"diffusion quiver step {t}")
         writer.video(f"diffusion/quiver/example_{si}", frames, 60, step)  # 120 frames @ 60 fps = 2 s
-    writer.scalars({"diffusion/flow_endpoint_error": float(np.mean(endpoint_errs)),
+    writer.scalars({"diffusion/pointwise_error": float(np.mean(endpoint_errs)),
                     "diffusion/sample_spread": float(np.mean(spreads))}, step)
     if was:
         m.train()
     _plog(writer, f"[diffusion_field @ep{step}] done in {time.perf_counter() - t0:.1f}s "
                   f"endpoint_err={np.mean(endpoint_errs):.3f} spread={np.mean(spreads):.4f}")
-    return {"diffusion_flow_endpoint_error": float(np.mean(endpoint_errs))}
+    return {"diffusion_pointwise_error": float(np.mean(endpoint_errs))}
 
 
 REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,

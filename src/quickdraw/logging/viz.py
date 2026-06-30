@@ -259,16 +259,16 @@ class TorusRenderer:
         pv, R, r = self.pv, self.R, self.r
         pl = pv.Plotter(off_screen=True, window_size=(int(size), int(size)))
         pl.set_background("white")
-        # order-independent transparency: without it VTK draws translucent actors in ADD order, so the
-        # fan/trajectories paint on top of the translucent torus even when they're behind it. Depth
-        # peeling blends everything by true depth (fan behind the torus is correctly occluded/dimmed).
-        # number_of_peels=12 (was 4): the ISO diagonal sightline pierces the front translucent tube wall,
-        # the interior fan/trajectory tubes, AND the back wall — often >4 transparent layers at one pixel.
-        # With only 4 peels the leftover fragments blend in undefined order -> the one-frame saturation
-        # pop in the iso view (the axial views look down a principal axis = few layers, always within budget,
-        # so they never flickered). 12 covers the iso stack; render is a bit slower but stable.
-        pl.enable_depth_peeling(number_of_peels=12, occlusion_ratio=0.0)
-        self._add_torus(pl, torus_opacity)
+        # order-independent transparency for the AXIAL views: without it VTK draws translucent actors in
+        # ADD order, so the fan/trajectories paint on top of the translucent torus even when behind it.
+        # Depth peeling blends by true depth (fan behind the torus correctly occluded/dimmed).
+        pl.enable_depth_peeling(number_of_peels=4, occlusion_ratio=0.0)
+        # The ISO torus is OPAQUE; the axial tori keep `torus_opacity` (translucent, see-through). The iso
+        # saturation FLASH was VTK depth-peeling intermittently mis-resolving the translucent iso torus over
+        # the moving fan (robust to peel count + plotter reuse — neither fixed it). An opaque iso has no
+        # translucency to mis-blend, so the flash is gone; the see-through fan stays visible in the axials
+        # (which never flickered — principal-axis sightline = few layers).
+        self._add_torus(pl, 1.0 if view == "iso" else torus_opacity)
         L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
         vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)
         # orthographic everywhere + an explicit parallel_scale => framing is fixed, never auto-fit/rescaled
