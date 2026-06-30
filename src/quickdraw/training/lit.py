@@ -70,8 +70,8 @@ class LitWorldModel(L.LightningModule):
         src = preds if in_loss else preds.detach()  # detached -> trains the decoder only (readout probe)
         obs_mse = torch.nn.functional.mse_loss(self.model.to_obs(src), future_obs)
         loss_total = sum(weights[k] * raw[k] for k in raw)  # actual minimized objective (scaled)
-        if in_loss:                                 # DSAR / reconstruction: loss_pred_obs is a real loss
-            raw["pred_obs"] = obs_mse
+        if in_loss:                                 # DSAR / reconstruction: the proprio-head recon is a real loss
+            raw["proprio"] = obs_mse                 # head-named (loss/proprio); image heads add loss/<head> later
             loss_total = loss_total + lam * obs_mse
             objective = loss_total
         else:                                       # JEPA variants: obs term is a decoder-only readout probe
@@ -102,20 +102,23 @@ class LitWorldModel(L.LightningModule):
             self.log("schedules/p_tf", p_tf)
             if self.has_physical:
                 self.log("schedules/physical_loss_ramp", self._physical_ramp())
-        with torch.no_grad():  # metrics in real (denormalized) obs space; LSAR decodes via to_obs
-            p_hat = self.norm.denorm_obs(self.model.to_obs(preds))
-            p_true = self.norm.denorm_obs(future_obs)
-            # a freshly-initialized decoder (esp. the no-LN reg variants at ep0) can emit non-finite obs ->
-            # the metric reduces to NaN. Clamp non-finite preds to a far-but-finite ±10 so a broken model
-            # reads as a LARGE-but-plottable error, not NaN (metric path only — never the loss).
-            p_hat = torch.nan_to_num(p_hat, nan=10.0, posinf=10.0, neginf=-10.0)
-            self.log(f"{tag}/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
-            self.log(f"{tag}/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
-            self.log(f"{tag}/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
-            # latent collapse diagnostics (LSAR only), once per validation epoch
-            if tag == "val" and hasattr(self.model, "collapse_diagnostics"):
-                for k, v in self.model.collapse_diagnostics(obs_seq).items():
-                    self.log(f"collapse/{k}", v)
+        # metrics in real (denormalized) obs space, grouped under metric/<head>/* — VAL ONLY (train rollout
+        # accuracy is redundant with the train loss, so we don't pay to compute it).
+        if tag == "val":
+            with torch.no_grad():
+                p_hat = self.norm.denorm_obs(self.model.to_obs(preds))
+                p_true = self.norm.denorm_obs(future_obs)
+                # a freshly-initialized decoder (esp. the no-LN reg variants at ep0) can emit non-finite obs ->
+                # the metric reduces to NaN. Clamp non-finite preds to a far-but-finite ±10 so a broken model
+                # reads as a LARGE-but-plottable error, not NaN (metric path only — never the loss).
+                p_hat = torch.nan_to_num(p_hat, nan=10.0, posinf=10.0, neginf=-10.0)
+                self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
+                self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
+                self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
+                # latent collapse diagnostics (LSAR only), once per validation epoch
+                if hasattr(self.model, "collapse_diagnostics"):
+                    for k, v in self.model.collapse_diagnostics(obs_seq).items():
+                        self.log(f"collapse/{k}", v)
         return objective
 
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):

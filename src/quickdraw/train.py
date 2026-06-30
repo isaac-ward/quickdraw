@@ -133,7 +133,8 @@ def main(cfg):
     # train/val run normally; subscribe to the eval routines enabled in conf/eval/default.yaml
     # (ood_horizon | ood_visual | ood_geometric | ood_dynamics | control), run every every_epochs
     callbacks = [
-        ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"), monitor="val/manifold_distance_error",
+        ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
+                        monitor="val/metric/proprio/manifold_distance_error",
                         mode="min", save_top_k=cfg.trainer.save_top_k, save_last=True),
         LoggingCallback(writer, cfg, norm, e, cfg.eval.during_train.every_epochs,
                         [name for name, on in cfg.eval.during_train.evals.items() if on],
