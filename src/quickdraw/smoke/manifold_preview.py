@@ -129,8 +129,8 @@ def main(cfg):
     # one causal transformer pass per episode gives h at every step; denoise 1 noise/slice, keep the path
     # (shared with eval_diffusion_field via evaluation.manifold so the cloud is defined in one place)
     from ..evaluation.manifold import manifold_clouds
-    paths6d, speed, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
-                                        seed=0, device=device)         # (N, K+1, 6) — SAME points for img + video
+    paths6d, speed, _, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
+                                           seed=0, device=device)      # (N, K+1, 6) — SAME points for img + video
     N = paths6d.shape[0]
     sub = f"{model_name} (K={K}) — {N:,} denoised next-states, one per context (of {n_avail:,} {SPLIT} contexts)"
     print(f"[manifold:{tag}] {N} points; {sub}")
