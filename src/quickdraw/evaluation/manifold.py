@@ -3,7 +3,7 @@ contexts; the union traces the learned manifold. Two sources, both seeded/determ
   - manifold_predictions: the COMMITTED next-state via the shared forward() path — works for ANY model
     (DSAR/LSAR/diffusion); for diffusion it's the eps=0 readout. Feeds the method-agnostic eval_manifold.
   - manifold_clouds: diffusion-SPECIFIC — one denoised sample per context keeping the whole ODE path, for
-    the noise->manifold animation (eval_diffusion/aggregate_denoising).
+    the noise->manifold animation (eval_diffusion/denoising_aggregate).
 Shared by the standalone preview (smoke/manifold_preview.py) and the in-training evals so the SAMPLING is
 defined in one place; the LOOK lives in logging.viz (fig_points_*/points_collapse_frames)."""
 from __future__ import annotations

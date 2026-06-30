@@ -7,7 +7,7 @@ manifold. The image and the collapse video use the SAME points.
   ... model.diffusion.shortcut=true model.diffusion.sampling_steps=1 ...       # shortcut
 
 Stage 'images' (fast): the 4 eval_manifold UMAP stills (data/latent space x 2D/3D, seeded, uncolored).
-'videos'/'both': the aggregate_denoising mp4. Writes to logs/viz_preview/ (model-agnostic filenames)."""
+'videos'/'both': the denoising_aggregate mp4. Writes to logs/viz_preview/ (model-agnostic filenames)."""
 from __future__ import annotations
 
 import os
@@ -157,7 +157,7 @@ def main(cfg):
                 f.savefig(f"{OUT}/manifold_umap_{space}_to_{nd}d.png", dpi=110); plt.close(f)
         print(f"[manifold] wrote 4 UMAP stills")
 
-    # videos: the eval_diffusion/aggregate_denoising clip, from the stochastic denoising ODE paths.
+    # videos: the eval_diffusion/denoising_aggregate clip, from the stochastic denoising ODE paths.
     if stage in ("videos", "both"):
         L, Z = (R + r) * 1.05, r * 1.6
         plims = ((-L, L), (-L, L), (-Z, Z))
@@ -165,9 +165,9 @@ def main(cfg):
                                            seed=0, device=device)
         sub = f"{model_name} (K={K}) — {paths6d.shape[0]:,} denoised next-states (of {n_avail:,} {SPLIT} contexts)"
         fa = viz.points_collapse_frames(paths6d[..., :3], lims=plims, n_frames=POS_FRAMES, point_size=2.0,
-                                        title=f"aggregate denoising — noise → manifold\n{sub}")   # flat purple
-        imageio.mimwrite(f"{OUT}/manifold_aggregate_denoising.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
-        print(f"[manifold] wrote aggregate_denoising mp4")
+                                        title=f"denoising aggregate — noise → manifold\n{sub}")   # flat purple
+        imageio.mimwrite(f"{OUT}/manifold_denoising_aggregate.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
+        print(f"[manifold] wrote denoising_aggregate mp4")
 
 
 if __name__ == "__main__":

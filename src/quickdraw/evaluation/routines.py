@@ -196,7 +196,7 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     (a) `denoising_multistep` (8 s): a FIXED agent (history + future lines static) while 32 SEQUENTIAL swarms
     each denoise — a grey swarm of decoded ODE paths flowing off-surface onto the torus, each leaving a tail
     that traces the field — then collapse their tails onto the next convergence point along the fixed future
-    line, one after another. (b) `aggregate_denoising` (4 s): the denoising paths pooled over many val
+    line, one after another. (b) `denoising_aggregate` (4 s): the denoising paths pooled over many val
     contexts collapsing from noise onto the recovered manifold. Diffusion-specific scalars:
     eval_diffusion/std_of_samples (std of the swarm's FINAL positions = predicted uncertainty) and
     eval_diffusion/time/{sample_s, sample_ms_per_euler_step}. (Pointwise accuracy lives in val/train
@@ -275,7 +275,7 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
         "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,
         "swarm_target_per_step_xyz": [s["true_next"] for s in ms_steps]}, step)
 
-    # (b) aggregate denoising (diffusion-SPECIFIC): pool the denoising ODE paths over many VAL contexts and
+    # (b) denoising aggregate (diffusion-SPECIFIC): pool the denoising ODE paths over many VAL contexts and
     # animate the swarm collapsing from noise onto the recovered manifold. The static, method-agnostic
     # manifold UMAPs live in the separate eval_manifold routine.
     from .manifold import manifold_clouds
@@ -287,8 +287,8 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     Lm, Zm = (R + r) * 1.05, r * 1.6
     plims = ((-Lm, Lm), (-Lm, Lm), (-Zm, Zm))
     mframes = viz.points_collapse_frames(paths6d[..., :3], lims=plims, n_frames=MAN_VID,    # flat purple
-                                         point_size=2.0, title=f"aggregate denoising — noise → manifold\n{msub}")
-    writer.video("eval_diffusion/aggregate_denoising", mframes, 60, step)  # 240 frames @ 60 fps = 4 s
+                                         point_size=2.0, title=f"denoising aggregate — noise → manifold\n{msub}")
+    writer.video("eval_diffusion/denoising_aggregate", mframes, 60, step)  # 240 frames @ 60 fps = 4 s
 
     writer.scalars({"eval_diffusion/std_of_samples": float(np.mean(spreads)),   # uncertainty (no val equivalent)
                     "eval_diffusion/time/sample_s": float(np.mean(sample_times)),
