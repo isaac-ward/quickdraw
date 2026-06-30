@@ -100,6 +100,54 @@ def load_fpv_frames(root: str, split: str, size: int = 128, max_frames: int | No
     return frames
 
 
+def load_split_episodes_mm(root: str, split: str, img_size: int = 128):
+    """Like load_split_episodes but ALSO returns per-episode FPV frames (area-downsampled to img_size,
+    uint8), aligned 1:1 with obs steps. Returns list of (obs (T,6), act (T,2), img (T,size,size,3) uint8).
+    The chunked FPV video is read in dataset row order (== obs row order), then split by episode_index."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    ds = LeRobotDataset(f"torus/{split}", root=os.path.join(root, split))
+    hf = ds.hf_dataset.with_format("numpy")
+    ep_idx = np.asarray(hf["episode_index"])
+    obs_all = np.stack(hf["observation_vector"]).astype(np.float32)
+    act_all = np.stack(hf["action"]).astype(np.float32)
+    frames_all = load_fpv_frames(root, split, size=img_size)               # (N, size, size, 3), row order
+    assert len(frames_all) == len(obs_all), f"FPV/row count mismatch: {len(frames_all)} vs {len(obs_all)}"
+    return [(obs_all[ep_idx == e], act_all[ep_idx == e], frames_all[ep_idx == e]) for e in np.unique(ep_idx)]
+
+
+class MMWindowLoader:
+    """DataLoader-shaped iterable of multimodal windows. obs/act windows are GPU-resident (tiny); image
+    windows are gathered per-batch from a CPU frame store (they cannot be GPU-resident — batch×L×H×W×3 is
+    huge) and moved to `device` as [0,1] floats. Yields {obs_seq (B,L,6), act_seq (B,L,2), image (B,L,H,W,3)}.
+    Window order matches `stack_windows` (episode order, sliding start), so obs/act/image stay aligned."""
+
+    def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device):
+        L = P + F
+        self.index = [(ei, s) for ei, (o, _, _) in enumerate(episodes) for s in range(0, len(o) - L + 1)]
+        obs_w, act_w = stack_windows([(o, a) for o, a, _ in episodes], P, F, normalizer)
+        self.obs, self.act = obs_w.to(device), act_w.to(device)
+        self.frames = [torch.from_numpy(img) for _, _, img in episodes]    # per-ep (T,H,W,3) uint8, CPU
+        self.win_ep = [ei for ei, _ in self.index]
+        self.win_s = [s for _, s in self.index]
+        self.L, self.batch, self.shuffle, self.device = L, batch, shuffle, device
+        self.N = len(self.index)
+
+    def __len__(self):
+        return (self.N + self.batch - 1) // self.batch
+
+    def __iter__(self):
+        order = torch.randperm(self.N) if self.shuffle else torch.arange(self.N)
+        for i in range(0, self.N, self.batch):
+            j = order[i: i + self.batch]
+            jd = j.to(self.device)
+            imgs = torch.stack([self.frames[self.win_ep[k]][self.win_s[k]: self.win_s[k] + self.L]
+                                for k in j.tolist()])                       # (b,L,H,W,3) uint8 CPU
+            yield {"obs_seq": self.obs.index_select(0, jd),
+                   "act_seq": self.act.index_select(0, jd),
+                   "image": imgs.to(self.device).float().div_(255.0)}
+
+
 class WindowDataset(Dataset):
     """Length-(P+F) windows. Returns normalized obs_seq (L,6) and act_seq (L,2)."""
 
