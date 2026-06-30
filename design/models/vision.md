@@ -144,43 +144,59 @@ FPV + chase + top-down) without surgery. The discipline:
 
 ## Decisions locked
 
-- **Naming.** Streams are `[proprio, image, action]`. `proprio` = the kinematic 6-vec `[p; ṗ]` (stored
-  lerobot key stays `observation_vector`, aliased to `proprio` at load — no data regen). Image =
-  `observation.images.fpv`.
-- **FPV resolution.** Source frames are **256×256×3**; we **downsample to 128×128 once at load** (cached,
-  not per-epoch).
-- **Image AE.** 100% ViT, trained **end-to-end** with the world model (no pretraining, no checkpoints),
-  **plain MSE** recon. Architecture: `Linear-patchify → ViT encoder → num_tokens learned queries
-  cross-attend (perceiver bottleneck) → ViT decoder → Linear-unpatchify`. **`num_tokens = 8`** to start.
-- **Latent = a LIST of tokens per step** (never a grid): `[proprio_token] ++ [num_tokens image tokens]`,
-  each with a learned type/feed + positional embedding. Carried state is `(1+num_tokens, d)`.
+- **Config-driven modalities (trunks + heads).** Each modality is a `{name, kind (vector|image), encoder
+  (trunk), decoder (head), loss_weight, enabled}` entry in a **config list**. The model builds
+  encoders/decoders, the fuser's streams, the per-head losses, the metrics, and the viz **by iterating that
+  list** — so the modality NAME flows straight through to the logs (`loss/<name>`, `metric/<name>/*`), and
+  enabling/disabling a trunk+head for an ablation is a config edit that "just works". Today: `proprio` +
+  `image`. Later: `proprio` + `image1` + `image2` + … with zero code change.
+- **Naming.** `proprio` = kinematic 6-vec `[p; ṗ]` (stored lerobot key stays `observation_vector`, aliased
+  at load — no data regen). Images = `observation.images.<name>`.
+- **FPV resolution.** Source frames **256×256×3**; **downsample to 128×128 once at load** (cached).
+- **Image AE.** 100% ViT, **end-to-end** (no pretraining, no checkpoints), **plain MSE** recon.
+  `Linear-patchify → ViT encoder → num_tokens learned queries cross-attend (perceiver bottleneck) → ViT
+  decoder → Linear-unpatchify`. **`num_tokens = 8`** to start.
+- **Action is its OWN token (not folded).** The per-step token bag fed to the backbone is
+  `[proprio, action, image_1..image_num_tokens]`. The action is encoded to one token (action MLP) and
+  marked with a type embedding; conditioning then happens through **attention** (every state token attends
+  the action token in the spatial pass) rather than pre-fusing it into another token. The action token is
+  **input-only** — injected fresh each step from the given action sequence, never decoded or predicted. So
+  the **carried / predicted** state is `[proprio] ++ [image_1..num_tokens]` (`1+num_tokens` tokens); the
+  action token is added on input each step.
+- **Latent = a LIST of tokens per step** (never a grid), each with a learned type + positional embedding.
 - **Backbone = factorized space-time attention** (ViViT/TimeSformer/Genie-style), built **now** (not
   deferred) because num_tokens grows soon: per block, **spatial** attention within a step (bidirectional,
   no mask) then **temporal** attention across steps (causal). Cost `O(W·N² + N·W²)` vs joint `O(W²·N²)`.
-  Each sub-attention is one of our existing `Transformer` blocks + FlexAttention (spatial: no mask;
-  temporal: plain 1-D causal). This **supersedes** the earlier "backbone untouched" sketch.
+  Each sub-attention reuses the (generalized, mask-agnostic) `Transformer` block + FlexAttention — spatial:
+  no mask; temporal: plain 1-D causal. This **supersedes** the earlier "backbone untouched" sketch.
 - **Diffusion denoiser = DiT** over the token list (adaLN on flow-time τ and shortcut step dd, conditioned
   on backbone context h). Rectified-flow / shortcut math unchanged.
 
 ## Losses (training objective)
 
-Total = weighted sum of a **world-model** term (model-specific) + **per-head reconstruction** terms:
+No `world/`/`recon/` prefixes. Two kinds of term: a **prediction** term (model-specific, named by what it
+is) and **per-head reconstruction** terms (named by the head — so they follow the config modality names):
 
-| term                    | what                                                   | models |
-|-------------------------|--------------------------------------------------------|--------|
-| `world/flow`            | rectified flow-matching velocity loss                  | diffusion |
-| `world/flow_consistency`| shortcut self-consistency                              | diffusion (shortcut) |
-| `world/pred_latent`     | next-latent prediction loss                            | LSAR |
-| `recon/proprio`         | **MSE** on decoded 6-vec (kinematic grounding)         | all latent models |
-| `recon/image`           | **MSE** on decoded 128² frame (image grounding)        | all (vision) |
+| term                | what                                            | tag             | models |
+|---------------------|-------------------------------------------------|-----------------|--------|
+| flow                | rectified flow-matching velocity loss           | `loss/flow`             | diffusion |
+| flow_consistency    | shortcut self-consistency (enables K=1)         | `loss/flow_consistency` | diffusion (shortcut) |
+| pred_latent         | next-latent prediction loss                     | `loss/pred_latent`      | LSAR |
+| `<head>` recon      | **MSE** on that head's decode (grounding)       | `loss/<head>` e.g. `loss/proprio`, `loss/image` | all latent models |
 
-- Both recon terms are computed on the model's **predicted next-states** (the rollout), exactly as the
-  kinematic grounding works today — this is the anti-collapse signal, now from *both* modalities.
-- **Balancing matters:** `recon/image` (mean over ~49k pixels in [0,1]) and `recon/proprio` (mean over 6
-  normalized dims) and `world/*` live on different scales → each gets a tunable weight
-  (`lambda_recon_image`, `lambda_recon_proprio`, `lambda_flow`, …) via the existing variations weighting.
-- **No LPIPS / perceptual loss** — it requires pretrained VGG/AlexNet weights, which violates the
-  no-pretrained constraint. Plain MSE only.
+- Reconstruction terms are **head-named** (`loss/proprio`, `loss/image`, later `loss/image1` …), computed
+  on the model's **predicted next-states** — the anti-collapse grounding, now from every enabled modality.
+- **Per-head weights live in config** (`weight:` on each modality entry) — needed because `loss/image`
+  (mean over ~49k pixels in [0,1]) and `loss/proprio` (6 normalized dims) and the prediction term live on
+  very different scales. (Phase 4 tunes these.)
+- **No LPIPS / perceptual loss** — needs pretrained VGG/AlexNet weights → excluded by the no-pretrained
+  rule. Plain MSE only.
+
+> *Glossary.* **flow** = the diffusion model's core objective: regress the flow field's velocity toward the
+> true noise→data transport (learn the denoising vector field). **flow_consistency** = the shortcut-model
+> extra term enforcing "one 2d-step == two chained d-steps," which is what lets it sample in K=1.
+> **pred_latent** = LSAR's deterministic analogue: MSE predicting next latent `z_{t+1}`. These are the
+> "predict the dynamics" terms; the head terms are the "reconstruct what you saw" grounding.
 
 ## Image metrics (eval — not losses)
 
@@ -194,64 +210,82 @@ Closed-form, no pretrained nets (so LPIPS is excluded):
 ```
 train/                                  (every epoch — scalars)
   loss                                  total
-  loss/world/{flow, flow_consistency | pred_latent}
-  loss/recon/{proprio, image}
+  loss/{flow, flow_consistency | pred_latent}     prediction term(s)
+  loss/<head>                           per-head recon, e.g. loss/proprio, loss/image  (config-named)
 val/                                    (every epoch — scalars)
   loss + same loss/* subtree
   metric/proprio/pointwise_error        (shared rollout metric, kinematic)
-  metric/image/{psnr, ssim, recon_mse}
+  metric/<image-head>/{psnr, ssim, recon_mse}     e.g. metric/image/psnr
 eval_manifold/                          (benchmark epochs — any method)
-  umap_{data,latent}_space_to_{2,3}d    (latent = concat of all tokens, flattened)
+  umap_{data,latent}_space_to_{2,3}d    (latent = concat of all carried tokens, flattened)
 eval_diffusion/                         (benchmark epochs — diffusion only)
   denoising_multistep, denoising_aggregate, std_of_samples, time/*
-eval_rollout/                           (benchmark epochs — NEW, vision)
-  fpv_pred_vs_true                      video: PREDICTED frames (top) | GROUND-TRUTH frames (bottom)
-ood_horizon/, control/                  (unchanged)
+eval_ood_horizon/                       (benchmark epochs)
+  …existing proprio rollout plots/curves…
+  <image-head>/filmstrip                STILL: 8 steps across the horizon, pred (top) | GT (bottom)
+  <image-head>/rollout                  VIDEO: pred (top, black until context plays out) | GT (bottom), synced
+control/                                (unchanged — see note)
 ```
 
-(Adopting `loss/world/*` + `loss/recon/*` + `metric/*` is a small logging refactor in the LightningModule;
-backport to DSAR/LSAR for consistency is optional.)
+- The predicted-vs-true image artifacts go under **`eval_ood_horizon`** (the existing open-loop rollout
+  eval), **not** a new `eval_rollout`. Two artifacts per image head, via the `viz.fig_image_filmstrip`
+  (still) and `viz.image_rollout_video` (synced video) utilities.
+- **`eval_control` is unchanged.** MPPI plans and scores on the **proprio decode** (position) exactly as
+  today, and the control video stays the torus viz from that kinematic decode. Vision rides along (the
+  latent now also carries image), but control needs no FPV to function; an FPV-during-control panel is a
+  later optional add, not required.
+- This naming (`loss/*`, `metric/*`, head-named) is **adopted for ALL models going forward** (DSAR/LSAR/
+  diffusion), so dashboards are consistent — a small logging refactor in the LightningModule.
 
 ## Implementation plan (phases — each ends at a verify gate)
 
-**Phase 0 — data plumbing & naming.**
+**Phase 0 — data plumbing, naming & the modality registry.**
 - 0.1 Alias `observation_vector → proprio`; loader returns aligned `(proprio[6], image[128,128,3], action[2])`.
 - 0.2 Downsample 256→128 **once at load**, cached.
-- 0.3 *Verify:* a batch yields aligned tensors; downsample is cached (not per-epoch).
+- 0.3 **Modality registry**: config lists `{name, kind, encoder, decoder, weight, enabled}`; the model
+  builds trunks/heads/fuser-streams/losses/metrics by iterating it. Enable/disable = config edit.
+- 0.4 *Verify:* a batch yields aligned tensors (cached downsample); toggling a modality off in config drops
+  its trunk/head/loss/metric with no code change.
 
 **Phase 1 — ViT autoencoder (image only, standalone).**
-- 1.1 Linear patchify (patch 16 → 64 patches) + posemb → ViT encoder (our block + FlexAttention, no mask).
+- 1.1 Linear patchify (patch 16 → 64 patches) + posemb → ViT encoder (generalized block + FlexAttention, no mask).
 - 1.2 Perceiver bottleneck: 8 learned queries cross-attend patches → 8 latent tokens.
 - 1.3 ViT decoder: 8 tokens → per-patch query tokens → transformer → Linear-unpatchify → 128².
 - 1.4 *Verify:* `smoke/vision_ae.py` + short fit; held-out recon PSNR passes threshold.
 
 **Phase 2 — factorized space-time backbone + token-bag carried state (on LSAR first).**
-- 2.1 Fuser gains image stream; per-step latent = `[proprio] ++ [8 image]`; decide action conditioning.
-- 2.2 Carried state `(9, d)` token bag; per-token `_ln`; `encode_state`/`to_obs`/`readout` handle the bag.
-- 2.3 **Factorized space-time block**: spatial attn (within step, unmasked) + temporal attn (across steps,
+- 2.1 Fuser gains the image + **action** streams; per-step bag = `[proprio, action, image_1..8]` (10 tokens),
+  action a **separate input-only token** (type-embedded), conditioning via attention — not folded in.
+- 2.2 Carried/predicted state = `[proprio] ++ [8 image]` (9 tokens); per-token `_ln`; action injected each
+  step; `encode_state`/`to_obs`/`readout` handle the bag.
+- 2.3 Generalize the `Transformer` block to be **mask-agnostic** (takes a `mask_mod`), then build the
+  **factorized space-time block**: spatial attn (within step, unmasked) + temporal attn (across steps,
   causal) + MLP; space/time positional embeddings; FlexAttention for both.
-- 2.4 Two decode heads (proprio MLP, image ViT decoder); `recon/{proprio,image}` losses.
+- 2.4 Decode heads from the registry (proprio MLP, image ViT decoder); `loss/<head>` recon terms.
 - 2.5 *Verify:* smoke + short LSAR run; both recon losses fall; AR rollout runs; eff_rank > 1 (no collapse).
 
 **Phase 3 — diffusion DiT denoiser.**
-- 3.1 Swap MLP flow field → DiT over the 9 tokens (adaLN on τ + shortcut dd; condition on h).
+- 3.1 Swap MLP flow field → DiT over the 9 carried tokens (adaLN on τ + shortcut dd; condition on h).
 - 3.2 Rectified-flow + shortcut unchanged.
 - 3.3 *Verify:* adapt `smoke/diffusion.py` A–H; ε=0 readout byte-stable; decode → image + vec.
 
-**Phase 4 — loss weighting & balancing.**
-- 4.1 Wire `lambda_recon_{image,proprio}` weights; tune so no term dominates.
-- 4.2 *Verify:* a run where both modalities improve together (neither recon term flatlines).
+**Phase 4 — per-head loss weights & balancing.**
+- 4.1 Wire the per-modality `weight:` from the registry into the objective; tune so no term dominates.
+- 4.2 *Verify:* a run where every modality improves together (no recon term flatlines).
 
-**Phase 5 — metrics + wandb restructure.**
-- 5.1 Add `metric/image/{psnr,ssim,recon_mse}` (closed-form).
-- 5.2 Adopt the `loss/world`, `loss/recon`, `metric/*` namespaces above.
-- 5.3 *Verify:* train/val dashboards show the grouped tree; image metrics populate.
+**Phase 5 — metrics + wandb restructure (all models).**
+- 5.1 Add `metric/<image-head>/{psnr,ssim,recon_mse}` (closed-form; no LPIPS).
+- 5.2 Adopt the head-named `loss/*` + `metric/*` namespaces **for DSAR/LSAR/diffusion alike** (consistent).
+- 5.3 *Verify:* train/val dashboards show the grouped tree; image metrics populate; non-vision runs still log.
 
-**Phase 6 — viz.**
-- 6.1 `eval_rollout/fpv_pred_vs_true`: AR rollout video, **predicted on top, ground truth on bottom**.
-- 6.2 `eval_manifold` latent UMAP on concat-of-all-tokens (data-space UMAP stays proprio 6-vec).
-- 6.3 `denoising_*` can decode each ODE step to an image (watch the FPV denoise from noise).
-- 6.4 *Verify:* eval logs the stacked rollout video + image panels cleanly.
+**Phase 6 — viz (under eval_ood_horizon).**
+- 6.1 `eval_ood_horizon/<image-head>/filmstrip` — `viz.fig_image_filmstrip`: 8 steps across the horizon,
+  pred (top) | GT (bottom), minimal text.
+- 6.2 `eval_ood_horizon/<image-head>/rollout` — `viz.image_rollout_video`: pred (top, black until context
+  plays out) | GT (bottom), synced, no text.
+- 6.3 `eval_manifold` latent UMAP on concat-of-all-carried-tokens (data-space UMAP stays proprio 6-vec).
+- 6.4 `denoising_*` can decode each ODE step to an image (watch the FPV denoise from noise).
+- 6.5 *Verify:* eval logs the filmstrip + synced rollout video + image panels cleanly.
 
 **Phase 7 — variations + multi-feed seam.**
 - 7.1 Per-stream noise σ (proprio vs image).

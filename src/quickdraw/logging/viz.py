@@ -775,3 +775,44 @@ def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, 
         frames.append(_fig_rgb(fig))
         plt.close(fig)
     return np.stack(frames)
+
+
+# ------------------------- vision: predicted-vs-true image rollout (filmstrip still + synced video) -------------------------
+def _img_u8(x):
+    """(H,W,3) or (...,H,W,3) -> uint8. Passes uint8 through; treats float as [0,1]."""
+    x = np.asarray(x)
+    return x if x.dtype == np.uint8 else (np.clip(x, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+
+def fig_image_filmstrip(pred_future, true_future, n_cols=8, title=""):
+    """A 2-row filmstrip over the prediction horizon: TOP = predicted frames, BOTTOM = ground truth, sampled
+    at n_cols evenly-spaced future steps. pred_future / true_future: (F,H,W,3) uint8 or float[0,1]. Minimal
+    text — only a 'pred'/'true' row label and the horizon offset above each column."""
+    pred_future, true_future = _img_u8(pred_future), _img_u8(true_future)
+    f = min(len(pred_future), len(true_future))
+    idx = np.unique(np.linspace(0, f - 1, min(n_cols, f)).round().astype(int))
+    fig, axes = plt.subplots(2, len(idx), figsize=(1.6 * len(idx), 3.4), squeeze=False)
+    for col, k in enumerate(idx):
+        for row, (frames, lbl) in enumerate(((pred_future, "pred"), (true_future, "true"))):
+            ax = axes[row, col]
+            ax.imshow(frames[k]); ax.set_xticks([]); ax.set_yticks([])
+            if col == 0:
+                ax.set_ylabel(lbl, fontsize=9)
+            if row == 0:
+                ax.set_title(f"+{int(k) + 1}", fontsize=7)        # horizon offset (steps ahead)
+    fig.suptitle(title, fontsize=10)
+    fig.subplots_adjust(left=0.05, right=0.99, top=0.88, bottom=0.01, wspace=0.04, hspace=0.04)
+    return fig
+
+
+def image_rollout_video(true_full, pred_future, context_len, sep_px=2):
+    """Stacked predicted-over-true rollout video, NO text. BOTTOM plays the full GT sequence (context THEN
+    future); TOP is black through the context, then the predicted future — so once context has played out
+    the two play in sync. true_full: (T,H,W,3); pred_future: (F,H,W,3), F = T - context_len. Returns
+    (T, 2H+sep_px, W, 3) uint8, ready for writer.video."""
+    true_full, pred_future = _img_u8(true_full), _img_u8(pred_future)
+    T, H, W = true_full.shape[:3]
+    black = np.zeros((context_len, H, W, 3), np.uint8)
+    top = np.concatenate([black, pred_future], axis=0)[:T]            # black during context, then predictions
+    sep = np.zeros((T, sep_px, W, 3), np.uint8)                       # thin divider (no text)
+    return np.concatenate([top, sep, true_full], axis=1)             # vstack: pred on top, GT on bottom
