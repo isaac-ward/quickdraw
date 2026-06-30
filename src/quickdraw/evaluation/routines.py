@@ -247,10 +247,10 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
 
     # (a) denoising_multistep: agent + history + future lines all STATIC; N SEQUENTIAL swarms — each predicts
     # the next consecutive step and denoises, then COLLAPSES its tails onto the convergence point before the
-    # next swarm. The target advances along the fixed future line (which spans the N steps). 32 x 15 = 480
-    # frames @ 60 fps = 8 s. Also yields the diffusion scalars (std_of_samples + sample timing) over its steps.
-    ms_t0, n_ms = P, 32
-    n_ms = min(n_ms, Tlen - 2 - ms_t0)                 # stay in-episode
+    # next swarm. The target advances along the fixed future line (which spans the N steps). 128 x 15 = 1920
+    # frames @ 60 fps = 32 s. Also yields the diffusion scalars (std_of_samples + sample timing) over its steps.
+    ms_t0 = max(P, 60)                                 # start late enough that the agent has a full ~60-step history tail
+    n_ms = min(128, Tlen - 2 - ms_t0)                  # 4x longer than before; stay in-episode
     ms_cur = norm.denorm_obs(obs[:, ms_t0])[0, :3].cpu().numpy()
     ms_tail = norm.denorm_obs(obs[0, max(0, ms_t0 - 60):ms_t0 + 1])[:, :3].cpu().numpy()
     ms_future = norm.denorm_obs(obs[0, ms_t0:ms_t0 + n_ms + 1])[:, :3].cpu().numpy()   # current -> ms_t0+n_ms (fixed)
