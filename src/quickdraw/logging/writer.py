@@ -23,6 +23,7 @@ class _Backend:
     def scalar(self, tag: str, value: float, step: int): ...
     def figure(self, tag: str, fig, step: int): ...
     def video(self, tag: str, frames, fps: int, step: int): ...  # frames: (T,H,W,3) uint8
+    def scene(self, tag: str, scene: dict, step: int): ...  # 3D scene geometry -> JSON (Blender, local only)
     def config(self, cfg: dict): ...
     def finalize(self): ...
 
@@ -51,6 +52,25 @@ class LocalBackend(_Backend):
 
     def video(self, tag, frames, fps, step):
         viz.save_mp4(self._path(tag, step, "mp4"), frames, fps)
+
+    def scene(self, tag, scene, step):
+        # Plain-language 3D scene geometry next to the media (e.g. epoch_0030/diffusion/quiver/example_0.json)
+        # so it can be reconstructed in Blender later. numpy arrays/scalars -> nested lists/floats.
+        import numpy as np
+
+        def cvt(o):
+            if isinstance(o, np.ndarray):
+                return o.tolist()
+            if isinstance(o, (np.floating, np.integer)):
+                return o.item()
+            if isinstance(o, dict):
+                return {k: cvt(v) for k, v in o.items()}
+            if isinstance(o, (list, tuple)):
+                return [cvt(v) for v in o]
+            return o
+
+        with open(self._path(tag, step, "json"), "w") as f:
+            json.dump(cvt(scene), f)
 
     def config(self, cfg):
         with open(os.path.join(self.dir, "config.json"), "w") as f:
@@ -123,6 +143,10 @@ class RunWriter:
     def video(self, tag, frames, fps, step):
         for b in self.backends:
             b.video(tag, frames, fps, step)
+
+    def scene(self, tag, scene: dict, step):
+        for b in self.backends:
+            b.scene(tag, scene, step)
 
     def config(self, cfg: dict):
         for b in self.backends:

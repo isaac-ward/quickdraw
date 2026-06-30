@@ -64,6 +64,17 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
                                          n_frames=len(true_full), title=f"{split} #{i}", smooth_window=win,
                                          log=lambda m, i=i: _plog(writer, f"[{prefix} @ep{step}]     ep{i} {m}"))
         writer.video(f"{prefix}/trajectory_video_{i}", frames, fps, step)
+        writer.scene(f"{prefix}/trajectory_video_{i}", {  # 3D geometry for Blender (plain-language keys)
+            "description": "Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a "
+                           "GREY agent on the model's PREDICTED path. They share the context, then diverge at "
+                           "the fork step. The action arrow is the applied action along the true path.",
+            "coordinate_system": "world xyz, same space as the torus",
+            "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
+            "true_path_xyz": true_full,                 # (T,3)
+            "predicted_path_xyz": pred_full,            # (T,3)
+            "fork_step_index": int(P),                  # prediction diverges from truth at this index
+            "action_arrow_per_step": {"origins_xyz": true_full[:len(avec)], "vectors_xyz": avec},
+        }, step)
 
     # dataset-aggregated error vs rollout step (mean of each metric over all episodes)
     f_avg = viz.fig_error_vs_step(res["agg"])
@@ -196,6 +207,19 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
         frames = viz.diffusion_quiver_frames(R, r, coloring, cur_xyz, act_amb, per_frame, agent_tail=agent_tail,
                                              true_next=nxt_xyz, title=f"diffusion quiver step {t}")
         writer.video(f"diffusion/quiver/example_{si}", frames, 60, step)  # 120 frames @ 60 fps = 2 s
+        writer.scene(f"diffusion/quiver/example_{si}", {  # 3D geometry for Blender (plain-language keys)
+            "description": "Diffusion flow-field quiver at one fixed prediction step. The torus is the manifold "
+                           "the agent moves on. The grey swarm are noise samples the model denoises ONTO the "
+                           "surface; the red committed path is the model's single best-guess prediction "
+                           "(current -> predicted next); the black ring marks the TRUE next position.",
+            "coordinate_system": "world xyz, same space as the torus",
+            "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
+            "moving_agent": {"recent_trajectory_tail_xyz": agent_tail, "current_position_xyz": cur_xyz},
+            "action_arrow": {"origin_xyz": cur_xyz, "vector_xyz": np.asarray(act_amb)},
+            "true_next_position_xyz": nxt_xyz,
+            "committed_prediction_path_xyz": committed,        # (K+1,3): current -> predicted next
+            "swarm_paths_xyz": [np.asarray(sp) for sp in swarm],  # each (K+1,3): decoded noise -> surface
+        }, step)
     writer.scalars({"diffusion/pointwise_error": float(np.mean(endpoint_errs)),
                     "diffusion/sample_spread": float(np.mean(spreads))}, step)
     if was:

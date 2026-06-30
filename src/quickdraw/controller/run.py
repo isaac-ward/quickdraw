@@ -63,15 +63,24 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     t = time.perf_counter()
     nf = len(res["true"]["path"])
     _plog(writer, f"[eval_control @ep{step}] rendering control video ({nf} frames, GPU/EGL)...")
-    frames = viz.control_compare_frames(R, r, "hsv", [_agent(res["true"], "black", R, r),
-                                                      _agent(res["pred"], "dimgray", R, r)],
+    agents = [_agent(res["true"], "black", R, r), _agent(res["pred"], "dimgray", R, r)]
+    frames = viz.control_compare_frames(R, r, "hsv", agents,
                                         n_frames=nf, title="control: true vs pred",
                                         fan_seq=res["fan_seq"],  # pred's MPPI candidate fan, colored by cost
-                                        reuse=bool(cfg.control.get("reuse_render", False)),  # False (default):
-                                        # fresh plotter/frame -> stable iso depth-peeling for the translucent
-                                        # agents+fan stack (reuse=True intermittently flickered the iso torus).
+                                        reuse=bool(cfg.control.get("reuse_render", False)),
                                         log=lambda m: _plog(writer, f"[eval_control @ep{step}]   video {m}"))
     writer.video("eval_control/control_video_0", frames, fps, step)  # _0: we show episode 0 only
+    writer.scene("eval_control/control_video_0", {  # 3D geometry for Blender (plain-language keys)
+        "description": "Dual MPPI control on the torus: a BLACK oracle agent (true dynamics) and a GREY "
+                       "learned-model agent, each navigating to a sequence of goals. Each goal is a RING zone "
+                       "on the surface; the action arrow per step is the applied control.",
+        "coordinate_system": "world xyz, same space as the torus",
+        "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
+        "goal_zone_ring_radius": float(0.0675 * (R + r)),
+        "agents": [{"name": nm, "color": a["color"], "path_xyz": a["path"], "goal_per_step_xyz": a["goal_seq"],
+                    "action_arrow_per_step": {"origins_xyz": a["path"], "vectors_xyz": a["avec"]}}
+                   for a, nm in zip(agents, ("oracle", "learned"))],
+    }, step)
     t_video = time.perf_counter() - t
     _plog(writer, f"[eval_control @ep{step}] video rendered in {t_video:.1f}s")
 

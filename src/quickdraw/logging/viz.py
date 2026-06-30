@@ -29,6 +29,8 @@ FPV_SIZE = 256      # egocentric video resolution (px, square)
 SURFACE_EPS = 0.02  # absolute outward lift for trajectory lines/arrows (no z-fighting, any R,r)
 ACTION_SMOOTH_WINDOW = 18  # default boxcar window for action-arrow smoothing (config can override)
 TORUS_OPACITY = 0.6  # torus alpha for atlas plots/videos (see prediction through it); FPV stays opaque
+AXIAL_OPACITY = 0.3  # THE one knob for axial see-through (iso is always opaque): used for every atlas plot
+#                      (eval horizon, control, diffusion, summaries). Half of the old 0.6 -> twice as transparent.
 _N_THETA, _N_PHI = 420, 210   # torus face density (smooth even up close in FPV)
 _TEX: dict = {}
 
@@ -263,12 +265,13 @@ class TorusRenderer:
         # ADD order, so the fan/trajectories paint on top of the translucent torus even when behind it.
         # Depth peeling blends by true depth (fan behind the torus correctly occluded/dimmed).
         pl.enable_depth_peeling(number_of_peels=4, occlusion_ratio=0.0)
-        # The ISO torus is OPAQUE; the axial tori keep `torus_opacity` (translucent, see-through). The iso
+        # The ISO torus is OPAQUE; the axial tori use the single AXIAL_OPACITY knob (translucent,
+        # see-through) — applied for EVERY atlas plot regardless of the caller's torus_opacity. The iso
         # saturation FLASH was VTK depth-peeling intermittently mis-resolving the translucent iso torus over
         # the moving fan (robust to peel count + plotter reuse — neither fixed it). An opaque iso has no
         # translucency to mis-blend, so the flash is gone; the see-through fan stays visible in the axials
         # (which never flickered — principal-axis sightline = few layers).
-        self._add_torus(pl, 1.0 if view == "iso" else torus_opacity)
+        self._add_torus(pl, 1.0 if view == "iso" else AXIAL_OPACITY)
         L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
         vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)
         # orthographic everywhere + an explicit parallel_scale => framing is fixed, never auto-fit/rescaled
@@ -546,7 +549,8 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
                 ai = min(k - 1, len(a["avec"]) - 1)
                 trajs.append({"xyz": a["path"][lo:k], "color": c, "tip": {"color": c, "lighting": False}})
                 trajs.append({"xyz": _tangent_ring(a["goal_seq"][gi], R, 0.0675 * sc), "color": c,
-                              "radius": 0.006 * sc, "start_sphere": False, "end_sphere": False})  # goal ring (1.5x agent diam)
+                              "radius": 0.008 * sc, "start_sphere": False, "end_sphere": False})  # goal ring (1.5x agent
+                #                                       diam; tube thickness == the main agent tail thickness)
                 arrows.append((a["path"][k - 1], a["avec"][ai], c))
             fan = fan_seq[min(k - 1, len(fan_seq) - 1)] if fan_seq else None  # this step's candidate fan
             fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
