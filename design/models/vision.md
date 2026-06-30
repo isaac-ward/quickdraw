@@ -201,9 +201,9 @@ is) and **per-head reconstruction** terms (named by the head — so they follow 
 ## Image metrics (eval — not losses)
 
 Closed-form, no pretrained nets (so LPIPS is excluded):
-- `image/psnr` — peak signal-to-noise ratio, predicted vs. true frame.
-- `image/ssim` — structural similarity.
-- `image/recon_mse` — the recon MSE surfaced as a metric.
+- `psnr` — peak signal-to-noise ratio, predicted vs. true frame.
+- `ssim` — structural similarity.
+- `mse` — pixel MSE surfaced as a metric.
 
 ## wandb structure (organized by head/trunk)
 
@@ -215,13 +215,14 @@ train/                                  (every epoch — scalars)
 val/                                    (every epoch — scalars)
   loss + same loss/* subtree
   metric/proprio/pointwise_error        (shared rollout metric, kinematic)
-  metric/<image-head>/{psnr, ssim, recon_mse}     e.g. metric/image/psnr
+  metric/<image-head>/{psnr, ssim, mse}           e.g. metric/image/psnr
 eval_manifold/                          (benchmark epochs — any method)
   umap_{data,latent}_space_to_{2,3}d    (latent = concat of all carried tokens, flattened)
 eval_diffusion/                         (benchmark epochs — diffusion only)
   denoising_multistep, denoising_aggregate, std_of_samples, time/*
 eval_ood_horizon/                       (benchmark epochs)
-  …existing proprio rollout plots/curves…
+  …existing proprio rollout plots + error-vs-step curve…
+  <image-head>/{psnr, ssim, mse}_vs_step  CURVE: image metric over the rollout horizon (mirrors proprio error-vs-step)
   <image-head>/filmstrip                STILL: 8 steps across the horizon, pred (top) | GT (bottom)
   <image-head>/rollout                  VIDEO: pred (top, black until context plays out) | GT (bottom), synced
 control/                                (unchanged — see note)
@@ -247,45 +248,50 @@ control/                                (unchanged — see note)
 - 0.4 *Verify:* a batch yields aligned tensors (cached downsample); toggling a modality off in config drops
   its trunk/head/loss/metric with no code change.
 
-**Phase 1 — ViT autoencoder (image only, standalone).**
-- 1.1 Linear patchify (patch 16 → 64 patches) + posemb → ViT encoder (generalized block + FlexAttention, no mask).
-- 1.2 Perceiver bottleneck: 8 learned queries cross-attend patches → 8 latent tokens.
-- 1.3 ViT decoder: 8 tokens → per-patch query tokens → transformer → Linear-unpatchify → 128².
-- 1.4 *Verify:* `smoke/vision_ae.py` + short fit; held-out recon PSNR passes threshold.
+**Phase 1 — logging contract / wandb restructure (ALL models, before any vision).**  *(moved up, per request)*
+- 1.1 Adopt the head-named `loss/*` (`loss/flow|flow_consistency|pred_latent`, `loss/<head>`) and
+  `metric/*` (`metric/proprio/pointwise_error`) namespaces in the LightningModule — **for DSAR/LSAR/
+  diffusion right now**, no vision needed. Modality-specific keys (`loss/image`, `metric/image/*`) are
+  *declared by the registry* and simply stay empty until the image head exists.
+- 1.2 *Verify:* a current (non-vision) DSAR/LSAR/diffusion run logs the new grouped tree; nothing dropped.
 
-**Phase 2 — factorized space-time backbone + token-bag carried state (on LSAR first).**
-- 2.1 Fuser gains the image + **action** streams; per-step bag = `[proprio, action, image_1..8]` (10 tokens),
+**Phase 2 — ViT autoencoder (image only, standalone).**
+- 2.1 Linear patchify (patch 16 → 64 patches) + posemb → ViT encoder (generalized block + FlexAttention, no mask).
+- 2.2 Perceiver bottleneck: 8 learned queries cross-attend patches → 8 latent tokens.
+- 2.3 ViT decoder: 8 tokens → per-patch query tokens → transformer → Linear-unpatchify → 128².
+- 2.4 *Verify:* `smoke/vision_ae.py` + short fit; held-out recon PSNR passes threshold.
+
+**Phase 3 — factorized space-time backbone + token-bag carried state (on LSAR first).**
+- 3.1 Fuser gains the image + **action** streams; per-step bag = `[proprio, action, image_1..8]` (10 tokens),
   action a **separate input-only token** (type-embedded), conditioning via attention — not folded in.
-- 2.2 Carried/predicted state = `[proprio] ++ [8 image]` (9 tokens); per-token `_ln`; action injected each
+- 3.2 Carried/predicted state = `[proprio] ++ [8 image]` (9 tokens); per-token `_ln`; action injected each
   step; `encode_state`/`to_obs`/`readout` handle the bag.
-- 2.3 Generalize the `Transformer` block to be **mask-agnostic** (takes a `mask_mod`), then build the
+- 3.3 Generalize the `Transformer` block to be **mask-agnostic** (takes a `mask_mod`), then build the
   **factorized space-time block**: spatial attn (within step, unmasked) + temporal attn (across steps,
   causal) + MLP; space/time positional embeddings; FlexAttention for both.
-- 2.4 Decode heads from the registry (proprio MLP, image ViT decoder); `loss/<head>` recon terms.
-- 2.5 *Verify:* smoke + short LSAR run; both recon losses fall; AR rollout runs; eff_rank > 1 (no collapse).
+- 3.4 Decode heads from the registry (proprio MLP, image ViT decoder); `loss/<head>` recon terms +
+  `metric/image/{psnr,ssim,mse}` now populate.
+- 3.5 *Verify:* smoke + short LSAR run; both recon losses fall; AR rollout runs; eff_rank > 1 (no collapse).
 
-**Phase 3 — diffusion DiT denoiser.**
-- 3.1 Swap MLP flow field → DiT over the 9 carried tokens (adaLN on τ + shortcut dd; condition on h).
-- 3.2 Rectified-flow + shortcut unchanged.
-- 3.3 *Verify:* adapt `smoke/diffusion.py` A–H; ε=0 readout byte-stable; decode → image + vec.
+**Phase 4 — diffusion DiT denoiser.**
+- 4.1 Swap MLP flow field → DiT over the 9 carried tokens (adaLN on τ + shortcut dd; condition on h).
+- 4.2 Rectified-flow + shortcut unchanged.
+- 4.3 *Verify:* adapt `smoke/diffusion.py` A–H; ε=0 readout byte-stable; decode → image + vec.
 
-**Phase 4 — per-head loss weights & balancing.**
-- 4.1 Wire the per-modality `weight:` from the registry into the objective; tune so no term dominates.
-- 4.2 *Verify:* a run where every modality improves together (no recon term flatlines).
-
-**Phase 5 — metrics + wandb restructure (all models).**
-- 5.1 Add `metric/<image-head>/{psnr,ssim,recon_mse}` (closed-form; no LPIPS).
-- 5.2 Adopt the head-named `loss/*` + `metric/*` namespaces **for DSAR/LSAR/diffusion alike** (consistent).
-- 5.3 *Verify:* train/val dashboards show the grouped tree; image metrics populate; non-vision runs still log.
+**Phase 5 — per-head loss weights & balancing.**
+- 5.1 Wire the per-modality `weight:` from the registry into the objective; tune so no term dominates.
+- 5.2 *Verify:* a run where every modality improves together (no recon term flatlines).
 
 **Phase 6 — viz (under eval_ood_horizon).**
 - 6.1 `eval_ood_horizon/<image-head>/filmstrip` — `viz.fig_image_filmstrip`: 8 steps across the horizon,
   pred (top) | GT (bottom), minimal text.
 - 6.2 `eval_ood_horizon/<image-head>/rollout` — `viz.image_rollout_video`: pred (top, black until context
   plays out) | GT (bottom), synced, no text.
-- 6.3 `eval_manifold` latent UMAP on concat-of-all-carried-tokens (data-space UMAP stays proprio 6-vec).
-- 6.4 `denoising_*` can decode each ODE step to an image (watch the FPV denoise from noise).
-- 6.5 *Verify:* eval logs the filmstrip + synced rollout video + image panels cleanly.
+- 6.3 `eval_ood_horizon/<image-head>/{psnr,ssim,mse}_vs_step` — image metric over the rollout horizon,
+  mirroring the existing proprio error-vs-step curve.
+- 6.4 `eval_manifold` latent UMAP on concat-of-all-carried-tokens (data-space UMAP stays proprio 6-vec).
+- 6.5 `denoising_*` can decode each ODE step to an image (watch the FPV denoise from noise).
+- 6.6 *Verify:* eval logs the filmstrip + synced rollout video + metric-vs-step curves cleanly.
 
 **Phase 7 — variations + multi-feed seam.**
 - 7.1 Per-stream noise σ (proprio vs image).
