@@ -175,6 +175,27 @@ conditioning) that unlocks K=1 (and therefore cheap in-rollout training). We wil
 - Optionally render a few **stochastic** samples (fresh noise) in the *video only*, to visualize the
   predicted spread / multimodality.
 
+### Why ε=0 is the fair deterministic prediction
+
+The **prior** is the noise distribution the flow ODE starts from: `ε ~ N(0, I)`, a standard Gaussian in
+the latent. To sample, draw `ε` from it and integrate the ODE to a prediction; `ε=0` is the **mean** (the
+centre) of that prior. We score the metrics on the `ε=0` path, and that is the fair choice for the
+head-to-head shoot-out:
+
+1. **Cost-matched & reproducible** — it is *one* deterministic forward pass, exactly like the deterministic
+   models (DSAR/LSAR) produce one prediction. Same input → same output, so the metric is stable and
+   golden-testable.
+2. **No information leakage** — `ε=0` is the prior's centre, *independent of the target*; it carries zero
+   information about the true next state. The prediction comes entirely from the learned field conditioned
+   on the past, so it isn't "cheating."
+3. **The alternatives are each unfair one way** — scoring a *random* sample would judge diffusion on noise
+   (too harsh); scoring the *posterior mean* (averaging N samples) is the MSE-optimal estimate but hands
+   diffusion an N×-sampling advantage the deterministic baselines don't get (too generous). `ε=0` is the
+   neutral, single-pass middle.
+
+Point estimate and uncertainty are kept separate: `val/pointwise_error` scores the `ε=0` prediction, while
+`eval_diffusion/std_of_samples` reports the predicted spread (std of the swarm's final positions).
+
 ---
 
 ## Visualizing the flow field (the headline diffusion artifact)
