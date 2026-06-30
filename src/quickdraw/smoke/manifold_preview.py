@@ -21,7 +21,7 @@ from ..logging import viz
 from ..training.setup import build_model, env_cfg, eval_episodes, load_checkpoint, normalizer
 
 OUT = "/app/logs/viz_preview"
-SPLIT, STRIDE, CUBE, N_POINTS = "train", 1, 3.0, 12000   # train contexts; 1 noise/context; SAME N for img+video
+SPLIT, STRIDE, CUBE, N_POINTS = "train", 1, 3.0, 10000   # train contexts; 1 noise/context; SAME N for img+video
 POS_FRAMES, POS_FPS = 480, 60        # position collapse: 8 s @ 60 fps (smooth, eased)
 UMAP_FRAMES, UMAP_FPS = 240, 60      # umap collapse: 4 s @ 60 fps
 UMAP_FIT_CAP = 24000                 # subsample for the UMAP fit (over ALL denoising steps, not just ends)

@@ -714,10 +714,10 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
             ax.set_box_aspect((xl[1] - xl[0], yl[1] - yl[0], zl[1] - zl[0]))  # proportional -> fills, undistorted
         else:
             ax.set_box_aspect((1, 1, 1))
-        ax.set_xlabel("x", fontsize=7); ax.set_ylabel("y", fontsize=7); ax.set_zlabel("z", fontsize=7)
-        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):    # keep the ticks (marks) but drop the numeric labels
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):    # keep the ticks (marks); drop tick AND axis labels
             axis.set_major_locator(MaxNLocator(5))
         ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+        ax.set_xlabel(""); ax.set_ylabel(""); ax.set_zlabel("")
     fig.subplots_adjust(left=0.0, right=0.88, top=0.93, bottom=0.0, wspace=0.0, hspace=0.0)  # use the whitespace
     if color is not None and sc is not None:
         cax = fig.add_axes([0.905, 0.30, 0.015, 0.40])             # dedicated right-side colorbar
