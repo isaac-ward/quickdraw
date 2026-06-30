@@ -180,59 +180,31 @@ conditioning) that unlocks K=1 (and therefore cheap in-rollout training). We wil
 ## Visualizing the flow field (the headline diffusion artifact)
 
 The field lives in the latent, but we render it **through the decoder into observation space** on the
-torus, so you can literally see the agent at a point on its arc with the field sweeping onto the surface
-and pinching to the next spot. The convergence is strongest at high noise level `τ` (far from the answer
-it pulls hard; near it, fine adjustments) and is **action-conditioned** (via `h`) — it points where the
-agent goes *given its action*. At **~4 fixed prediction steps** along episode 0 (fixed so you can watch
-it sharpen across training epochs), we render two complementary views, each a **PNG via the
-`TorusRenderer`** with the extra geometry drawn on top of the usual torus + current-dot + action-arrow:
+torus, so you literally watch a swarm of noise samples flow onto the surface and pinch to the next spot.
+At **3 FIXED prediction steps** along episode 0 (fixed so you can watch it sharpen across epochs), rendered
+as the full 4-panel atlas (iso + 3 axial) via the `TorusRenderer`:
 
-- **Streamlines — a static IMAGE** (`diffusion/streamline/example_{0,1,2,3}`): sample N≈16 noise vectors,
-  integrate each through `v_θ` (conditioned on this step's `h`, `z_t`), **decode every integration step**
-  → N paths that start off-manifold and flow *onto* the torus, converging to the predicted next position.
-  A streamline already integrates over all `τ`, so one frame captures the whole journey. Overlay the
-  **deterministic-ODE sample** (the single committed prediction used for metrics) as a highlighted path,
-  and mark the **true next position** — so you see the cloud of possibilities, the one it commits to, and
-  whether it aims true.
-- **Quiver — a short τ-ANIMATION** (`eval_diffusion/quiver/example_{0,1,2,3}`, a gif/mp4): the torus + dot +
-  action-arrow stay fixed; sweep `τ` from 1→0 (the denoising direction) over ~12–16 frames, and each frame
-  re-probe the field on a small grid of positions near the agent (`v=v_θ(enc(p), τ, h)`, obs-space arrow
-  `dec(z+δv)[:3] − dec(z)[:3]`). **Critically, the prediction particle(s) MOVE each frame** — the committed
-  sample (and a few swarm samples) ride their decoded ODE path `dec(z_t + x_k)` from off-surface (τ=1)
-  onto the torus (τ=0), leaving a short trail. Without that motion the animation is just arrows rescaling
-  in place ("breathing"); with it, it's the streamline being traced live with the field as context. The
-  field also evolves: big *global* pull at high `τ` → organizing toward the next spot at mid `τ` →
-  ~zero near `τ=0`. **Scale arrows consistently across frames** (no per-frame normalize) so the calm-down
-  is visible.
-- **Shortcut models:** the viz uses the **fine** underlying field (small step size `d`, many τ frames) for
-  a smooth picture regardless of the prediction's K — a shortcut model still has that fine field (trained
-  on the flow-matching loss at small `d`). The **committed path** still reflects the real prediction: for
-  a shortcut model that's a 1-step **leap** (one straight segment) drawn over the smooth fine field, which
-  visualizes what shortcutting does.
+- **Quiver** (`eval_diffusion/quiver/example_{0,1,2}`, ~2 s mp4): the torus, current dot, action arrow,
+  the agent's black history tail AND future path, and a black truth ring (the true next position) stay
+  fixed; a **GREY SWARM** of ~16 decoded ODE paths flows from off-surface noise (τ=1) onto the torus (τ=0),
+  each leaving a growing tail so the accumulating tails trace the field. (No field-probe arrows and no
+  committed/red particle — the swarm itself shows the flow.)
+- **Multistep** (`eval_diffusion/quiver_multistep`, ~4 s mp4): the SAME single prediction with the agent
+  and its history held FIXED, the swarm integrated with a fine 16-step ODE and played over 4 s so each
+  denoising step reads clearly.
+- **Shortcut models:** the swarm viz uses a fine many-step integration regardless of the prediction's K
+  (the model still has a fine field), so the picture is smooth even when inference is K=1.
 
-**How the geometry is computed.**
-- *Streamlines* are recorded from the sampler: at each integration step the in-progress residual is
-  `x_k`, and the path point is `dec(z_t + x_k)[:3]` — the intermediate positions ARE the per-step states
-  of the ODE loop (decode every step, not just the ends). Each path runs from `dec(z_t + ε)` (decoded
-  noise, **off-surface**) to `dec(z_t + Δẑ)` (the predicted **next position on the torus**), curved (the
-  nonlinear decoder bends even near-straight latent paths into obs-space arcs). For a smooth render the
-  viz may integrate FINER than the prediction's K (e.g. ~20 steps) — decoupled; it just wants a clean
-  arc. Swarm = ~16 random `ε`; bright committed path = the fixed `ε`.
-- *Quiver* is a short **τ-animation** (the field depends on `τ`, so one slice is incomplete; a streamline
-  integrates across all `τ`, the quiver instead *sweeps* them). Per frame, at `τ` from 1→0, straight
-  arrows probed on a fixed grid of positions `p` near the agent: `z=enc(p)`, `v=v_θ(z, τ, h)`, obs-space
-  direction `dec(z + δ·v)[:3] − dec(z)[:3]`, drawn from `p`. Arrow scale is held constant across frames
-  so the field's calm-down (big global pull → ~zero) is visible.
+How the geometry is computed: each swarm path is `dec(z_t + x_k)[:3]` recorded at every ODE step, from
+`dec(z_t + ε)` (decoded noise, **off-surface**) to `dec(z_t + Δẑ)` (on the torus), curved because the
+decoder is nonlinear. Swarm = ~16 random `ε` (fixed generator seed → reproducible). Cost is dominated by
+the render.
 
-Cost is dominated by the *render*, not the flow (the field + decoder are tiny; a frame is a few hundred
-evals). 4 steps × 2 views is cheap enough to log every eval epoch.
-
-**What it looks like.** A funnel/teardrop: a diffuse cloud of decoded-noise points floating off the
-torus, ~16 threads arcing down and pinching to a tight knot at the next position (comets homing on a
-landing site), the bright committed path down its spine, and a ring at the true next spot. Beam *width*
-= confidence (tight = sure; split = multimodal); whether threads land *on* the skin vs float above it
-= on-manifold vs drift (the failure mode, made visible). Across epochs (steps are fixed) you watch the
-fat scattered funnel narrow into a clean on-surface beam that bullseyes the ring.
+**What it looks like.** A funnel/teardrop: a cloud of decoded-noise points off the torus, ~16 grey threads
+arcing down and pinching to a tight knot at the next position, with a black ring at the true next spot.
+Beam *width* = confidence (tight = sure; split = multimodal); whether threads land *on* the skin vs float
+above = on-manifold vs drift. Across epochs (steps are fixed) you watch the fat scattered funnel narrow
+into a clean on-surface beam that bullseyes the ring.
 
 ---
 
@@ -249,14 +221,15 @@ grounding, full-grad), `{tag}/loss/flow_consistency` (shortcut mode only).
 `collapse/latent_norm`, … (reused).
 
 **Diffusion-specific scalars**:
-- `eval_diffusion/sample_spread` — std across stochastic samples of the predicted next-position (predicted
-  uncertainty / multimodality).
-- `eval_diffusion/pointwise_error` — mean over the viz steps of ‖committed prediction − true next
-  position‖ (tube-radii); the quantitative companion to the flow-field viz (should trend down).
+- `eval_diffusion/std_of_samples` — std across the swarm's FINAL (fully-denoised) next-position samples
+  (predicted uncertainty / multimodality). No deterministic-model equivalent.
+- `eval_diffusion/time/{sample_s, sample_ms_per_euler_step}` — wall time of one K-step deterministic
+  prediction (quantifies flow-K6 vs shortcut-K1 inference cost).
 
-**Flow-field viz**: `diffusion/streamline/example_{0,1,2,3}` (static PNGs — full integrated path) and
-`eval_diffusion/quiver/example_{0,1,2,3}` (short gif/mp4 — the field swept over `τ` 1→0), on top of the usual
-`eval_control/control_video_0`, `eval_ood_horizon` videos, etc.
+Pointwise accuracy is NOT duplicated here — it's the shared `val/pointwise_error` rollout metric.
+
+**Flow-field viz**: `eval_diffusion/quiver/example_{0,1,2}` (~2 s) and `eval_diffusion/quiver_multistep`
+(~4 s) mp4s, on top of the usual `eval_control/control_video_0`, `eval_ood_horizon` videos, etc.
 
 ---
 

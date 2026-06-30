@@ -657,31 +657,3 @@ def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, agen
     finally:
         rend.close()
     return np.stack(frames)
-
-
-def diffusion_quiver_multistep_frames(R, r, coloring, steps, frames_per_step=15, title="", size=860,
-                                      view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY):
-    """16 consecutive denoising predictions played one after another (each ~`frames_per_step` frames =
-    0.25 s @ 60 fps -> 4 s for 16), as the agent walks forward along its path. `steps` is a list of per-step
-    dicts: {current, action_amb, agent_tail, future_path, true_next, per_frame} — per_frame is that step's
-    swarm denoising sub-animation, subsampled to frames_per_step. Same atlas + look as the single quiver."""
-    sc = R + r
-    rend = TorusRenderer(R, r, coloring)
-    frames = []
-    try:
-        for s in steps:
-            static = _quiver_static_trajs(s["current"], s["agent_tail"], s["future_path"], s["true_next"], R, sc)
-            cur, act = np.asarray(s["current"]), np.asarray(s["action_amb"])
-            pf = s["per_frame"]
-            idx = np.linspace(0, len(pf) - 1, frames_per_step).astype(int)   # compress this step's denoising
-            for j in idx:
-                fig = fig_torus_atlas(R, r, trajs=static + _quiver_swarm_trajs(pf[int(j)], sc),
-                                      arrows=[(cur, act)], coloring=coloring, title=title, markers=False,
-                                      iso_size=size, ax_size=int(round(size * 0.67)), view_pad=view_pad,
-                                      torus_opacity=torus_opacity, renderer=rend)
-                fig.set_dpi(VIDEO_DPI)
-                frames.append(_fig_rgb(fig))
-                plt.close(fig)
-    finally:
-        rend.close()
-    return np.stack(frames)

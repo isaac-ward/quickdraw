@@ -199,12 +199,12 @@ import matplotlib
 matplotlib.use("Agg")
 try:
     from quickdraw.evaluation.routines import _quiver_frames_data
-    pf = _quiver_frames_data(committed, swarm=swarm, n_frames=6)
+    pf = _quiver_frames_data(swarm, n_frames=6)
     fr1 = viz.diffusion_quiver_frames(R, r, "rainbow", cur, act_amb, pf, true_next=nxt, size=240)
     fr2 = viz.diffusion_quiver_frames(R, r, "rainbow", cur, act_amb, pf, true_next=nxt, size=240)
-    moved = not np.array_equal(np.asarray(pf[0]["trail"]), np.asarray(pf[-1]["trail"]))
+    moved = not np.array_equal(np.asarray(pf[0]["swarm"][0]["trail"]), np.asarray(pf[-1]["swarm"][0]["trail"]))
     check("G.quiver frames render finite", np.isfinite(fr1).all() and fr1.shape[0] == 6)
-    check("G.committed particle MOVES across frames", moved)
+    check("G.swarm flows across frames", moved)
     check("G.quiver deterministic (identical on two calls)", np.array_equal(fr1, fr2))
 except Exception as e:
     import traceback
