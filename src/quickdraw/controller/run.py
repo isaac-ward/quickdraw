@@ -44,7 +44,10 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     _plog(writer, f"[eval_control @ep{step}] start: MPPI {cfg.control.n_episodes} eps x 2 controllers, "
                   f"{cfg.control.num_samples} samples, H={cfg.control.horizon}, max_steps={cfg.control.max_steps}")
     t = time.perf_counter()
-    res, _ = run_control(model, normalizer, ecfg, MPPIConfig(**cfg.control), device=device,
+    # reuse_render is a RENDER knob living in the control config; strip it before building MPPIConfig
+    # (which has no such field) so MPPIConfig(**...) doesn't choke on the extra key.
+    mppi_kwargs = {k: v for k, v in cfg.control.items() if k != "reuse_render"}
+    res, _ = run_control(model, normalizer, ecfg, MPPIConfig(**mppi_kwargs), device=device,
                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"))
     t_ctrl = time.perf_counter() - t
     # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers both controllers + chunk
@@ -64,6 +67,9 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                                                       _agent(res["pred"], "dimgray", R, r)],
                                         n_frames=nf, title="control: true vs pred",
                                         fan_seq=res["fan_seq"],  # pred's MPPI candidate fan, colored by cost
+                                        reuse=bool(cfg.control.get("reuse_render", False)),  # False (default):
+                                        # fresh plotter/frame -> stable iso depth-peeling for the translucent
+                                        # agents+fan stack (reuse=True intermittently flickered the iso torus).
                                         log=lambda m: _plog(writer, f"[eval_control @ep{step}]   video {m}"))
     writer.video("eval_control/control_video_0", frames, fps, step)  # _0: we show episode 0 only
     t_video = time.perf_counter() - t

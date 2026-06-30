@@ -498,7 +498,8 @@ def traj_compare_frames(R, r, coloring, true_full, pred_full, avec_true, P, n_fr
 
 
 def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
-                           smooth_window=ACTION_SMOOTH_WINDOW, torus_opacity=TORUS_OPACITY, fan_seq=None, log=None):
+                           smooth_window=ACTION_SMOOTH_WINDOW, torus_opacity=TORUS_OPACITY, fan_seq=None,
+                           log=None, reuse=False):
     """Animated dual-controller race (eval_control). Each agent = {path (T,3), avec (T,3) ambient
     applied action, goal_seq (T,3) its current goal, color}. Per frame each agent gets a flat moving
     head + trailing tail + a colored action arrow, plus a SMALL same-color sphere marking ITS current
@@ -517,7 +518,7 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
     # frame (the fan present + iso diagonal stresses the peel state). A fresh plotter re-inits depth
     # peeling cleanly each frame -> stable. (Matches this class's documented intent; the OOD-horizon
     # producer has no fan, so it keeps reuse=True. Cost: control video render is a bit slower.)
-    rend = TorusRenderer(R, r, coloring, reuse=False)
+    rend = TorusRenderer(R, r, coloring, reuse=reuse)
     try:
         for fi, ti in enumerate(idx):
             if log is not None and fi % every == 0:

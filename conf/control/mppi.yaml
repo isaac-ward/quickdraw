@@ -21,3 +21,6 @@ beta_vel: 0.0          # near-goal velocity penalty OFF: it made the controller 
 r_settle: 0.5          # distance under which the velocity penalty would turn on (unused while beta_vel=0)
 n_episodes: 16         # parallel control episodes (random inits/orders); video is episode 0
 n_goals: 5             # goals visited per episode (random subset of the 8 NESW in/out goals)
+reuse_render: false    # control video renderer reuse. false (default): fresh plotter per frame (cached
+                       # mesh) -> stable iso depth-peeling for the overlapping translucent agents+fan stack.
+                       # true: persistent plotter (faster) but intermittently flickers the iso torus opacity.
