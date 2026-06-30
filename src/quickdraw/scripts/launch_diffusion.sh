@@ -24,6 +24,12 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 : "${RS_PROBLEM:?author + export the run_summary fresh, not hardcoded; missing RS_PROBLEM}"
 : "${RS_TRIED:?missing RS_TRIED}"; : "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
 
+# GPU-UTILISATION NOTE (measured 2026-06-30, head-to-head baseline_lsar + diff_flow + diff_shortcut, batch
+# 256, BPTT 16, on 2x H100 80GB): 3 runs across 2 GPUs left them UNDER-USED — GPU0 ~41/80 GB at ~10-30%
+# util (it carried 2 runs), GPU1 ~21/80 GB at ~10% util (1 run). Per-epoch ~700-1000 s (eval epochs slower).
+# So next time pack MORE per GPU (the variation campaign ran 3/GPU) and/or raise data.batch to ~512-1024 to
+# saturate memory+SMs — at ~25% util there's room for ~3-4x the throughput before we're GPU-bound.
+#
 # fixed across both: diffusion model, full backbone, batch 256, v8 data, truncated BPTT (16) — the
 # variation-campaign settings, so diffusion is comparable. diffusion_field viz on (the headline artifact).
 COMMON=( model=diffusion data.root="$DATA" data.batch=256 model.detach_every=16

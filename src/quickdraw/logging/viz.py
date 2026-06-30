@@ -28,9 +28,12 @@ FPV_FOV = 103.5     # egocentric camera FOV (deg); VTK default is 30
 FPV_SIZE = 256      # egocentric video resolution (px, square)
 SURFACE_EPS = 0.02  # absolute outward lift for trajectory lines/arrows (no z-fighting, any R,r)
 ACTION_SMOOTH_WINDOW = 18  # default boxcar window for action-arrow smoothing (config can override)
-TORUS_OPACITY = 0.6  # torus alpha for atlas plots/videos (see prediction through it); FPV stays opaque
-AXIAL_OPACITY = 0.3  # THE one knob for axial see-through (iso is always opaque): used for every atlas plot
-#                      (eval horizon, control, diffusion, summaries). Half of the old 0.6 -> twice as transparent.
+TORUS_OPACITY = 0.6  # legacy default still passed by some callers; _build overrides it with ATLAS_TORUS_OPACITY
+ATLAS_TORUS_OPACITY = 0.3  # THE one knob: opacity of EVERY atlas torus — iso AND axial, the SAME — for every
+#                            plot (eval horizon, control, diffusion, summaries). Was 0.6 -> now 0.3 (2x more
+#                            transparent). The FAN is rendered OPAQUE (see _add_fan): a transparent fan over a
+#                            transparent torus was the iso depth-peeling flicker; an opaque fan is one solid
+#                            layer, so the iso can stay translucent (see-through) without the flash.
 _N_THETA, _N_PHI = 420, 210   # torus face density (smooth even up close in FPV)
 _TEX: dict = {}
 
@@ -195,10 +198,11 @@ def _tangent_ring(center, R, radius, n=48):
     return c[None] + radius * (np.cos(t)[:, None] * u[None] + np.sin(t)[:, None] * w[None])
 
 
-def _add_fan(pl, pv, R, r, fan, opacity=0.5, max_show=48):
+def _add_fan(pl, pv, R, r, fan, opacity=1.0, max_show=48):
     """MPPI candidate fan as thin TUBES (same primitive as the trail — depth-correct + blends cleanly,
     unlike GL lines which can't sub-pixel and don't alpha-blend) colored by return via RdYlGn -> high
-    return = green = low cost. fan: {"pts": (K,H,3), "ret": (K,)}.
+    return = green = low cost. fan: {"pts": (K,H,3), "ret": (K,)}. OPAQUE (opacity=1.0): a transparent
+    fan over the transparent torus was the iso depth-peeling flicker; one solid fan layer avoids it.
     SUBSAMPLE to max_show: hundreds of overlapping candidates read as an opaque blob; a sparse subset is
     what actually looks thin + transparent (the candidates are iid noise, so any subset is representative)."""
     pts = np.asarray(fan["pts"], float)              # (K,H,3)
@@ -265,13 +269,11 @@ class TorusRenderer:
         # ADD order, so the fan/trajectories paint on top of the translucent torus even when behind it.
         # Depth peeling blends by true depth (fan behind the torus correctly occluded/dimmed).
         pl.enable_depth_peeling(number_of_peels=4, occlusion_ratio=0.0)
-        # The ISO torus is OPAQUE; the axial tori use the single AXIAL_OPACITY knob (translucent,
-        # see-through) — applied for EVERY atlas plot regardless of the caller's torus_opacity. The iso
-        # saturation FLASH was VTK depth-peeling intermittently mis-resolving the translucent iso torus over
-        # the moving fan (robust to peel count + plotter reuse — neither fixed it). An opaque iso has no
-        # translucency to mis-blend, so the flash is gone; the see-through fan stays visible in the axials
-        # (which never flickered — principal-axis sightline = few layers).
-        self._add_torus(pl, 1.0 if view == "iso" else AXIAL_OPACITY)
+        # EVERY atlas torus (iso AND axial) uses the single ATLAS_TORUS_OPACITY knob — same transparency
+        # everywhere, regardless of the caller's torus_opacity. The iso saturation FLASH came from VTK
+        # depth-peeling mis-resolving a TRANSPARENT torus over a TRANSPARENT fan; making the FAN opaque
+        # (see _add_fan) removes that transparent-on-transparent stress, so the iso can stay translucent.
+        self._add_torus(pl, ATLAS_TORUS_OPACITY)
         L = (R + r) * _PAD          # torus reference bound (cube + axis labels)
         vl = view_l if view_l is not None else L  # FIXED view half-extent (>= L shows off-manifold drift)
         # orthographic everywhere + an explicit parallel_scale => framing is fixed, never auto-fit/rescaled
