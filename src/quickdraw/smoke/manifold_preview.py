@@ -34,7 +34,6 @@ def main(cfg):
 
     from ..models.diffusion import Diffusion, _ln
     stage = os.environ.get("MANIFOLD_STAGE", "images")
-    no_ln = stage.endswith("noln")     # decode the viz path WITHOUT LayerNorm -> the noise start is genuinely far in 6D
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(cfg).to(device)
     load_checkpoint(model, cfg.checkpoint)
@@ -73,7 +72,7 @@ def main(cfg):
             h, zt = h_all[0, ts], z[0, ts]
             eps = (torch.rand(len(ts), dz, generator=g, device=device) * 2 - 1) * CUBE   # uniform hypercube
             _, path = m.flow.sample(h, steps=K, deterministic=False, eps=eps, record_path=True)
-            dec = np.stack([norm.denorm_obs(m.to_obs((zt + x) if no_ln else _ln(zt + x))).cpu().numpy()
+            dec = np.stack([norm.denorm_obs(m.to_obs(_ln(zt + x))).cpu().numpy()
                             for x in path])                                                       # (K+1, nt, 6)
             paths6d.extend(np.transpose(dec, (1, 0, 2)))                                          # list of (K+1, 6)
     paths6d = np.stack(paths6d)                                          # (N, K+1, 6) — SAME points for img + video
@@ -99,17 +98,8 @@ def main(cfg):
             f.savefig(f"{expdir}/{name}.png", dpi=110); plt.close(f)
             print(f"[manifold] wrote embed_experiments/{name}.png")
 
-        if no_ln:
-            # NO-LN decode (start genuinely far in 6D) + UMAP fit on END-points only (keeps the shell)
-            import umap
-            reducer = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05).fit(end)
-            us, ue = reducer.transform(start), reducer.transform(end)
-            ul = cube(us, ue)
-            save(us, ul, "noln_umap_start", "no-LN decode + UMAP fit-on-ends — START (noise)")
-            save(ue, ul, "noln_umap_end", "no-LN decode + UMAP fit-on-ends — END (manifold)")
-            return
-
-        # (3) PCA(3) on STANDARDIZED 6D, fit on ALL trajectory steps (linear -> no neighbour-squashing)
+        # PCA(3) on STANDARDIZED 6D, fit on ALL trajectory steps (linear -> no neighbour-squashing, no
+        # transform-projection artifact: the noise START projects honestly far from the manifold END).
         from sklearn.decomposition import PCA
         mu, sd = flat.mean(0), flat.std(0) + 1e-6
         pca = PCA(n_components=3).fit((flat - mu) / sd)
@@ -117,16 +107,6 @@ def main(cfg):
         pl = cube(ps, pe)
         save(ps, pl, "pca_start", "PCA(3) std-6D, fit on all steps — START (noise)")
         save(pe, pl, "pca_end", "PCA(3) std-6D, fit on all steps — END (manifold)")
-
-        # (1) UMAP fit on ENDS + a 15% sample of START (noise) points; transform start/end
-        import umap
-        nidx = rng.choice(end.shape[0], int(0.15 * end.shape[0]), replace=False)
-        reducer = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05).fit(
-            np.vstack([end, start[nidx]]))
-        us, ue = reducer.transform(start), reducer.transform(end)
-        ul = cube(us, ue)
-        save(us, ul, "umapmix_start", "UMAP fit on ends + 15% noise — START (noise)")
-        save(ue, ul, "umapmix_end", "UMAP fit on ends + 15% noise — END (manifold)")
         return
 
     # ---- A) position 3D ----  (flat torus -> per-axis lims so it fills)
