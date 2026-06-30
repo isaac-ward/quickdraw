@@ -173,16 +173,15 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     m.eval()
     t0 = time.perf_counter()
     eps_ds = eval_episodes(cfg, norm, "val")
-    data6d, latents, speed, n_avail = manifold_predictions(m, norm, eps_ds, P=cfg.data.P, n_points=5000,
-                                                           stride=1, seed=0, device=device)
-    sub = f"{cfg.model.name} — {data6d.shape[0]:,} committed next-states (of {n_avail:,} val contexts)"
-    CBAR = "speed = |predicted next velocity|"
+    data6d, latents, _, n_avail = manifold_predictions(m, norm, eps_ds, P=cfg.data.P, n_points=5000,
+                                                       stride=1, seed=0, device=device)
+    sub = f"{data6d.shape[0]:,} next-state predictions (of {n_avail:,} val contexts)"   # model-agnostic
     for space, label, pts in (("data_space", "data space (full 6D pos+vel)", data6d),
                               ("latent_space", f"latent space (full {latents.shape[1]}D z)", latents)):
         for nd in (3, 2):
             e = umap_reduce(pts, n_components=nd, seed=0)
             fig_fn = viz.fig_points_4view if nd == 3 else viz.fig_points_2d
-            f = fig_fn(e, color=speed, lims=pad_lims(e), point_size=2.5, cbar_label=CBAR,
+            f = fig_fn(e, lims=pad_lims(e), point_size=2.5,            # no color/colorbar (structure only)
                        title=f"recovered manifold — UMAP of {label} to {nd}D, seed=0\n{sub}")
             writer.figure(f"eval_manifold/umap_{space}_to_{nd}d", f, step); plt.close(f)
     if was:

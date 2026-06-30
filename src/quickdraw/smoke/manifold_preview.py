@@ -6,8 +6,8 @@ manifold. The image and the collapse video use the SAME points.
       model=diffusion checkpoint=<run_dir_or_ckpt> data.root=<data>           # rectified-flow
   ... model.diffusion.shortcut=true model.diffusion.sampling_steps=1 ...       # shortcut
 
-Stage 'images' (fast): final stills (A position-3D, B UMAP-3D, orthographic, seeded). 'videos'/'both': the
-collapse mp4s. Output names are suffixed by the model (flow/shortcut). Writes to logs/viz_preview/."""
+Stage 'images' (fast): the 4 eval_manifold UMAP stills (data/latent space x 2D/3D, seeded, uncolored).
+'videos'/'both': the aggregate_denoising mp4. Writes to logs/viz_preview/ (model-agnostic filenames)."""
 from __future__ import annotations
 
 import os
@@ -41,9 +41,7 @@ def main(cfg):
     assert isinstance(m, Diffusion), "manifold preview needs a diffusion model"
     norm, ecfg = normalizer(cfg), env_cfg(cfg)
     R, r, K, P = ecfg.R, ecfg.r, m.sampling_steps, cfg.data.P
-    shortcut = bool(m.cfg.shortcut)
-    tag = "shortcut" if shortcut else "flow"
-    model_name = "shortcut" if shortcut else "rectified-flow"
+    model_name = "shortcut" if bool(m.cfg.shortcut) else "rectified-flow"
     ds = eval_episodes(cfg, norm, SPLIT)
     n_ep = len(ds)
     rng = np.random.RandomState(0)
@@ -146,18 +144,18 @@ def main(cfg):
     # ---- the SAME artifact set the in-training evals log (shared helpers) ----
     # images: the 4 eval_manifold UMAP stills, from DETERMINISTIC committed predictions (any-method path).
     if stage in ("images", "both"):
-        data6d, latents, speed, _ = manifold_predictions(m, norm, ds, P=P, n_points=N_POINTS, stride=STRIDE,
-                                                          seed=0, device=device)
-        sub = f"{model_name} — {data6d.shape[0]:,} committed next-states (of {n_avail:,} {SPLIT} contexts)"
+        data6d, latents, _, _ = manifold_predictions(m, norm, ds, P=P, n_points=N_POINTS, stride=STRIDE,
+                                                      seed=0, device=device)
+        sub = f"{data6d.shape[0]:,} next-state predictions (of {n_avail:,} {SPLIT} contexts)"   # model-agnostic
         for space, label, pts in (("data_space", "data space (full 6D pos+vel)", data6d),
                                   ("latent_space", f"latent space (full {latents.shape[1]}D z)", latents)):
             for nd in (3, 2):
                 emb = umap_reduce(pts, n_components=nd, seed=0)
                 fig_fn = viz.fig_points_4view if nd == 3 else viz.fig_points_2d
-                f = fig_fn(emb, color=speed, lims=pad_lims(emb), point_size=2.5, cbar_label=CBAR,
+                f = fig_fn(emb, lims=pad_lims(emb), point_size=2.5,    # no color/colorbar (structure only)
                            title=f"recovered manifold — UMAP of {label} to {nd}D, seed=0\n{sub}")
-                f.savefig(f"{OUT}/manifold_umap_{space}_to_{nd}d_{tag}.png", dpi=110); plt.close(f)
-        print(f"[manifold:{tag}] wrote 4 UMAP stills")
+                f.savefig(f"{OUT}/manifold_umap_{space}_to_{nd}d.png", dpi=110); plt.close(f)
+        print(f"[manifold] wrote 4 UMAP stills")
 
     # videos: the eval_diffusion/aggregate_denoising clip, from the stochastic denoising ODE paths.
     if stage in ("videos", "both"):
@@ -168,8 +166,8 @@ def main(cfg):
         sub = f"{model_name} (K={K}) — {paths6d.shape[0]:,} denoised next-states (of {n_avail:,} {SPLIT} contexts)"
         fa = viz.points_collapse_frames(paths6d[..., :3], color=speed, lims=plims, n_frames=POS_FRAMES, point_size=2.0,
                                         cbar_label=CBAR, title=f"aggregate denoising — noise → manifold\n{sub}")
-        imageio.mimwrite(f"{OUT}/manifold_aggregate_denoising_{tag}.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
-        print(f"[manifold:{tag}] wrote aggregate_denoising mp4")
+        imageio.mimwrite(f"{OUT}/manifold_aggregate_denoising.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
+        print(f"[manifold] wrote aggregate_denoising mp4")
 
 
 if __name__ == "__main__":
