@@ -172,12 +172,16 @@ FPV + chase + top-down) without surgery. The discipline:
 - **Diffusion denoiser = DiT** over the token list (adaLN on flow-time τ and shortcut step dd, conditioned
   on backbone context h). Rectified-flow / shortcut math unchanged.
 - **No new `model.name`.** Vision is *not* a separate model — the existing `dsar`/`lsar`/`diffusion`
-  configs gain a `modalities:` list. A model is "vision" iff that list contains an image modality. With
-  only `proprio` (the default), every model behaves exactly as today (the token bag is a single proprio
-  token → identical to the current vector latent), so the non-vision path stays **bit-identical**. The
+  configs gain a `modalities:` list. A model is "vision" iff that list contains an image modality. The
   carried-token-bag generalization (and per-token `_ln`) lives in the shared `SequenceModel` base, so
-  DSAR/LSAR/diffusion all inherit it; `contraction`'s Jacobian is taken over the *flattened* token bag
-  (size `(1+num_tokens)·d`), still modality-blind.
+  DSAR/LSAR/diffusion all inherit it; `contraction`'s Jacobian is taken over the *flattened* token bag.
+- **The vision era is a new general backbone — NOT bit-identical to pre-vision (by design).** Because
+  action is its **own token** (your choice), even the proprio-only case is a per-step bag `[proprio, action]`
+  fused *by attention* (factorized space-time), not the old single MLP-fused `[state⊕action]` token. So a
+  proprio-only run in the new framework differs architecturally from `pre-vision`. That's intended: the
+  `pre-vision` git tag preserves the exact old behavior, and the headline all-models comparison **retrains
+  everything inside this one general framework** (apples-to-apples across DSAR/LSAR/diffusion × proprio/image),
+  which is what the comparison needs. We keep the *task/data/metrics* identical; only the backbone unifies.
 
 ## Losses (training objective)
 
