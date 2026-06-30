@@ -161,11 +161,11 @@ def main(cfg):
     if stage in ("videos", "both"):
         L, Z = (R + r) * 1.05, r * 1.6
         plims = ((-L, L), (-L, L), (-Z, Z))
-        paths6d, speed, _, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
-                                               seed=0, device=device)
+        paths6d, _, _, _ = manifold_clouds(m, norm, ds, P=P, n_points=N_POINTS, cube=CUBE, stride=STRIDE,
+                                           seed=0, device=device)
         sub = f"{model_name} (K={K}) — {paths6d.shape[0]:,} denoised next-states (of {n_avail:,} {SPLIT} contexts)"
-        fa = viz.points_collapse_frames(paths6d[..., :3], color=speed, lims=plims, n_frames=POS_FRAMES, point_size=2.0,
-                                        cbar_label=CBAR, title=f"aggregate denoising — noise → manifold\n{sub}")
+        fa = viz.points_collapse_frames(paths6d[..., :3], lims=plims, n_frames=POS_FRAMES, point_size=2.0,
+                                        title=f"aggregate denoising — noise → manifold\n{sub}")   # flat purple
         imageio.mimwrite(f"{OUT}/manifold_aggregate_denoising.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
         print(f"[manifold] wrote aggregate_denoising mp4")
 

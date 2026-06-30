@@ -303,15 +303,14 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
     # manifold UMAPs live in the separate eval_manifold routine.
     from .manifold import manifold_clouds
     MAN_N, MAN_VID = 5000, 240
-    paths6d, mspeed, _, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=MAN_N, cube=3.0,
-                                                  stride=1, seed=0, device=device)
+    paths6d, _, _, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=MAN_N, cube=3.0,
+                                             stride=1, seed=0, device=device)
     msub = (f"{'shortcut' if m.cfg.shortcut else 'rectified-flow'} (K={K}) — "
             f"{paths6d.shape[0]:,} next-states (of {n_avail:,} val contexts)")
     Lm, Zm = (R + r) * 1.05, r * 1.6
     plims = ((-Lm, Lm), (-Lm, Lm), (-Zm, Zm))
-    mframes = viz.points_collapse_frames(paths6d[..., :3], color=mspeed, lims=plims, n_frames=MAN_VID,
-                                         point_size=2.0, cbar_label="speed = |predicted next velocity|",
-                                         title=f"aggregate denoising — noise → manifold\n{msub}")
+    mframes = viz.points_collapse_frames(paths6d[..., :3], lims=plims, n_frames=MAN_VID,    # flat purple
+                                         point_size=2.0, title=f"aggregate denoising — noise → manifold\n{msub}")
     writer.video("eval_diffusion/aggregate_denoising", mframes, 60, step)  # 240 frames @ 60 fps = 4 s
 
     writer.scalars({"eval_diffusion/std_of_samples": float(np.mean(spreads)),   # uncertainty (no val equivalent)

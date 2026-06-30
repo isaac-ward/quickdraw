@@ -687,12 +687,15 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
 
 
 # ------------------------- diffusion: recovered-manifold point clouds (matplotlib 3D) -------------------------
+_POINT_PURPLE = "#8E44AD"   # flat fill when no scalar `color` is given (color everything purple)
+
+
 def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="",
                      depthshade=True):
     """A 3D point cloud from 4 ORTHOGRAPHIC views in a 2x2 GridSpec (plain matplotlib 3D scatter — no torus
     mesh, the POINTS are the surface). Views: side (x-z), top-down (x-y), and two obliques. pts: (N,3).
-    color: (N,) scalar or None. lims: (lo,hi) cube OR ((xlo,xhi),(ylo,yhi),(zlo,zhi)) per-axis — the box
-    aspect is taken from the lims extents so the cloud FILLS each panel without distortion."""
+    color: (N,) scalar array -> colormap + colorbar; None -> flat purple, no colorbar. lims: (lo,hi) cube
+    OR ((xlo,xhi),(ylo,yhi),(zlo,zhi)) per-axis — box aspect from the lims extents so the cloud FILLS."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
     pts = np.asarray(pts)
     if lims is not None and np.ndim(lims) == 1:
@@ -705,7 +708,8 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
     for i, (elev, azim, lbl) in enumerate(views):
         ax = fig.add_subplot(gs[i // 2, i % 2], projection="3d")
         ax.set_proj_type("ortho")                                  # orthographic (no perspective foreshortening)
-        sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size, c=color, cmap=cmap,
+        sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size,
+                        c=(color if color is not None else _POINT_PURPLE), cmap=cmap,
                         depthshade=depthshade, linewidths=0)
         ax.view_init(elev=elev, azim=azim)
         if lims is not None:
@@ -719,7 +723,7 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
         ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
         ax.set_xlabel(""); ax.set_ylabel(""); ax.set_zlabel("")
     fig.subplots_adjust(left=0.0, right=0.88, top=0.93, bottom=0.0, wspace=0.0, hspace=0.0)  # use the whitespace
-    if color is not None and sc is not None:
+    if isinstance(color, np.ndarray) and sc is not None:           # colorbar only for a scalar field
         cax = fig.add_axes([0.905, 0.30, 0.015, 0.40])             # dedicated right-side colorbar
         fig.colorbar(sc, cax=cax, label=cbar_label)
     fig.suptitle(title, fontsize=11, y=0.995)
@@ -734,14 +738,15 @@ def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="pl
     pts = np.asarray(pts)
     fig = plt.figure(figsize=(10, 9))
     ax = fig.add_subplot(1, 1, 1)
-    sc = ax.scatter(pts[:, 0], pts[:, 1], s=point_size, c=color, cmap=cmap, linewidths=0)
+    sc = ax.scatter(pts[:, 0], pts[:, 1], s=point_size,
+                    c=(color if color is not None else _POINT_PURPLE), cmap=cmap, linewidths=0)
     if lims is not None:
         (xl, yl) = lims
         ax.set_xlim(xl); ax.set_ylim(yl)
     ax.xaxis.set_major_locator(MaxNLocator(5)); ax.yaxis.set_major_locator(MaxNLocator(5))
     ax.set_xticklabels([]); ax.set_yticklabels([])
     fig.subplots_adjust(left=0.03, right=0.88, top=0.93, bottom=0.03)  # axes fills the region (no letterbox)
-    if color is not None:
+    if isinstance(color, np.ndarray):                                # colorbar only for a scalar field
         cax = fig.add_axes([0.905, 0.30, 0.015, 0.40])               # dedicated right-side colorbar
         fig.colorbar(sc, cax=cax, label=cbar_label)
     fig.suptitle(title, fontsize=11, y=0.98)
