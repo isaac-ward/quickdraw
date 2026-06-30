@@ -99,6 +99,20 @@ rollout (`p_tf` curriculum + `detach_every` BPTT) all operate on the fused repre
 - **Contraction** is still the `dz×dz` latent Jacobian via the eager `sdpa(MATH)` double-vjp path —
   modality-blind, unchanged.
 
+## Multi-feed: design the seam now, build one feed
+
+We start with the single egocentric FPV feed, but the design must extend to **N visual feeds** (e.g.
+FPV + chase + top-down) without surgery. The discipline:
+
+- **One shared ViT encoder** applied to every feed (weights tied), so adding a feed adds no parameters.
+- **Per-feed identity embedding** added to that feed's tokens (like a positional embedding, but for
+  "which camera") so the model can tell feeds apart while sharing the encoder.
+- Every feed's tokens flow into the **same list-based `TokenStreamFuser`** — N image streams + the
+  kinematic stream + action. The fuser already takes an arbitrary list of streams, so the only
+  discipline is **never hard-coding "one image stream"** anywhere downstream.
+- The carried latent stays **feed-count-agnostic** (a token list with feed-identity embeddings), so
+  feed #2 is a config change (`feeds: [fpv, chase]`), not an architecture change.
+
 ## What's genuinely new to build
 
 - **ViT image encoder** + **image decoder** (ViT / transposed-conv) heads.
