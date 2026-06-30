@@ -34,6 +34,7 @@ def main(cfg):
 
     from ..models.diffusion import Diffusion, _ln
     stage = os.environ.get("MANIFOLD_STAGE", "images")
+    no_ln = stage.endswith("noln")     # decode the viz path WITHOUT LayerNorm -> the noise start is genuinely far in 6D
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(cfg).to(device)
     load_checkpoint(model, cfg.checkpoint)
@@ -72,13 +73,61 @@ def main(cfg):
             h, zt = h_all[0, ts], z[0, ts]
             eps = (torch.rand(len(ts), dz, generator=g, device=device) * 2 - 1) * CUBE   # uniform hypercube
             _, path = m.flow.sample(h, steps=K, deterministic=False, eps=eps, record_path=True)
-            dec = np.stack([norm.denorm_obs(m.to_obs(_ln(zt + x))).cpu().numpy() for x in path])  # (K+1, nt, 6)
+            dec = np.stack([norm.denorm_obs(m.to_obs((zt + x) if no_ln else _ln(zt + x))).cpu().numpy()
+                            for x in path])                                                       # (K+1, nt, 6)
             paths6d.extend(np.transpose(dec, (1, 0, 2)))                                          # list of (K+1, 6)
     paths6d = np.stack(paths6d)                                          # (N, K+1, 6) — SAME points for img + video
     N = paths6d.shape[0]
     speed = np.linalg.norm(paths6d[:, -1, 3:], axis=1)                  # color = |predicted next velocity|
     sub = f"{model_name} (K={K}) — {N:,} denoised next-states, one per context (of {n_avail:,} {SPLIT} contexts)"
     print(f"[manifold:{tag}] {N} points; {sub}")
+
+    # ---- 6D-embedding experiment: compare 3D reducers on the START (noise) vs END (manifold) frames ----
+    if stage.startswith("embed_experiment"):
+        expdir = f"{OUT}/embed_experiments"; os.makedirs(expdir, exist_ok=True)
+        start, end, flat = paths6d[:, 0], paths6d[:, -1], paths6d.reshape(-1, 6)
+
+        def cube(a, b):                                  # shared per-axis lims covering both clouds
+            both = np.vstack([a, b]); out = []
+            for i in range(3):
+                lo, hi = float(both[:, i].min()), float(both[:, i].max()); pad = 0.05 * (hi - lo + 1e-6)
+                out.append((lo - pad, hi + pad))
+            return tuple(out)
+
+        def save(pts, lims, name, ttl):
+            f = viz.fig_points_4view(pts, color=speed, lims=lims, point_size=2.5, cbar_label=CBAR, title=ttl)
+            f.savefig(f"{expdir}/{name}.png", dpi=110); plt.close(f)
+            print(f"[manifold] wrote embed_experiments/{name}.png")
+
+        if no_ln:
+            # NO-LN decode (start genuinely far in 6D) + UMAP fit on END-points only (keeps the shell)
+            import umap
+            reducer = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05).fit(end)
+            us, ue = reducer.transform(start), reducer.transform(end)
+            ul = cube(us, ue)
+            save(us, ul, "noln_umap_start", "no-LN decode + UMAP fit-on-ends — START (noise)")
+            save(ue, ul, "noln_umap_end", "no-LN decode + UMAP fit-on-ends — END (manifold)")
+            return
+
+        # (3) PCA(3) on STANDARDIZED 6D, fit on ALL trajectory steps (linear -> no neighbour-squashing)
+        from sklearn.decomposition import PCA
+        mu, sd = flat.mean(0), flat.std(0) + 1e-6
+        pca = PCA(n_components=3).fit((flat - mu) / sd)
+        ps, pe = pca.transform((start - mu) / sd), pca.transform((end - mu) / sd)
+        pl = cube(ps, pe)
+        save(ps, pl, "pca_start", "PCA(3) std-6D, fit on all steps — START (noise)")
+        save(pe, pl, "pca_end", "PCA(3) std-6D, fit on all steps — END (manifold)")
+
+        # (1) UMAP fit on ENDS + a 15% sample of START (noise) points; transform start/end
+        import umap
+        nidx = rng.choice(end.shape[0], int(0.15 * end.shape[0]), replace=False)
+        reducer = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05).fit(
+            np.vstack([end, start[nidx]]))
+        us, ue = reducer.transform(start), reducer.transform(end)
+        ul = cube(us, ue)
+        save(us, ul, "umapmix_start", "UMAP fit on ends + 15% noise — START (noise)")
+        save(ue, ul, "umapmix_end", "UMAP fit on ends + 15% noise — END (manifold)")
+        return
 
     # ---- A) position 3D ----  (flat torus -> per-axis lims so it fills)
     L, Z = (R + r) * 1.05, r * 1.6
