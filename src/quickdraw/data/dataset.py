@@ -54,6 +54,52 @@ def load_split_episodes(root: str, split: str):
     return [(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)]
 
 
+def load_fpv_frames(root: str, split: str, size: int = 128, max_frames: int | None = None, cache: bool = True):
+    """All egocentric FPV frames for a split (lerobot chunked video), AREA-downsampled to size×size ONCE
+    and cached to disk (npy next to the split). Returns uint8 (N, size, size, 3). The downsample is the
+    only per-frame work and it's cached, so repeat loads are instant (mmap)."""
+    import glob as _glob
+
+    import imageio.v2 as imageio
+    cache_path = os.path.join(root, split, f"fpv_{size}.npy")
+    if cache and max_frames is None and os.path.exists(cache_path):
+        return np.load(cache_path)
+    vid = os.path.join(root, split, "videos", "observation.images.fpv")
+    mp4s = sorted(_glob.glob(os.path.join(vid, "*", "*.mp4")))
+    assert mp4s, f"no FPV mp4s under {vid}"
+    out, buf = [], []
+
+    def _flush():
+        if not buf:
+            return
+        x = torch.from_numpy(np.stack(buf)).permute(0, 3, 1, 2).float()       # (b,3,H,W)
+        x = torch.nn.functional.interpolate(x, size=(size, size), mode="area")  # anti-aliased downsample
+        out.append(x.permute(0, 2, 3, 1).round().clamp(0, 255).to(torch.uint8).numpy())
+        buf.clear()
+
+    def _have():
+        return sum(len(o) for o in out) + len(buf)
+
+    for p in mp4s:
+        rd = imageio.get_reader(p)
+        for fr in rd:
+            buf.append(np.asarray(fr)[..., :3])
+            if len(buf) >= 512:
+                _flush()
+            if max_frames is not None and _have() >= max_frames:
+                break
+        rd.close()
+        if max_frames is not None and _have() >= max_frames:
+            break
+    _flush()
+    frames = np.concatenate(out, 0)
+    if max_frames is not None:
+        frames = frames[:max_frames]
+    elif cache:
+        np.save(cache_path, frames)
+    return frames
+
+
 class WindowDataset(Dataset):
     """Length-(P+F) windows. Returns normalized obs_seq (L,6) and act_seq (L,2)."""
 
