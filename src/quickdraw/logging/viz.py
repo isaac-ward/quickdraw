@@ -601,15 +601,16 @@ def fpv_frames(R, r, coloring, obs, n_frames=10000, fov=FPV_FOV, size=FPV_SIZE):
 def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, agent_tail=None,
                             true_next=None, title="", size=860, view_pad=EVAL_VIEW_PAD,
                             torus_opacity=TORUS_OPACITY):
-    """Short tau-sweep ANIMATION (tau 1->0, the denoising direction). The torus + moving-agent tail +
-    current dot + action arrow + a black TRUTH ring (the true next position) stay fixed; a GREY SWARM of
-    decoded ODE paths flows from off-surface noise onto the torus EACH leaving its own growing tail (so the
-    accumulating tails trace the flow field), and the RED committed particle rides its own path. per_frame
-    is a list of {particle: (3,), trail: (k,3), swarm: [{particle, trail}..]} from the caller."""
+    """Short tau-sweep ANIMATION (tau 1->0, the denoising direction), rendered as the FULL 4-panel atlas
+    (iso + 3 axial, like the control/OOD videos) so the see-through axial views are available. The torus +
+    moving-agent tail + current dot + action arrow + a black TRUTH ring (the true next position) stay fixed;
+    a GREY SWARM of decoded ODE paths flows from off-surface noise onto the torus EACH leaving its own
+    growing tail (so the accumulating tails trace the flow field), and the RED committed particle rides its
+    own path. per_frame is a list of {particle: (3,), trail: (k,3), swarm: [{particle, trail}..]}."""
     sc = R + r
-    ring_r = 0.0225 * sc                                                 # ring diameter = 0.5x the agent diameter
-    rend = TorusRenderer(R, r, coloring, sizes=(size, size))
-    vl, frames = sc * view_pad, []
+    ring_r = 0.0225 * sc                                                 # truth ring diameter = 0.5x the agent diameter
+    rend = TorusRenderer(R, r, coloring)                                 # reused across frames (atlas, like control)
+    frames = []
     cur, act = np.asarray(current), np.asarray(action_amb)
     tail = np.asarray(agent_tail) if agent_tail is not None else None   # moving agent's trajectory tail (static)
     ring = _tangent_ring(true_next, R, ring_r) if true_next is not None else None  # black truth ring (static)
@@ -637,8 +638,12 @@ def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, agen
             else:
                 trajs.append({"xyz": np.asarray(fr["particle"])[None], "color": "red",
                               "start_sphere": True, "end_sphere": False})
-            frames.append(rend.view(trajs, None, [(cur, act)], "iso", size, markers=False, view_l=vl,
-                                    torus_opacity=torus_opacity))
+            fig = fig_torus_atlas(R, r, trajs=trajs, arrows=[(cur, act)], coloring=coloring, title=title,
+                                  markers=False, iso_size=size, ax_size=int(round(size * 0.67)),
+                                  view_pad=view_pad, torus_opacity=torus_opacity, renderer=rend)
+            fig.set_dpi(VIDEO_DPI)
+            frames.append(_fig_rgb(fig))
+            plt.close(fig)
     finally:
         rend.close()
     return np.stack(frames)
