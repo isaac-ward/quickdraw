@@ -687,36 +687,51 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
 
 
 # ------------------------- diffusion: recovered-manifold point clouds (matplotlib 3D) -------------------------
-def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap="viridis", cbar_label=""):
-    """A 3D point cloud from 4 angles in a 2x2 GridSpec (plain matplotlib 3D scatter — no torus mesh, the
-    POINTS are the surface). Views: side (x-z), top-down (x-y), and two obliques. pts: (N,3). color: (N,)
-    scalar or None. lims: (lo, hi) shared cube, or None to autoscale."""
+def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap="viridis", cbar_label="",
+                     depthshade=True):
+    """A 3D point cloud from 4 ORTHOGRAPHIC views in a 2x2 GridSpec (plain matplotlib 3D scatter — no torus
+    mesh, the POINTS are the surface). Views: side (x-z), top-down (x-y), and two obliques. pts: (N,3).
+    color: (N,) scalar or None. lims: (lo,hi) cube OR ((xlo,xhi),(ylo,yhi),(zlo,zhi)) per-axis — the box
+    aspect is taken from the lims extents so the cloud FILLS each panel without distortion."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
     pts = np.asarray(pts)
+    if lims is not None and np.ndim(lims) == 1:
+        lims = (tuple(lims), tuple(lims), tuple(lims))
+    from matplotlib.ticker import MaxNLocator
     views = [(8, -90, "side  (x–z)"), (89, -90, "top-down  (x–y)"), (26, 45, "oblique A"), (26, 135, "oblique B")]
-    fig = plt.figure(figsize=(11, 11))
-    gs = GridSpec(2, 2, figure=fig, wspace=0.04, hspace=0.08)
+    fig = plt.figure(figsize=(12, 12))
+    gs = GridSpec(2, 2, figure=fig, wspace=0.0, hspace=0.0)
     sc = None
     for i, (elev, azim, lbl) in enumerate(views):
         ax = fig.add_subplot(gs[i // 2, i % 2], projection="3d")
+        ax.set_proj_type("ortho")                                  # orthographic (no perspective foreshortening)
         sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size, c=color, cmap=cmap,
-                        depthshade=True, linewidths=0)
+                        depthshade=depthshade, linewidths=0)
         ax.view_init(elev=elev, azim=azim)
-        ax.set_title(lbl, fontsize=10)
+        ax.text2D(0.04, 0.92, lbl, transform=ax.transAxes, fontsize=9)   # in-axes label (no suptitle collision)
         if lims is not None:
-            ax.set_xlim(lims); ax.set_ylim(lims); ax.set_zlim(lims)
-        ax.set_box_aspect((1, 1, 1))
-        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+            (xl, yl, zl) = lims
+            ax.set_xlim(xl); ax.set_ylim(yl); ax.set_zlim(zl)
+            ax.set_box_aspect((xl[1] - xl[0], yl[1] - yl[0], zl[1] - zl[0]))  # proportional -> fills, undistorted
+        else:
+            ax.set_box_aspect((1, 1, 1))
+        ax.set_xlabel("x", fontsize=7); ax.set_ylabel("y", fontsize=7); ax.set_zlabel("z", fontsize=7)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.set_major_locator(MaxNLocator(4))
+        ax.tick_params(labelsize=6)
+    fig.subplots_adjust(left=0.0, right=0.88, top=0.93, bottom=0.0, wspace=0.0, hspace=0.0)  # use the whitespace
     if color is not None and sc is not None:
-        fig.colorbar(sc, ax=fig.axes, shrink=0.5, pad=0.02, label=cbar_label)
-    fig.suptitle(title, fontsize=12)
+        cax = fig.add_axes([0.905, 0.30, 0.015, 0.40])             # dedicated right-side colorbar
+        fig.colorbar(sc, cax=cax, label=cbar_label)
+    fig.suptitle(title, fontsize=11, y=0.995)
     return fig
 
 
 def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
-                           cmap="viridis", cbar_label="", dpi=110):
+                           cmap="viridis", cbar_label="", depthshade=False, dpi=110):
     """Animate a cloud collapsing onto the recovered manifold: paths (N, T, 3) are the per-point positions
-    over the T denoising steps; each frame is fig_points_4view at an interpolated time. Returns RGB frames."""
+    over the T denoising steps; each frame is fig_points_4view at an interpolated time. Returns RGB frames.
+    depthshade defaults False here (much faster for the many-frame render)."""
     paths = np.asarray(paths)
     T = paths.shape[1]
     frames = []
@@ -724,7 +739,7 @@ def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, 
         j0 = int(np.floor(f)); j1 = min(j0 + 1, T - 1); w = f - j0
         pts = (1 - w) * paths[:, j0] + w * paths[:, j1]
         fig = fig_points_4view(pts, color=color, title=title, lims=lims, point_size=point_size,
-                               cmap=cmap, cbar_label=cbar_label)
+                               cmap=cmap, cbar_label=cbar_label, depthshade=depthshade)
         fig.set_dpi(dpi)
         frames.append(_fig_rgb(fig))
         plt.close(fig)

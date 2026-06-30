@@ -1,14 +1,17 @@
-"""PREVIEW: recovered-manifold point clouds from a trained diffusion checkpoint. Pool denoised samples over
-many validation contexts -> the union of next-state end-points traces the learned manifold.
+"""PREVIEW: recovered-manifold point clouds from a trained diffusion checkpoint. Pool denoised next-state
+end-points over MANY contexts (a sliding window over the TRAINING episodes) -> the union traces the learned
+manifold. The image and the collapse video use the SAME points.
 
   MANIFOLD_STAGE=images uv run python -m quickdraw.smoke.manifold_preview \
-      model=diffusion checkpoint=<run_dir_or_ckpt> data.root=<data>
+      model=diffusion checkpoint=<run_dir_or_ckpt> data.root=<data>           # rectified-flow
+  ... model.diffusion.shortcut=true model.diffusion.sampling_steps=1 ...       # shortcut
 
-Stage 'images' (fast): the final-frame stills (A position-3D, B UMAP-3D). Stage 'videos': the collapse mp4s.
-Writes to logs/viz_preview/. (Driver for the eventual eval_diffusion/manifold_* routine.)"""
+Stage 'images' (fast): final stills (A position-3D, B UMAP-3D, orthographic, seeded). 'videos'/'both': the
+collapse mp4s. Output names are suffixed by the model (flow/shortcut). Writes to logs/viz_preview/."""
 from __future__ import annotations
 
 import os
+from collections import defaultdict
 
 import hydra
 import numpy as np
@@ -18,12 +21,14 @@ from ..logging import viz
 from ..training.setup import build_model, env_cfg, eval_episodes, load_checkpoint, normalizer
 
 OUT = "/app/logs/viz_preview"
-N_CTX, M_EPS, CUBE = 96, 48, 3.0          # contexts x noise-samples per context; uniform-hypercube half-width (latent)
+SPLIT, STRIDE, CUBE, N_POINTS = "train", 1, 3.0, 30000   # train = most contexts; 1 noise/context; SAME N for img+video
+N_FRAMES = 40
 
 
 @hydra.main(config_path="../../../conf", config_name="config", version_base=None)
 def main(cfg):
     import imageio.v2 as imageio
+    import matplotlib.pyplot as plt
 
     from ..models.diffusion import Diffusion, _ln
     stage = os.environ.get("MANIFOLD_STAGE", "images")
@@ -34,66 +39,79 @@ def main(cfg):
     m = getattr(model, "_orig_mod", model)
     assert isinstance(m, Diffusion), "manifold preview needs a diffusion model"
     norm, ecfg = normalizer(cfg), env_cfg(cfg)
-    R, r, K, dz, W, P = ecfg.R, ecfg.r, m.sampling_steps, m.cfg.dz, m.window, cfg.data.P
-    eps_ds = eval_episodes(cfg, norm, "val")
-    n_ep = len(eps_ds)
+    R, r, K, dz, P = ecfg.R, ecfg.r, m.sampling_steps, m.cfg.dz, cfg.data.P
+    shortcut = bool(m.cfg.shortcut)
+    tag = "shortcut" if shortcut else "flow"
+    model_name = "shortcut" if shortcut else "rectified-flow"
+    ds = eval_episodes(cfg, norm, SPLIT)
+    n_ep = len(ds)
     rng = np.random.RandomState(0)
     g = torch.Generator(device=device).manual_seed(0)
     os.makedirs(OUT, exist_ok=True)
 
-    def decode(z_t, x):
-        return norm.denorm_obs(m.to_obs(_ln(z_t + x))).cpu().numpy()       # (.,6)
+    # pick N_POINTS random (episode, step) context slices over the whole training split
+    slices = [(ei, t) for ei in range(n_ep) for t in range(P, ds[ei]["obs_seq"].shape[0] - 1, STRIDE)]
+    n_avail = len(slices)
+    rng.shuffle(slices)
+    by_ep = defaultdict(list)
+    for ei, t in slices[:N_POINTS]:
+        by_ep[ei].append(t)
 
-    # pool over many validation contexts: each draws M uniform-hypercube latent noises, denoises K steps
-    paths = []
+    # one causal transformer pass per episode gives h at every step; denoise 1 noise/slice, keep the path
+    paths6d = []
     with torch.no_grad():
-        for _ in range(N_CTX):
-            ep = eps_ds[rng.randint(n_ep)]
+        for ei, ts in by_ep.items():
+            ep = ds[ei]
             obs = ep["obs_seq"].to(device)[None].float()
             act = ep["act_seq"].to(device)[None].float()
-            t = rng.randint(P, obs.shape[1] - 2)
             z = m.encode_state(obs)
-            w = min(W, t + 1)
-            h = m.transformer(m.to_token(z[:, t - w + 1:t + 1], act[:, t - w + 1:t + 1]))[:, -1].expand(M_EPS, -1)
-            z_t = z[:, t].expand(M_EPS, -1)
-            eps = (torch.rand(M_EPS, dz, generator=g, device=device) * 2 - 1) * CUBE   # uniform hypercube
+            h_all = m.transformer(m.to_token(z, act))
+            ts = np.array(sorted(ts))
+            h, zt = h_all[0, ts], z[0, ts]
+            eps = (torch.rand(len(ts), dz, generator=g, device=device) * 2 - 1) * CUBE   # uniform hypercube
             _, path = m.flow.sample(h, steps=K, deterministic=False, eps=eps, record_path=True)
-            dec = np.stack([decode(z_t, x) for x in path])                 # (K+1, M, 6)
-            paths.append(np.transpose(dec, (1, 0, 2)))                     # (M, K+1, 6)
-    allp = np.concatenate(paths, axis=0)                                   # (Pn, K+1, 6)
-    speed = np.linalg.norm(allp[:, -1, 3:], axis=1)                        # end-velocity magnitude (color)
-    print(f"[manifold] {allp.shape[0]} points, K={K} steps, contexts={N_CTX}")
+            dec = np.stack([norm.denorm_obs(m.to_obs(_ln(zt + x))).cpu().numpy() for x in path])  # (K+1, nt, 6)
+            paths6d.extend(np.transpose(dec, (1, 0, 2)))                                          # list of (K+1, 6)
+    paths6d = np.stack(paths6d)                                          # (N, K+1, 6) — SAME points for img + video
+    N = paths6d.shape[0]
+    speed = np.linalg.norm(paths6d[:, -1, 3:], axis=1)                  # color = |predicted next velocity|
+    sub = f"{model_name} (K={K}) — {N} pts from {n_avail} {SPLIT} contexts"
+    print(f"[manifold:{tag}] {N} points; {sub}")
 
-    # ---- A) position 3D (the surface should appear) ----
-    pos = allp[..., :3]                                                    # (Pn, K+1, 3)
-    lim = (R + r) * 1.15
+    # ---- A) position 3D ----  (flat torus -> per-axis lims so it fills)
+    L, Z = (R + r) * 1.05, r * 1.6
+    plims = ((-L, L), (-L, L), (-Z, Z))
+    pos = paths6d[..., :3]
     if stage in ("images", "both"):
-        f = viz.fig_points_4view(pos[:, -1], color=speed, lims=(-lim, lim), cbar_label="speed",
-                                 title="recovered manifold — position (denoised end-points)")
-        f.savefig(f"{OUT}/manifold_position_final.png", dpi=95); import matplotlib.pyplot as plt; plt.close(f)
-        print("[manifold] wrote manifold_position_final.png")
+        f = viz.fig_points_4view(pos[:, -1], color=speed, lims=plims, point_size=2.0,
+                                 cbar_label="speed = |predicted next velocity|",
+                                 title=f"recovered manifold — position\n{sub}")
+        f.savefig(f"{OUT}/manifold_position_final_{tag}.png", dpi=110); plt.close(f)
+        print(f"[manifold:{tag}] wrote manifold_position_final_{tag}.png")
 
-    # ---- B) UMAP 3D of the full 6D (one fit, transform all -> consistent video) ----
+    # ---- B) UMAP of the full 6D (seeded; one fit; transform the paths for the video) ----
     import umap
     reducer = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05)
-    emb = reducer.fit_transform(allp.reshape(-1, 6)).reshape(allp.shape[0], allp.shape[1], 3)  # (Pn, K+1, 3)
-    elim = (float(emb.min()), float(emb.max()))
+    emb = reducer.fit_transform(paths6d[:, -1])                         # (N,3) end-points
+    def _ax(a):
+        lo, hi = float(emb[:, a].min()), float(emb[:, a].max()); pad = 0.05 * (hi - lo + 1e-6)
+        return (lo - pad, hi + pad)
+    elims = (_ax(0), _ax(1), _ax(2))
     if stage in ("images", "both"):
-        import matplotlib.pyplot as plt
-        f = viz.fig_points_4view(emb[:, -1], color=speed, lims=elim, cbar_label="speed",
-                                 title="recovered manifold — UMAP of full 6D (position+velocity)")
-        f.savefig(f"{OUT}/manifold_umap_final.png", dpi=95); plt.close(f)
-        print("[manifold] wrote manifold_umap_final.png")
+        f = viz.fig_points_4view(emb, color=speed, lims=elims, point_size=2.5, cbar_label="speed",
+                                 title=f"recovered manifold — UMAP of full 6D (pos+vel), seed=0\n{sub}")
+        f.savefig(f"{OUT}/manifold_umap_final_{tag}.png", dpi=110); plt.close(f)
+        print(f"[manifold:{tag}] wrote manifold_umap_final_{tag}.png")
 
     if stage in ("videos", "both"):
-        sub = rng.choice(allp.shape[0], min(2500, allp.shape[0]), replace=False)   # subsample for render speed
-        fa = viz.points_collapse_frames(pos[sub], color=speed[sub], lims=(-lim, lim), n_frames=50,
-                                        cbar_label="speed", title="manifold collapse — position")
-        imageio.mimwrite(f"{OUT}/manifold_position_collapse.mp4", list(fa), fps=25, macro_block_size=2, quality=8)
-        fb = viz.points_collapse_frames(emb[sub], color=speed[sub], lims=elim, n_frames=50,
-                                        cbar_label="speed", title="manifold collapse — UMAP 6D")
-        imageio.mimwrite(f"{OUT}/manifold_umap_collapse.mp4", list(fb), fps=25, macro_block_size=2, quality=8)
-        print("[manifold] wrote collapse mp4s")
+        fa = viz.points_collapse_frames(pos, color=speed, lims=plims, n_frames=N_FRAMES, point_size=2.0,
+                                        cbar_label="speed", title=f"manifold collapse — position\n{sub}")
+        imageio.mimwrite(f"{OUT}/manifold_position_collapse_{tag}.mp4", list(fa), fps=20, macro_block_size=2, quality=8)
+        emb_p = reducer.transform(paths6d.reshape(-1, 6)).reshape(N, paths6d.shape[1], 3)
+        fb = viz.points_collapse_frames(emb_p, color=speed, lims=elims, n_frames=N_FRAMES, point_size=2.5,
+                                        cbar_label="speed", title=f"manifold collapse — UMAP 6D\n{sub}")
+        imageio.mimwrite(f"{OUT}/manifold_umap_collapse_{tag}.mp4", list(fb), fps=20, macro_block_size=2, quality=8)
+        print(f"[manifold:{tag}] wrote collapse mp4s")
 
 
 if __name__ == "__main__":
