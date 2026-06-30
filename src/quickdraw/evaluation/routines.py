@@ -50,11 +50,8 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
                  {"xyz": pred_xyz, "color": "dimgray", "start_sphere": False, "end_sphere": True}]
         f_traj = viz.fig_torus_atlas(R, r, trajs=trajs, coloring=coloring, title=f"{split} #{i}",
                                      view_pad=viz.EVAL_VIEW_PAD, torus_opacity=viz.TORUS_OPACITY)
-        f_err = viz.fig_error_vs_step({m: res["per_step"][m][i] for m in res["per_step"]})
-        writer.figure(f"{prefix}/trajectory_plot_{i}", f_traj, step)
-        writer.figure(f"{prefix}/error_vs_step_{i}", f_err, step)
+        writer.figure(f"{prefix}/trajectory_plot_{i}", f_traj, step)   # per-rollout error curve dropped (avg-only)
         plt.close(f_traj)
-        plt.close(f_err)
         # MP4 mirror: full true/pred paths (context + branch) + the true applied-action arrow
         true_full = np.concatenate([ctx_xyz, true_xyz[1:]], axis=0)
         pred_full = np.concatenate([ctx_xyz, pred_xyz[1:]], axis=0)
@@ -76,10 +73,11 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
             "action_arrow_per_step": {"origins_xyz": true_full[:len(avec)], "vectors_xyz": avec},
         }, step)
 
-    # dataset-aggregated error vs rollout step (mean of each metric over all episodes)
-    f_avg = viz.fig_error_vs_step(res["agg"])
-    writer.figure(f"{prefix}/error_vs_step_avg", f_avg, step)
-    plt.close(f_avg)
+    # dataset-aggregated error vs rollout step (mean of each metric over all episodes), both y-scales
+    for ys in ("linear", "log"):
+        f_avg = viz.fig_error_vs_step(res["agg"], yscale=ys)
+        writer.figure(f"{prefix}/error_vs_step_avg_{ys}", f_avg, step)
+        plt.close(f_avg)
     summary = {m: float(res["agg"][m].mean()) for m in res["agg"]}  # mean over the rollout
     writer.scalars({f"{prefix}/{m}_mean": v for m, v in summary.items()}, step)
     _plog(writer, f"[{prefix} @ep{step}] done in {time.perf_counter() - t0:.1f}s")

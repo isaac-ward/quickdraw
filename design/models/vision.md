@@ -221,12 +221,21 @@ eval_manifold/                          (benchmark epochs — any method)
 eval_diffusion/                         (benchmark epochs — diffusion only)
   denoising_multistep, denoising_aggregate, std_of_samples, time/*
 eval_ood_horizon/                       (benchmark epochs)
-  …existing proprio rollout plots + error-vs-step curve…
-  <image-head>/{psnr, ssim, mse}_vs_step  CURVE: image metric over the rollout horizon (mirrors proprio error-vs-step)
+  trajectory_plot_i, trajectory_video_i      per-rollout torus plot + video (kept)
+  error_vs_step_avg_{linear,log}             proprio error over horizon, AVG-only, BOTH y-scales, caption at bottom
+  <image-head>/{psnr,ssim,mse}_vs_step_{linear,log}  image metric over horizon, avg-only, both y-scales, captioned
   <image-head>/filmstrip                STILL: 8 steps across the horizon, pred (top) | GT (bottom)
   <image-head>/rollout                  VIDEO: pred (top, black until context plays out) | GT (bottom), synced
 control/                                (unchanged — see note)
 ```
+
+Logging rules baked in:
+- **Metrics are val-only** (not `train/`). `train/` carries the loss terms (+ lr/grad-norm) only; quality
+  measures (`metric/proprio/pointwise_error`, `metric/<image>/{psnr,ssim,mse}`) live under `val/` — train
+  rollout accuracy is redundant with the train loss, so we don't pay to compute it.
+- **error-vs-step curves: AVG-only** (per-rollout curves dropped) and logged in **both linear and log
+  y-scale** (`*_linear`, `*_log`). Captions explaining each metric stay at the bottom of the figure
+  (existing proprio captions kept; image metrics get their own `CAPTIONS` entries).
 
 - The predicted-vs-true image artifacts go under **`eval_ood_horizon`** (the existing open-loop rollout
   eval), **not** a new `eval_rollout`. Two artifacts per image head, via the `viz.fig_image_filmstrip`
