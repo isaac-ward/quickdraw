@@ -21,9 +21,10 @@ from ..logging import viz
 from ..training.setup import build_model, env_cfg, eval_episodes, load_checkpoint, normalizer
 
 OUT = "/app/logs/viz_preview"
-SPLIT, STRIDE, CUBE, N_POINTS = "train", 1, 3.0, 30000   # train = most contexts; 1 noise/context; SAME N for img+video
-POS_FRAMES, POS_FPS = 96, 12         # position collapse video: 96 frames @ 12 fps = 8 s
-UMAP_FRAMES, UMAP_FPS = 40, 20       # umap collapse video: 2 s
+SPLIT, STRIDE, CUBE, N_POINTS = "train", 1, 3.0, 12000   # train contexts; 1 noise/context; SAME N for img+video
+POS_FRAMES, POS_FPS = 480, 60        # position collapse: 8 s @ 60 fps (smooth, eased)
+UMAP_FRAMES, UMAP_FPS = 240, 60      # umap collapse: 4 s @ 60 fps
+UMAP_FIT_CAP = 24000                 # subsample for the UMAP fit (over ALL denoising steps, not just ends)
 CBAR = "speed = |predicted next velocity|"
 
 
@@ -90,14 +91,18 @@ def main(cfg):
         f.savefig(f"{OUT}/manifold_position_final_{tag}.png", dpi=110); plt.close(f)
         print(f"[manifold:{tag}] wrote manifold_position_final_{tag}.png")
 
-    # ---- B) UMAP of the full 6D (seeded; one fit; transform the paths for the video) ----
+    # ---- B) UMAP of the full 6D ----  fit on ALL denoising-step points (not just ends), so the START
+    # (noise) occupies its OWN region of the embedding and the collapse genuinely shows noise -> manifold.
     import umap
-    reducer = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05)
-    emb = reducer.fit_transform(paths6d[:, -1])                         # (N,3) end-points
+    flat = paths6d.reshape(-1, 6)
+    fit_idx = rng.choice(flat.shape[0], min(UMAP_FIT_CAP, flat.shape[0]), replace=False)
+    reducer = umap.UMAP(n_components=3, random_state=0, n_neighbors=30, min_dist=0.05).fit(flat[fit_idx])
+    emb_all = reducer.transform(flat).reshape(N, paths6d.shape[1], 3)   # (N, T, 3) over all steps
+    emb = emb_all[:, -1]                                                # end-points (image)
     def _ax(a):
-        lo, hi = float(emb[:, a].min()), float(emb[:, a].max()); pad = 0.05 * (hi - lo + 1e-6)
+        lo, hi = float(emb_all[..., a].min()), float(emb_all[..., a].max()); pad = 0.05 * (hi - lo + 1e-6)
         return (lo - pad, hi + pad)
-    elims = (_ax(0), _ax(1), _ax(2))
+    elims = (_ax(0), _ax(1), _ax(2))                                    # from ALL steps -> includes the noise region
     if stage in ("images", "both"):
         f = viz.fig_points_4view(emb, color=speed, lims=elims, point_size=2.5, cbar_label=CBAR,
                                  title=f"recovered manifold — UMAP of full 6D (pos+vel), seed=0\n{sub}")
@@ -108,8 +113,7 @@ def main(cfg):
         fa = viz.points_collapse_frames(pos, color=speed, lims=plims, n_frames=POS_FRAMES, point_size=2.0,
                                         cbar_label=CBAR, title=f"recovered manifold — position\n{sub}")
         imageio.mimwrite(f"{OUT}/manifold_position_collapse_{tag}.mp4", list(fa), fps=POS_FPS, macro_block_size=2, quality=8)
-        emb_p = reducer.transform(paths6d.reshape(-1, 6)).reshape(N, paths6d.shape[1], 3)
-        fb = viz.points_collapse_frames(emb_p, color=speed, lims=elims, n_frames=UMAP_FRAMES, point_size=2.5,
+        fb = viz.points_collapse_frames(emb_all, color=speed, lims=elims, n_frames=UMAP_FRAMES, point_size=2.5,
                                         cbar_label=CBAR, title=f"recovered manifold — UMAP of full 6D (pos+vel)\n{sub}")
         imageio.mimwrite(f"{OUT}/manifold_umap_collapse_{tag}.mp4", list(fb), fps=UMAP_FPS, macro_block_size=2, quality=8)
         print(f"[manifold:{tag}] wrote collapse mp4s")

@@ -727,14 +727,19 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
 
 
 def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
-                           cmap="plasma", cbar_label="", depthshade=False, dpi=110):
+                           cmap="plasma", cbar_label="", depthshade=False, ease=True, dpi=110):
     """Animate a cloud collapsing onto the recovered manifold: paths (N, T, 3) are the per-point positions
-    over the T denoising steps; each frame is fig_points_4view at an interpolated time. Returns RGB frames.
-    depthshade defaults False here (much faster for the many-frame render)."""
+    over the T denoising steps; each frame is fig_points_4view at an interpolated time. ease=True applies a
+    cubic ease-OUT so the motion slows toward the end (the cloud appears to settle). depthshade defaults
+    False here (much faster for the many-frame render)."""
     paths = np.asarray(paths)
     T = paths.shape[1]
     frames = []
-    for f in np.linspace(0, T - 1, n_frames):
+    for k in range(n_frames):
+        u = k / (n_frames - 1) if n_frames > 1 else 1.0
+        if ease:
+            u = 1.0 - (1.0 - u) ** 3                          # cubic ease-out -> slows into the manifold (settling)
+        f = u * (T - 1)
         j0 = int(np.floor(f)); j1 = min(j0 + 1, T - 1); w = f - j0
         pts = (1 - w) * paths[:, j0] + w * paths[:, j1]
         fig = fig_points_4view(pts, color=color, title=title, lims=lims, point_size=point_size,
