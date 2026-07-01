@@ -152,6 +152,8 @@ class LoggingCallback(L.Callback):
     def _bench(self, pl_module):
         """time/ms/* + time/hz/* from a controlled rollout micro-benchmark (batch B and batch 1)."""
         m, dev = pl_module.model, pl_module.device
+        if hasattr(getattr(m, "_orig_mod", m), "layout"):   # multimodal (dict obs) — skip the vector benchmark
+            return {}
         P, F, B = self.cfg.data.P, self.cfg.data.F, int(self.cfg.data.batch)
         od, ad = m.cfg.obs_dim, m.cfg.action_dim
         roll_b = _bench_rollout(m, P, F, od, ad, dev, B)   # full rollout, whole batch
