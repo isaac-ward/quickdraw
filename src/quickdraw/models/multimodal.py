@@ -87,9 +87,16 @@ class MultiModalSequenceModel(nn.Module):
     # ---- shared autoregressive rollout (token-bag analogue of SequenceWorldModel._rollout) ----
     def _rollout(self, ctx_obs: dict[str, Tensor], actions: Tensor, horizon: int, p_tf: float,
                  true_future: dict[str, Tensor] | None, detach_every: int) -> Tensor:
-        W = self.window
         bag_buf = list(self.encode_state(ctx_obs).unbind(dim=1))     # P bags of (B,n_state,d)
         tf_future = self.encode_state(true_future) if true_future is not None else None
+        return self._rollout_from(bag_buf, actions, horizon, p_tf, tf_future, detach_every)
+
+    def _rollout_from(self, bag_buf, actions: Tensor, horizon: int, p_tf: float,
+                      tf_future: Tensor | None, detach_every: int) -> Tensor:
+        """Rollout from a PRE-ENCODED context (list of P bags). Lets callers encode the context once and
+        roll many action variants from it (MPPI: encode the image context once, share across K candidates)."""
+        W = self.window
+        bag_buf = list(bag_buf)
         B = bag_buf[0].shape[0]
         preds = []
         for h in range(horizon):
@@ -120,6 +127,18 @@ class MultiModalSequenceModel(nn.Module):
     def rollout_train(self, ctx_obs, actions, true_future: dict, p_tf: float, detach_every: int = 8) -> Tensor:
         horizon = next(iter(true_future.values())).shape[1]
         return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every)
+
+    @torch.no_grad()
+    def imagine_shared(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int, heads=None) -> dict[str, Tensor]:
+        """MPPI helper: encode B contexts ONCE (the expensive image encode), expand to B*K, then roll K
+        action variants per context. ctx_obs: (B,P,*); actions: (B*K, P-1+horizon, 2). Decodes only `heads`
+        (e.g. ['proprio'] for scoring). Avoids re-encoding the image context per candidate."""
+        with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
+            bags = self.encode_state(ctx_obs)                                    # (B,P,n_state,d) — one encode
+            buf = [b.repeat_interleave(K, dim=0) for b in bags.unbind(1)]        # each (B*K,n_state,d)
+            bag = self._rollout_from(buf, actions, horizon, 0.0, None, 0)
+            out = self.to_obs(bag, heads=heads)
+        return {k: v.float() for k, v in out.items()}
 
     @torch.no_grad()
     def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None) -> dict[str, Tensor]:

@@ -47,8 +47,18 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     # reuse_render is a RENDER knob living in the control config; strip it before building MPPIConfig
     # (which has no such field) so MPPIConfig(**...) doesn't choke on the extra key.
     mppi_kwargs = {k: v for k, v in cfg.control.items() if k != "reuse_render"}
+    fpv = None                                    # multimodal: render FPV context in the MPPI loop
+    core = getattr(model, "_orig_mod", model)
+    if hasattr(core, "layout"):
+        img_size = next((mod.ae.cfg.img_size for mod in core.modalities.values() if hasattr(mod, "ae")), 128)
+        try:
+            coloring = json.load(open(os.path.join(cfg.data.root, "dataset_card.json"))).get("coloring", {}).get("train", "rainbow")
+        except OSError:
+            coloring = "rainbow"
+        fpv = {"coloring": coloring, "fov": float(cfg.data.fpv_fov), "size": int(img_size)}
+        _plog(writer, f"[eval_control @ep{step}] multimodal: FPV render in the MPPI loop (coloring={coloring}, size={img_size})")
     res, _ = run_control(model, normalizer, ecfg, MPPIConfig(**mppi_kwargs), device=device,
-                         log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"))
+                         log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv)
     t_ctrl = time.perf_counter() - t
     # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers both controllers + chunk
     # execution over n_chunks replans, so per-chunk wall time = t_ctrl / n_chunks.

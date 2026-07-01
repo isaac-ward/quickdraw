@@ -95,6 +95,27 @@ def _model_rollout_fn(model, normalizer, ctx, pa):
     return fn
 
 
+def _render_fpv(states, R, r, coloring, fov, size, device):
+    """Render the egocentric FPV for a batch of torus states (B,6) -> (B,size,size,3) [0,1] on device."""
+    from ..logging import viz
+    frames = viz.fpv_frames(R, r, coloring, states.detach().cpu().numpy(), fov=fov, size=size)  # (B,s,s,3) uint8
+    return torch.from_numpy(frames).float().div_(255.0).to(device)
+
+
+def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa):
+    """Learned rollout for a MULTIMODAL model: proprio + rendered FPV context. The image context is encoded
+    ONCE and shared across the K candidates (imagine_shared); candidates score on decoded PROPRIO only."""
+    def fn(cand):                                           # cand: (G,K,H,2)
+        G, K, H = cand.shape[:3]
+        ctx = {"proprio": normalizer.norm_obs(ctx_pro), "image": ctx_fpv}   # (G,p,6), (G,p,s,s,3)
+        paK = pa[:, None].expand(G, K, pa.shape[1], 2).reshape(G * K, pa.shape[1], 2)
+        actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, 2)], dim=1))  # (G*K, p-1+H, 2)
+        pr = normalizer.denorm_obs(model.imagine_shared(ctx, actK, H, K, heads=["proprio"])["proprio"])
+        pr = pr.view(G, K, H, 6)
+        return pr[..., :3], pr[..., 3:]
+    return fn
+
+
 def _init_controller(cfg, B, device, seed):
     env = TorusEnv(cfg, batch=B, device=device)
     env.reset(torch.Generator(device=device).manual_seed(seed))
@@ -104,9 +125,15 @@ def _init_controller(cfg, B, device, seed):
 
 
 @torch.no_grad()
-def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, device="cpu", log=None):
+def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, device="cpu", log=None, fpv=None):
     """Race the oracle (true-dynamics) and the learned controller through 8 goals. Returns both
-    controllers' per-step paths/actions/goals (episode 0 for the video) and aggregate stats."""
+    controllers' per-step paths/actions/goals (episode 0 for the video) and aggregate stats.
+    `fpv` (dict {coloring, fov, size}) enables the MULTIMODAL learned controller: the FPV is rendered per
+    step for the model's image context (proprio comes from the env)."""
+    core = getattr(model, "_orig_mod", model)
+    is_mm = hasattr(core, "layout")
+    def _fpv(states):
+        return _render_fpv(states, env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"], device)
     goals = control_goals(env_cfg.R, env_cfg.r, device=device)
     names = [n for n, _ in goals]
     n_goals = min(mppi.n_goals, len(goals))                   # visit this many per episode (subset of the 8)
@@ -124,6 +151,8 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
         c["mean"] = torch.zeros(B, H, 2, device=device)
         c["done_step"] = torch.full((B,), -1, dtype=torch.long, device=device)
         c["dist_log"] = []  # per executed step: distance of each episode to its current goal
+    if is_mm:               # learned controller needs the FPV context (proprio comes from the env)
+        ctrls["pred"]["fpv"] = [_fpv(ctrls["pred"]["obs"][-1])]
 
     t0 = time.perf_counter()
     step = 0
@@ -138,7 +167,11 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
             if kind == "pred":
                 ctx = torch.stack(c["obs"][-P:], dim=1)
                 pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, 2, device=device)
-                rollout = _model_rollout_fn(model, normalizer, ctx, pa)
+                if is_mm:
+                    ctx_fpv = torch.stack(c["fpv"][-P:], dim=1)   # (B, p, s, s, 3) rendered FPV context
+                    rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa)
+                else:
+                    rollout = _model_rollout_fn(model, normalizer, ctx, pa)
             else:
                 rollout = _true_rollout_fn(c["env"], env_cfg, device)
             c["plan"], _, p_xyz, ret = _mppi_step(rollout, c["mean"], cur, mppi, a_max, g)
@@ -157,6 +190,8 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                 c["goal_log"].append(cur.cpu().numpy())
                 new_obs = c["env"].step(c["plan"][:, j])
                 c["obs"].append(new_obs)
+                if is_mm and kind == "pred":                   # render the new FPV for the model's context
+                    c["fpv"].append(_fpv(new_obs))
                 c["act"].append(c["plan"][:, j])
                 d = (new_obs[:, :3] - cur).norm(dim=-1)                 # (B,)
                 c["dist_log"].append(d.cpu().numpy())

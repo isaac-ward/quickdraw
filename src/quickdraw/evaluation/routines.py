@@ -173,9 +173,8 @@ def eval_ood_dynamics(cfg, model, norm, ecfg, writer, device, step=0):
 
 
 def eval_control(cfg, model, norm, ecfg, writer, device, step=0):
-    """Dual MPPI control (oracle vs learned) through a random sequence of 8 goals."""
-    if _is_mm(model):                      # MPPI planning on the dict-obs token-bag model is future work
-        return {}
+    """Dual MPPI control (oracle vs learned) through a random sequence of 8 goals. Multimodal models plan
+    with an FPV context rendered in the loop (run_and_log_control handles it)."""
     return {"control": run_and_log_control(cfg, model, norm, ecfg, writer, device, step)}
 
 
