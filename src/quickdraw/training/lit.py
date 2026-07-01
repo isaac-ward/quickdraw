@@ -99,8 +99,8 @@ class LitWorldModel(L.LightningModule):
                                      self.R, self.r, self.v_scale, self.dt, tag == "train", self._physical_ramp())
                     term, diag = v.loss(ctx)
                     if term is not None:
-                        loss = loss + term
-                        self.log(f"{tag}/loss/physical", term.detach())
+                        loss = loss + term                                    # objective uses the WEIGHTED term
+                        self.log(f"{tag}/loss/physical", (term / max(v.weight, 1e-8)).detach())  # log PRE-weight (raw), like loss/*
                     if tag == "train":
                         for dk, dv in diag.items():
                             self.log(f"physical_loss/{dk}", dv)
