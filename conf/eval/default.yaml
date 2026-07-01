@@ -15,3 +15,4 @@ during_train:
     control: true          # dual MPPI control (oracle vs learned) through 8 goals (eval_control)
     diffusion_field: false # diffusion ONLY: quiver flow-field viz + aggregate_denoising (self-skips for other models)
     manifold: true         # ANY method: recovered-manifold UMAPs (data + latent space, 2D + 3D)
+    vision: true           # VISION ONLY (self-skips w/o image heads): FPV rollout filmstrip+video+metric curves

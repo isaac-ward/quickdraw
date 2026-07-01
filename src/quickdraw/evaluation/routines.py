@@ -22,7 +22,13 @@ import torch
 from .openloop import eval_batched
 
 
+def _is_mm(model):
+    return hasattr(getattr(model, "_orig_mod", model), "layout")
+
+
 def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, prefix, step, coloring="rainbow", fps=60):
+    if _is_mm(model):                      # multimodal models use eval_vision for rollouts (dict obs) — skip
+        return {}
     t0 = time.perf_counter()
     eps = eval_episodes(cfg, norm, split)  # whole split; one batched rollout for all of it
     obs = torch.stack([eps[i]["obs_seq"] for i in range(len(eps))]).to(device)
@@ -118,6 +124,8 @@ def eval_ood_dynamics(cfg, model, norm, ecfg, writer, device, step=0):
 
 def eval_control(cfg, model, norm, ecfg, writer, device, step=0):
     """Dual MPPI control (oracle vs learned) through a random sequence of 8 goals."""
+    if _is_mm(model):                      # MPPI planning on the dict-obs token-bag model is future work
+        return {}
     return {"control": run_and_log_control(cfg, model, norm, ecfg, writer, device, step)}
 
 
@@ -159,6 +167,84 @@ def _quiver_round_data(swarm, grow=10, collapse=5):
     return pf
 
 
+def _ssim(a, b):
+    """Windowed SSIM over (N,H,W,3) images in [0,1] (uniform 7x7 window via avg_pool — pooling, not a
+    learned conv). Returns mean SSIM scalar."""
+    import torch.nn.functional as F
+    a, b = a.permute(0, 3, 1, 2), b.permute(0, 3, 1, 2)
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    mu_a, mu_b = F.avg_pool2d(a, 7, 1), F.avg_pool2d(b, 7, 1)
+    va = F.avg_pool2d(a * a, 7, 1) - mu_a ** 2
+    vb = F.avg_pool2d(b * b, 7, 1) - mu_b ** 2
+    cab = F.avg_pool2d(a * b, 7, 1) - mu_a * mu_b
+    s = ((2 * mu_a * mu_b + C1) * (2 * cab + C2)) / ((mu_a ** 2 + mu_b ** 2 + C1) * (va + vb + C2))
+    return float(s.mean())
+
+
+@torch.no_grad()
+def eval_vision(cfg, model, norm, ecfg, writer, device, step=0):
+    """Vision eval (SELF-SKIPS unless the model has image head(s)): autoregressive FPV rollout on held-out
+    val episodes. Logs, under eval_ood_horizon/<image-head>/: a filmstrip (pred top / GT bottom, 8 steps),
+    a synced rollout video (pred top black-through-context / GT bottom), and per-step psnr/ssim/mse curves
+    (avg over episodes, linear + log). Reuses viz.fig_image_filmstrip / image_rollout_video."""
+    import numpy as _np
+
+    from ..data.dataset import load_split_episodes_mm
+    m = getattr(model, "_orig_mod", model)
+    if not hasattr(m, "layout"):
+        return {}
+    img_heads = [n for n, _ in m.layout if n != "proprio"]
+    if not img_heads:
+        return {}
+    was = m.training
+    m.eval()
+    t0 = time.perf_counter()
+    P = cfg.data.P
+    H = min(int(cfg.data.F), 24)
+    n_ep = 8
+    img_size = m.modalities[img_heads[0]].ae.cfg.img_size
+    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+    eps = [e for e in eps if len(e[0]) >= P + H][:n_ep]
+    # batched context + real actions across the chosen episodes
+    pro = torch.stack([norm.norm_obs(torch.from_numpy(o[:P])) for o, _, _ in eps]).float().to(device)
+    imgs = {h: torch.stack([torch.from_numpy(im[:P]) for _, _, im in eps]).float().div(255.0).to(device) for h in img_heads}
+    ctx = {"proprio": pro, **imgs}
+    acts = torch.stack([torch.from_numpy(a[:P + H - 1]) for _, a, _ in eps]).float().to(device)
+    out = m.imagine_eval(ctx, acts, H)                                  # {head:(n_ep,H,...)}
+    _plog(writer, f"[vision @ep{step}] {len(eps)} episodes, H={H}, heads={img_heads}")
+
+    for head in img_heads:
+        pred = out[head].clamp(0, 1)                                    # (n_ep,H,size,size,3)
+        true = torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
+        # per-step metrics averaged over episodes
+        psnr_s, ssim_s, mse_s = [], [], []
+        for t in range(H):
+            mse = float(torch.mean((pred[:, t] - true[:, t]) ** 2))
+            mse_s.append(mse)
+            psnr_s.append(-10.0 * _np.log10(max(mse, 1e-12)))
+            ssim_s.append(_ssim(pred[:, t], true[:, t]))
+        curves = {"psnr": _np.array(psnr_s), "ssim": _np.array(ssim_s), "mse": _np.array(mse_s)}
+        for ys in ("linear", "log"):
+            f = viz.fig_error_vs_step(curves, yscale=ys)
+            writer.figure(f"eval_ood_horizon/{head}/metric_vs_step_{ys}", f, step); plt.close(f)
+        writer.scalars({f"val/metric/{head}/psnr": float(_np.mean(psnr_s)),
+                        f"val/metric/{head}/ssim": float(_np.mean(ssim_s)),
+                        f"val/metric/{head}/mse": float(_np.mean(mse_s))}, step)
+        # filmstrip + synced rollout video for episode 0
+        p0, t0f = pred[0].cpu().numpy(), true[0].cpu().numpy()
+        full_true = eps[0][2][: P + H].astype(_np.float32) / 255.0
+        ff = viz.fig_image_filmstrip(p0, t0f, n_cols=8,
+                                     title=f"{head} rollout — pred (top) vs GT (bottom), H={H}, PSNR {_np.mean(psnr_s):.1f}dB")
+        writer.figure(f"eval_ood_horizon/{head}/filmstrip", ff, step); plt.close(ff)
+        vid = viz.image_rollout_video(full_true, p0, context_len=P)
+        writer.video(f"eval_ood_horizon/{head}/rollout", vid.astype(_np.uint8), 10, step)
+
+    if was:
+        m.train()
+    _plog(writer, f"[vision @ep{step}] done in {time.perf_counter() - t0:.1f}s")
+    return {}
+
+
 @torch.no_grad()
 def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     """Recovered-manifold UMAPs — works for ANY method. Pool the model's COMMITTED next-state prediction
@@ -167,6 +253,8 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     union traces the learned manifold; speed colors |predicted next velocity|."""
     from .manifold import manifold_predictions, pad_lims, umap_reduce
     m = getattr(model, "_orig_mod", model)
+    if hasattr(m, "layout"):               # multimodal token-bag manifold UMAP is future work — skip cleanly
+        return {}
     was = m.training
     m.eval()
     t0 = time.perf_counter()
@@ -301,4 +389,5 @@ def eval_diffusion_field(cfg, model, norm, ecfg, writer, device, step=0):
 
 REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
-            "control": eval_control, "diffusion_field": eval_diffusion_field, "manifold": eval_manifold}
+            "control": eval_control, "diffusion_field": eval_diffusion_field, "manifold": eval_manifold,
+            "vision": eval_vision}
