@@ -71,6 +71,12 @@ class MultiModalSequenceModel(nn.Module):
     def readout(self, h_bag: Tensor, prev_bag: Tensor) -> Tensor:
         return self.predict_next(h_bag[..., : self.n_state, :], prev_bag)
 
+    def carry_transform(self, bag: Tensor) -> Tensor:
+        """What gets fed back into the rollout. Latent models (LSAR/diffusion) carry the predicted latent
+        bag as-is (identity). Data-space (DSAR) overrides to re-encode the DECODED obs — so the rollout
+        carries the observation, compounding error in data space (the defining DSAR property)."""
+        return bag
+
     # ---- teacher-forced parallel forward ----
     def forward(self, obs: dict[str, Tensor], act: Tensor) -> Tensor:
         s = self.encode_state(obs)
@@ -98,12 +104,13 @@ class MultiModalSequenceModel(nn.Module):
             bm = pad_block_mask(W, pad, x.device)                   # temporal causal + drop padded steps
             h_last = self.backbone(x, temporal_block_mask=bm)[:, -1]  # (B,n_input,d)
             s_pred = self.readout(h_last, bag_buf[-1])              # (B,n_state,d)
-            preds.append(s_pred)
+            preds.append(s_pred)                                   # raw prediction -> loss/decode
+            carried = self.carry_transform(s_pred)                 # data-space re-encode for DSAR; identity else
             if tf_future is not None and p_tf > 0.0:
                 tf = (torch.rand(B, 1, 1, device=s_pred.device) < p_tf).float()
-                s_feed = tf * tf_future[:, h] + (1.0 - tf) * s_pred
+                s_feed = tf * tf_future[:, h] + (1.0 - tf) * carried
             else:
-                s_feed = s_pred
+                s_feed = carried
             if detach_every and ((h + 1) % detach_every == 0):
                 s_feed = s_feed.detach()
             bag_buf.append(s_feed)
@@ -147,6 +154,18 @@ class MultiModalLSAR(MultiModalSequenceModel):
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
         target = self.encode_state({k: future_obs[k] for k, _ in self.layout}).detach()
         return {"pred_latent": F.mse_loss(pred_bag, target)}, {"pred_latent": self.lambda_pred_latent}
+
+
+class MultiModalDSAR(MultiModalLSAR):
+    """Data-space AR over the token bag: same delta predictor as LSAR, but the carried state is RE-ENCODED
+    from the decoded obs each rollout step (carry_transform), so error compounds in data space. No
+    pred_latent term — the per-head obs reconstruction is the only loss (as vector DSAR)."""
+
+    def carry_transform(self, bag: Tensor) -> Tensor:
+        return self.encode_state(self.to_obs(bag))    # decode -> obs -> re-encode (data-space feedback)
+
+    def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
+        return {}, {}
 
 
 class MultiModalDiffusion(MultiModalSequenceModel):

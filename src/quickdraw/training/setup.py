@@ -41,9 +41,11 @@ def build_model(cfg):
 
     specs = _modality_specs(cfg)
     if specs is not None:
-        from ..models.multimodal import MultiModalDiffusion, MultiModalLSAR
+        from ..models.multimodal import MultiModalDiffusion, MultiModalDSAR, MultiModalLSAR
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
                       mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2))
+        if name in ("mm_dsar", "dsar", "base"):
+            return MultiModalDSAR(**common)
         if name in ("mm_lsar", "lsar"):
             return MultiModalLSAR(**common, lambda_pred_latent=m.get("lambda_pred_latent", 1.0))
         if name in ("mm_diffusion", "diffusion"):

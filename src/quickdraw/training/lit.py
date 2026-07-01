@@ -70,12 +70,17 @@ class LitWorldModel(L.LightningModule):
             if name != "proprio":
                 obs[name] = batch[name]
         act = batch["act_seq"]
+        # per-stream input noise (training only): perturb the model INPUTS; targets/metrics use clean obs.
+        obs_in = obs
+        if tag == "train":
+            obs_in = {k: (v + torch.randn_like(v) * m.modalities[k].noise_std) if m.modalities[k].noise_std > 0 else v
+                      for k, v in obs.items()}
         if p_tf >= 1.0:                                        # parallel teacher forcing
-            preds = m({k: v[:, :-1] for k, v in obs.items()}, act[:, :-1])[:, P - 1:]
-        else:                                                 # autoregressive rollout (TF source = clean obs)
-            ctx = {k: v[:, :P] for k, v in obs.items()}
-            preds = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs.items()}, p_tf, self.detach_every)
-        future = {k: v[:, P:] for k, v in obs.items()}
+            preds = m({k: v[:, :-1] for k, v in obs_in.items()}, act[:, :-1])[:, P - 1:]
+        else:                                                 # autoregressive rollout (TF source = noised input)
+            ctx = {k: v[:, :P] for k, v in obs_in.items()}
+            preds = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf, self.detach_every)
+        future = {k: v[:, P:] for k, v in obs.items()}         # CLEAN targets
         dec = m.to_obs(preds)
         wts = {mod.name: float(mod.weight) for mod in m.modalities.values()}
         recon = {name: F.mse_loss(dec[name], future[name]) for name, _ in m.layout}

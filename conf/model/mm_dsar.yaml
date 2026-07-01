@@ -1,0 +1,17 @@
+name: mm_dsar
+d: 256
+depth: 4
+heads: 8
+window: 32
+mlp_ratio: 4.0
+rope_theta: 10000.0
+action_dim: 2
+p_tf_start: 1.0
+p_tf_end: 0.0
+p_tf_warmup_epochs: 4
+detach_every: 8
+# data-space AR: carried state re-encoded from decoded obs each step. Per-stream input noise via
+# noise_std on each modality (training only). Registry = trunks+heads; drop image for the proprio ablation.
+modalities:
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, noise_std: 0.0}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, noise_std: 0.0}

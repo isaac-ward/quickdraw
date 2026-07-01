@@ -28,6 +28,7 @@ class ModalitySpec:
     name: str
     kind: str           # "vector" | "image"
     weight: float = 1.0     # per-head reconstruction-loss weight
+    noise_std: float = 0.0  # per-stream input noise sigma (training only; the variations design's per-stream sigma)
     # vector
     dim: int = 6
     # image
@@ -72,6 +73,7 @@ class VectorModality(Modality):
     def __init__(self, spec: ModalitySpec, d: int, hidden: int = 64):
         super().__init__()
         self.name, self.n_tokens, self.weight = spec.name, 1, spec.weight
+        self.noise_std = float(spec.noise_std)
         self.dim = spec.dim
         self.enc = _mlp(spec.dim, d, hidden)
         self.dec = _mlp(d, spec.dim, hidden)
@@ -90,6 +92,7 @@ class ImageModality(Modality):
     def __init__(self, spec: ModalitySpec, d: int):
         super().__init__()
         self.name, self.n_tokens, self.weight = spec.name, spec.num_tokens, spec.weight
+        self.noise_std = float(spec.noise_std)
         self.ae = ImageAutoencoder(VisionAEConfig(
             img_size=spec.img_size, patch=spec.patch, d=d, enc_depth=spec.ae_depth,
             dec_depth=spec.ae_depth, num_tokens=spec.num_tokens, channels=spec.channels))
