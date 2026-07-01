@@ -23,12 +23,13 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 : "${RS_PROBLEM:?author + export the run_summary fresh, not hardcoded; missing RS_PROBLEM}"
 : "${RS_TRIED:?missing RS_TRIED}"; : "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
 
-# BATCH / GPU-FILL: image windows can't be GPU-resident (batch*L*128^2*3), so batch is small vs the vector
-# stage. Start at 16 (safe on 80GB H100) and RAISE toward memory once we measure fill (that's the point of
-# this shakedown). data.F=24 keeps the image window (and per-step ViT encode count) bounded. One epoch of
-# the train split + all four MM eval routines at the end (every_epochs=1). Control params are trimmed so the
-# FPV-in-loop MPPI doesn't dominate the eval on this shakedown; raise for the real sweep.
-COMMON=( data.root="$DATA" data.batch=16 data.F=24
+# BATCH / GPU-FILL (measured 2026-07-01, 128^2, GPU-resident frame loader, one run per H100 80GB->96GB):
+#   batch 16 -> ~45% util, ~8.6 GB (frame store ~4 GB fixed + activations); under-filled + 3600 steps/epoch.
+#   The frame store is GPU-resident (index_select gather, no host copy), so it's compute-bound now.
+# batch 96 saturates better (activations ~6x, ~30 GB, util toward 80%+, ~450 steps/epoch). data.F=24 keeps
+# the image window + per-step ViT encode count bounded. One epoch + all four MM evals (every_epochs=1).
+# Control params trimmed so the FPV-in-loop MPPI doesn't dominate the shakedown eval; raise for the real sweep.
+COMMON=( data.root="$DATA" data.batch=96 data.F=24
          trainer.max_epochs=1 eval.during_train.every_epochs=1 eval.during_train.at_epochs=null
          eval.horizon=256 eval.n_episodes=16
          control.n_episodes=4 control.max_steps=64 control.num_samples=128 control.horizon=16 )
