@@ -94,6 +94,14 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     t_video = time.perf_counter() - t
     _plog(writer, f"[eval_control @ep{step}] video rendered in {t_video:.1f}s")
 
+    # (MM) predictor-in-the-loop video: over the WHOLE control run (ep0), the model's imagined FPV for the
+    # SELECTED plan (top) vs the actual FPV (bottom). Shows whether MPPI planned against reality or a fantasy.
+    if res.get("pred_fpv_video") is not None:
+        pv = res["pred_fpv_video"]
+        pvid = viz.image_rollout_video(pv["actual"], pv["pred"], context_len=0)   # context_len=0 -> top=pred, bottom=actual
+        writer.video("eval_control/prediction_video", pvid, fps, step)
+        _plog(writer, f"[eval_control @ep{step}] prediction_video: {len(pv['pred'])} steps (pred top / actual bottom)")
+
     # realized cost over time: episode-0 distance to the current goal per control step
     # colours match the race video: oracle = black, learned = dimgray. Dotted verticals mark the steps
     # where episode-0's goal advances (explains the sharp jumps: distance re-targets to the next goal).

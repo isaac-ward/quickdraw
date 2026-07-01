@@ -157,6 +157,8 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     next_log = 100
     fan_log = []        # per executed step: episode-0 pred candidate fan {pts (K,H,3), ret (K,)} for the viz
     cur_fan = None
+    pred_fpv_log = []   # (MM) per executed step: ep0 model-imagined FPV for the SELECTED plan (pred vs actual video)
+    cur_plan_fpv = None
     while step < mppi.max_steps:
         n_chunks += 1
         for kind, c in ctrls.items():  # plan once per chunk (re-grounded on the latest true state)
@@ -178,6 +180,10 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                 pts = p_xyz[0].cpu().numpy()                                    # (K, H, 3)
                 anchored = np.concatenate([np.broadcast_to(anchor, (pts.shape[0], 1, 3)), pts], axis=1)
                 cur_fan = {"pts": anchored, "ret": ret[0].cpu().numpy()}        # (K, H+1, 3)
+                if is_mm:  # ep0 model-imagined FPV for the SELECTED plan (why MPPI chose it) -> pred-vs-actual video
+                    ctx0 = {"proprio": normalizer.norm_obs(ctx[0:1]), img_head: ctx_fpv[0:1]}
+                    act0 = normalizer.norm_act(torch.cat([pa[0:1], c["plan"][0:1]], dim=1))  # (1, p-1+H, 2)
+                    cur_plan_fpv = model.imagine_eval(ctx0, act0, H, heads=[img_head])[img_head][0].clamp(0, 1)  # (H,s,s,3)
         for j in range(chunk):  # execute `chunk` actions of each plan open-loop, then replan
             if step >= mppi.max_steps:
                 break
@@ -189,6 +195,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                 c["obs"].append(new_obs)
                 if is_mm and kind == "pred":                   # render the new FPV for the model's context
                     c["fpv"].append(_fpv(new_obs))
+                    pred_fpv_log.append(cur_plan_fpv[j].detach().cpu().numpy())  # ep0 predicted FPV for this executed obs
                 c["act"].append(c["plan"][:, j])
                 d = (new_obs[:, :3] - cur).norm(dim=-1)                 # (B,)
                 c["dist_log"].append(d.cpu().numpy())
@@ -213,6 +220,10 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
 
     out = {"goals": [(n, p.cpu().numpy()) for n, p in goals], "n_goals": n_goals, "n_chunks": n_chunks,
            "n_steps": step, "dt": dt, "fan_seq": fan_log}  # pred candidate fan per executed step (ep 0)
+    if is_mm and pred_fpv_log:  # ep0 pred-vs-actual FPV over the whole control run (from the selected plans)
+        actual = np.stack([f[0].detach().cpu().numpy() for f in ctrls["pred"]["fpv"][1:]])  # skip initial ctx frame
+        n = min(len(pred_fpv_log), len(actual))
+        out["pred_fpv_video"] = {"pred": np.stack(pred_fpv_log)[:n], "actual": actual[:n]}
     for kind, c in ctrls.items():
         done = c["done_step"]
         completed = done >= 0
