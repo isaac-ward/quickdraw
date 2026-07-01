@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from .flow import FlowField
 from .modalities import ModalitySpec, build_modalities
 from .spacetime import SpaceTimeTransformer
 from .transformer import pad_block_mask
@@ -143,3 +144,47 @@ class MultiModalLSAR(MultiModalSequenceModel):
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
         target = self.encode_state({k: future_obs[k] for k, _ in self.layout}).detach()
         return {"pred_latent": F.mse_loss(pred_bag, target)}, {"pred_latent": self.lambda_pred_latent}
+
+
+class MultiModalDiffusion(MultiModalSequenceModel):
+    """Latent flow-matching over the token bag. `predict_next` denoises the next-bag RESIDUAL with the
+    shared FlowField (rectified flow / shortcut), applied PER TOKEN (the token is a leading dim, and the
+    per-token context h already carries cross-token structure from the space-time backbone). Mirrors
+    models/diffusion.py's teacher-forced flow loss, generalized to the bag. `predict_next` samples
+    (deterministic ε=0 at eval unless stochastic_eval — the committed prediction)."""
+
+    def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
+                 sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
+                 stochastic_eval: bool = False, time_sampling: str = "uniform", flow_hidden: int = 0,
+                 lambda_flow: float = 1.0, lambda_consistency: float = 1.0):
+        super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
+                         rope_theta=rope_theta, action_dim=action_dim)
+        assert predict in ("residual", "absolute")
+        self.predict_residual = predict == "residual"
+        self.sampling_steps = int(sampling_steps)
+        self.stochastic_eval = bool(stochastic_eval)
+        self.time_sampling = time_sampling
+        self.lambda_flow, self.lambda_consistency = lambda_flow, lambda_consistency
+        self.flow = FlowField(d, h_dim=d, hidden=(flow_hidden or d), cond="concat", shortcut=shortcut)
+        self.pred_obs_in_loss = True
+        self.lambda_pred_obs = 1.0
+
+    def predict_next(self, h_state: Tensor, prev_bag: Tensor) -> Tensor:
+        det = (not self.training) and (not self.stochastic_eval)
+        out = self.flow.sample(h_state, steps=self.sampling_steps, deterministic=det)   # per-token over the bag
+        return _ln(prev_bag + out) if self.predict_residual else _ln(out)
+
+    def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
+        """Teacher-forced rectified-flow loss over the bag (mirrors models/diffusion.py)."""
+        assert act_seq is not None
+        z = self.encode_state(obs)                              # (B,L,n_state,d)
+        L = z.shape[1]
+        s = z[:, :-1]                                           # contexts (B,L-1,n_state,d)
+        h = self.backbone(self._to_input(s, act_seq[:, :L - 1]))
+        h_state = h[..., : self.n_state, :]                     # (B,L-1,n_state,d)
+        target = (z[:, 1:] - s).detach() if self.predict_residual else z[:, 1:].detach()
+        l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
+        raw, w = {"flow": l_flow}, {"flow": self.lambda_flow}
+        if l_cons is not None:
+            raw["flow_consistency"], w["flow_consistency"] = l_cons, self.lambda_consistency
+        return raw, w
