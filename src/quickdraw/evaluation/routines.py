@@ -251,16 +251,21 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     (deterministic forward() readout; for diffusion the eps=0 prediction) over many VAL contexts, then UMAP
     both the decoded DATA space (6D pos+vel) and the carried LATENT space to 3D and 2D (4 stills). The
     union traces the learned manifold; speed colors |predicted next velocity|."""
-    from .manifold import manifold_predictions, pad_lims, umap_reduce
+    from .manifold import manifold_predictions, manifold_predictions_mm, pad_lims, umap_reduce
     m = getattr(model, "_orig_mod", model)
-    if hasattr(m, "layout"):               # multimodal token-bag manifold UMAP is future work — skip cleanly
-        return {}
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    eps_ds = eval_episodes(cfg, norm, "val")
-    data6d, latents, _, n_avail = manifold_predictions(m, norm, eps_ds, P=cfg.data.P, n_points=5000,
-                                                       stride=1, seed=0, device=device)
+    if hasattr(m, "layout"):               # multimodal: latent = flattened token bag, data = decoded proprio
+        from ..data.dataset import load_split_episodes_mm
+        img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+        mm_eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+        data6d, latents, _, n_avail = manifold_predictions_mm(m, norm, mm_eps, P=cfg.data.P, n_points=2000,
+                                                              stride=1, seed=0, device=device)
+    else:
+        eps_ds = eval_episodes(cfg, norm, "val")
+        data6d, latents, _, n_avail = manifold_predictions(m, norm, eps_ds, P=cfg.data.P, n_points=5000,
+                                                           stride=1, seed=0, device=device)
     sub = f"{data6d.shape[0]:,} next-state predictions (of {n_avail:,} val contexts)"   # model-agnostic
     for space, label, pts in (("data_space", "data space (full 6D pos+vel)", data6d),
                               ("latent_space", f"latent space (full {latents.shape[1]}D z)", latents)):

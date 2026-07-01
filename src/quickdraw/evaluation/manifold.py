@@ -73,6 +73,34 @@ def manifold_clouds(m, norm, ds, *, P, n_points, cube, stride, seed, device):
     return paths6d, speed, latents, n_avail
 
 
+@torch.no_grad()
+def manifold_predictions_mm(m, norm, mm_eps, *, P, n_points, stride, seed, device):
+    """Multimodal analogue of manifold_predictions. Committed next-state token bag over many contexts via
+    the shared forward(); returns (data6d (N,6) decoded PROPRIO physical, latents (N, n_state*d) = the
+    flattened carried token bag, speed (N,), n_avail). mm_eps: list of (obs (T,6), act (T,2), img (T,H,W,3))."""
+    n_ep = len(mm_eps)
+    rng = np.random.RandomState(seed)
+    slices = [(ei, t) for ei in range(n_ep) for t in range(P, len(mm_eps[ei][0]) - 1, stride)]
+    n_avail = len(slices)
+    rng.shuffle(slices)
+    by_ep = defaultdict(list)
+    for ei, t in slices[:n_points]:
+        by_ep[ei].append(t)
+    data6d, latents = [], []
+    for ei, ts in by_ep.items():
+        o, a, im = mm_eps[ei]
+        obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device),
+               "image": torch.from_numpy(im).float().div(255.0)[None].to(device)}
+        act = torch.from_numpy(a).float()[None].to(device)
+        pred = m(obs, act)                                   # (1,T,n_state,d)
+        sel = pred[0, np.array(sorted(ts))]                  # (nt,n_state,d)
+        latents.extend(sel.reshape(sel.shape[0], -1).cpu().numpy())            # flatten bag -> (n_state*d,)
+        data6d.extend(norm.denorm_obs(m.to_obs(sel)["proprio"]).cpu().numpy())  # decoded proprio 6-vec
+    data6d, latents = np.stack(data6d), np.stack(latents)
+    speed = np.linalg.norm(data6d[:, 3:], axis=1)
+    return data6d, latents, speed, n_avail
+
+
 def umap_reduce(pts, *, n_components, seed=0):
     """UMAP of any (N, D) cloud -> (N, n_components). Used for both the decoded data space (6D) and the
     carried latent space (dz), at 2D or 3D. fit_transform directly (no out-of-sample transform), honest."""
