@@ -95,12 +95,12 @@ def _model_rollout_fn(model, normalizer, ctx, pa):
     return fn
 
 
-def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa):
+def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa, img_head):
     """Learned rollout for a MULTIMODAL model: proprio + rendered FPV context. The image context is encoded
     ONCE and shared across the K candidates (imagine_shared); candidates score on decoded PROPRIO only."""
     def fn(cand):                                           # cand: (G,K,H,2)
         G, K, H = cand.shape[:3]
-        ctx = {"proprio": normalizer.norm_obs(ctx_pro), "image": ctx_fpv}   # (G,p,6), (G,p,s,s,3)
+        ctx = {"proprio": normalizer.norm_obs(ctx_pro), img_head: ctx_fpv}   # (G,p,6), (G,p,s,s,3)
         paK = pa[:, None].expand(G, K, pa.shape[1], 2).reshape(G * K, pa.shape[1], 2)
         actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, 2)], dim=1))  # (G*K, p-1+H, 2)
         pr = normalizer.denorm_obs(model.imagine_shared(ctx, actK, H, K, heads=["proprio"])["proprio"])
@@ -125,6 +125,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     step for the model's image context (proprio comes from the env)."""
     core = getattr(model, "_orig_mod", model)
     is_mm = hasattr(core, "layout")
+    img_head = next((n for n, _ in core.layout if n != "proprio"), None) if is_mm else None
     from ..logging import viz
     fpv_rend = viz.FPVRenderer(env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"]) if is_mm else None
 
@@ -165,7 +166,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                 pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, 2, device=device)
                 if is_mm:
                     ctx_fpv = torch.stack(c["fpv"][-P:], dim=1)   # (B, p, s, s, 3) rendered FPV context
-                    rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa)
+                    rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa, img_head)
                 else:
                     rollout = _model_rollout_fn(model, normalizer, ctx, pa)
             else:
