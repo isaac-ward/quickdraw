@@ -123,6 +123,9 @@ class MultiModalSequenceModel(nn.Module):
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
         return {}, {}
 
+    def on_optimizer_step(self) -> None:            # parity with SequenceWorldModel (EMA hook; no-op here)
+        pass
+
 
 class MultiModalLSAR(MultiModalSequenceModel):
     """Latent-space AR over the token bag: predict the next bag with a per-token MLP residual (+ LN);
