@@ -90,9 +90,59 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
     return summary
 
 
+@torch.no_grad()
+def _mm_openloop(cfg, m, norm, ecfg, writer, device, step):
+    """Multimodal long-horizon open loop: PROPRIO rollout (images stay in the latent, not decoded — cheap)
+    over held-out val episodes. Logs error-vs-step (avg, linear+log) + a torus pred-vs-true trajectory plot."""
+    import numpy as _np
+
+    from ..data.dataset import load_split_episodes_mm
+    was = m.training
+    m.eval()
+    t0 = time.perf_counter()
+    P = cfg.data.P
+    img_heads = [n for n, _ in m.layout if n != "proprio"]
+    img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+    n_ep = min(int(cfg.eval.get("n_episodes", 32) or 32), len(eps))
+    eps = eps[:n_ep]
+    H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
+    pro = torch.stack([norm.norm_obs(torch.from_numpy(o[:P])) for o, _, _ in eps]).float().to(device)
+    ctx = {"proprio": pro}
+    for h in img_heads:
+        ctx[h] = torch.stack([torch.from_numpy(im[:P]) for _, _, im in eps]).float().div(255.0).to(device)
+    acts = torch.stack([torch.from_numpy(a[:P + H - 1]) for _, a, _ in eps]).float().to(device)
+    pred = m.imagine_eval(ctx, acts, H, heads=["proprio"])["proprio"]            # (n_ep,H,6)
+    p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
+    p_true = torch.stack([torch.from_numpy(o[P:P + H]) for o, _, _ in eps]).float().to(device)
+    err = (p_hat[..., :3] - p_true[..., :3]).norm(dim=-1).mean(0).cpu().numpy()  # position L2 per step
+    curves = {"pointwise_error": err}
+    for ys in ("linear", "log"):
+        f = viz.fig_error_vs_step(curves, yscale=ys)
+        writer.figure(f"eval_ood_horizon/error_vs_step_avg_{ys}", f, step); plt.close(f)
+    # torus trajectory plot (episode 0): context (light) -> true (black) -> pred (grey)
+    ctx_xyz = norm.denorm_obs(pro[0]).cpu().numpy()[:, :3]
+    true_xyz = _np.concatenate([ctx_xyz[-1:], p_true[0, :, :3].cpu().numpy()])
+    pred_xyz = _np.concatenate([ctx_xyz[-1:], p_hat[0, :, :3].cpu().numpy()])
+    trajs = [{"xyz": ctx_xyz, "color": "lightgray", "start_sphere": True, "end_sphere": False, "start_scale": 0.5},
+             {"xyz": true_xyz, "color": "black", "start_sphere": False, "end_sphere": True},
+             {"xyz": pred_xyz, "color": "dimgray", "start_sphere": False, "end_sphere": True}]
+    f = viz.fig_torus_atlas(ecfg.R, ecfg.r, trajs=trajs, title=f"eval_ood_horizon (proprio) H={H}",
+                            view_pad=viz.EVAL_VIEW_PAD, torus_opacity=viz.TORUS_OPACITY)
+    writer.figure("eval_ood_horizon/trajectory_plot_0", f, step); plt.close(f)
+    writer.scalars({"eval_ood_horizon/pointwise_error_mean": float(err.mean())}, step)
+    if was:
+        m.train()
+    _plog(writer, f"[ood_horizon-mm @ep{step}] {n_ep} eps, H={H}, done in {time.perf_counter() - t0:.1f}s")
+    return {"eval_ood_horizon": float(err.mean())}
+
+
 def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     """Long-horizon open-loop rollout on the base geometry. OOD because the rollout is far longer
     than the short horizon trained on; same env, so scored on ecfg's geometry."""
+    m = getattr(model, "_orig_mod", model)
+    if hasattr(m, "layout"):               # multimodal: proprio long-horizon (images stay latent)
+        return _mm_openloop(cfg, m, norm, ecfg, writer, device, step)
     s = _openloop_split(cfg, model, norm, writer, device, "eval_ood_horizon", ecfg.R, ecfg.r,
                         ecfg.init_speed, "eval_ood_horizon", step, fps=round(1.0 / ecfg.dt))
     return {"eval_ood_horizon": s}

@@ -52,10 +52,11 @@ class MultiModalSequenceModel(nn.Module):
         toks = [self.modalities[name].encode(obs[name]) for name, _ in self.layout]
         return _ln(torch.cat(toks, dim=-2))
 
-    def to_obs(self, bag: Tensor) -> dict[str, Tensor]:              # (B,*,n_state,d) -> {name:(B,*,*)}
+    def to_obs(self, bag: Tensor, heads=None) -> dict[str, Tensor]:  # (B,*,n_state,d) -> {name:(B,*,*)}
         out, off = {}, 0
         for name, n in self.layout:
-            out[name] = self.modalities[name].decode(bag[..., off:off + n, :])
+            if heads is None or name in heads:                       # partial decode (e.g. proprio-only long rollouts)
+                out[name] = self.modalities[name].decode(bag[..., off:off + n, :])
             off += n
         return out
 
@@ -121,10 +122,12 @@ class MultiModalSequenceModel(nn.Module):
         return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every)
 
     @torch.no_grad()
-    def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int) -> dict[str, Tensor]:
+    def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None) -> dict[str, Tensor]:
+        """`heads` limits which modalities are decoded (e.g. ['proprio'] for cheap long-horizon rollouts —
+        the full latent bag, including image tokens, still rolls forward; we just skip decoding images)."""
         with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
             bag = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0)
-            out = self.to_obs(bag)
+            out = self.to_obs(bag, heads=heads)
         return {k: v.float() for k, v in out.items()}
 
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
