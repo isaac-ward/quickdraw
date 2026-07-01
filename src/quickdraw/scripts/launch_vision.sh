@@ -11,9 +11,9 @@
 #
 # RUN SUMMARY IS NOT HARDCODED — supply it FRESH each launch via env vars (train.py rejects duplicates).
 # Plain words + periods only (Hydra rejects ; , - : = ). Shared: RS_PROBLEM RS_TRIED RS_DETAIL RS_RATIONALE.
-# Per-run trying: RS_TRYING_lsar RS_TRYING_diff.
+# Per-run trying: RS_TRYING_dsar RS_TRYING_lsar.
 #
-# Usage: RS_PROBLEM=.. RS_TRIED=.. RS_DETAIL=.. RS_RATIONALE=.. RS_TRYING_lsar=.. RS_TRYING_diff=.. \
+# Usage: RS_PROBLEM=.. RS_TRIED=.. RS_DETAIL=.. RS_RATIONALE=.. RS_TRYING_dsar=.. RS_TRYING_lsar=.. \
 #          bash src/quickdraw/scripts/launch_vision.sh
 set -uo pipefail
 cd "$(dirname "$0")/../../.." || exit 1   # -> repo root
@@ -39,20 +39,22 @@ echo "[vision] killing any existing vis_ runs..."
 docker compose exec -T app pkill -9 -f "experiment=vis_" 2>/dev/null || true
 sleep 4
 
-launch () {  # $1=gpu  $2=experiment-name  $3=model-config  $4=trying-env-var-name
-  local gpu="$1" name="$2" model="$3" tvar="$4"
+launch () {  # $1=gpu  $2=experiment-name  $3=model-config  $4=trying-env-var-name  $5..=extra overrides
+  local gpu="$1" name="$2" model="$3" tvar="$4"; shift 4
   local trying="${!tvar:?missing $tvar the run-specific trying note}"
-  echo "[vision] launching $name (model=$model) on GPU $gpu"
+  echo "[vision] launching $name (model=$model) on GPU $gpu  ${*:+[+ $*]}"
   docker compose exec -T -d -e CUDA_VISIBLE_DEVICES="$gpu" -e TORCHINDUCTOR_COMPILE_THREADS=1 \
     -e TORCHINDUCTOR_CACHE_DIR="/tmp/inductor_$name" -e TRITON_CACHE_DIR="/tmp/triton_$name" app \
-    uv run python -m quickdraw.train model="$model" "${COMMON[@]}" experiment="$name" "${RS[@]}" \
+    uv run python -m quickdraw.train model="$model" "${COMMON[@]}" "$@" experiment="$name" "${RS[@]}" \
       run_summary.trying="$trying"
 }
 
-# ONE run per GPU: latent-space AR (GPU0) + latent diffusion (GPU1), both proprio + image_fpv.
-launch 0 vis_lsar_image mm_lsar      RS_TRYING_lsar
+# ONE run per GPU: vision DSAR (GPU0) + vision LSAR with EMA target encoder + physical loss (GPU1).
+# physical_loss active from step 0 (warmup 0) for the shakedown; on-surface + tangent + kinematic continuity.
+launch 0 vis_dsar         mm_dsar     RS_TRYING_dsar
 sleep 45
-launch 1 vis_diff_image mm_diffusion RS_TRYING_diff
+launch 1 vis_lsar_ema_phys mm_lsar_ema RS_TRYING_lsar \
+  variations.physical_loss.weight=0.3 variations.physical_loss.continuity=0.3 variations.physical_loss.warmup_epochs=0
 
-echo "[vision] launched 2 vision runs (mm_lsar on GPU0, mm_diffusion on GPU1), 1 epoch + eval each."
+echo "[vision] launched 2 vision runs (dsar on GPU0, lsar+ema+physical on GPU1), 1 epoch + eval each."
 echo "[vision] watch GPU fill:  watch -n2 nvidia-smi   |  progress: logs/train_*vis_*/progress.log"

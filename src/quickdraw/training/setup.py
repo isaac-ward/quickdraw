@@ -47,7 +47,8 @@ def build_model(cfg):
         if name in ("mm_dsar", "dsar", "base"):
             return MultiModalDSAR(**common)
         if name in ("mm_lsar", "lsar"):
-            return MultiModalLSAR(**common, lambda_pred_latent=m.get("lambda_pred_latent", 1.0))
+            return MultiModalLSAR(**common, lambda_pred_latent=m.get("lambda_pred_latent", 1.0),
+                                  ema=bool(m.get("ema", False)), ema_decay=float(m.get("ema_decay", 0.996)))
         if name in ("mm_diffusion", "diffusion"):
             d = m.get("diffusion", {})
             dfg = (lambda k, v: d.get(k, v)) if hasattr(d, "get") else (lambda k, v: getattr(d, k, v))

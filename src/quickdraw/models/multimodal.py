@@ -63,6 +63,20 @@ class MultiModalSequenceModel(nn.Module):
     def _to_input(self, bag: Tensor, act: Tensor) -> Tensor:        # (B,T,n_state,d),(B,T,2)->(B,T,n_input,d)
         return torch.cat([bag, self.act_enc(act).unsqueeze(-2)], dim=-2)
 
+    def physical_state(self, bag: Tensor):
+        """Proprio 6-vec for the physical-loss variation, decoded with a FROZEN decoder (grad flows to the
+        latent, not the decoder weights — like LSAR). Returns None if there is no proprio head."""
+        from torch.func import functional_call
+        off = 0
+        for name, n in self.layout:
+            if name == "proprio":
+                dec = self.modalities["proprio"].dec
+                pb = {k: v.detach() for k, v in dec.named_parameters()}
+                pb.update({k: b.detach() for k, b in dec.named_buffers()})
+                return functional_call(dec, pb, (bag[..., off:off + n, :][..., 0, :],))   # (...,6)
+            off += n
+        return None
+
     # ---- model-specific token-space prediction (subclass) ----
     def predict_next(self, h_state: Tensor, prev_bag: Tensor) -> Tensor:
         """h_state: backbone context at the state-token slots (B,*,n_state,d); prev_bag: same shape.
@@ -161,21 +175,53 @@ class MultiModalLSAR(MultiModalSequenceModel):
     pred_latent = MSE to the encoded true-next bag (Reconstruction collapse: obs heads ground the encoder)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 pred_hidden: int = 0, lambda_pred_latent: float = 1.0):
+                 pred_hidden: int = 0, lambda_pred_latent: float = 1.0, ema: bool = False, ema_decay: float = 0.996):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
-        self.pred_obs_in_loss = True
         self.lambda_pred_obs = 1.0
+        self.ema = ema
+        if ema:                                                 # I-JEPA/BYOL: EMA target encoder + online predictor q;
+            import copy                                          # obs recon becomes a decoder-only PROBE (doesn't shape enc)
+            self.ema_modalities = copy.deepcopy(self.modalities)
+            for p in self.ema_modalities.parameters():
+                p.requires_grad_(False)
+            self.predictor_q = _mlp(d, d, h)
+            self.ema_decay = float(ema_decay)
+            self.pred_obs_in_loss = False
+        else:
+            self.pred_obs_in_loss = True                        # Reconstruction: obs recon grounds the encoder
 
     def predict_next(self, h_state: Tensor, prev_bag: Tensor) -> Tensor:
         return _ln(prev_bag + self.predictor(h_state))
 
+    def _encode_ema(self, obs) -> Tensor:
+        toks = [self.ema_modalities[name].encode(obs[name]) for name, _ in self.layout]
+        return _ln(torch.cat(toks, dim=-2))
+
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
-        target = self.encode_state({k: future_obs[k] for k, _ in self.layout}).detach()
+        fut = {k: future_obs[k] for k, _ in self.layout}
+        if self.ema:                                            # target = EMA-encoded true future; online = q(pred)
+            target = self._encode_ema(fut).detach()
+            online = self.predictor_q(pred_bag)
+            return {"pred_latent": F.mse_loss(online, target)}, {"pred_latent": self.lambda_pred_latent}
+        target = self.encode_state(fut).detach()
         return {"pred_latent": F.mse_loss(pred_bag, target)}, {"pred_latent": self.lambda_pred_latent}
+
+    @torch.no_grad()
+    def on_optimizer_step(self) -> None:
+        if self.ema:                                            # EMA target <- online encoders
+            for pe, p in zip(self.ema_modalities.parameters(), self.modalities.parameters()):
+                pe.mul_(self.ema_decay).add_(p.detach(), alpha=1.0 - self.ema_decay)
+            for be, b in zip(self.ema_modalities.buffers(), self.modalities.buffers()):
+                be.copy_(b)
+
+    @torch.no_grad()
+    def collapse_diagnostics(self, obs) -> dict:
+        from .collapse import latent_diagnostics
+        return latent_diagnostics(self.encode_state(obs).reshape(-1, self.d).float())
 
 
 class MultiModalDSAR(MultiModalLSAR):

@@ -59,9 +59,11 @@ class LitWorldModel(L.LightningModule):
 
     def _step_mm(self, batch, tag):
         """Multimodal (token-bag) step: per-head recon losses `loss/<head>` (config-weighted) + the model
-        term (pred_latent / flow); metrics grouped as `metric/<head>/*` (val-only). Variations are skipped
-        for now (physical/contraction over the token bag is future work; both default to weight 0)."""
+        term (pred_latent / flow) + optional physical_loss on the proprio decode; metrics grouped as
+        `metric/<head>/*` (val-only). Per-stream input noise applied here. (Contraction over the token bag
+        is still future work.) For EMA/JEPA heads the obs recon is a detached decoder-only probe."""
         import torch.nn.functional as F
+        from .variations import PhysicalLoss, VarContext
         m = self._core()
         P, L = self.P, self.P + self.F
         p_tf = self._cur_p_tf()
@@ -81,17 +83,35 @@ class LitWorldModel(L.LightningModule):
             ctx = {k: v[:, :P] for k, v in obs_in.items()}
             preds = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf, self.detach_every)
         future = {k: v[:, P:] for k, v in obs.items()}         # CLEAN targets
-        dec = m.to_obs(preds)
+        # EMA/JEPA heads: obs recon is a decoder-only probe (detach preds so it doesn't shape the encoder).
+        recon_src = preds if getattr(m, "pred_obs_in_loss", True) else preds.detach()
+        dec = m.to_obs(recon_src)
         wts = {mod.name: float(mod.weight) for mod in m.modalities.values()}
         recon = {name: F.mse_loss(dec[name], future[name]) for name, _ in m.layout}
         raw, w = m.loss_terms(preds, future, obs, p_tf, act)
         loss = sum(w[k] * raw[k] for k in raw) + sum(wts[k] * recon[k] for k in recon)
+
+        # physical_loss variation on the proprio decode (on-surface + tangent-velocity + continuity).
+        if self.variations:
+            for v in self.variations.variations:
+                if isinstance(v, PhysicalLoss):
+                    ctx = VarContext(m, preds, future["proprio"], obs["proprio"], act, self.norm,
+                                     self.R, self.r, self.v_scale, self.dt, tag == "train", self._physical_ramp())
+                    term, diag = v.loss(ctx)
+                    if term is not None:
+                        loss = loss + term
+                        self.log(f"{tag}/loss/physical", term.detach())
+                    if tag == "train":
+                        for dk, dv in diag.items():
+                            self.log(f"physical_loss/{dk}", dv)
 
         self.log(f"{tag}/loss/total", loss, prog_bar=(tag == "train"))
         for k, v in {**raw, **recon}.items():                 # loss/{flow|pred_latent}, loss/proprio, loss/image
             self.log(f"{tag}/loss/{k}", v)
         if tag == "train":
             self.log("schedules/p_tf", p_tf)
+            if self.has_physical:
+                self.log("schedules/physical_loss_ramp", self._physical_ramp())
         if tag == "val":
             with torch.no_grad():
                 p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
@@ -105,6 +125,9 @@ class LitWorldModel(L.LightningModule):
                     mse = F.mse_loss(dec[name].clamp(0, 1), future[name])
                     self.log(f"val/metric/{name}/mse", mse)
                     self.log(f"val/metric/{name}/psnr", -10.0 * torch.log10(mse.clamp_min(1e-12)))
+                if hasattr(m, "collapse_diagnostics"):        # latent-collapse (esp. for EMA); on the encoded bag
+                    for k, val in m.collapse_diagnostics(obs).items():
+                        self.log(f"collapse/{k}", val)
         return loss
 
     def _step(self, batch, tag):

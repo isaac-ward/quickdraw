@@ -49,6 +49,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     mppi_kwargs = {k: v for k, v in cfg.control.items() if k != "reuse_render"}
     fpv = None                                    # multimodal: render FPV context in the MPPI loop
     core = getattr(model, "_orig_mod", model)
+    img_head = next((n for n, _ in core.layout if n != "proprio"), "image") if hasattr(core, "layout") else "image"
     if hasattr(core, "layout"):
         img_size = next((mod.ae.cfg.img_size for mod in core.modalities.values() if hasattr(mod, "ae")), 128)
         try:
@@ -99,8 +100,8 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     if res.get("pred_fpv_video") is not None:
         pv = res["pred_fpv_video"]
         pvid = viz.image_rollout_video(pv["actual"], pv["pred"], context_len=0)   # context_len=0 -> top=pred, bottom=actual
-        writer.video("eval_control/prediction_video", pvid, fps, step)
-        _plog(writer, f"[eval_control @ep{step}] prediction_video: {len(pv['pred'])} steps (pred top / actual bottom)")
+        writer.video(f"eval_control/{img_head}/prediction_video", pvid, fps, step)   # <head> organization (like eval_ood_horizon)
+        _plog(writer, f"[eval_control @ep{step}] {img_head}/prediction_video: {len(pv['pred'])} steps (pred top / actual bottom)")
 
     # realized cost over time: episode-0 distance to the current goal per control step
     # colours match the race video: oracle = black, learned = dimgray. Dotted verticals mark the steps
