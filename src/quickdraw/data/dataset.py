@@ -117,35 +117,39 @@ def load_split_episodes_mm(root: str, split: str, img_size: int = 128):
 
 
 class MMWindowLoader:
-    """DataLoader-shaped iterable of multimodal windows. obs/act windows are GPU-resident (tiny); image
-    windows are gathered per-batch from a CPU frame store (they cannot be GPU-resident — batch×L×H×W×3 is
-    huge) and moved to `device` as [0,1] floats. Yields {obs_seq (B,L,6), act_seq (B,L,2), image (B,L,H,W,3)}.
-    Window order matches `stack_windows` (episode order, sliding start), so obs/act/image stay aligned."""
+    """DataLoader-shaped iterable of multimodal windows, ALL GPU-resident. obs/act windows + the FRAME store
+    (uint8, ~3 GB at 128²) live on `device`; per batch we gather image windows by a pure GPU index (no host
+    copy, no Python loop), so the loader isn't a CPU bottleneck. Yields {obs_seq (B,L,6), act_seq (B,L,2),
+    image_fpv (B,L,H,W,3) in [0,1]}. Window order matches `stack_windows`, so all streams stay aligned."""
 
     def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device):
         L = P + F
-        self.index = [(ei, s) for ei, (o, _, _) in enumerate(episodes) for s in range(0, len(o) - L + 1)]
         obs_w, act_w = stack_windows([(o, a) for o, a, _ in episodes], P, F, normalizer)
         self.obs, self.act = obs_w.to(device), act_w.to(device)
-        self.frames = [torch.from_numpy(img) for _, _, img in episodes]    # per-ep (T,H,W,3) uint8, CPU
-        self.win_ep = [ei for ei, _ in self.index]
-        self.win_s = [s for _, s in self.index]
-        self.L, self.batch, self.shuffle, self.device = L, batch, shuffle, device
-        self.N = len(self.index)
+        # concat all episode frames -> one GPU uint8 store; per-window GLOBAL frame indices (start .. start+L)
+        frames, starts, off = [], [], 0
+        for o, _, img in episodes:
+            frames.append(torch.from_numpy(img))
+            starts.extend(range(off, off + len(o) - L + 1))
+            off += len(img)
+        self.frames = torch.cat(frames, 0).to(device)                       # (N_total,H,W,3) uint8, GPU-resident
+        starts = torch.tensor(starts, device=device)
+        self.win_idx = starts[:, None] + torch.arange(L, device=device)[None]  # (N_windows, L) global frame idx
+        self.batch, self.shuffle, self.device = batch, shuffle, device
+        self.N = self.win_idx.shape[0]
+        assert self.N == self.obs.shape[0], f"window/obs mismatch: {self.N} vs {self.obs.shape[0]}"
 
     def __len__(self):
         return (self.N + self.batch - 1) // self.batch
 
     def __iter__(self):
-        order = torch.randperm(self.N) if self.shuffle else torch.arange(self.N)
+        order = torch.randperm(self.N, device=self.device) if self.shuffle else torch.arange(self.N, device=self.device)
         for i in range(0, self.N, self.batch):
             j = order[i: i + self.batch]
-            jd = j.to(self.device)
-            imgs = torch.stack([self.frames[self.win_ep[k]][self.win_s[k]: self.win_s[k] + self.L]
-                                for k in j.tolist()])                       # (b,L,H,W,3) uint8 CPU
-            yield {"obs_seq": self.obs.index_select(0, jd),
-                   "act_seq": self.act.index_select(0, jd),
-                   "image_fpv": imgs.to(self.device).float().div_(255.0)}
+            imgs = self.frames[self.win_idx.index_select(0, j)].float().div_(255.0)   # (b,L,H,W,3) [0,1] GPU gather
+            yield {"obs_seq": self.obs.index_select(0, j),
+                   "act_seq": self.act.index_select(0, j),
+                   "image_fpv": imgs}
 
 
 class WindowDataset(Dataset):
