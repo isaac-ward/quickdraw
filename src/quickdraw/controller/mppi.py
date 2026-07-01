@@ -129,7 +129,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     fpv_rend = viz.FPVRenderer(env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"]) if is_mm else None
 
     def _fpv(states):                                   # (B,6) -> (B,s,s,3) [0,1] on device (persistent plotter)
-        return torch.from_numpy(fpv_rend.render(states)).float().div_(255.0).to(device)
+        return torch.from_numpy(fpv_rend.render(states.detach().cpu().numpy())).float().div_(255.0).to(device)
     goals = control_goals(env_cfg.R, env_cfg.r, device=device)
     names = [n for n, _ in goals]
     n_goals = min(mppi.n_goals, len(goals))                   # visit this many per episode (subset of the 8)
