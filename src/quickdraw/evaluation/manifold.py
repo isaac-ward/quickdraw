@@ -86,11 +86,12 @@ def manifold_predictions_mm(m, norm, mm_eps, *, P, n_points, stride, seed, devic
     by_ep = defaultdict(list)
     for ei, t in slices[:n_points]:
         by_ep[ei].append(t)
+    img_head = next((n for n, _ in m.layout if n != "proprio"), None)   # single FPV feed's head name
     data6d, latents = [], []
     for ei, ts in by_ep.items():
         o, a, im = mm_eps[ei]
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device),
-               "image": torch.from_numpy(im).float().div(255.0)[None].to(device)}
+               img_head: torch.from_numpy(im).float().div(255.0)[None].to(device)}
         act = torch.from_numpy(a).float()[None].to(device)
         pred = m(obs, act)                                   # (1,T,n_state,d)
         sel = pred[0, np.array(sorted(ts))]                  # (nt,n_state,d)
