@@ -565,6 +565,47 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
     return np.stack(frames)
 
 
+class FPVRenderer:
+    """FAST egocentric FPV for the control loop / previews: ONE persistent offscreen plotter + torus mesh
+    (built once), then per state just move the camera and screenshot. ~order-of-magnitude faster than
+    fpv_frames (which rebuilds plotter + mesh every frame). NOT byte-identical to the data renderer (VTK
+    state persists across camera moves), which is fine for control. Maintains per-episode heading smoothing
+    across successive render() calls, so a streaming control loop gets the same smoothed heading as data."""
+
+    def __init__(self, R, r, coloring, fov=FPV_FOV, size=FPV_SIZE):
+        self.R, self.r, self.fov = R, r, float(fov)
+        self.rend = TorusRenderer(R, r, coloring)
+        self.pl = self.rend.pv.Plotter(off_screen=True, window_size=(int(size), int(size)))
+        self.pl.set_background("white")
+        self.rend._add_torus(self.pl, 1.0)
+        self.pl.camera.view_angle = self.fov
+        self._sm = None                                  # per-episode smoothed heading (persists across calls)
+
+    def render(self, obs):                               # obs (B,6) physical states -> (B,size,size,3) uint8
+        obs = np.asarray(obs)
+        B = len(obs)
+        if self._sm is None or len(self._sm) != B:
+            self._sm = [None] * B
+        out = []
+        for i in range(B):
+            p, v = obs[i, :3], obs[i, 3:]
+            n = _normal_from_point(p[None], self.R)[0]
+            n = n / (np.linalg.norm(n) + 1e-9)
+            fwd = v - np.dot(v, n) * n
+            nf = np.linalg.norm(fwd)
+            cur = fwd / nf if nf > 1e-6 else (self._sm[i] if self._sm[i] is not None else np.array([1.0, 0.0, 0.0]))
+            self._sm[i] = cur if self._sm[i] is None else (0.85 * self._sm[i] + 0.15 * cur)
+            self._sm[i] = self._sm[i] / (np.linalg.norm(self._sm[i]) + 1e-9)
+            self.pl.camera_position = [tuple(p + 0.06 * self.r * n), tuple(p + self._sm[i] * 2 * self.r), tuple(n)]
+            self.pl.camera.view_angle = self.fov
+            out.append(self.pl.screenshot(return_img=True))
+        return np.stack(out)
+
+    def close(self):
+        self.pl.close()
+        self.rend.close()
+
+
 def fpv_frames(R, r, coloring, obs, n_frames=10000, fov=FPV_FOV, size=FPV_SIZE):
     """Egocentric observation_image: camera at the particle, smoothed heading along tangential
     velocity, up = surface normal, configurable FOV. No velocity arrow here."""

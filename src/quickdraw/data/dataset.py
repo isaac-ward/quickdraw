@@ -145,7 +145,7 @@ class MMWindowLoader:
                                 for k in j.tolist()])                       # (b,L,H,W,3) uint8 CPU
             yield {"obs_seq": self.obs.index_select(0, jd),
                    "act_seq": self.act.index_select(0, jd),
-                   "image": imgs.to(self.device).float().div_(255.0)}
+                   "image_fpv": imgs.to(self.device).float().div_(255.0)}
 
 
 class WindowDataset(Dataset):

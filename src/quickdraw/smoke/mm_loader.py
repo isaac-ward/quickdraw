@@ -33,8 +33,8 @@ def main():
     batch = next(iter(loader))
     check("obs_seq (B,L,6)", batch["obs_seq"].shape == (B, L, 6), str(tuple(batch["obs_seq"].shape)))
     check("act_seq (B,L,2)", batch["act_seq"].shape == (B, L, 2))
-    check("image (B,L,128,128,3)", batch["image"].shape == (B, L, 128, 128, 3), str(tuple(batch["image"].shape)))
-    img = batch["image"]
+    check("image (B,L,128,128,3)", batch["image_fpv"].shape == (B, L, 128, 128, 3), str(tuple(batch["image_fpv"].shape)))
+    img = batch["image_fpv"]
     check("image in [0,1]", float(img.min()) >= 0.0 and float(img.max()) <= 1.0,
           f"[{float(img.min()):.3f},{float(img.max()):.3f}]")
 

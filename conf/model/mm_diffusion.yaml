@@ -21,4 +21,4 @@ diffusion:
   flow_hidden: 0           # 0 -> mirror d
 modalities:
   - {name: proprio, kind: vector, dim: 6, weight: 1.0}
-  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0}
+  - {name: image_fpv, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0}

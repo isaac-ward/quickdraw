@@ -15,4 +15,4 @@ detach_every: 8
 # to ablate a trunk+head with no code change. proprio (vector, 1 token) + image (ViT AE, num_tokens).
 modalities:
   - {name: proprio, kind: vector, dim: 6, weight: 1.0}
-  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0}
+  - {name: image_fpv, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0}

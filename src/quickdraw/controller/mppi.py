@@ -95,13 +95,6 @@ def _model_rollout_fn(model, normalizer, ctx, pa):
     return fn
 
 
-def _render_fpv(states, R, r, coloring, fov, size, device):
-    """Render the egocentric FPV for a batch of torus states (B,6) -> (B,size,size,3) [0,1] on device."""
-    from ..logging import viz
-    frames = viz.fpv_frames(R, r, coloring, states.detach().cpu().numpy(), fov=fov, size=size)  # (B,s,s,3) uint8
-    return torch.from_numpy(frames).float().div_(255.0).to(device)
-
-
 def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa):
     """Learned rollout for a MULTIMODAL model: proprio + rendered FPV context. The image context is encoded
     ONCE and shared across the K candidates (imagine_shared); candidates score on decoded PROPRIO only."""
@@ -132,8 +125,11 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     step for the model's image context (proprio comes from the env)."""
     core = getattr(model, "_orig_mod", model)
     is_mm = hasattr(core, "layout")
-    def _fpv(states):
-        return _render_fpv(states, env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"], device)
+    from ..logging import viz
+    fpv_rend = viz.FPVRenderer(env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"]) if is_mm else None
+
+    def _fpv(states):                                   # (B,6) -> (B,s,s,3) [0,1] on device (persistent plotter)
+        return torch.from_numpy(fpv_rend.render(states)).float().div_(255.0).to(device)
     goals = control_goals(env_cfg.R, env_cfg.r, device=device)
     names = [n for n, _ in goals]
     n_goals = min(mppi.n_goals, len(goals))                   # visit this many per episode (subset of the 8)
@@ -232,4 +228,6 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
             "mean_steps_to_complete": steps_tc,                                # over completed episodes
             "mean_seconds_to_complete": steps_tc * dt,
         }
+    if fpv_rend is not None:
+        fpv_rend.close()
     return out, names
