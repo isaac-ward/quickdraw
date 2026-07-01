@@ -54,7 +54,57 @@ class LitWorldModel(L.LightningModule):
         preds = self.model.rollout_train(ctx, actions, tf_source, p_tf, self.detach_every)
         return preds, obs_target[:, P:]
 
+    def _core(self):
+        return getattr(self.model, "_orig_mod", self.model)
+
+    def _step_mm(self, batch, tag):
+        """Multimodal (token-bag) step: per-head recon losses `loss/<head>` (config-weighted) + the model
+        term (pred_latent / flow); metrics grouped as `metric/<head>/*` (val-only). Variations are skipped
+        for now (physical/contraction over the token bag is future work; both default to weight 0)."""
+        import torch.nn.functional as F
+        m = self._core()
+        P, L = self.P, self.P + self.F
+        p_tf = self._cur_p_tf()
+        obs = {"proprio": batch["obs_seq"]}
+        for name, _ in m.layout:
+            if name != "proprio":
+                obs[name] = batch[name]
+        act = batch["act_seq"]
+        if p_tf >= 1.0:                                        # parallel teacher forcing
+            preds = m({k: v[:, :-1] for k, v in obs.items()}, act[:, :-1])[:, P - 1:]
+        else:                                                 # autoregressive rollout (TF source = clean obs)
+            ctx = {k: v[:, :P] for k, v in obs.items()}
+            preds = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs.items()}, p_tf, self.detach_every)
+        future = {k: v[:, P:] for k, v in obs.items()}
+        dec = m.to_obs(preds)
+        wts = {mod.name: float(mod.weight) for mod in m.modalities.values()}
+        recon = {name: F.mse_loss(dec[name], future[name]) for name, _ in m.layout}
+        raw, w = m.loss_terms(preds, future, obs, p_tf, act)
+        loss = sum(w[k] * raw[k] for k in raw) + sum(wts[k] * recon[k] for k in recon)
+
+        self.log(f"{tag}/loss/total", loss, prog_bar=(tag == "train"))
+        for k, v in {**raw, **recon}.items():                 # loss/{flow|pred_latent}, loss/proprio, loss/image
+            self.log(f"{tag}/loss/{k}", v)
+        if tag == "train":
+            self.log("schedules/p_tf", p_tf)
+        if tag == "val":
+            with torch.no_grad():
+                p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
+                p_true = self.norm.denorm_obs(future["proprio"])
+                self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
+                self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
+                self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
+                for name, _ in m.layout:
+                    if name == "proprio":
+                        continue
+                    mse = F.mse_loss(dec[name].clamp(0, 1), future[name])
+                    self.log(f"val/metric/{name}/mse", mse)
+                    self.log(f"val/metric/{name}/psnr", -10.0 * torch.log10(mse.clamp_min(1e-12)))
+        return loss
+
     def _step(self, batch, tag):
+        if hasattr(self._core(), "layout"):          # multimodal (token-bag) model -> per-head path
+            return self._step_mm(batch, tag)
         obs_seq, act_seq = batch["obs_seq"], batch["act_seq"]
         training = tag == "train"
         p_tf = self._cur_p_tf()

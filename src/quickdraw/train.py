@@ -105,7 +105,9 @@ def main(cfg):
     model = build_model(cfg)
     _startup_log(run_dir, f"[startup] model built: {sum(p.numel() for p in model.parameters()) / 1000:.0f}K "
                           f"params (model={cfg.model.name})")
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not cfg.model.get("modalities"):
+        # (multimodal token-bag models skip compile: the per-batch image gather + ViT AE complicate it;
+        # FlexAttention still runs, just eager.)
         # Compile the parallel forward only; the rollout stays EAGER. Compiling the transformer for the
         # rollout backfired badly: the rollout hits ~57 distinct sequence lengths, which blows past
         # torch._dynamo's recompile cache limit and thrashes (~18x slower). Eager rollout = the fast path.

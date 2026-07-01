@@ -1,0 +1,18 @@
+name: mm_lsar
+d: 256                     # backbone/token width (all modality tokens live at d)
+depth: 4
+heads: 8                   # head_dim = 32 (power of 2 for FlexAttention)
+window: 32                 # temporal attention span
+mlp_ratio: 4.0
+rope_theta: 10000.0
+action_dim: 2
+lambda_pred_latent: 1.0
+p_tf_start: 1.0
+p_tf_end: 0.0
+p_tf_warmup_epochs: 4
+detach_every: 8
+# config-driven modality registry: names flow to logs (loss/<name>, metric/<name>/*); drop/add an entry
+# to ablate a trunk+head with no code change. proprio (vector, 1 token) + image (ViT AE, num_tokens).
+modalities:
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0}

@@ -1,0 +1,24 @@
+name: mm_diffusion
+d: 256                     # backbone/token width (all modality tokens live at d)
+depth: 4
+heads: 8                   # head_dim = 32 (power of 2 for FlexAttention)
+window: 32                 # temporal attention span
+mlp_ratio: 4.0
+rope_theta: 10000.0
+action_dim: 2
+lambda_flow: 1.0
+lambda_consistency: 1.0
+p_tf_start: 1.0
+p_tf_end: 0.0
+p_tf_warmup_epochs: 4
+detach_every: 16
+diffusion:
+  shortcut: false          # true -> K=1 sampling via self-consistency
+  sampling_steps: 6
+  predict: residual
+  stochastic_eval: false   # false -> eps=0 committed prediction at eval
+  time_sampling: uniform
+  flow_hidden: 0           # 0 -> mirror d
+modalities:
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0}

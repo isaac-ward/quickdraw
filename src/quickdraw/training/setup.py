@@ -8,7 +8,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..data.dataset import (
-    GPUWindowLoader, Normalizer, TrajectoryDataset, WindowDataset, load_split_episodes, stack_windows,
+    GPUWindowLoader, MMWindowLoader, Normalizer, TrajectoryDataset, WindowDataset,
+    load_split_episodes, load_split_episodes_mm, stack_windows,
 )
 from ..environments.torus import TorusConfig
 from ..models.base import BaseModelConfig, BaseWorldModel
@@ -19,10 +20,43 @@ def env_cfg(cfg) -> TorusConfig:
     return TorusConfig(R=e.R, r=e.r, dt=e.dt, gamma=e.gamma, a_max=e.a_max, init_speed=e.init_speed, mass=e.mass)
 
 
+def _modality_specs(cfg):
+    """cfg.model.modalities (list of dicts) -> list[ModalitySpec], or None for the non-vision (vector) path."""
+    ms = cfg.model.get("modalities", None)
+    if not ms:
+        return None
+    from ..models.modalities import ModalitySpec
+    return [ModalitySpec(**dict(e)) for e in ms]
+
+
+def _image_size(specs) -> int:
+    return next((s.img_size for s in specs if s.kind == "image"), 128)
+
+
 def build_model(cfg):
-    """Dispatch on cfg.model.name: data-space (DSAR) or latent-space (LSAR + a collapse mechanism)."""
+    """Dispatch on cfg.model.name: data-space (DSAR) or latent-space (LSAR + a collapse mechanism) or
+    diffusion; if cfg.model.modalities is set, build the MULTIMODAL variant (token-bag spine)."""
     m = cfg.model
     name = str(m.get("name", "base"))
+
+    specs = _modality_specs(cfg)
+    if specs is not None:
+        from ..models.multimodal import MultiModalDiffusion, MultiModalLSAR
+        common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
+                      mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2))
+        if name in ("mm_lsar", "lsar"):
+            return MultiModalLSAR(**common, lambda_pred_latent=m.get("lambda_pred_latent", 1.0))
+        if name in ("mm_diffusion", "diffusion"):
+            d = m.get("diffusion", {})
+            dfg = (lambda k, v: d.get(k, v)) if hasattr(d, "get") else (lambda k, v: getattr(d, k, v))
+            return MultiModalDiffusion(**common, sampling_steps=int(dfg("sampling_steps", 6)),
+                                       shortcut=bool(dfg("shortcut", False)), predict=str(dfg("predict", "residual")),
+                                       stochastic_eval=bool(dfg("stochastic_eval", False)),
+                                       time_sampling=str(dfg("time_sampling", "uniform")),
+                                       flow_hidden=int(dfg("flow_hidden", 0)),
+                                       lambda_flow=m.get("lambda_flow", 1.0),
+                                       lambda_consistency=m.get("lambda_consistency", 1.0))
+        raise ValueError(f"modalities set but unknown multimodal model.name: {name!r}")
     if name in ("base", "dsar", "data_space_autoregressor"):
         return BaseWorldModel(BaseModelConfig(
             d=m.d, depth=m.depth, heads=m.heads, window=m.window,
@@ -71,6 +105,15 @@ def normalizer(cfg) -> Normalizer:
 
 def window_loaders(cfg, norm: Normalizer):
     P, F = cfg.data.P, cfg.data.F
+    specs = _modality_specs(cfg)
+    if specs is not None:                      # multimodal: obs/act GPU-resident + per-batch image gather
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        img_size = _image_size(specs)
+        loaders = {}
+        for split, shuffle in (("train", True), ("val", False)):
+            eps = load_split_episodes_mm(cfg.data.root, split, img_size=img_size)
+            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev)
+        return loaders
     # vector stage: keep the whole windowed set resident on the GPU (tiny) -> no worker/copy overhead
     fast_gpu = cfg.data.get("fast_gpu", True) and torch.cuda.is_available()
     loaders = {}
