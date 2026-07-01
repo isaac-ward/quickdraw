@@ -89,7 +89,7 @@ def main():
     f.savefig(f"{OUT}/mm_lsar_filmstrip.png", dpi=110)
     full_true = (img[: P + H].astype(np.float32) / 255.0)                    # context + future GT
     vid = viz.image_rollout_video(full_true, pred_img, context_len=P)
-    imageio.mimwrite(f"{OUT}/mm_lsar_rollout.mp4", list((vid).astype(np.uint8)), fps=10, macro_block_size=2, quality=8)
+    imageio.mimwrite(f"{OUT}/mm_lsar_rollout.mp4", list((vid).astype(np.uint8)), fps=60, macro_block_size=2, quality=8)
     print(f"[train_mm] wrote {OUT}/mm_lsar_filmstrip.png and mm_lsar_rollout.mp4")
     print("[train_mm] OK" if img_mse < 0.02 else "[train_mm] DONE (review artifacts)")
 

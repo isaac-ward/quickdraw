@@ -286,7 +286,7 @@ def eval_vision(cfg, model, norm, ecfg, writer, device, step=0):
                                      title=f"{head} rollout — pred (top) vs GT (bottom), H={H}, PSNR {_np.mean(psnr_s):.1f}dB")
         writer.figure(f"eval_ood_horizon/{head}/filmstrip", ff, step); plt.close(ff)
         vid = viz.image_rollout_video(full_true, p0, context_len=P)
-        writer.video(f"eval_ood_horizon/{head}/rollout", vid.astype(_np.uint8), 10, step)
+        writer.video(f"eval_ood_horizon/{head}/rollout", vid.astype(_np.uint8), 60, step)   # 60 fps (matches dt)
 
     if was:
         m.train()
