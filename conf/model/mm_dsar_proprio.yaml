@@ -1,0 +1,15 @@
+# Proprio-only MultiModalDSAR — data-space AR, image modality removed (baseline for the vision comparison).
+name: mm_dsar
+d: 256
+depth: 4
+heads: 8
+window: 32
+mlp_ratio: 4.0
+rope_theta: 10000.0
+action_dim: 2
+p_tf_start: 1.0
+p_tf_end: 0.0
+p_tf_warmup_epochs: 4
+detach_every: 8
+modalities:
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, noise_std: 0.0}
