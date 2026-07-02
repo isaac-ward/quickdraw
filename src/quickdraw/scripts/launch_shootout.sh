@@ -59,11 +59,11 @@ launch () {  # $1=gpu  $2=experiment-name  $3..=model overrides
 # ood_horizon + control + VTK video render, which is CPU-heavy ~minutes) so 6 renders don't all peak
 # together. Training itself is fast now (~18s/epoch).
 STAGGER=45
-launch 0 so_dsar        model=base;                                                sleep $STAGGER
-launch 1 so_lsar_ema    model=latent_space_autoregressor +collapse=ema;            sleep $STAGGER
-launch 0 so_lsar_naked  model=latent_space_autoregressor +collapse=naked;          sleep $STAGGER
-launch 1 so_lsar_sigreg model=latent_space_autoregressor +collapse=sigreg;         sleep $STAGGER
-launch 0 so_lsar_recon  model=latent_space_autoregressor +collapse=reconstruction; sleep $STAGGER
-launch 1 so_lsar_vicreg model=latent_space_autoregressor +collapse=vicreg
+launch 0 so_dsar        model=mm_dsar_proprio;                                                sleep $STAGGER
+launch 1 so_lsar_ema    model=mm_lsar_proprio +collapse=ema;            sleep $STAGGER
+launch 0 so_lsar_naked  model=mm_lsar_proprio +collapse=naked;          sleep $STAGGER
+launch 1 so_lsar_sigreg model=mm_lsar_proprio +collapse=sigreg;         sleep $STAGGER
+launch 0 so_lsar_recon  model=mm_lsar_proprio +collapse=reconstruction; sleep $STAGGER
+launch 1 so_lsar_vicreg model=mm_lsar_proprio +collapse=vicreg
 
 echo "[shootout] launched 6 (3 per GPU, staggered). Monitor: logs/train_*so_*/progress.log or wandb."

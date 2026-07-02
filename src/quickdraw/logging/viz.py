@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import textwrap
+import time
 
 import matplotlib
 
@@ -37,8 +38,8 @@ _N_THETA, _N_PHI = 420, 210   # torus face density (smooth even up close in FPV)
 _TEX: dict = {}
 
 CAPTIONS = {
-    "obs_vector_mse":
-        "obs_vector_mse  ·  mean over the 6 obs dims of (ô − o)² (normalized — the training loss)  ·  "
+    "obs_error":
+        "obs_error  ·  mean over the 6 obs dims of (ô − o)² (normalized — the training loss)  ·  "
         "how large is the whole-state prediction error per step?  ·  [0, ∞)",
     "manifold_distance_error":
         "manifold_distance_error  ·  ρ=√(x²+y²),  |signed_dist(p̂)|/r = |√((ρ−R)² + z²) − r| / r  ·  how far the "
@@ -49,6 +50,18 @@ CAPTIONS = {
     "tangent_velocity_error":
         "tangent_velocity_error  ·  |⟨ṗ̂, n̂(p̂)⟩| / v_scale  ·  the predicted velocity's off-surface (normal) "
         "component, in characteristic speeds (dimensionless, ÷ this split's v_scale)  ·  [0, ‖ṗ̂‖/v_scale]",
+    # image-head rollout metrics (eval_ood_horizon/<head>/metric_vs_step_*): predicted FPV frame x̂ vs ground truth x.
+    # psnr is drawn in the TOP panel (dB); ssim/mse/l1 share the BOTTOM [0,1] panel (same x-axis).
+    "psnr":
+        "psnr  ·  PSNR = −10·log₁₀(MSE),  MSE over pixels in [0,1] (peak=1)  ·  higher = sharper reconstruction  ·  "
+        "TOP panel, dB, [0, ∞)",
+    "ssim":
+        "ssim  ·  SSIM = [(2μx̂μx + c₁)(2σx̂x + c₂)] / [(μx̂² + μx² + c₁)(σx̂² + σx² + c₂)] over local windows "
+        "(μ,σ = per-window mean/(co)variance; c₁,c₂ stabilizers)  ·  1 = identical  ·  native [−1,1], shown clamped to [0,1]",
+    "mse":
+        "mse  ·  MSE = mean_pixels((x̂ − x)²),  x,x̂ ∈ [0,1]  ·  per-pixel L2 (= the image training loss)  ·  lower = closer  ·  [0, 1]",
+    "l1":
+        "l1  ·  L1 = mean_pixels(|x̂ − x|),  x,x̂ ∈ [0,1]  ·  per-pixel L1, less outlier-sensitive than MSE  ·  lower = closer  ·  [0, 1]",
 }
 _AXIAL_VIEWS = [("x", "y", "z"), ("y", "x", "z"), ("z", "x", "y")]  # (view axis, xlabel, ylabel)
 
@@ -385,20 +398,34 @@ def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", tit
 
 
 def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | None = None, vlines=None,
-                      yscale: str = "log"):
-    fig, ax = plt.subplots(figsize=(11, 6))  # wide enough that the long metric captions don't clip
-    for name, series in errors.items():
-        ax.plot(series, label=name, color=(colors or {}).get(name))
-    # vlines: {color: [step indices]} -> dotted verticals marking events (e.g. goal switches). These
-    # explain the sharp jumps in dist-to-current-goal: the distance re-targets when the goal advances.
+                      yscale: str = "log", split_top=None):
+    """Curves vs rollout step. If `split_top` (a set of keys) is given AND there are other keys, those go in
+    a TOP panel and the rest in a BOTTOM panel sharing ONE long x-axis (e.g. PSNR in dB on top; ssim/mse/l1
+    in [0,1] below), instead of squashing incompatible scales together. Captions (CAPTIONS) render below."""
+    top = set(split_top or ()) & set(errors)
+    top_keys = [k for k in errors if k in top]
+    bot_keys = [k for k in errors if k not in top]
+    if top_keys and bot_keys:                                    # two EQUAL-height stacked panels, shared x
+        fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True, gridspec_kw={"height_ratios": [1, 1]})
+        panels = [(axes[0], top_keys), (axes[1], bot_keys)]
+    else:                                                        # single panel
+        fig, ax = plt.subplots(figsize=(11, 6))
+        panels = [(ax, list(errors))]
+    for ax_, keys in panels:
+        for name in keys:
+            ax_.plot(errors[name], label=name, color=(colors or {}).get(name))
+        ax_.set_yscale(yscale)  # log spreads small early + late blow-up; linear for bounded curves (control dist)
+        ax_.grid(True, which="both", alpha=0.3)
+        ax_.set_ylabel(f"({yscale} scale)" if yscale == "log" else "value")
+        ax_.legend(loc="best")
+    ax_bottom = panels[-1][0]
+    if len(panels) == 2 and yscale == "linear":                  # image bottom panel (ssim/mse/l1) -> fixed [0,1] axis
+        ax_bottom.set_ylim(0, 1)
+    # vlines: {color: [step indices]} -> dotted verticals marking events (e.g. goal switches), on the bottom panel
     for color, steps in (vlines or {}).items():
         for s in steps:
-            ax.axvline(float(s), color=color, linestyle=":", linewidth=1.0, alpha=0.6)
-    ax.set_xlabel("rollout step")
-    ax.set_ylabel(f"error ({yscale} scale)" if yscale == "log" else "distance")
-    ax.set_yscale(yscale)  # log spreads small early + late blow-up; linear for bounded curves (control dist)
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend()
+            ax_bottom.axvline(float(s), color=color, linestyle=":", linewidth=1.0, alpha=0.6)
+    ax_bottom.set_xlabel("rollout step")
     # caption goes INSIDE the figure (reserve bottom margin) — wandb.Image ignores bbox_inches="tight",
     # so anything placed below y=0 gets clipped in the wandb logs. Wrap each caption to the figure
     # width so long lines fold onto new lines (readable in full) instead of running past the right edge;
@@ -406,7 +433,7 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
     lines = []
     for k in errors:
         if k in CAPTIONS:
-            lines += textwrap.wrap(CAPTIONS[k], width=120, subsequent_indent="      ") or [CAPTIONS[k]]
+            lines += textwrap.wrap(CAPTIONS[k], width=190, subsequent_indent="      ") or [CAPTIONS[k]]
     fig.subplots_adjust(bottom=min(0.55, 0.10 + 0.028 * len(lines)))
     fig.text(0.02, 0.02, "\n".join(lines), fontsize=7, va="bottom")
     return fig
@@ -535,13 +562,14 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
     frames = []
     every = max(1, len(idx) // 10)  # progress every ~10% of frames
     sc = R + r
-    # reuse: the iso saturation flash is fixed at the source by number_of_peels=12 in _build (the iso
-    # diagonal pierces >4 translucent layers), so the FAST reuse=True path is stable even with the fan.
+    # reuse: the iso saturation flash is fixed at the source by number_of_peels=4 in _build (the iso
+    # diagonal pierces several translucent layers), so the FAST reuse=True path is stable even with the fan.
     rend = TorusRenderer(R, r, coloring, reuse=reuse)
+    _t0 = time.perf_counter()
     try:
         for fi, ti in enumerate(idx):
             if log is not None and fi % every == 0:
-                log(f"rendered {fi}/{len(idx)} frames")
+                log(_eta_str(_t0, fi, len(idx)))
             k, lo = int(ti), max(0, int(ti) - tail)
             trajs, arrows = [], []
             for a in agents:
@@ -598,6 +626,7 @@ class FPVRenderer:
             self._sm[i] = self._sm[i] / (np.linalg.norm(self._sm[i]) + 1e-9)
             self.pl.camera_position = [tuple(p + 0.06 * self.r * n), tuple(p + self._sm[i] * 2 * self.r), tuple(n)]
             self.pl.camera.view_angle = self.fov
+            self.pl.render()                                 # force VTK to apply the camera move; screenshot() alone reuses the prior render (frozen frames)
             out.append(self.pl.screenshot(return_img=True))
         return np.stack(out)
 
@@ -673,35 +702,15 @@ def _quiver_swarm_trajs(fr, sc):
     return out
 
 
-def diffusion_quiver_frames(R, r, coloring, current, action_amb, per_frame, agent_tail=None,
-                            future_path=None, true_next=None, title="", size=860, view_pad=EVAL_VIEW_PAD,
-                            torus_opacity=TORUS_OPACITY):
-    """Short tau-sweep ANIMATION (tau 1->0, the denoising direction), rendered as the FULL 4-panel atlas
-    (iso + 3 axial). Fixed across frames: the current dot, the action arrow, the moving-agent HISTORY tail
-    AND its FUTURE path (both black, same thickness — where it came from + where it's going), and a black
-    TRUTH ring (true next position). Animated: a GREY SWARM of decoded ODE paths flows from off-surface
-    noise onto the torus, each leaving its own growing tail (the accumulating tails trace the flow field).
-    No committed/red particle. per_frame is a list of {swarm: [{particle, trail}..]} (committed unused)."""
-    sc = R + r
-    rend = TorusRenderer(R, r, coloring)                                 # reused across frames (atlas, like control)
-    static = _quiver_static_trajs(current, agent_tail, future_path, true_next, R, sc)
-    cur, act, frames = np.asarray(current), np.asarray(action_amb), []
-    try:
-        for fr in per_frame:
-            fig = fig_torus_atlas(R, r, trajs=static + _quiver_swarm_trajs(fr, sc), arrows=[(cur, act)],
-                                  coloring=coloring, title=title, markers=False, iso_size=size,
-                                  ax_size=int(round(size * 0.67)), view_pad=view_pad,
-                                  torus_opacity=torus_opacity, renderer=rend)
-            fig.set_dpi(VIDEO_DPI)
-            frames.append(_fig_rgb(fig))
-            plt.close(fig)
-    finally:
-        rend.close()
-    return np.stack(frames)
+def _eta_str(t0, done, total):
+    """'{done}/{total} frames | elapsed Xs | ETA Ys (~HH:MM:SS)' for a render loop's progress callback."""
+    el = time.perf_counter() - t0
+    rem = el / max(1, done) * max(0, total - done)
+    return f"{done}/{total} frames | elapsed {el:.0f}s | ETA {rem:.0f}s (~{time.strftime('%H:%M:%S', time.localtime(time.time() + rem))})"
 
 
 def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agent_tail, future_path, steps,
-                                       title="", size=860, view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY):
+                                       title="", size=860, view_pad=EVAL_VIEW_PAD, torus_opacity=TORUS_OPACITY, log=None):
     """N SEQUENTIAL swarms at a FIXED agent. The current dot, the action arrow, the black history tail and
     the black future path are STATIC the whole time; each step's grey swarm denoises (converges) to its own
     target ring — which advances along the fixed future line — one swarm after the next. steps: a list of
@@ -710,18 +719,32 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
     rend = TorusRenderer(R, r, coloring)
     base = _quiver_static_trajs(current, agent_tail, future_path, None, R, sc)   # ring is per-step, added below
     cur, act, frames = np.asarray(current), np.asarray(action_amb), []
+    total = sum(len(s["per_frame"]) for s in steps)
+    every = max(1, total // 10)                                       # progress every ~10% of frames
+    t0 = time.perf_counter()
     try:
         for s in steps:
-            ring = {"xyz": _tangent_ring(s["true_next"], R, 0.0225 * sc), "color": "black",
-                    "radius": 0.006 * sc, "start_sphere": False, "end_sphere": False}
+            target = {"xyz": np.asarray(s["true_next"])[None], "color": "black", "marker_color": "black",
+                      "start_sphere": True, "end_sphere": False, "start_scale": 0.5}   # solid black sphere, radius 0.0225*sc (was a ring)
             for fr in s["per_frame"]:
-                fig = fig_torus_atlas(R, r, trajs=base + [ring] + _quiver_swarm_trajs(fr, sc),
+                if log is not None and len(frames) % every == 0:
+                    log(_eta_str(t0, len(frames), total))
+                fig = fig_torus_atlas(R, r, trajs=base + [target] + _quiver_swarm_trajs(fr, sc),
                                       arrows=[(cur, act)], coloring=coloring, title=title, markers=False,
                                       iso_size=size, ax_size=int(round(size * 0.67)), view_pad=view_pad,
                                       torus_opacity=torus_opacity, renderer=rend)
                 fig.set_dpi(VIDEO_DPI)
                 frames.append(_fig_rgb(fig))
                 plt.close(fig)
+        if steps:   # 0.5s hold (30 frames @ 60fps) on the clean scene — last swarm gone, grey disappeared
+            last_tgt = {"xyz": np.asarray(steps[-1]["true_next"])[None], "color": "black", "marker_color": "black",
+                        "start_sphere": True, "end_sphere": False, "start_scale": 0.5}
+            fig = fig_torus_atlas(R, r, trajs=base + [last_tgt], arrows=[(cur, act)], coloring=coloring,
+                                  title=title, markers=False, iso_size=size, ax_size=int(round(size * 0.67)),
+                                  view_pad=view_pad, torus_opacity=torus_opacity, renderer=rend)
+            fig.set_dpi(VIDEO_DPI)
+            frames.extend([_fig_rgb(fig)] * 30)
+            plt.close(fig)
     finally:
         rend.close()
     return np.stack(frames)
@@ -794,31 +817,6 @@ def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="pl
     return fig
 
 
-def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
-                           cmap="plasma", cbar_label="", depthshade=False, ease=True, dpi=110):
-    """Animate a cloud collapsing onto the recovered manifold: paths (N, T, 3) are the per-point positions
-    over the T denoising steps; each frame is fig_points_4view at an interpolated time. ease=True applies a
-    cubic ease-OUT so the motion slows toward the end (the cloud appears to settle). depthshade defaults
-    False here (much faster for the many-frame render)."""
-    paths = np.asarray(paths)
-    T = paths.shape[1]
-    frames = []
-    for k in range(n_frames):
-        u = k / (n_frames - 1) if n_frames > 1 else 1.0
-        if ease:
-            u = 1.0 - (1.0 - u) ** 3                          # cubic ease-out -> slows into the manifold (settling)
-        f = u * (T - 1)
-        j0 = int(np.floor(f)); j1 = min(j0 + 1, T - 1); w = f - j0
-        pts = (1 - w) * paths[:, j0] + w * paths[:, j1]
-        fig = fig_points_4view(pts, color=color, title=title, lims=lims, point_size=point_size,
-                               cmap=cmap, cbar_label=cbar_label, depthshade=depthshade)
-        fig.set_dpi(dpi)
-        frames.append(_fig_rgb(fig))
-        plt.close(fig)
-    return np.stack(frames)
-
-
-# ------------------------- vision: predicted-vs-true image rollout (filmstrip still + synced video) -------------------------
 def _img_u8(x):
     """(H,W,3) or (...,H,W,3) -> uint8. Passes uint8 through; treats float as [0,1]."""
     x = np.asarray(x)
@@ -857,3 +855,33 @@ def image_rollout_video(true_full, pred_future, context_len, sep_px=2):
     top = np.concatenate([black, pred_future], axis=0)[:T]            # black during context, then predictions
     sep = np.zeros((T, sep_px, W, 3), np.uint8)                       # thin divider (no text)
     return np.concatenate([top, sep, true_full], axis=1)             # vstack: pred on top, GT on bottom
+
+
+def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
+                           cmap="plasma", cbar_label="", depthshade=False, ease=True, dpi=110, log=None):
+    """Animate a cloud collapsing onto the recovered manifold: paths (N, T, 3) are the per-point positions
+    over the T denoising steps; each frame is fig_points_4view at an interpolated time. ease=True applies a
+    cubic ease-OUT so the motion slows toward the end (the cloud appears to settle). depthshade defaults
+    False here (much faster for the many-frame render)."""
+    paths = np.asarray(paths)
+    T = paths.shape[1]
+    frames = []
+    every = max(1, n_frames // 10)                           # progress every ~10% of frames
+    t0 = time.perf_counter()
+    for k in range(n_frames):
+        if log is not None and k % every == 0:
+            log(_eta_str(t0, k, n_frames))
+        u = k / (n_frames - 1) if n_frames > 1 else 1.0
+        if ease:
+            move = 0.85                                       # even (constant-speed) collapse over the first ~85% (~6.8s of 8s), then hold still ~1.2s
+            u = min(u / move, 1.0)                            # linear tween then clamp — visibly moving the whole window (was cubic ease-out -> all motion in the first 4s)
+        f = u * (T - 1)
+        j0 = int(np.floor(f)); j1 = min(j0 + 1, T - 1); w = f - j0
+        pts = (1 - w) * paths[:, j0] + w * paths[:, j1]
+        fig = fig_points_4view(pts, color=color, title=title, lims=lims, point_size=point_size,
+                               cmap=cmap, cbar_label=cbar_label, depthshade=depthshade)
+        fig.set_dpi(dpi)
+        frames.append(_fig_rgb(fig))
+        plt.close(fig)
+    return np.stack(frames)
+

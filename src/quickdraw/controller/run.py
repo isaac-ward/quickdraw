@@ -47,10 +47,10 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     # reuse_render is a RENDER knob living in the control config; strip it before building MPPIConfig
     # (which has no such field) so MPPIConfig(**...) doesn't choke on the extra key.
     mppi_kwargs = {k: v for k, v in cfg.control.items() if k != "reuse_render"}
-    fpv = None                                    # multimodal: render FPV context in the MPPI loop
+    fpv = None                                    # image models: render FPV context in the MPPI loop
     core = getattr(model, "_orig_mod", model)
-    img_head = next((n for n, _ in core.layout if n != "proprio"), "image") if hasattr(core, "layout") else "image"
-    if hasattr(core, "layout"):
+    img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
+    if img_head is not None:                       # only render FPV when there's a real image head
         img_size = next((mod.ae.cfg.img_size for mod in core.modalities.values() if hasattr(mod, "ae")), 128)
         try:
             coloring = json.load(open(os.path.join(cfg.data.root, "dataset_card.json"))).get("coloring", {}).get("train", "rainbow")
@@ -132,6 +132,10 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                   f"oracle={res['true']['mean_goals_reached']:.2f} (success {res['true']['success_rate']:.2f}, "
                   f"{res['true']['mean_seconds_to_complete']:.2f}s) "
                   f"pred={res['pred']['mean_goals_reached']:.2f} (success {res['pred']['success_rate']:.2f})")
-    with open(os.path.join(writer.dir, "control_summary.json"), "w") as f:
+    # write the raw summary next to THIS epoch's control media (logs/epoch_<i>/eval_control/), not the flat run
+    # root — mirrors how writer.video/figure organize by epoch, so it's per-epoch (not clobbered each eval).
+    ep_dir = os.path.join(writer.dir, "logs", f"epoch_{step:04d}", "eval_control")
+    os.makedirs(ep_dir, exist_ok=True)
+    with open(os.path.join(ep_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     return summary

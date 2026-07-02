@@ -1,7 +1,7 @@
 # Proprio-only MultiModalLSAR — same general backbone as mm_lsar, image modality removed (ablation
 # baseline for the vision comparison; the registry drop is the only difference). eval_vision self-skips.
 name: mm_lsar
-d: 256
+d: 32
 depth: 4
 heads: 8
 window: 32

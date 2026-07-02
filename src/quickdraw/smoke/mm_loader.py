@@ -29,7 +29,7 @@ def main():
           f"{len(eps)} eps, frame shape {tuple(eps[0][2].shape)}")
     check("per-episode obs/frame counts aligned", all(len(o) == len(img) for o, _, img in eps))
 
-    loader = MMWindowLoader(eps, P, Fh, norm, batch=B, shuffle=False, device=DEV)
+    loader = MMWindowLoader(eps, P, Fh, norm, batch=B, shuffle=False, device=DEV, image_head="image_fpv")
     batch = next(iter(loader))
     check("obs_seq (B,L,6)", batch["obs_seq"].shape == (B, L, 6), str(tuple(batch["obs_seq"].shape)))
     check("act_seq (B,L,2)", batch["act_seq"].shape == (B, L, 2))

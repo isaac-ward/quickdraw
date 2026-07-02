@@ -1,7 +1,7 @@
 name: mm_lsar
-d: 256                     # backbone/token width (all modality tokens live at d)
+d: 32                     # backbone/token width (all modality tokens live at d)
 depth: 4
-heads: 8                   # head_dim = 32 (power of 2 for FlexAttention)
+heads: 8                   # head_dim = 4 (d/heads; power of 2 for FlexAttention)
 window: 32                 # temporal attention span
 mlp_ratio: 4.0
 rope_theta: 10000.0

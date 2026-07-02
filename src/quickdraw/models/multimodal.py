@@ -20,6 +20,7 @@ from .flow import FlowField
 from .modalities import ModalitySpec, build_modalities
 from .spacetime import SpaceTimeTransformer
 from .transformer import pad_block_mask
+from .collapse import CollapseStrategy, Reconstruction
 
 
 def _ln(x: Tensor) -> Tensor:
@@ -29,6 +30,17 @@ def _ln(x: Tensor) -> Tensor:
 
 def _mlp(i: int, o: int, h: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(i, h), nn.GELU(), nn.Linear(h, o))
+
+
+def _pred_loss(pred: Tensor, target: Tensor, metric: str) -> Tensor:
+    """Latent-prediction loss (mirrors models/lsar.py.pred_loss): stop-grad the target; mse / BYOL
+    normed_mse / cosine per the collapse strategy's pred_metric."""
+    target = target.detach()
+    if metric == "mse":
+        return F.mse_loss(pred, target)
+    if metric == "normed_mse":
+        return F.mse_loss(pred, _ln(target))
+    return F.mse_loss(_ln(pred), _ln(target))   # cosine: standardize both
 
 
 class MultiModalSequenceModel(nn.Module):
@@ -46,11 +58,34 @@ class MultiModalSequenceModel(nn.Module):
         self.act_enc = _mlp(action_dim, d, d)                 # action -> 1 token
         self.backbone = SpaceTimeTransformer(d, depth, heads, window, mlp_ratio,
                                              n_slots=self.n_input, rope_theta=rope_theta)
+        self.latent_norm = True   # LN the carried token bag (scale-free); LSAR turns it OFF for variance-based regs
+
+    def arch_table(self) -> list[tuple[str, str, int]]:
+        """Rows (component, shape transform, #params) describing the token-bag dataflow — printed at the top
+        of progress.log. Shows how each modality becomes token(s), how the bag is fused by the backbone
+        (spatial within-step + temporal across-step), and the per-token prediction head."""
+        def npar(mod): return sum(p.numel() for p in mod.parameters()) if mod is not None else 0
+        rows = []
+        for name, ntok in self.layout:
+            mod = self.modalities[name]
+            ins = f"(B,T,{mod.ae.cfg.img_size},{mod.ae.cfg.img_size},3)" if hasattr(mod, "ae") else f"(B,T,{mod.dim})"
+            rows.append((f"modality:{name} (trunk+head)", f"{ins} -> (B,T,{ntok},{self.d})", npar(mod)))
+        rows.append(("action_enc", f"(B,T,2) -> (B,T,1,{self.d})", npar(self.act_enc)))
+        rows.append(("token_bag (per step)", f"{self.n_state} state tokens ++ 1 action = (B,T,{self.n_input},{self.d})", 0))
+        rows.append(("backbone space-time", f"(B,T,{self.n_input},{self.d}) -> same  "
+                     f"[spatial: {self.n_input} tokens/step fuse; temporal: T causal]", npar(self.backbone)))
+        head = getattr(self, "flow", None) or getattr(self, "predictor", None)
+        label = "flow field (rectified flow)" if hasattr(self, "flow") else "predictor (per-token MLP residual)"
+        rows.append((f"predict_next: {label}", f"(B,T,{self.n_state},{self.d}) -> (B,T,{self.n_state},{self.d})", npar(head)))
+        if getattr(self, "predictor_q", None) is not None:
+            rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
+        return rows
 
     # ---- modality <-> token bag ----
     def encode_state(self, obs: dict[str, Tensor]) -> Tensor:        # {name:(B,T,*)} -> (B,T,n_state,d)
         toks = [self.modalities[name].encode(obs[name]) for name, _ in self.layout]
-        return _ln(torch.cat(toks, dim=-2))
+        bag = torch.cat(toks, dim=-2)
+        return _ln(bag) if self.latent_norm else bag
 
     def to_obs(self, bag: Tensor, heads=None) -> dict[str, Tensor]:  # (B,*,n_state,d) -> {name:(B,*,*)}
         out, off = {}, 0
@@ -91,6 +126,14 @@ class MultiModalSequenceModel(nn.Module):
         bag as-is (identity). Data-space (DSAR) overrides to re-encode the DECODED obs — so the rollout
         carries the observation, compounding error in data space (the defining DSAR property)."""
         return bag
+
+    def one_step_states(self, bag_win: Tensor, act_win: Tensor, attn_eager: bool = False) -> Tensor:
+        """One advance of the rollout as a pure bag->bag map (token-bag analogue of SequenceWorldModel):
+        (bag_win (B,W,n_state,d), act_win (B,W,2)) -> next bag (B,n_state,d) at the LAST position. Backbone-
+        only, so it's identical for every MM model; attn_eager routes through the double-backprop-able
+        sdpa(MATH) path used by the contraction penalty's Jacobian power-iteration."""
+        h = self.backbone(self._to_input(bag_win, act_win), attn_eager=attn_eager)
+        return self.readout(h[:, -1], bag_win[:, -1])
 
     # ---- teacher-forced parallel forward ----
     def forward(self, obs: dict[str, Tensor], act: Tensor) -> Tensor:
@@ -175,46 +218,62 @@ class MultiModalLSAR(MultiModalSequenceModel):
     pred_latent = MSE to the encoded true-next bag (Reconstruction collapse: obs heads ground the encoder)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 pred_hidden: int = 0, lambda_pred_latent: float = 1.0, ema: bool = False, ema_decay: float = 0.996):
+                 pred_hidden: int = 0, lambda_pred_latent: float = 1.0,
+                 collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
+        self.lambda_reg = lambda_reg
         self.lambda_pred_obs = 1.0
-        self.ema = ema
-        if ema:                                                 # I-JEPA/BYOL: EMA target encoder + online predictor q;
-            import copy                                          # obs recon becomes a decoder-only PROBE (doesn't shape enc)
+        # collapse strategy = the SAME abstraction as vector LSAR (recon/ema/naked/vicreg/sigreg). It's a
+        # POLICY object here: MM keeps its own multi-encoder EMA/encode mechanics but reads the strategy's
+        # flags + reg_loss + pred_metric. Reconstruction (obs grounds the encoder) is the default.
+        self.collapse = collapse or Reconstruction()
+        self.latent_norm = not self.collapse.has_reg           # OFF for vicreg/sigreg (var/cov fight LN)
+        self.pred_obs_in_loss = self.collapse.obs_grounds_encoder
+        self.predictor_q = None                                # BYOL online-only predictor q (asymmetry)
+        if self.collapse.needs_predictor:
+            self.predictor_q = _mlp(d, d, h)
+        self.ema_modalities = None                             # I-JEPA/BYOL: frozen slow copy of the encoders
+        if self.collapse.needs_ema:
+            import copy
             self.ema_modalities = copy.deepcopy(self.modalities)
             for p in self.ema_modalities.parameters():
                 p.requires_grad_(False)
-            self.predictor_q = _mlp(d, d, h)
-            self.ema_decay = float(ema_decay)
-            self.pred_obs_in_loss = False
-        else:
-            self.pred_obs_in_loss = True                        # Reconstruction: obs recon grounds the encoder
+            self.ema_tau = float(getattr(self.collapse, "tau", 0.996))
+        self.expander = None                                   # VICReg expander (only if strategy asks; none do)
+        if getattr(self.collapse, "needs_expander", False):
+            self.expander = _mlp(d, expander_dim, expander_dim)
 
     def predict_next(self, h_state: Tensor, prev_bag: Tensor) -> Tensor:
-        return _ln(prev_bag + self.predictor(h_state))
+        bag = prev_bag + self.predictor(h_state)
+        return _ln(bag) if self.latent_norm else bag
 
     def _encode_ema(self, obs) -> Tensor:
         toks = [self.ema_modalities[name].encode(obs[name]) for name, _ in self.layout]
-        return _ln(torch.cat(toks, dim=-2))
+        bag = torch.cat(toks, dim=-2)
+        return _ln(bag) if self.latent_norm else bag
 
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
         fut = {k: future_obs[k] for k, _ in self.layout}
-        if self.ema:                                            # target = EMA-encoded true future; online = q(pred)
-            target = self._encode_ema(fut).detach()
-            online = self.predictor_q(pred_bag)
-            return {"pred_latent": F.mse_loss(online, target)}, {"pred_latent": self.lambda_pred_latent}
-        target = self.encode_state(fut).detach()
-        return {"pred_latent": F.mse_loss(pred_bag, target)}, {"pred_latent": self.lambda_pred_latent}
+        target = (self._encode_ema(fut) if self.collapse.needs_ema else self.encode_state(fut)).detach()
+        online = self.predictor_q(pred_bag) if self.predictor_q is not None else pred_bag  # BYOL: q(online)
+        raw = {"pred_latent": _pred_loss(online, target, self.collapse.pred_metric)}
+        w = {"pred_latent": self.lambda_pred_latent * self.collapse.lambda_pred}
+        if self.collapse.has_reg:                              # SIGReg/VICReg on the (un-LN'd) token latents
+            z = self.encode_state(obs).reshape(-1, self.d)
+            if self.expander is not None:
+                z = self.expander(z)
+            raw["reg"], w["reg"] = self.collapse.reg_loss(z), self.lambda_reg
+        return raw, w
 
     @torch.no_grad()
     def on_optimizer_step(self) -> None:
-        if self.ema:                                            # EMA target <- online encoders
+        if self.ema_modalities is not None:                    # EMA target encoders <- online encoders
             for pe, p in zip(self.ema_modalities.parameters(), self.modalities.parameters()):
-                pe.mul_(self.ema_decay).add_(p.detach(), alpha=1.0 - self.ema_decay)
+                pe.mul_(self.ema_tau).add_(p.detach(), alpha=1.0 - self.ema_tau)
             for be, b in zip(self.ema_modalities.buffers(), self.modalities.buffers()):
                 be.copy_(b)
 

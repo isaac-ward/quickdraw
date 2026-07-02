@@ -20,6 +20,16 @@ def run_standalone(cfg, routines, label: str | None = None):
         routines = [routines]
     label = label or routines[0]
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # rebuild the model ARCHITECTURE from the run's saved config (logs/config.json) so ANY checkpoint loads
+    # regardless of the CLI default model (modalities/d/name may differ). Falls back to cfg.model if absent.
+    ck = cfg.get("checkpoint", None)
+    run = os.path.dirname(os.path.dirname(ck)) if ck and str(ck).endswith(".ckpt") else ck
+    cfgj = os.path.join(run, "logs", "config.json") if run else None
+    if cfgj and os.path.exists(cfgj):
+        from omegaconf import OmegaConf
+        saved = OmegaConf.create(json.load(open(cfgj)))
+        OmegaConf.set_struct(cfg, False)
+        cfg.model = saved.model                                  # adopt the trained model config (arch + modalities)
     model = build_model(cfg).to(device)
     load_checkpoint(model, cfg.checkpoint)  # .ckpt file or train run dir (-> best.ckpt)
     model.eval()

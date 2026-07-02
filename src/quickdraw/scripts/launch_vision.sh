@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Vision shakedown: ONE multimodal (proprio + image_fpv) run per GPU, ONE epoch, then evaluate — to see
-# what a single vision run costs (GPU mem + util + per-epoch time) before packing a full sweep. The token-
-# bag world model (design/models/vision.md): proprio MLP trunk/head + 128^2 ViT-AE image trunk/head, fused
-# on the factorized space-time backbone. In-loop eval = the four MM routines (vision rollout, manifold UMAP,
-# ood_horizon proprio long-horizon, control MPPI with FPV rendered in the loop).
+# Vision runs: TWO multimodal (proprio + image_fpv) runs, ONE per H100, 50 epochs, eval every 10 (skipping 0).
+# GPU 0: LSAR with RECON grounding (plain mm_lsar).  GPU 1: diffusion with shortcut (K=1 self-consistency).
+# Matched for a fair head-to-head: identical spine/tokens/data/hyperparams; only the next-state head differs
+# (MLP-residual latent step vs rectified-flow step). recon = the 06-28 shootout's best collapse strategy;
+# physical loss is OFF (it diverged even on recon in those runs). detach_every=16 on both.
+# Packing is OFF: autoregressive-rollout epochs (p_tf<1) balloon activation memory and OOM when two share a GPU.
+# The token-bag world model (design/models/vision.md): proprio MLP trunk/head + 128^2 ViT-AE image trunk/head,
+# fused on the factorized space-time backbone. In-loop eval = the four MM routines (vision rollout, manifold
+# UMAP, ood_horizon proprio long-horizon, control MPPI with FPV rendered in the loop).
 # ============================================================================================
 # !!! DO NOT set TORCHDYNAMO_DISABLE=1. (MM models skip torch.compile anyway — the per-batch image gather +
 #     ViT AE aren't compiled; FlexAttention still runs eager. See train.py.)
@@ -11,9 +15,9 @@
 #
 # RUN SUMMARY IS NOT HARDCODED — supply it FRESH each launch via env vars (train.py rejects duplicates).
 # Plain words + periods only (Hydra rejects ; , - : = ). Shared: RS_PROBLEM RS_TRIED RS_DETAIL RS_RATIONALE.
-# Per-run trying: RS_TRYING_dsar RS_TRYING_lsar.
+# Per-run trying: RS_TRYING_lsar RS_TRYING_diff.
 #
-# Usage: RS_PROBLEM=.. RS_TRIED=.. RS_DETAIL=.. RS_RATIONALE=.. RS_TRYING_dsar=.. RS_TRYING_lsar=.. \
+# Usage: RS_PROBLEM=.. RS_TRIED=.. RS_DETAIL=.. RS_RATIONALE=.. RS_TRYING_lsar=.. RS_TRYING_diff=.. \
 #          bash src/quickdraw/scripts/launch_vision.sh
 set -uo pipefail
 cd "$(dirname "$0")/../../.." || exit 1   # -> repo root
@@ -23,16 +27,15 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 : "${RS_PROBLEM:?author + export the run_summary fresh, not hardcoded; missing RS_PROBLEM}"
 : "${RS_TRIED:?missing RS_TRIED}"; : "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
 
-# BATCH / GPU-FILL (measured 2026-07-01, 128^2, GPU-resident frame loader, one run per H100 80GB->96GB):
-#   batch 16 -> ~45% util, ~8.6 GB (frame store ~4 GB fixed + activations); under-filled + 3600 steps/epoch.
-#   The frame store is GPU-resident (index_select gather, no host copy), so it's compute-bound now.
-# batch 96 saturates better (activations ~6x, ~30 GB, util toward 80%+, ~450 steps/epoch). data.F=24 keeps
-# the image window + per-step ViT encode count bounded. One epoch + all four MM evals (every_epochs=1).
-# Control params trimmed so the FPV-in-loop MPPI doesn't dominate the shakedown eval; raise for the real sweep.
-COMMON=( data.root="$DATA" data.batch=96 data.F=24
-         trainer.max_epochs=1 eval.during_train.every_epochs=1 eval.during_train.at_epochs=null
-         eval.horizon=256 eval.n_episodes=16
-         control.n_episodes=4 control.max_steps=64 control.num_samples=128 control.horizon=16 )
+# BATCH / GPU (measured 2026-07-01, 128^2, GPU-resident loader). At batch 96 while p_tf=1 (parallel, epoch 0):
+#   LSAR+EMA+phys ~25.6 GB, diffusion ~33 GB. BUT once the p_tf curriculum turns on AUTOREGRESSIVE rollout
+#   (epoch 1+), activation memory balloons (F sequential steps of ViT decode/re-encode held for BPTT) and two
+#   runs sharing a GPU OOM (killed vis_dsar this way). So ONE run per GPU. AR epochs are ~7-8x slower than the
+#   parallel epoch 0 (~15 min/ep at F=24) -> ~2 days for 200 ep, hence 50 epochs. data.F=24 is only the TRAINING
+#   window; eval rolls the full long horizon. eval every 10 skipping 0; control un-trimmed (mppi.yaml defaults).
+GROUP="${GROUP:-vis_shootout}"    # wandb group: all runs of this sweep grouped in the UI (override with GROUP=..)
+COMMON=( data.root="$DATA" data.batch=96 data.F=24 logging.group="$GROUP"
+         eval.horizon=256 eval.vision_horizon=256 eval.n_episodes=16 )
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED"
      run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )
 
@@ -50,12 +53,11 @@ launch () {  # $1=gpu  $2=experiment-name  $3=model-config  $4=trying-env-var-na
       run_summary.trying="$trying"
 }
 
-# ONE run per GPU: vision DSAR (GPU0) + vision LSAR with EMA target encoder + physical loss (GPU1).
-# physical_loss active from step 0 (warmup 0) for the shakedown; on-surface + tangent + kinematic continuity.
-launch 0 vis_dsar         mm_dsar     RS_TRYING_dsar
+# ONE run per GPU, matched head-to-head.  GPU 0: LSAR with recon grounding (plain mm_lsar).  GPU 1: diffusion
+# with shortcut (K=1 sampling via self-consistency).  detach_every=16 on both so the BPTT window matches too.
+launch 0 vis_lsar_recon         mm_lsar      RS_TRYING_lsar model.detach_every=16
 sleep 45
-launch 1 vis_lsar_ema_phys mm_lsar_ema RS_TRYING_lsar \
-  variations.physical_loss.weight=0.3 variations.physical_loss.continuity=0.3 variations.physical_loss.warmup_epochs=0
+launch 1 vis_diffusion_shortcut mm_diffusion RS_TRYING_diff model.diffusion.shortcut=true
 
-echo "[vision] launched 2 vision runs (dsar on GPU0, lsar+ema+physical on GPU1), 1 epoch + eval each."
-echo "[vision] watch GPU fill:  watch -n2 nvidia-smi   |  progress: logs/train_*vis_*/progress.log"
+echo "[vision] launched 2 vision runs (GPU0: lsar_recon; GPU1: diffusion_shortcut), 50 epochs, eval every 10."
+echo "[vision] wandb group: $GROUP   |   watch: nvidia-smi   |   progress: logs/train_*vis_*/progress.log"

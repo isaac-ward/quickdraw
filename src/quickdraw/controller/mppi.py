@@ -80,27 +80,15 @@ def _true_rollout_fn(env: TorusEnv, cfg: TorusConfig, device):
     return fn
 
 
-def _model_rollout_fn(model, normalizer, ctx, pa):
-    """Roll candidate action sequences through the LEARNED model from the real context (ctx,pa)."""
-    def fn(cand):                                            # cand: (G,K,H,2)
-        G, K, H = cand.shape[:3]
-        p = ctx.shape[1]
-        ctxK = ctx[:, None].expand(G, K, p, 6).reshape(G * K, p, 6)
-        paK = pa[:, None].expand(G, K, pa.shape[1], 2).reshape(G * K, pa.shape[1], 2)
-        actK = torch.cat([paK, cand.reshape(G * K, H, 2)], dim=1)        # (G*K, p-1+H, 2)
-        pr = normalizer.denorm_obs(model.imagine_eval(normalizer.norm_obs(ctxK),
-                                                      normalizer.norm_act(actK), H))
-        pr = pr.view(G, K, H, 6)
-        return pr[..., :3], pr[..., 3:]
-    return fn
-
-
 def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa, img_head):
-    """Learned rollout for a MULTIMODAL model: proprio + rendered FPV context. The image context is encoded
-    ONCE and shared across the K candidates (imagine_shared); candidates score on decoded PROPRIO only."""
+    """Learned rollout for the spine: proprio (+ rendered FPV context when img_head is set). The image
+    context is encoded ONCE and shared across the K candidates (imagine_shared); candidates score on decoded
+    PROPRIO only. img_head=None -> proprio-only control (no image stream)."""
     def fn(cand):                                           # cand: (G,K,H,2)
         G, K, H = cand.shape[:3]
-        ctx = {"proprio": normalizer.norm_obs(ctx_pro), img_head: ctx_fpv}   # (G,p,6), (G,p,s,s,3)
+        ctx = {"proprio": normalizer.norm_obs(ctx_pro)}                      # (G,p,6)
+        if img_head is not None:
+            ctx[img_head] = ctx_fpv                                          # (G,p,s,s,3) rendered FPV context
         paK = pa[:, None].expand(G, K, pa.shape[1], 2).reshape(G * K, pa.shape[1], 2)
         actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, 2)], dim=1))  # (G*K, p-1+H, 2)
         pr = normalizer.denorm_obs(model.imagine_shared(ctx, actK, H, K, heads=["proprio"])["proprio"])
@@ -124,10 +112,10 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     `fpv` (dict {coloring, fov, size}) enables the MULTIMODAL learned controller: the FPV is rendered per
     step for the model's image context (proprio comes from the env)."""
     core = getattr(model, "_orig_mod", model)
-    is_mm = hasattr(core, "layout")
-    img_head = next((n for n, _ in core.layout if n != "proprio"), None) if is_mm else None
+    img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
+    use_fpv = img_head is not None and fpv is not None                     # render FPV in the loop ONLY with a real image head
     from ..logging import viz
-    fpv_rend = viz.FPVRenderer(env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"]) if is_mm else None
+    fpv_rend = viz.FPVRenderer(env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"]) if use_fpv else None
 
     def _fpv(states):                                   # (B,6) -> (B,s,s,3) [0,1] on device (persistent plotter)
         return torch.from_numpy(fpv_rend.render(states.detach().cpu().numpy())).float().div_(255.0).to(device)
@@ -148,8 +136,9 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
         c["mean"] = torch.zeros(B, H, 2, device=device)
         c["done_step"] = torch.full((B,), -1, dtype=torch.long, device=device)
         c["dist_log"] = []  # per executed step: distance of each episode to its current goal
-    if is_mm:               # learned controller needs the FPV context (proprio comes from the env)
-        ctrls["pred"]["fpv"] = [_fpv(ctrls["pred"]["obs"][-1])]
+    if use_fpv:             # learned controller needs the FPV context (proprio comes from the env)
+        ctrls["pred"]["fpv"] = [_fpv(ctrls["pred"]["obs"][-1])]   # GPU: last P frames only (context)
+        ctrls["pred"]["fpv_ep0"] = []                            # CPU: ep0 frame per executed step (for the video)
 
     t0 = time.perf_counter()
     step = 0
@@ -166,11 +155,8 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
             if kind == "pred":
                 ctx = torch.stack(c["obs"][-P:], dim=1)
                 pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, 2, device=device)
-                if is_mm:
-                    ctx_fpv = torch.stack(c["fpv"][-P:], dim=1)   # (B, p, s, s, 3) rendered FPV context
-                    rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa, img_head)
-                else:
-                    rollout = _model_rollout_fn(model, normalizer, ctx, pa)
+                ctx_fpv = torch.stack(c["fpv"][-P:], dim=1) if use_fpv else None   # (B,p,s,s,3) FPV context, or None (proprio-only)
+                rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa, img_head if use_fpv else None)
             else:
                 rollout = _true_rollout_fn(c["env"], env_cfg, device)
             c["plan"], _, p_xyz, ret = _mppi_step(rollout, c["mean"], cur, mppi, a_max, g)
@@ -180,7 +166,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                 pts = p_xyz[0].cpu().numpy()                                    # (K, H, 3)
                 anchored = np.concatenate([np.broadcast_to(anchor, (pts.shape[0], 1, 3)), pts], axis=1)
                 cur_fan = {"pts": anchored, "ret": ret[0].cpu().numpy()}        # (K, H+1, 3)
-                if is_mm:  # ep0 model-imagined FPV for the SELECTED plan (why MPPI chose it) -> pred-vs-actual video
+                if use_fpv:  # ep0 model-imagined FPV for the SELECTED plan (why MPPI chose it) -> pred-vs-actual video
                     ctx0 = {"proprio": normalizer.norm_obs(ctx[0:1]), img_head: ctx_fpv[0:1]}
                     act0 = normalizer.norm_act(torch.cat([pa[0:1], c["plan"][0:1]], dim=1))  # (1, p-1+H, 2)
                     cur_plan_fpv = model.imagine_eval(ctx0, act0, H, heads=[img_head])[img_head][0].clamp(0, 1)  # (H,s,s,3)
@@ -193,8 +179,10 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                 c["goal_log"].append(cur.cpu().numpy())
                 new_obs = c["env"].step(c["plan"][:, j])
                 c["obs"].append(new_obs)
-                if is_mm and kind == "pred":                   # render the new FPV for the model's context
+                if use_fpv and kind == "pred":                 # render the new FPV for the model's context
                     c["fpv"].append(_fpv(new_obs))
+                    c["fpv_ep0"].append(c["fpv"][-1][0].detach().cpu().numpy())  # ep0 frame -> CPU (video, full run)
+                    c["fpv"] = c["fpv"][-P:]                     # keep ONLY the last P frames on GPU (context) — bounds memory
                     pred_fpv_log.append(cur_plan_fpv[j].detach().cpu().numpy())  # ep0 predicted FPV for this executed obs
                 c["act"].append(c["plan"][:, j])
                 d = (new_obs[:, :3] - cur).norm(dim=-1)                 # (B,)
@@ -209,10 +197,14 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
         for c in ctrls.values():  # warm-start: shift the executed chunk off the plan
             c["mean"] = torch.cat([c["plan"][:, chunk:], torch.zeros(B, chunk, 2, device=device)], dim=1) * mppi.mean_decay
         if log is not None and step >= next_log:  # periodic progress (so eval_control time is visible live)
+            el = time.perf_counter() - t0
+            eta = el / max(1, step) * max(0, mppi.max_steps - step)   # upper bound (may end early once all goals hit)
+            finish = time.strftime("%H:%M:%S", time.localtime(time.time() + eta))
             gr = {k: float(c["gidx"].clamp(max=n_goals).float().mean()) for k, c in ctrls.items()}
-            log(f"step {step}/{mppi.max_steps} ({time.perf_counter() - t0:.0f}s) "
-                f"mean goals true={gr['true']:.1f} pred={gr['pred']:.1f} / {n_goals}")
-            next_log += 100
+            log(f"step {step}/{mppi.max_steps} ({int(100 * step / mppi.max_steps)}%) | elapsed {el:.0f}s "
+                f"ETA {eta:.0f}s (~{finish}) | {n_chunks} replans ({1000 * el / max(1, n_chunks):.0f} ms/replan) "
+                f"| mean goals true={gr['true']:.1f} pred={gr['pred']:.1f}/{n_goals}")
+            next_log += 50                                            # every 50 steps (was 100) — denser live progress
         if all((c["gidx"] >= n_goals).all() for c in ctrls.values()):
             break
     elapsed = time.perf_counter() - t0
@@ -220,8 +212,8 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
 
     out = {"goals": [(n, p.cpu().numpy()) for n, p in goals], "n_goals": n_goals, "n_chunks": n_chunks,
            "n_steps": step, "dt": dt, "fan_seq": fan_log}  # pred candidate fan per executed step (ep 0)
-    if is_mm and pred_fpv_log:  # ep0 pred-vs-actual FPV over the whole control run (from the selected plans)
-        actual = np.stack([f[0].detach().cpu().numpy() for f in ctrls["pred"]["fpv"][1:]])  # skip initial ctx frame
+    if use_fpv and pred_fpv_log:  # ep0 pred-vs-actual FPV over the whole control run (from the selected plans)
+        actual = np.stack(ctrls["pred"]["fpv_ep0"])   # CPU-accumulated ep0 frames (full run; GPU kept only last P)
         n = min(len(pred_fpv_log), len(actual))
         out["pred_fpv_video"] = {"pred": np.stack(pred_fpv_log)[:n], "actual": actual[:n]}
     for kind, c in ctrls.items():

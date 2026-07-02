@@ -117,27 +117,31 @@ def load_split_episodes_mm(root: str, split: str, img_size: int = 128):
 
 
 class MMWindowLoader:
-    """DataLoader-shaped iterable of multimodal windows, ALL GPU-resident. obs/act windows + the FRAME store
-    (uint8, ~3 GB at 128²) live on `device`; per batch we gather image windows by a pure GPU index (no host
-    copy, no Python loop), so the loader isn't a CPU bottleneck. Yields {obs_seq (B,L,6), act_seq (B,L,2),
-    image_fpv (B,L,H,W,3) in [0,1]}. Window order matches `stack_windows`, so all streams stay aligned."""
+    """The ONE GPU-resident window loader for every model. obs/act windows live on `device`; when an image
+    modality is present (`image_head` set) its FRAME store (uint8, ~3 GB at 128²) is held resident too and
+    gathered per batch by a pure GPU index (no host copy). PROPRIO-ONLY passes `image_head=None` -> no frames
+    are loaded or gathered (episodes are (obs, act) pairs). Yields {obs_seq (B,L,6), act_seq (B,L,2)[,
+    <image_head> (B,L,H,W,3) in [0,1]]}. Window order matches `stack_windows`, so all streams stay aligned."""
 
-    def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device):
+    def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device,
+                 image_head: str | None = None):
         L = P + F
-        obs_w, act_w = stack_windows([(o, a) for o, a, _ in episodes], P, F, normalizer)
+        self.image_head = image_head
+        obs_w, act_w = stack_windows([(e[0], e[1]) for e in episodes], P, F, normalizer)
         self.obs, self.act = obs_w.to(device), act_w.to(device)
-        # concat all episode frames -> one GPU uint8 store; per-window GLOBAL frame indices (start .. start+L)
-        frames, starts, off = [], [], 0
-        for o, _, img in episodes:
-            frames.append(torch.from_numpy(img))
-            starts.extend(range(off, off + len(o) - L + 1))
-            off += len(img)
-        self.frames = torch.cat(frames, 0).to(device)                       # (N_total,H,W,3) uint8, GPU-resident
-        starts = torch.tensor(starts, device=device)
-        self.win_idx = starts[:, None] + torch.arange(L, device=device)[None]  # (N_windows, L) global frame idx
+        self.frames = None
+        if image_head is not None:   # concat all episode frames -> one GPU uint8 store + per-window GLOBAL frame idx
+            frames, starts, off = [], [], 0
+            for e in episodes:
+                o, img = e[0], e[2]
+                frames.append(torch.from_numpy(img))
+                starts.extend(range(off, off + len(o) - L + 1))
+                off += len(img)
+            self.frames = torch.cat(frames, 0).to(device)                    # (N_total,H,W,3) uint8, GPU-resident
+            starts = torch.tensor(starts, device=device)
+            self.win_idx = starts[:, None] + torch.arange(L, device=device)[None]
         self.batch, self.shuffle, self.device = batch, shuffle, device
-        self.N = self.win_idx.shape[0]
-        assert self.N == self.obs.shape[0], f"window/obs mismatch: {self.N} vs {self.obs.shape[0]}"
+        self.N = self.obs.shape[0]
 
     def __len__(self):
         return (self.N + self.batch - 1) // self.batch
@@ -146,32 +150,10 @@ class MMWindowLoader:
         order = torch.randperm(self.N, device=self.device) if self.shuffle else torch.arange(self.N, device=self.device)
         for i in range(0, self.N, self.batch):
             j = order[i: i + self.batch]
-            imgs = self.frames[self.win_idx.index_select(0, j)].float().div_(255.0)   # (b,L,H,W,3) [0,1] GPU gather
-            yield {"obs_seq": self.obs.index_select(0, j),
-                   "act_seq": self.act.index_select(0, j),
-                   "image_fpv": imgs}
-
-
-class WindowDataset(Dataset):
-    """Length-(P+F) windows. Returns normalized obs_seq (L,6) and act_seq (L,2)."""
-
-    def __init__(self, episodes, P: int, F: int, normalizer: Normalizer):
-        self.eps = episodes
-        self.P, self.F, self.L = P, F, P + F
-        self.norm = normalizer
-        self.index = [
-            (ei, s) for ei, (o, _) in enumerate(episodes) for s in range(0, len(o) - self.L + 1)
-        ]
-
-    def __len__(self):
-        return len(self.index)
-
-    def __getitem__(self, i):
-        ei, s = self.index[i]
-        o, a = self.eps[ei]
-        obs = torch.from_numpy(o[s : s + self.L])
-        act = torch.from_numpy(a[s : s + self.L])
-        return {"obs_seq": self.norm.norm_obs(obs), "act_seq": self.norm.norm_act(act)}
+            out = {"obs_seq": self.obs.index_select(0, j), "act_seq": self.act.index_select(0, j)}
+            if self.frames is not None:
+                out[self.image_head] = self.frames[self.win_idx.index_select(0, j)].float().div_(255.0)  # GPU gather
+            yield out
 
 
 def stack_windows(episodes, P: int, F: int, normalizer: Normalizer):
@@ -186,27 +168,6 @@ def stack_windows(episodes, P: int, F: int, normalizer: Normalizer):
         act_w.append(torch.from_numpy(a).unfold(0, L, 1).permute(0, 2, 1).contiguous())  # (n,L,2)
     obs, act = torch.cat(obs_w), torch.cat(act_w)
     return normalizer.norm_obs(obs), normalizer.norm_act(act)
-
-
-class GPUWindowLoader:
-    """DataLoader-shaped iterable over windows held resident on `device`. Batches are produced by
-    on-device index_select, so there is no host->device copy and no worker IPC in the train loop.
-    Single-device only (no DistributedSampler); fine for one H100."""
-
-    def __init__(self, obs_windows, act_windows, batch: int, shuffle: bool, device):
-        self.obs = obs_windows.to(device)
-        self.act = act_windows.to(device)
-        self.N, self.batch, self.shuffle = self.obs.shape[0], batch, shuffle
-
-    def __len__(self):
-        return (self.N + self.batch - 1) // self.batch
-
-    def __iter__(self):
-        dev = self.obs.device
-        idx = torch.randperm(self.N, device=dev) if self.shuffle else torch.arange(self.N, device=dev)
-        for i in range(0, self.N, self.batch):
-            j = idx[i : i + self.batch]
-            yield {"obs_seq": self.obs.index_select(0, j), "act_seq": self.act.index_select(0, j)}
 
 
 class TrajectoryDataset(Dataset):

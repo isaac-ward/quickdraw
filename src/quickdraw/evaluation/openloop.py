@@ -27,10 +27,10 @@ def eval_batched(model, normalizer, R, r, v_scale, P, obs_seq, act_seq):
     p_hat = normalizer.denorm_obs(preds)
     p_true = normalizer.denorm_obs(obs_seq[:, P:])
     # clamp non-finite decoded preds to ±10 so a broken decoder reads as a large-but-finite error, not
-    # NaN (metric path only; matches lit._step). obs_vector_mse below uses raw preds intentionally.
+    # NaN (metric path only; matches lit._step). obs_error below uses raw preds intentionally.
     p_hat = torch.nan_to_num(p_hat, nan=10.0, posinf=10.0, neginf=-10.0)
     per_step = {
-        "obs_vector_mse": ((preds - obs_seq[:, P:]) ** 2).mean(-1),  # (N,horizon) normalized = the loss
+        "obs_error": ((preds - obs_seq[:, P:]) ** 2).mean(-1),  # (N,horizon) normalized = the loss
         "manifold_distance_error": T.manifold_distance_error(p_hat, R, r),
         "pointwise_error": T.pointwise_error(p_hat, p_true),
         "tangent_velocity_error": T.tangent_velocity_error(p_hat, R, v_scale),

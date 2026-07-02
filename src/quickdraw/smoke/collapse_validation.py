@@ -1,5 +1,5 @@
 """Collapse-axis smoke/validation: train each LSAR mechanism for a few hundred steps and track
-effective_rank / L_pred / obs-error. No Trainer/compile/wandb.
+participation_ratio / L_pred / obs-error. No Trainer/compile/wandb.
 
   uv run python -m quickdraw.smoke.collapse_validation [data_root] [--p_tf P] [--steps N]
 
@@ -67,8 +67,8 @@ def main():
             model.on_optimizer_step()
             if step % args.log == 0:
                 with torch.no_grad():
-                    er = float(model.collapse_diagnostics(batch["obs_seq"])["effective_rank"])
-                print(f"  step {step:4d}: eff_rank={er:5.2f}  L_pred={logged.get('train/loss/pred_latent', 0):.4f}  "
+                    er = float(model.collapse_diagnostics(batch["obs_seq"])["rank/participation_ratio"])
+                print(f"  step {step:4d}: PR={er:5.2f}  L_pred={logged.get('train/loss/pred_latent', 0):.4f}  "
                       f"mde={logged.get('train/manifold_distance_error', 0):.3f}  loss={float(loss):.3f}", flush=True)
     print("VALIDATION DONE", flush=True)
 

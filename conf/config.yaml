@@ -1,5 +1,5 @@
 defaults:
-  - model: base
+  - model: mm_dsar_proprio
   - data: torus
   - optim: adamw
   - trainer: default

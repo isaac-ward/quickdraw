@@ -1,11 +1,8 @@
 """Recovered-manifold point clouds: pool the model's next-state predictions over many (episode, step)
 contexts; the union traces the learned manifold. Two sources, both seeded/deterministic given `seed`:
-  - manifold_predictions: the COMMITTED next-state via the shared forward() path — works for ANY model
-    (DSAR/LSAR/diffusion); for diffusion it's the eps=0 readout. Feeds the method-agnostic eval_manifold.
-  - manifold_clouds: diffusion-SPECIFIC — one denoised sample per context keeping the whole ODE path, for
-    the noise->manifold animation (eval_diffusion/denoising_aggregate).
-Shared by the standalone preview (smoke/manifold_preview.py) and the in-training evals so the SAMPLING is
-defined in one place; the LOOK lives in logging.viz (fig_points_*/points_collapse_frames)."""
+  manifold_predictions: the COMMITTED next-state token bag via the shared forward() path (for diffusion the
+  eps=0 readout) — returns decoded-proprio 6D + the flattened latent bag. Feeds the method-agnostic
+  eval_manifold. The SAMPLING is defined here in one place; the LOOK lives in logging.viz (fig_points_*)."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -26,55 +23,7 @@ def _sample_contexts(ds, *, P, n_points, stride, seed):
 
 
 @torch.no_grad()
-def manifold_predictions(m, norm, ds, *, P, n_points, stride, seed, device):
-    """METHOD-AGNOSTIC recovered manifold: the model's COMMITTED (deterministic) next-state prediction over
-    many contexts, via the shared forward() path (encode -> transformer -> readout). Returns
-    (data6d (N, 6) physical units, latents (N, state_dim) the carried next-state, speed (N,), n_avail)."""
-    by_ep, n_avail = _sample_contexts(ds, P=P, n_points=n_points, stride=stride, seed=seed)
-    data6d, latents = [], []
-    for ei, ts in by_ep.items():
-        ep = ds[ei]
-        obs = ep["obs_seq"].to(device)[None].float()
-        act = ep["act_seq"].to(device)[None].float()
-        pred = m(obs, act)[0, np.array(sorted(ts))]                # (nt, state) committed next-state per context
-        latents.extend(pred.cpu().numpy())
-        data6d.extend(norm.denorm_obs(m.to_obs(pred)).cpu().numpy())
-    data6d, latents = np.stack(data6d), np.stack(latents)
-    speed = np.linalg.norm(data6d[:, 3:], axis=1)                 # color = |predicted next velocity|
-    return data6d, latents, speed, n_avail
-
-
-@torch.no_grad()
-def manifold_clouds(m, norm, ds, *, P, n_points, cube, stride, seed, device):
-    """Diffusion-SPECIFIC: one uniform-hypercube noise per context, denoised through the flow to the
-    committed next-state, keeping the whole ODE path. Returns (paths6d (N, K+1, 6) physical units,
-    speed (N,) = |predicted next velocity|, latents (N, dz) = committed latent _ln(z_t+Δẑ), n_avail)."""
-    from ..models.diffusion import _ln
-    dz, K = m.cfg.dz, m.sampling_steps
-    g = torch.Generator(device=device).manual_seed(seed)
-    by_ep, n_avail = _sample_contexts(ds, P=P, n_points=n_points, stride=stride, seed=seed)
-    paths6d, latents = [], []
-    for ei, ts in by_ep.items():
-        ep = ds[ei]
-        obs = ep["obs_seq"].to(device)[None].float()
-        act = ep["act_seq"].to(device)[None].float()
-        z = m.encode_state(obs)
-        h_all = m.transformer(m.to_token(z, act))                  # one causal pass -> h at every step
-        ts = np.array(sorted(ts))
-        h, zt = h_all[0, ts], z[0, ts]
-        eps = (torch.rand(len(ts), dz, generator=g, device=device) * 2 - 1) * cube   # uniform hypercube
-        _, path = m.flow.sample(h, steps=K, deterministic=False, eps=eps, record_path=True)
-        lat = [_ln(zt + x) for x in path]                          # K+1 latents along the ODE, each (nt, dz)
-        dec = np.stack([norm.denorm_obs(m.to_obs(li)).cpu().numpy() for li in lat])   # (K+1, nt, 6)
-        paths6d.extend(np.transpose(dec, (1, 0, 2)))                                  # list of (K+1, 6)
-        latents.extend(lat[-1].cpu().numpy())                      # committed latent end-point, (dz,) each
-    paths6d, latents = np.stack(paths6d), np.stack(latents)
-    speed = np.linalg.norm(paths6d[:, -1, 3:], axis=1)             # color = |predicted next velocity|
-    return paths6d, speed, latents, n_avail
-
-
-@torch.no_grad()
-def manifold_predictions_mm(m, norm, mm_eps, *, P, n_points, stride, seed, device):
+def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
     """Multimodal analogue of manifold_predictions. Committed next-state token bag over many contexts via
     the shared forward(); returns (data6d (N,6) decoded PROPRIO physical, latents (N, n_state*d) = the
     flattened carried token bag, speed (N,), n_avail). mm_eps: list of (obs (T,6), act (T,2), img (T,H,W,3))."""
@@ -118,3 +67,43 @@ def pad_lims(e, frac=0.05):
         lo, hi = float(e[:, a].min()), float(e[:, a].max()); pad = frac * (hi - lo + 1e-6)
         out.append((lo - pad, hi + pad))
     return tuple(out)
+
+
+@torch.no_grad()
+def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device):
+    """Diffusion-SPECIFIC (token-bag spine): one uniform-hypercube noise per context, denoised through the
+    per-token flow to the committed next PROPRIO token, keeping the WHOLE ODE path. Returns (paths6d
+    (N, K+1, 6) physical proprio, speed (N,), latents (N, d) = committed proprio token, n_avail). Feeds
+    eval_diffusion's `denoising_aggregate` (the swarm collapsing from noise onto the recovered manifold)."""
+    import torch.nn.functional as F
+    _ln = lambda x: F.layer_norm(x, (x.shape[-1],))
+    d, K = m.d, m.sampling_steps
+    g = torch.Generator(device=device).manual_seed(seed)
+    img_head = next((n for n, _ in m.layout if n != "proprio"), None)
+    rng = np.random.RandomState(seed)
+    slices = [(ei, t) for ei in range(len(mm_eps)) for t in range(P, len(mm_eps[ei][0]) - 1, stride)]
+    n_avail = len(slices); rng.shuffle(slices)
+    by_ep = defaultdict(list)
+    for ei, t in slices[:n_points]:
+        by_ep[ei].append(t)
+    dec = m.modalities["proprio"]
+    paths6d, latents = [], []
+    for ei, ts in by_ep.items():
+        o, a, im = mm_eps[ei]
+        obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device)}
+        if img_head is not None:
+            obs[img_head] = torch.from_numpy(im).float().div(255.0)[None].to(device)
+        act = norm.norm_act(torch.from_numpy(a)).float()[None].to(device)
+        z = m.encode_state(obs)                                    # (1, T, n_state, d)
+        h_all = m.backbone(m._to_input(z, act))                    # one causal pass -> h at every step
+        ts_a = np.array(sorted(ts))
+        h_pro, zt_pro = h_all[0, ts_a, 0, :], z[0, ts_a, 0, :]     # (nt, d) proprio-token conditioning + token
+        eps = (torch.rand(len(ts_a), d, generator=g, device=device) * 2 - 1) * cube   # uniform hypercube noise
+        _, path = m.flow.sample(h_pro, steps=K, deterministic=False, eps=eps, record_path=True)
+        decs = np.stack([norm.denorm_obs(dec.decode(_ln(zt_pro + x)[:, None, :].float())).float().cpu().numpy()
+                         for x in path])                           # (K+1, nt, 6): decoded proprio along the ODE
+        paths6d.extend(np.transpose(decs, (1, 0, 2)))              # list of (K+1, 6)
+        latents.extend(_ln(zt_pro + path[-1]).float().cpu().numpy())   # committed proprio token, (d,)
+    paths6d, latents = np.stack(paths6d), np.stack(latents)
+    speed = np.linalg.norm(paths6d[:, -1, 3:], axis=1)             # |predicted next velocity|
+    return paths6d, speed, latents, n_avail

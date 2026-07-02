@@ -6,13 +6,12 @@ import lightning as L
 import torch
 
 from ..environments import torus as T
-from ..models.base import BaseWorldModel
 from .schedules import linear_schedule
 from .variations import VarContext, PhysicalLoss, make_variation_suite
 
 
 class LitWorldModel(L.LightningModule):
-    def __init__(self, model: BaseWorldModel, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
+    def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
                  lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0):
         super().__init__()
@@ -41,32 +40,18 @@ class LitWorldModel(L.LightningModule):
         # physical-loss weight multiplier: 0 -> 1 over physical_warmup epochs (no ramp if warmup<=0)
         return linear_schedule(0.0, 1.0, self.physical_warmup, self.current_epoch)
 
-    # ---- shared: produce future predictions (normalized) for a batch window ----
-    # obs_input feeds the model (may be noise-augmented); obs_target is the clean target/TF-source split.
-    def _future_preds(self, obs_input, act_seq, obs_target):
-        P, L = self.P, self.P + self.F
-        p_tf = self._cur_p_tf()
-        if p_tf >= 1.0:  # parallel teacher forcing (one causal pass)
-            preds = self.model(obs_input[:, :-1], act_seq[:, :-1])  # predict obs[:,1:]
-            return preds[:, P - 1 :], obs_target[:, P:]
-        ctx, actions = obs_input[:, :P], act_seq[:, : L - 1]
-        tf_source = obs_input[:, P:]  # teacher-forcing feed is an INPUT (noised); loss target stays clean
-        preds = self.model.rollout_train(ctx, actions, tf_source, p_tf, self.detach_every)
-        return preds, obs_target[:, P:]
-
     def _core(self):
         return getattr(self.model, "_orig_mod", self.model)
 
-    def _step_mm(self, batch, tag):
+    def _step(self, batch, tag):
         """Multimodal (token-bag) step: per-head recon losses `loss/<head>` (config-weighted) + the model
-        term (pred_latent / flow) + optional physical_loss on the proprio decode; metrics grouped as
-        `metric/<head>/*` (val-only). Per-stream input noise applied here. (Contraction over the token bag
-        is still future work.) For EMA/JEPA heads the obs recon is a detached decoder-only probe."""
+        term (pred_latent / flow) + the shaping variations (physical_loss on the proprio decode, contraction on
+        the one-step token-bag map) via the unified VariationSuite. Per-stream input noise applied inline here;
+        metrics grouped as `metric/<head>/*` (val-only). For EMA/JEPA heads the obs recon is a detached probe."""
         import torch.nn.functional as F
-        from .variations import PhysicalLoss, VarContext
         m = self._core()
         P, L = self.P, self.P + self.F
-        p_tf = self._cur_p_tf()
+        p_tf = self._cur_p_tf() if tag == "train" else 0.0   # val = pure autoregressive + deterministic (no teacher forcing)
         obs = {"proprio": batch["obs_seq"]}
         for name, _ in m.layout:
             if name != "proprio":
@@ -91,19 +76,22 @@ class LitWorldModel(L.LightningModule):
         raw, w = m.loss_terms(preds, future, obs, p_tf, act)
         loss = sum(w[k] * raw[k] for k in raw) + sum(wts[k] * recon[k] for k in recon)
 
-        # physical_loss variation on the proprio decode (on-surface + tangent-velocity + continuity).
+        # train-time shaping variations (per-stream input noise applied inline above; here the LOSS terms:
+        # physical_loss on the proprio decode, contraction on the one-step token-bag map). Routed through the
+        # ONE VariationSuite so any variation applies to every model. obs is the dict-of-streams bag; enable_grad
+        # lets contraction build its Jacobian graph on val (Trainer runs with inference_mode=False).
         if self.variations:
-            for v in self.variations.variations:
-                if isinstance(v, PhysicalLoss):
-                    ctx = VarContext(m, preds, future["proprio"], obs["proprio"], act, self.norm,
-                                     self.R, self.r, self.v_scale, self.dt, tag == "train", self._physical_ramp())
-                    term, diag = v.loss(ctx)
-                    if term is not None:
-                        loss = loss + term                                    # objective uses the WEIGHTED term
-                        self.log(f"{tag}/loss/physical", (term / max(v.weight, 1e-8)).detach())  # log PRE-weight (raw), like loss/*
-                    if tag == "train":
-                        for dk, dv in diag.items():
-                            self.log(f"physical_loss/{dk}", dv)
+            ctx = VarContext(m, preds, future["proprio"], obs, act, self.norm,
+                             self.R, self.r, self.v_scale, self.dt, tag == "train", self._physical_ramp())
+            with torch.enable_grad():
+                extra, comps, diags = self.variations.losses(ctx)
+            if extra is not None:
+                loss = loss + extra
+            for k, val in comps.items():                              # {tag}/loss/{physical,contraction} (weighted)
+                self.log(f"{tag}/loss/{k}", val)
+            if tag == "train":
+                for k, val in diags.items():                          # physical_loss/{d_off,v_off,continuity}, contraction/sigma_max
+                    self.log(k, val)
 
         self.log(f"{tag}/loss/total", loss, prog_bar=(tag == "train"))
         for k, v in {**raw, **recon}.items():                 # loss/{flow|pred_latent}, loss/proprio, loss/image
@@ -119,85 +107,19 @@ class LitWorldModel(L.LightningModule):
                 self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
                 self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
                 self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
+                self.log("val/metric/proprio/obs_error", recon["proprio"])   # decoded-proprio MSE (normalized) — comparable across models
                 for name, _ in m.layout:
                     if name == "proprio":
                         continue
-                    mse = F.mse_loss(dec[name].clamp(0, 1), future[name])
+                    dclamp = dec[name].clamp(0, 1)
+                    mse = F.mse_loss(dclamp, future[name])
                     self.log(f"val/metric/{name}/mse", mse)
+                    self.log(f"val/metric/{name}/l1", F.l1_loss(dclamp, future[name]))
                     self.log(f"val/metric/{name}/psnr", -10.0 * torch.log10(mse.clamp_min(1e-12)))
                 if hasattr(m, "collapse_diagnostics"):        # latent-collapse (esp. for EMA); on the encoded bag
                     for k, val in m.collapse_diagnostics(obs).items():
                         self.log(f"collapse/{k}", val)
         return loss
-
-    def _step(self, batch, tag):
-        if hasattr(self._core(), "layout"):          # multimodal (token-bag) model -> per-head path
-            return self._step_mm(batch, tag)
-        obs_seq, act_seq = batch["obs_seq"], batch["act_seq"]
-        training = tag == "train"
-        p_tf = self._cur_p_tf()
-        # variations: perturb the obs INPUTS only (noise injection); targets/metrics use clean obs_seq.
-        obs_input, t_logs = self.variations.transform_obs(obs_seq, training)
-        preds, future_obs = self._future_preds(obs_input, act_seq, obs_seq)  # preds = STATES (obs for DSAR, latent for LSAR)
-        # model-specific RAW terms + weights (DSAR: {}; LSAR: {pred_latent[, reg]}; diffusion: {flow[, ...]}).
-        # act_seq is forwarded for models that re-run the backbone teacher-forced (diffusion); others ignore it.
-        raw, weights = self.model.loss_terms(preds, future_obs, obs_seq, p_tf, act_seq)
-        # unified obs-rollout error: decode the predicted rollout and compare to the true future obs.
-        in_loss = getattr(self.model, "pred_obs_in_loss", True)   # True: DSAR/recon (shapes model); else probe
-        lam = getattr(self.model, "lambda_pred_obs", 1.0)
-        src = preds if in_loss else preds.detach()  # detached -> trains the decoder only (readout probe)
-        obs_mse = torch.nn.functional.mse_loss(self.model.to_obs(src), future_obs)
-        loss_total = sum(weights[k] * raw[k] for k in raw)  # actual minimized objective (scaled)
-        if in_loss:                                 # DSAR / reconstruction: the proprio-head recon is a real loss
-            raw["proprio"] = obs_mse                 # head-named (loss/proprio); image heads add loss/<head> later
-            loss_total = loss_total + lam * obs_mse
-            objective = loss_total
-        else:                                       # JEPA variants: obs term is a decoder-only readout probe
-            objective = loss_total + lam * obs_mse
-        # train-time shaping variations (noise already applied to inputs above; here the loss terms).
-        # Computed on BOTH train and val so every optimized loss component shows in the {tag}/loss/*
-        # breakdown. enable_grad: the contraction term builds a Jacobian graph and val runs under no_grad.
-        if self.variations:
-            ctx = VarContext(self.model, preds, future_obs, obs_seq, act_seq, self.norm,
-                             self.R, self.r, self.v_scale, self.dt, training, self._physical_ramp())
-            with torch.enable_grad():   # contraction builds a Jacobian graph; val runs under no_grad
-                extra, comps, diags = self.variations.losses(ctx)
-            if extra is not None:
-                loss_total = loss_total + extra   # so {tag}/loss/total includes the variation components
-                objective = objective + extra
-            for k, val in comps.items():          # {tag}/loss/{physical,contraction} on BOTH train + val
-                self.log(f"{tag}/loss/{k}", val)
-            if training:                          # diagnostics + the noise sigma are train-only
-                for k, val in {**t_logs, **diags}.items():
-                    self.log(k, val)
-        # logging: loss/* are RAW (pre-scaling, comparable across methods); loss/total is the actual
-        # scaled objective (incl. any variation components). obs_error = decoded-rollout obs MSE (all methods).
-        self.log(f"{tag}/loss/total", loss_total, prog_bar=(tag == "train"))
-        for k, v in raw.items():
-            self.log(f"{tag}/loss/{k}", v)
-        self.log(f"{tag}/obs_error", obs_mse.detach())
-        if tag == "train":   # scheduled quantities grouped under schedules/
-            self.log("schedules/p_tf", p_tf)
-            if self.has_physical:
-                self.log("schedules/physical_loss_ramp", self._physical_ramp())
-        # metrics in real (denormalized) obs space, grouped under metric/<head>/* — VAL ONLY (train rollout
-        # accuracy is redundant with the train loss, so we don't pay to compute it).
-        if tag == "val":
-            with torch.no_grad():
-                p_hat = self.norm.denorm_obs(self.model.to_obs(preds))
-                p_true = self.norm.denorm_obs(future_obs)
-                # a freshly-initialized decoder (esp. the no-LN reg variants at ep0) can emit non-finite obs ->
-                # the metric reduces to NaN. Clamp non-finite preds to a far-but-finite ±10 so a broken model
-                # reads as a LARGE-but-plottable error, not NaN (metric path only — never the loss).
-                p_hat = torch.nan_to_num(p_hat, nan=10.0, posinf=10.0, neginf=-10.0)
-                self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
-                self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
-                self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
-                # latent collapse diagnostics (LSAR only), once per validation epoch
-                if hasattr(self.model, "collapse_diagnostics"):
-                    for k, v in self.model.collapse_diagnostics(obs_seq).items():
-                        self.log(f"collapse/{k}", v)
-        return objective
 
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
         # clip (Trainer sets val=1.0) AND log the total grad norm pre- and post-clip, generically for

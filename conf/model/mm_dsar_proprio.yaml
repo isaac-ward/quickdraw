@@ -1,6 +1,6 @@
 # Proprio-only MultiModalDSAR — data-space AR, image modality removed (baseline for the vision comparison).
 name: mm_dsar
-d: 256
+d: 32
 depth: 4
 heads: 8
 window: 32

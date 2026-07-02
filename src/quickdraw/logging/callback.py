@@ -65,11 +65,16 @@ class ProgressPrinter(L.Callback):
     def on_fit_start(self, trainer, pl_module):
         m = getattr(pl_module.model, "_orig_mod", pl_module.model)  # unwrap torch.compile's OptimizedModule
         n = sum(p.numel() for p in m.parameters())
-        self._emit(f"[train] {n/1000:.0f}K params | max_epochs={trainer.max_epochs} | device={pl_module.device}")
-        for name, mod in m.named_children():  # per-submodule param summary (so progress.log shows the model)
-            sub = sum(p.numel() for p in mod.parameters())
-            if sub:
-                self._emit(f"  [model] {name:<14} {sub/1000:8.1f}K params")
+        self._emit(f"[train] {type(m).__name__} {n/1e6:.2f}M params | max_epochs={trainer.max_epochs} | device={pl_module.device}")
+        if hasattr(m, "arch_table"):   # token-bag dataflow (component | shape transform | params) — see model.arch_table
+            self._emit(f"[arch] d={m.d} window={m.window} | per-step bag = {m.n_state} state token(s) + 1 action = {m.n_input} tokens")
+            for comp, shape, params in m.arch_table():
+                self._emit(f"  {comp:<34} {shape:<60} {params/1e6:7.3f}M")
+        else:
+            for name, mod in m.named_children():
+                sub = sum(p.numel() for p in mod.parameters())
+                if sub:
+                    self._emit(f"  [model] {name:<14} {sub/1000:8.1f}K params")
 
     def on_sanity_check_start(self, trainer, pl_module):
         self._emit("[startup] sanity-check validation running (this JIT-compiles the val/forward path)...")
@@ -88,6 +93,18 @@ class ProgressPrinter(L.Callback):
         if self._t_b0 is not None and not self._compiled:
             self._emit(f"[compile] first training batch (incl. any torch.compile) {time.perf_counter() - self._t_b0:.1f}s")
             self._compiled = True
+        # live intra-epoch progress at ~quartiles: AR-rollout epochs (p_tf<1) are MUCH longer than the
+        # parallel epoch 0, so without this a long epoch looks hung. The ~left is a THIS-EPOCH estimate.
+        nb = trainer.num_training_batches
+        if self._t0 and nb and nb != float("inf"):
+            q = max(1, int(nb) // 4)
+            done = batch_idx + 1
+            if done % q == 0 and done < nb:
+                el = time.time() - self._t0
+                frac = done / nb
+                eta_ep = el / frac - el   # seconds left in THIS epoch
+                self._emit(f"[ep {trainer.current_epoch:>3} {100 * frac:3.0f}%] {done}/{int(nb)} batches | "
+                           f"{el:.0f}s elapsed, epoch done ~{time.strftime('%H:%M:%S', time.localtime(time.time() + eta_ep))}")
 
     def on_train_epoch_start(self, trainer, pl_module):
         self._t0 = time.time()
@@ -97,7 +114,6 @@ class ProgressPrinter(L.Callback):
             return
         dt = time.time() - self._t0 if self._t0 else 0.0
         self._epoch_times.append(dt)
-        avg = sum(self._epoch_times) / len(self._epoch_times)
         left = max(0, trainer.max_epochs - (trainer.current_epoch + 1))
         m = trainer.callback_metrics
 
@@ -108,9 +124,8 @@ class ProgressPrinter(L.Callback):
         self._emit(
             f"[ep {trainer.current_epoch:>3}/{trainer.max_epochs}] "
             f"train_loss={g('train/loss/total'):.4f} val_loss={g('val/loss/total'):.4f} "
-            f"val_MDE={g('val/manifold_distance_error'):.4f} val_pw={g('val/pointwise_error'):.4f} "
-            f"val_tv={g('val/tangent_velocity_error'):.4f} p_tf={g('schedules/p_tf'):.2f} "
-            f"| {dt:.1f}s/ep  eta {_fmt_secs(avg * left)}"
+            f"| {dt:.1f}s/ep  run_eta {_fmt_secs(dt * left)} "  # run_eta = THIS epoch's time x epochs left
+            f"(finish ~{time.strftime('%m-%d %H:%M', time.localtime(time.time() + dt * left))})"
         )
 
 
@@ -132,11 +147,13 @@ class LoggingCallback(L.Callback):
         # explicit list (e.g. [20, 40]) takes precedence over the every-N cadence
         if self.at_epochs is not None:
             return epoch in self.at_epochs
-        return self.every > 0 and epoch % self.every == 0
+        return self.every > 0 and epoch > 0 and epoch % self.every == 0   # every N, SKIPPING epoch 0
 
     def on_fit_start(self, trainer, pl_module):
         self.writer.config(OmegaConf.to_container(self.cfg, resolve=True))
         self._t_fit = time.perf_counter()
+        n_params = sum(p.numel() for p in pl_module.model.parameters())   # constant -> log ONCE, not per epoch
+        self.writer.scalars({"model/params": float(n_params), "model/params_millions": n_params / 1e6}, step=0)
 
     def on_train_epoch_start(self, trainer, pl_module):
         self._t_epoch = time.perf_counter()
@@ -195,7 +212,6 @@ class LoggingCallback(L.Callback):
             metrics["time/compile_seconds"] = self._compile_s
         if torch.cuda.is_available():
             metrics["mem/peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
-        metrics["model/params"] = float(sum(p.numel() for p in pl_module.model.parameters()))
         self.writer.scalars(metrics, step=epoch)
 
     def on_fit_end(self, trainer, pl_module):

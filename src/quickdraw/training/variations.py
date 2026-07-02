@@ -150,42 +150,50 @@ class Contraction(Variation):
     def _vjp(f, x: Tensor, u: Tensor) -> Tensor:
         return torch.autograd.grad(f(x), x, grad_outputs=u)[0]                     # J^T u
 
+    @staticmethod
+    def _unit(v: Tensor) -> Tensor:   # normalize over ALL non-batch dims: works for (B,dz) and the token bag (B,n_state,d)
+        return v / (v.flatten(1).norm(dim=1).view(-1, *([1] * (v.ndim - 1))) + 1e-12)
+
     def _sigma_max(self, model, states: Tensor, act_w: Tensor) -> Tensor:
         prefix = states[:, :-1].detach()                            # fixed history (wrt: last_state)
-        last = states[:, -1].detach().requires_grad_(True)          # the differentiated leaf
+        last = states[:, -1].detach().requires_grad_(True)          # the differentiated leaf (B, *state)
 
         def one_step(x: Tensor) -> Tensor:
             s_win = torch.cat([prefix, x[:, None]], dim=1)
             return model.one_step_states(s_win, act_w, attn_eager=True)
 
-        v = torch.randn_like(last)
-        v = v / (v.norm(dim=-1, keepdim=True) + 1e-12)
+        v = self._unit(torch.randn_like(last))
         for _ in range(self.power_iters):                           # find top right-singular vector (no graph)
             Jv = self._jvp(one_step, last, v, create_graph=False)
             w = self._vjp(one_step, last, Jv.detach())
-            v = (w / (w.norm(dim=-1, keepdim=True) + 1e-12)).detach()
+            v = self._unit(w).detach()
         Jv = self._jvp(one_step, last, v, create_graph=True)        # final Rayleigh step (grad -> params)
-        return Jv.norm(dim=-1).mean()
+        return Jv.flatten(1).norm(dim=1).mean()                     # ‖J v‖ over the full (flattened) state
 
     def loss(self, ctx: VarContext) -> tuple[Tensor | None, dict]:
         model, obs, act = ctx.model, ctx.obs_seq, ctx.act_seq
-        Tlen = obs.shape[1]
+        is_dict = isinstance(obs, dict)                             # MM: obs is a {stream: tensor} bag
+        rep = next(iter(obs.values())) if is_dict else obs         # representative stream (shape/device)
+        Tlen = rep.shape[1]
         # a window of `win` states needs `win` aligned actions (token i consumes a_i, the last predicting
         # the next state), so the last state index s+win-1 must have an action: s+win-1 <= len(act)-1.
         win = min(model.window, Tlen - 1)
         max_start = Tlen - 1 - win
         if win < 1 or max_start < 0:
             return None, {}
+
+        def _win(a, b):   # slice a length-(b-a) window of the obs (dict-of-streams for MM, else a tensor)
+            return {k: v[:, a:b].float() for k, v in obs.items()} if is_dict else obs[:, a:b].float()
         # fp32, autocast off: second-order AD through attention is unstable in bf16 (matches collapse diag).
-        with torch.autocast(device_type=obs.device.type, enabled=False):
+        with torch.autocast(device_type=rep.device.type, enabled=False):
             n = min(self.n, max_start + 1)
             if max_start > 0:
-                starts = torch.randint(0, max_start + 1, (n,), device=obs.device).tolist()
+                starts = torch.randint(0, max_start + 1, (n,), device=rep.device).tolist()
             else:
                 starts = [0] * n
             sigmas = []
             for s in starts:
-                states = model.encode_state(obs[:, s:s + win].float())   # (B, win, state)
+                states = model.encode_state(_win(s, s + win))        # (B, win, *state) — token bag for MM
                 sigmas.append(self._sigma_max(model, states, act[:, s:s + win].float()))
             sigma_max = torch.stack(sigmas).mean()
         L = torch.relu(sigma_max - self.target).pow(2)

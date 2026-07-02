@@ -32,15 +32,27 @@ class _SpatialAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim)
         self.out = nn.Linear(dim, dim)
 
+    # SDPA's CUDA kernel launch overflows when the batch dim M=B*T is very large (MPPI eval batches thousands
+    # of candidate rollouts) -> cudaErrorInvalidConfiguration. Spatial attention is independent per row, so we
+    # slice M into chunks under this cap and concat — exact, and a no-op for the small batches seen in training.
+    _M_CHUNK = 8192
+
     def forward(self, x: Tensor, attn_eager: bool = False) -> Tensor:   # x: (M, N, d)
         M, N, _ = x.shape
         qkv = self.qkv(x).view(M, N, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]                         # (M, H, N, Dh)
-        if attn_eager:   # MATH backend supports double-backward (contraction penalty); default SDPA does not
-            with sdpa_kernel(SDPBackend.MATH):
-                o = F.scaled_dot_product_attention(q, k, v)
+
+        def _attend(qq, kk, vv):
+            if attn_eager:   # MATH backend supports double-backward (contraction penalty); default SDPA does not
+                with sdpa_kernel(SDPBackend.MATH):
+                    return F.scaled_dot_product_attention(qq, kk, vv)
+            return F.scaled_dot_product_attention(qq, kk, vv)   # full (bidirectional)
+
+        if M <= self._M_CHUNK:
+            o = _attend(q, k, v)
         else:
-            o = F.scaled_dot_product_attention(q, k, v)         # full (bidirectional)
+            o = torch.cat([_attend(q[i:i + self._M_CHUNK], k[i:i + self._M_CHUNK], v[i:i + self._M_CHUNK])
+                           for i in range(0, M, self._M_CHUNK)], dim=0)
         return self.out(o.transpose(1, 2).reshape(M, N, self.heads * self.head_dim))
 
 

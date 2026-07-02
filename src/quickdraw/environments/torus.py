@@ -112,19 +112,6 @@ def tangent_velocity_error(o_hat: Tensor, R: float, v_scale: float) -> Tensor:
     return (v_hat * n).sum(dim=-1).abs() / v_scale
 
 
-def _wrap(a: Tensor) -> Tensor:
-    """Wrap angle differences to (-pi, pi]."""
-    return (a + math.pi) % TWO_PI - math.pi
-
-
-def phase_drift(o_hat: Tensor, o_true: Tensor, R: float) -> tuple[Tensor, Tensor]:
-    p_hat, _ = split_obs(o_hat)
-    p_true, _ = split_obs(o_true)
-    th_h, ph_h = angles_from_point(p_hat, R)
-    th_t, ph_t = angles_from_point(p_true, R)
-    return _wrap(th_h - th_t), _wrap(ph_h - ph_t)
-
-
 # --------------------------------------------------------------------------------------
 # Control goals: 8 points = NESW (theta in {0,90,180,270}) on BOTH the outer ring (phi=0) and the
 # inner ring (phi=pi). All lie in the z=0 plane (outer radius R+r, inner radius R-r). The control eval

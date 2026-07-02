@@ -1,18 +1,23 @@
-horizon: 2048              # long-horizon / ood rollout length (capped by episode length)
-n_episodes: 64             # episodes averaged per OOD open-loop eval (first N of the split; null = whole split)
+horizon: 2048              # long-horizon / ood rollout length (capped by episode length); image heads roll it too
+n_episodes: 64             # episodes averaged per OOD open-loop eval (proprio-only; image heads use 8, decode cost)
 n_plot: 1                  # per-episode trajectory plots+videos+error curves per eval split (just _0)
+
+# denoising eval (diffusion only): which trajectory + swarm angle it shows, and the multistep render cost
+denoising_seed: null       # null -> use the epoch step (a DIFFERENT trajectory/angle each eval); set an int to pin one
+denoising_max_steps: null  # null -> full 128 sequential swarms (~25min render); lower it to speed the multistep render
 
 # evals that run *during training* (train/val happen normally regardless). flip any to true; the
 # enabled routines are cycled through on every eval epoch.
 during_train:
-  every_epochs: 10         # run the enabled routines every N epochs (0 disables); ignored if at_epochs set
-  at_epochs: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]   # explicit benchmark epochs (skips 0); takes precedence
+  every_epochs: 20         # run the enabled routines every N epochs, SKIPPING epoch 0 (20,40,60,80,...); 0 disables
+  at_epochs: null          # explicit benchmark-epoch list; if set it OVERRIDES every_epochs (null = use cadence)
   evals:
     ood_horizon: true      # long-horizon open-loop rollout (OOD vs the short training horizon)
     ood_visual: false      # open-loop on the visual-OOD split (texture shift)
     ood_geometric: false   # open-loop on the geometric-OOD split (R, r shift)
     ood_dynamics: false    # open-loop on the dynamics-OOD split (gamma/a_max/mass shift)
     control: true          # dual MPPI control (oracle vs learned) through 8 goals (eval_control)
-    diffusion_field: false # diffusion ONLY: quiver flow-field viz + aggregate_denoising (self-skips for other models)
+    denoising_multistep: true  # diffusion ONLY: fixed-agent sequential-swarm flow-field video (self-skips for other models)
+    denoising_aggregate: true  # diffusion ONLY: pooled next-states collapsing from noise onto the manifold (self-skips)
     manifold: true         # ANY method: recovered-manifold UMAPs (data + latent space, 2D + 3D)
-    vision: true           # VISION ONLY (self-skips w/o image heads): FPV rollout filmstrip+video+metric curves
+    # (image FPV rollout/filmstrip/metrics are now part of ood_horizon — under eval_ood_horizon/<head>/)

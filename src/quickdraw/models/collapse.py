@@ -34,11 +34,21 @@ def latent_diagnostics(z: Tensor) -> dict:
            "latent_norm": z.norm(dim=-1).mean(),          # mean |z| per sample (magnitude drift)
            "latent_abs_max": z.abs().max()}               # worst-case dim magnitude (blow-up watch)
     try:
-        # eff_rank from SINGULAR values of the centered latents (participation ratio in [1, dz]):
-        # robust where eigvalsh on the covariance fails to converge on ill-conditioned/degenerate
-        # latents (e.g. the physical-loss runs drive repeated eigenvalues -> eigvalsh crashed val).
-        ev = torch.linalg.svdvals(zc) ** 2                # = (N-1)*eigenvalues; scale cancels in PR
-        out["effective_rank"] = (ev.sum() ** 2) / (ev.pow(2).sum() + 1e-12)
+        # TWO effective-rank measures of the latent spectrum, both from the SINGULAR values of the centered
+        # latents (robust where eigvalsh on the covariance fails on ill-conditioned/degenerate latents — e.g.
+        # the physical-loss runs drive repeated eigenvalues and crashed val). Both live in [1, dz], same
+        # spirit, but different functions (2nd moment vs entropy), so we log both under rank/*:
+        #   rank/participation_ratio = (Σλ)²/Σλ²  (λ = σ², covariance eigenvalues) — "effective number of
+        #     variance-carrying directions"; standard in comp-neuroscience / physics (inverse participation
+        #     ratio). Recovers k for k equal eigenvalues, → 1 under full collapse.
+        #   rank/rankme = exp(H) of the normalized singular-value distribution (Shannon entropy H). Refs:
+        #     Roy & Vetterli, "The effective rank: a measure of effective dimensionality", EUSIPCO 2007;
+        #     Garrido, Balestriero, Najman & LeCun, "RankMe", ICML 2023 (arXiv:2210.02885).
+        sv = torch.linalg.svdvals(zc)                     # singular values σ_i of the centered latents
+        ev = sv ** 2                                      # = (N-1)*covariance eigenvalues; scale cancels in PR
+        out["rank/participation_ratio"] = (ev.sum() ** 2) / (ev.pow(2).sum() + 1e-12)
+        p = sv / sv.sum() + 1e-7                           # normalized singular-value distribution (+eps for log)
+        out["rank/rankme"] = torch.exp(-(p * p.log()).sum())
         cov = (zc.t() @ zc) / max(1, zc.shape[0] - 1)
         d = cov.diag().clamp_min(1e-12).sqrt()
         corr = cov / (d[:, None] * d[None, :])
@@ -138,7 +148,7 @@ class SIGReg(CollapseStrategy):
 class VICReg(CollapseStrategy):
     """VICReg (arXiv 2105.04906): variance hinge (per-dim std floor) + covariance decorrelation. Applied
     DIRECTLY to the dz latent, NOT an expander: in a world model the latent IS the state, and an
-    expander lets the latent collapse (eff_rank ~3/16) while the high-dim embedding stays full-rank,
+    expander lets the latent collapse (participation_ratio ~3/16) while the high-dim embedding stays full-rank,
     hiding the collapse. Binding var/cov to the latent forces the state itself to use all dz dims. The
     invariance term is loss_pred_latent, weighted lambda_pred=25 (paper's 25/25/1 balance)."""
     has_reg = True
