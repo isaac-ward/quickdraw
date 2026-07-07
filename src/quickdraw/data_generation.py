@@ -100,7 +100,7 @@ def main(cfg):
         os.makedirs(os.path.join(fpv_root, name), exist_ok=True)
     log(f"[gen] simulated {len(data)} splits, {sum(o.shape[0] for _, o, _, _ in data.values())} trajectories")
 
-    workers = os.cpu_count() or 4
+    workers = int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4))   # cap to leave CPU for concurrent training
 
     # 2. SUMMARY atlas plot + video per split FIRST, so the new physics can be eyeballed before the long
     # FPV render. Each runs in a worker and streams its own frame progress to progress.log.
