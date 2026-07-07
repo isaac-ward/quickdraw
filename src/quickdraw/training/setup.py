@@ -82,12 +82,13 @@ def window_loaders(cfg, norm: Normalizer):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
+        stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
         if img is not None:
             eps = load_split_episodes_mm(cfg.data.root, split, img_size=img.img_size)
-            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, image_head=img.name)
+            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, image_head=img.name, stride=stride)
         else:                                                    # proprio-only: (obs, act) pairs, no FPV frames
             eps = load_split_episodes(cfg.data.root, split)
-            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev)
+            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
     return loaders
 
 

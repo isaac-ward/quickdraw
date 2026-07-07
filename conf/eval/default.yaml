@@ -9,7 +9,7 @@ denoising_max_steps: null  # null -> full 128 sequential swarms (~25min render);
 # evals that run *during training* (train/val happen normally regardless). flip any to true; the
 # enabled routines are cycled through on every eval epoch.
 during_train:
-  every_epochs: 20         # run the enabled routines every N epochs, SKIPPING epoch 0 (20,40,60,80,...); 0 disables
+  every_epochs: 20         # every N epochs (SKIP 0) + an early eval at N/2 -> 10, 20, 40, 60, 80, ...; 0 disables
   at_epochs: null          # explicit benchmark-epoch list; if set it OVERRIDES every_epochs (null = use cadence)
   evals:
     ood_horizon: true      # long-horizon open-loop rollout (OOD vs the short training horizon)

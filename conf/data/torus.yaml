@@ -2,6 +2,8 @@ root: null     # set to the data_generation run dir, e.g. data.root=logs/data_ge
 P: 8           # past context steps fed before prediction starts (obs already carries velocity, so
                # the state is near-Markov -> little history needed; P need NOT equal F)
 F: 64          # future horizon rolled out during training (sets the BPTT length, not test horizon)
+window_stride: 1   # TRAIN windows: 1 = every start (dense, redundant — adjacent windows overlap L-1 steps);
+                   # >1 strides the starts (e.g. 4 = 4x fewer batches/epoch, ~no coverage loss over many epochs). val stays 1.
 batch: 1024    # fast baseline: 515K model + F=64 full BPTT fits ~51 GB at this batch
 workers: 4
 fast_gpu: true   # vector stage: hold all windows resident on GPU, batch by on-device index (no workers/copies)

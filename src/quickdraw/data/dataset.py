@@ -124,10 +124,10 @@ class MMWindowLoader:
     <image_head> (B,L,H,W,3) in [0,1]]}. Window order matches `stack_windows`, so all streams stay aligned."""
 
     def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device,
-                 image_head: str | None = None):
+                 image_head: str | None = None, stride: int = 1):
         L = P + F
         self.image_head = image_head
-        obs_w, act_w = stack_windows([(e[0], e[1]) for e in episodes], P, F, normalizer)
+        obs_w, act_w = stack_windows([(e[0], e[1]) for e in episodes], P, F, normalizer, stride)
         self.obs, self.act = obs_w.to(device), act_w.to(device)
         self.frames = None
         if image_head is not None:   # concat all episode frames -> one GPU uint8 store + per-window GLOBAL frame idx
@@ -135,7 +135,7 @@ class MMWindowLoader:
             for e in episodes:
                 o, img = e[0], e[2]
                 frames.append(torch.from_numpy(img))
-                starts.extend(range(off, off + len(o) - L + 1))
+                starts.extend(range(off, off + len(o) - L + 1, stride))   # stride matches stack_windows -> streams stay aligned
                 off += len(img)
             self.frames = torch.cat(frames, 0).to(device)                    # (N_total,H,W,3) uint8, GPU-resident
             starts = torch.tensor(starts, device=device)
@@ -156,16 +156,17 @@ class MMWindowLoader:
             yield out
 
 
-def stack_windows(episodes, P: int, F: int, normalizer: Normalizer):
-    """Pre-build ALL length-(P+F) windows into two normalized tensors (no per-item work later).
-    Returns obs_windows (N,L,6), act_windows (N,L,2). For the vector stage N*L*8 floats is tiny."""
+def stack_windows(episodes, P: int, F: int, normalizer: Normalizer, stride: int = 1):
+    """Pre-build the length-(P+F) windows (every `stride` starts) into two normalized tensors (no per-item
+    work later). Returns obs_windows (N,L,6), act_windows (N,L,2). stride>1 drops near-duplicate overlapping
+    windows (adjacent starts share L-1 steps) -> fewer batches/epoch, ~no coverage loss over many epochs."""
     L = P + F
     obs_w, act_w = [], []
     for o, a in episodes:
         if len(o) < L:
             continue
-        obs_w.append(torch.from_numpy(o).unfold(0, L, 1).permute(0, 2, 1).contiguous())  # (n,L,6)
-        act_w.append(torch.from_numpy(a).unfold(0, L, 1).permute(0, 2, 1).contiguous())  # (n,L,2)
+        obs_w.append(torch.from_numpy(o).unfold(0, L, stride).permute(0, 2, 1).contiguous())  # (n,L,6)
+        act_w.append(torch.from_numpy(a).unfold(0, L, stride).permute(0, 2, 1).contiguous())  # (n,L,2)
     obs, act = torch.cat(obs_w), torch.cat(act_w)
     return normalizer.norm_obs(obs), normalizer.norm_act(act)
 

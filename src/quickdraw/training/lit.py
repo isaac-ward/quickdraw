@@ -13,12 +13,14 @@ from .variations import VarContext, PhysicalLoss, make_variation_suite
 class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
-                 lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0):
+                 lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0,
+                 recon_frac: float = 1.0):
         super().__init__()
         self.model = model
         self.norm = normalizer
         self.R, self.r, self.v_scale, self.P, self.F = R, r, v_scale, P, F
         self.dt = dt
+        self.recon_frac = float(recon_frac)   # <1 -> supervise the decode recon on a random subset of F frames (ALL heads)
         self.p_tf_start, self.p_tf_end, self.p_tf_warmup = p_tf_start, p_tf_end, p_tf_warmup
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
         # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
@@ -70,9 +72,20 @@ class LitWorldModel(L.LightningModule):
         future = {k: v[:, P:] for k, v in obs.items()}         # CLEAN targets
         # EMA/JEPA heads: obs recon is a decoder-only probe (detach preds so it doesn't shape the encoder).
         recon_src = preds if getattr(m, "pred_obs_in_loss", True) else preds.detach()
-        dec = m.to_obs(recon_src)
         wts = {mod.name: float(mod.weight) for mod in m.modalities.values()}
-        recon = {name: F.mse_loss(dec[name], future[name]) for name, _ in m.layout}
+        # recon on a RANDOM subset of the F rollout frames when recon_frac<1 (train only), the SAME subset across
+        # ALL output modalities. The ViT-AE decode is F x per-step, so fewer frames = less compute; random (not a
+        # fixed stride) -> every frame gets recon gradient over an epoch (unbiased). The DYNAMICS loss (flow /
+        # pred_latent, below) stays on all F frames regardless. frac=1.0 (default) = decode all frames.
+        frac = self.recon_frac if tag == "train" else 1.0
+        if frac < 1.0:
+            Tf = recon_src.shape[1]; k = max(1, int(round(frac * Tf)))
+            idx = torch.randperm(Tf, device=recon_src.device)[:k]
+            src, fut = recon_src[:, idx], {kk: v[:, idx] for kk, v in future.items()}
+        else:
+            src, fut = recon_src, future
+        dec = m.to_obs(src)
+        recon = {name: F.mse_loss(dec[name], fut[name]) for name, _ in m.layout}
         raw, w = m.loss_terms(preds, future, obs, p_tf, act)
         loss = sum(w[k] * raw[k] for k in raw) + sum(wts[k] * recon[k] for k in recon)
 

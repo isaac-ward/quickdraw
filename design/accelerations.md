@@ -174,6 +174,8 @@ Measured 128² frames, 1 run/GPU:
 | diff | 64 | 8 | 16 | 8 | 48 | 16 | ~14 GB | ~20 GB (flat) | ~23 min | probe — 5× over-provisioned |
 | lsar | 64 | 8 | 16 | 8 | 96 | 24 | ~30 GB | **~46 GB (flat)** | **~17 min** | ✅ CHOSEN for overnight; ~half the card, matches d=32 batch/F |
 | diff | 64 | 8 | 16 | 8 | 96 | 24 | ~31 GB | **~48 GB (flat)** | **~18 min** | ✅ diffusion ~+2 GB heavier; still ~51% of card |
+| lsar | 64 | 8 | 32 | 8 | 96 | 24 | ~44 GB | **~62 GB (flat)** | ~19 min | vis_refactor2 (iter 2, tokens 16→32 to de-blur); fits, ~65% card |
+| diff | 64 | 8 | 32 | 8 | 96 | 24 | ~45 GB | **~66 GB (flat)** | ~21 min | vis_refactor2; ~70% card, ~30 GB headroom |
 
 > ⚠ **Batch barely speeds AR epochs — they're latency-bound, not throughput-bound.** batch 48→96 (F 24)
 > only cut the AR epoch ~20→17 min (~15%), NOT ~2×, even though it halves batches/epoch. Reason: an AR epoch's
@@ -220,3 +222,50 @@ the fragility** — a secondary reason to prefer d=64.
   `denoising_aggregate` ~90 s; `manifold` UMAP ~40 s (2k pts) / ~2–3 min (8k pts).
 - At `every_epochs=20` over 100 epochs = ~5 checkpoints × the above **per run** → budget several hours of eval on
   top of training. Cap `eval.denoising_max_steps` or `control.n_episodes` if you need faster checkpoints.
+
+---
+
+## Experiment 6 — F (training rollout horizon): memory + time budget (2026-07-06)
+
+Motivation: eval rolls **~247 steps open-loop**, but training uses **F=24**, so the model never learns long-horizon
+stability → open-loop drift (in the FPV rollout, color goes wrong by ~+106 steps, then structure). Can we raise F?
+
+**Memory scales with F, NOT `detach_every`.** In `MultiModalSequence._rollout_from` (`models/multimodal.py`) every
+one of the F step-predictions is appended to `preds` and held for the *single* backward over the summed loss;
+`detach_every` only `.detach()`s the CARRIED state (truncates gradient DEPTH for stability), it does **not** free the
+resident forward activations. Empirically (confirms the linear fit in Exp 2/5):
+
+    AR memory ≈ base + c · (batch · F)          # linear in batch·F; detach_every does not reduce it
+
+So **F and batch trade linearly.** At the iter-2 codec (d=64, tokens=32, patch=8), measured AR = ~64 GB at
+batch 96 / F 24. To hold ~64 GB while raising F, drop batch to keep `batch·F ≈ 2304`:
+
+| target F | batch (≈const ~64 GB) |
+|--:|--:|
+| 24 (now) | 96 |
+| 48 | 48 |
+| 96 | 24 |
+| 247 | ~9 (impractical — tiny batch hurts optimization) |
+
+**The binding constraint is TIME, not memory.** AR epochs are latency-bound (time ∝ F; batch barely helps — see the
+Exp 5 latency callout). At F=24 an epoch is ~19 min:
+
+| F | ~epoch | ~100 epochs |
+|--:|--:|--:|
+| 24 | 19 min | ~1.3 day |
+| 48 | ~38 min | ~2.6 days |
+| 96 | ~76 min | ~5 days |
+| 247 (eval horizon) | ~3.2 h | **~13 days (infeasible)** |
+
+**Options to raise F:**
+- **Activation-checkpoint the rollout** (`torch.utils.checkpoint`, per step or per detach-segment): recompute the step
+  forward during backward instead of storing it → AR memory drops to ∝ `detach_every` (not F), so F=96 fits at batch 96.
+  ~1.3× compute. **Decouples F from MEMORY; does NOT help the ∝F TIME.**
+- **Trade batch for F** (batch 48/F 48, …) — free, but small batch hurts optimization.
+- **F-curriculum** (ramp F up during training like `p_tf`): cheap short-F early, long-F late. Not currently supported.
+- **Cheaper stability levers instead of brute-force F:** the contraction penalty (`variations.contraction`, weight 0)
+  + a decode→encode carry (re-project onto the manifold each step). Likely higher ROI than large F.
+
+**Verdict:** F=247 is time-infeasible. Practical path = **F≈48 + checkpointing** (keeps batch 96, ~2.6 days) **paired
+with the contraction penalty** — "sees its own multi-step drift" + "dynamics that pull back" is the actual cure for the
+color→structure drift, at a fraction of the cost of training at the full horizon.

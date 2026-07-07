@@ -51,11 +51,23 @@ def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
     return data6d, latents, speed, n_avail
 
 
-def umap_reduce(pts, *, n_components, seed=0):
-    """UMAP of any (N, D) cloud -> (N, n_components). Used for both the decoded data space (6D) and the
-    carried latent space (dz), at 2D or 3D. fit_transform directly (no out-of-sample transform), honest."""
-    import umap
-    return umap.UMAP(n_components=n_components, random_state=seed, n_neighbors=30, min_dist=0.05).fit_transform(pts)
+def reduce_dims(pts, method, *, n_components, seed=0):
+    """Reduce an (N, D) cloud -> (N, n_components) by 'umap' | 'tsne' | 'pca'. Complementary lenses:
+    PCA = linear + deterministic + global-geometry-faithful (the arbiter of whether blobs are REALLY
+    connected/separated); UMAP = nonlinear neighborhoods; t-SNE = local cluster structure (t-SNE is fed a
+    PCA-50 pre-projection, the standard denoise+speedup). fit_transform directly (no out-of-sample), honest."""
+    if method == "pca":
+        from sklearn.decomposition import PCA
+        return PCA(n_components=n_components, random_state=seed).fit_transform(pts)
+    if method == "umap":
+        import umap
+        return umap.UMAP(n_components=n_components, random_state=seed, n_neighbors=30, min_dist=0.05).fit_transform(pts)
+    if method == "tsne":
+        from sklearn.decomposition import PCA
+        from sklearn.manifold import TSNE
+        x = PCA(n_components=min(50, pts.shape[1]), random_state=seed).fit_transform(pts) if pts.shape[1] > 50 else pts
+        return TSNE(n_components=n_components, random_state=seed, init="pca", perplexity=30).fit_transform(x)
+    raise ValueError(f"unknown reducer {method!r}")
 
 
 def pad_lims(e, frac=0.05):

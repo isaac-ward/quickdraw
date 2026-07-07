@@ -794,6 +794,49 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
     return fig
 
 
+def fig_points_6view(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="",
+                     depthshade=True):
+    """A 3D point cloud from 6 ORTHOGRAPHIC views in a 2x3 grid — SAME points + SAME embedding, 6 camera angles.
+    Top row: front on, side on, top down. Bottom row: an ISOMETRIC view (elev≈35.26°) rotated +0/+30/+60°
+    around the vertical (azimuth) axis. Each panel is titled so rotation consistency is legible.
+    pts: (N,3); lims like fig_points_4view."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
+    from matplotlib.ticker import MaxNLocator
+    pts = np.asarray(pts)
+    if lims is not None and np.ndim(lims) == 1:
+        lims = (tuple(lims), tuple(lims), tuple(lims))
+    _ISO = 35.264                                                  # true isometric elevation (atan(1/sqrt(2)))
+    views = [(0, -90, "front on"), (0, 0, "side on"), (90, -90, "top down"),
+             (_ISO, 45, "isometric +0°"), (_ISO, 75, "isometric +30°"), (_ISO, 105, "isometric +60°")]
+    fig = plt.figure(figsize=(18, 12))
+    gs = GridSpec(2, 3, figure=fig, wspace=0.0, hspace=0.06)
+    sc = None
+    for i, (elev, azim, lbl) in enumerate(views):
+        ax = fig.add_subplot(gs[i // 3, i % 3], projection="3d")
+        ax.set_proj_type("ortho")                                  # orthographic (no perspective foreshortening)
+        sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size,
+                        c=(color if color is not None else _POINT_PURPLE), cmap=cmap,
+                        depthshade=depthshade, linewidths=0)
+        ax.view_init(elev=elev, azim=azim)
+        if lims is not None:
+            (xl, yl, zl) = lims
+            ax.set_xlim(xl); ax.set_ylim(yl); ax.set_zlim(zl)
+            ax.set_box_aspect((xl[1] - xl[0], yl[1] - yl[0], zl[1] - zl[0]))
+        else:
+            ax.set_box_aspect((1, 1, 1))
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.set_major_locator(MaxNLocator(5))
+        ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+        ax.set_xlabel(""); ax.set_ylabel(""); ax.set_zlabel("")
+        ax.set_title(lbl, fontsize=10, y=0.97)                     # named view (top row + rotated bottom row)
+    fig.subplots_adjust(left=0.0, right=0.9, top=0.92, bottom=0.0, wspace=0.0, hspace=0.06)
+    if isinstance(color, np.ndarray) and sc is not None:
+        cax = fig.add_axes([0.915, 0.30, 0.012, 0.40])
+        fig.colorbar(sc, cax=cax, label=cbar_label)
+    fig.suptitle(title, fontsize=11, y=0.99)
+    return fig
+
+
 def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label=""):
     """The 2D analogue of fig_points_4view: a single scatter, same styling (no tick/axis labels, right-side
     colorbar). The cloud is STRETCHED to fill the panel — intended for UMAP/embedding coordinates, which
@@ -860,8 +903,9 @@ def image_rollout_video(true_full, pred_future, context_len, sep_px=2):
 def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
                            cmap="plasma", cbar_label="", depthshade=False, ease=True, dpi=110, log=None):
     """Animate a cloud collapsing onto the recovered manifold: paths (N, T, 3) are the per-point positions
-    over the T denoising steps; each frame is fig_points_4view at an interpolated time. ease=True applies a
-    cubic ease-OUT so the motion slows toward the end (the cloud appears to settle). depthshade defaults
+    over the T denoising steps; each frame is fig_points_4view at an interpolated time. ease=True uses a
+    trapezoidal velocity profile: constant-speed collapse for most of the window, then a linear deceleration
+    into a soft stop (the cloud eases to a settle, no hard halt), then held still. depthshade defaults
     False here (much faster for the many-frame render)."""
     paths = np.asarray(paths)
     T = paths.shape[1]
@@ -873,8 +917,11 @@ def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, 
             log(_eta_str(t0, k, n_frames))
         u = k / (n_frames - 1) if n_frames > 1 else 1.0
         if ease:
-            move = 0.85                                       # even (constant-speed) collapse over the first ~85% (~6.8s of 8s), then hold still ~1.2s
-            u = min(u / move, 1.0)                            # linear tween then clamp — visibly moving the whole window (was cubic ease-out -> all motion in the first 4s)
+            move = 0.85                                       # collapse completes by ~85% of frames (~6.8s of 8s), then hold still
+            tt = min(u / move, 1.0)                           # 0->1 collapse progress in linear time
+            k = 0.8                                           # constant speed for the first k, then linear velocity ramp-down to 0 -> eases into the settle
+            integ = tt if tt <= k else k + (tt - k) - (tt - k) ** 2 / (2.0 * (1.0 - k))
+            u = integ / ((1.0 + k) / 2.0)                     # trapezoidal velocity (flat, then decel over the last ~1.4s); no hard stop
         f = u * (T - 1)
         j0 = int(np.floor(f)); j1 = min(j0 + 1, T - 1); w = f - j0
         pts = (1 - w) * paths[:, j0] + w * paths[:, j1]

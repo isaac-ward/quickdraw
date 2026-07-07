@@ -12,6 +12,8 @@ ema_decay: 0.996
 p_tf_start: 1.0
 p_tf_end: 0.0
 p_tf_warmup_epochs: 4
+recon_frac: 1.0            # fraction (0-1) of the F rollout frames to supervise the decode recon on (train only;
+                           #   ALL output modalities, same random subset per step). 1.0=all. <1 saves ViT-AE decode compute.
 detach_every: 8
 modalities:
   - {name: proprio, kind: vector, dim: 6, weight: 1.0}

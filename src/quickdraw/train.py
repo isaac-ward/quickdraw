@@ -102,6 +102,20 @@ def main(cfg):
     loaders = window_loaders(cfg, norm)
     _startup_log(run_dir, f"[startup] data ready in {time.perf_counter() - _t:.1f}s: "
                           f"{getattr(loaders['train'], 'N', '?')} train / {getattr(loaders['val'], 'N', '?')} val windows")
+    # data inventory per split (trajectories / transitions / seconds / hours / windows) so coverage is legible
+    hz = round(1.0 / cfg.environments.dt); P, Fh, strd = cfg.data.P, cfg.data.F, int(cfg.data.get("window_stride", 1)); L = P + Fh
+    _startup_log(run_dir, f"[startup] data inventory ({hz} Hz, P={P} F={Fh} L={L} window_stride={strd}):")
+    for name, s in cfg.data.splits.items():
+        nt, st = int(s["n_traj"]), int(s["steps"]); frames = nt * st; secs = frames / hz
+        line = (f"[startup]   {name:<18} {nt:>4} traj x {st:>5} steps = {frames:>8} frames "
+                f"({nt * (st - 1):>8} transitions) = {secs:8.1f}s = {secs / 3600:5.2f}h")
+        if name in ("train", "val"):
+            ss = strd if name == "train" else 1                    # val stays dense (stride 1)
+            per = (st - L) // ss + 1 if st >= L else 0
+            line += f" | windows: {nt} x {per} (stride {ss}) = {nt * per}"
+        else:
+            line += f" | full-traj eval rollouts: {nt}"
+        _startup_log(run_dir, line)
     model = build_model(cfg)
     _startup_log(run_dir, f"[startup] model built: {sum(p.numel() for p in model.parameters()) / 1000:.0f}K "
                           f"params (model={cfg.model.name})")
@@ -124,7 +138,8 @@ def main(cfg):
     lit = LitWorldModel(model, norm, e.R, e.r, e.init_speed, cfg.data.P, cfg.data.F,
                         cfg.model.p_tf_start, cfg.model.p_tf_end, cfg.model.p_tf_warmup_epochs,
                         cfg.optim.lr, cfg.optim.weight_decay, cfg.model.detach_every,
-                        variations=cfg.get("variations"), dt=e.dt)
+                        variations=cfg.get("variations"), dt=e.dt,
+                        recon_frac=float(cfg.model.get("recon_frac", 1.0)))
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py). Lightning's own
     # logger is OFF; all logging flows through the writer via LoggingCallback.

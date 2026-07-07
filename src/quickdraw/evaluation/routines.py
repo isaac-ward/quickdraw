@@ -252,29 +252,31 @@ def _ssim(a, b):
 
 @torch.no_grad()
 def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
-    """Recovered-manifold UMAPs — works for ANY method. Pool the model's COMMITTED next-state prediction
-    (deterministic forward() readout; for diffusion the eps=0 prediction) over many VAL contexts, then UMAP
-    both the decoded DATA space (6D pos+vel) and the carried LATENT space to 3D and 2D (4 stills). The
-    union traces the learned manifold; speed colors |predicted next velocity|."""
+    """Recovered-manifold projections of the carried LATENT space (the flattened token bag), for ANY model.
+    Pool the model's COMMITTED next-state prediction (deterministic forward() readout; eps=0 for diffusion)
+    over many VAL contexts, then project the latent to 3D + 2D with THREE reducers — PCA (linear, global-
+    geometry-faithful), UMAP (nonlinear neighborhoods), t-SNE (local clusters) — each under eval_manifold/<method>/.
+    The 3D still is a 6-view (fig_points_6view). Data-space (6D proprio) plots dropped — it's just the torus."""
     from ..data.dataset import load_split_episodes_mm
-    from .manifold import manifold_predictions, pad_lims, umap_reduce
+    from .manifold import manifold_predictions, pad_lims, reduce_dims
     m = getattr(model, "_orig_mod", model)
     was = m.training
     m.eval()
     t0 = time.perf_counter()
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     mm_eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)   # decodes proprio; latent = flattened bag
-    data6d, latents, _, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
-                                                       stride=1, seed=0, device=device)
-    sub = f"{data6d.shape[0]:,} next-state predictions (of {n_avail:,} val contexts)"   # model-agnostic
-    for space, label, pts in (("data_space", "data space (full 6D pos+vel)", data6d),
-                              ("latent_space", f"latent space (full {latents.shape[1]}D z)", latents)):
+    _, latents, _, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
+                                                  stride=1, seed=0, device=device)
+    sub = f"{latents.shape[0]:,} next-state predictions (of {n_avail:,} val contexts)"   # model-agnostic
+    label = f"latent space (full {latents.shape[1]}D z)"
+    for method in ("umap", "tsne", "pca"):     # PCA = global truth, UMAP = neighborhoods, t-SNE = local clusters
         for nd in (3, 2):
-            e = umap_reduce(pts, n_components=nd, seed=0)
-            fig_fn = viz.fig_points_4view if nd == 3 else viz.fig_points_2d
+            e = reduce_dims(latents, method, n_components=nd, seed=0)
+            fig_fn = viz.fig_points_6view if nd == 3 else viz.fig_points_2d   # 3D = 6-view (front/side/top + 3 rotations)
             f = fig_fn(e, lims=pad_lims(e), point_size=2.5,            # no color/colorbar (structure only)
-                       title=f"recovered manifold — UMAP of {label} to {nd}D, seed=0\n{sub}")
-            writer.figure(f"eval_manifold/umap_{space}_to_{nd}d", f, step); plt.close(f)
+                       title=f"recovered manifold — {method.upper()} of {label} to {nd}D, seed=0\n{sub}")
+            writer.figure(f"eval_manifold/{method}/latent_space_to_{nd}d", f, step); plt.close(f)
+            _plog(writer, f"[manifold @ep{step}] {method} {nd}D done ({time.perf_counter() - t0:.0f}s)")
     if was:
         m.train()
     _plog(writer, f"[manifold @ep{step}] done in {time.perf_counter() - t0:.1f}s")
