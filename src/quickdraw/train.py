@@ -103,15 +103,15 @@ def main(cfg):
     _startup_log(run_dir, f"[startup] data ready in {time.perf_counter() - _t:.1f}s: "
                           f"{getattr(loaders['train'], 'N', '?')} train / {getattr(loaders['val'], 'N', '?')} val windows")
     # data inventory per split (trajectories / transitions / seconds / hours / windows) so coverage is legible
-    hz = round(1.0 / cfg.environments.dt); P, Fh, strd = cfg.data.P, cfg.data.F, int(cfg.data.get("window_stride", 1)); L = P + Fh
-    _startup_log(run_dir, f"[startup] data inventory ({hz} Hz, P={P} F={Fh} L={L} window_stride={strd}):")
+    hz = round(1.0 / cfg.environments.dt); P, Fh, strd = cfg.data.P, cfg.data.F, int(cfg.data.get("window_stride", 1)); winL = P + Fh
+    _startup_log(run_dir, f"[startup] data inventory ({hz} Hz, P={P} F={Fh} L={winL} window_stride={strd}):")
     for name, s in cfg.data.splits.items():
         nt, st = int(s["n_traj"]), int(s["steps"]); frames = nt * st; secs = frames / hz
         line = (f"[startup]   {name:<18} {nt:>4} traj x {st:>5} steps = {frames:>8} frames "
                 f"({nt * (st - 1):>8} transitions) = {secs:8.1f}s = {secs / 3600:5.2f}h")
         if name in ("train", "val"):
             ss = strd if name == "train" else 1                    # val stays dense (stride 1)
-            per = (st - L) // ss + 1 if st >= L else 0
+            per = (st - winL) // ss + 1 if st >= winL else 0
             line += f" | windows: {nt} x {per} (stride {ss}) = {nt * per}"
         else:
             line += f" | full-traj eval rollouts: {nt}"
