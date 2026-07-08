@@ -11,6 +11,11 @@ defaults:
   - reward: default
   - _self_
 
+# language-steered control (eval_language): steer MPPI toward a natural-language request via a trained reward head
+language:
+  request: red
+  head: logs/train_reward_2026_07_08_07_25_06_reward_color/reward_head.pt   # a train_reward run's reward_head.pt
+
 # short experiment summary -> run dir is logs/<timestamp>_<experiment> (override on CLI)
 experiment: base
 

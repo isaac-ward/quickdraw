@@ -186,16 +186,22 @@ class MultiModalSequenceModel(nn.Module):
         return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every)
 
     @torch.no_grad()
-    def imagine_shared(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int, heads=None) -> dict[str, Tensor]:
+    def imagine_shared(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int, heads=None,
+                       return_bag: bool = False) -> dict[str, Tensor]:
         """MPPI helper: encode B contexts ONCE (the expensive image encode), expand to B*K, then roll K
         action variants per context. ctx_obs: (B,P,*); actions: (B*K, P-1+horizon, 2). Decodes only `heads`
-        (e.g. ['proprio'] for scoring). Avoids re-encoding the image context per candidate."""
+        (e.g. ['proprio'] for scoring). Avoids re-encoding the image context per candidate.
+        return_bag=True also returns the rolled latent token bag under key `_bag` ((B*K,H,n_state,d)) — the
+        object a language reward scores directly (decode-free)."""
         with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
             bags = self.encode_state(ctx_obs)                                    # (B,P,n_state,d) — one encode
             buf = [b.repeat_interleave(K, dim=0) for b in bags.unbind(1)]        # each (B*K,n_state,d)
             bag = self._rollout_from(buf, actions, horizon, 0.0, None, 0)
             out = self.to_obs(bag, heads=heads)
-        return {k: v.float() for k, v in out.items()}
+        out = {k: v.float() for k, v in out.items()}
+        if return_bag:
+            out["_bag"] = bag.float()
+        return out
 
     @torch.no_grad()
     def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None) -> dict[str, Tensor]:
