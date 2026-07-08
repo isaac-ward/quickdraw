@@ -1,0 +1,15 @@
+# Language reward head R(latent, text): distilled from an eval_interpret run's (latent, label) pairs.
+# Trained torch-only (MiniLM embeds text via `transformers`, mean-pooled). See design/language_steering.md.
+
+interpret_run: logs/eval_interpret_2026_07_08_04_07_28_interpret_r3diff_v4   # source run (has projections/ + labels.json)
+factor: color            # which factor to align to (must be a source: vlm/analytic factor in conf/interpret)
+embed_dim: 128           # shared f_z/f_t projection dim
+hidden: 256              # MLP hidden width
+epochs: 300
+lr: 1.0e-3
+batch: 512
+temperature: 0.07        # cosine-logit temperature for the cross-entropy
+val_frac: 0.15           # held-out fraction, split BY CLIP (no per-step leakage)
+seed: 0
+text_model: sentence-transformers/paraphrase-MiniLM-L3-v2
+paraphrases: ["{c}", "the {c} band", "a {c} surface", "the {c} floor"]   # {c} -> the bucket name

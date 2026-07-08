@@ -101,6 +101,41 @@ UMAP/t-SNE show neighborhood/cluster structure. Cross-check confusion figs tell 
     [eval_interpret @ep100] projecting umap/tsne/pca (2d+3d) + rendering 18 plots + 3 confusions...
     [eval_interpret @ep100] done in Xs -> eval_interpret/
 
+## Projections (the reducers)
+
+Every 3D/2D plot applies one reducer to the latent cloud. They split into **unsupervised** (label-blind — the
+honest "does the geometry organize itself?") and **supervised** (told the labels — "how separable is this
+attribute, if we push?"). All are re-fit per point-set, so orientation/scale isn't comparable across runs;
+the 3D view is a 3×3 nine-view (iso about vertical / about horizontal + axial) on an equal-aspect cube.
+
+**Unsupervised** — under `plots/{pca,tsne,umap}/`, each with an uncolored `none_` view:
+- **PCA** — linear, deterministic. Projects onto the directions of maximum variance. The arbiter of *global*
+  geometry: if PCA separates the classes, they're genuinely separated (nothing coaxed it), and relative
+  distances are meaningful. Label-blind.
+- **t-SNE** — nonlinear, stochastic. Preserves *local* neighborhoods (who's near whom) but NOT global layout —
+  cluster sizes and between-cluster distances are not meaningful, so read only local grouping. Fed a PCA-50
+  pre-projection (denoise + speed). No out-of-sample `transform`.
+- **UMAP** — nonlinear. Preserves local neighborhoods plus more global structure than t-SNE; faster, and has a
+  `transform()` for projecting new points. Sits between PCA (global-faithful) and t-SNE (local-faithful).
+
+**Supervised** — under `plots/{lda,umap-sup-<w>}/`, fit per-factor (supervised by that factor's labels), no
+`none_` view:
+- **LDA** (Linear Discriminant Analysis) — linear, supervised. Computes the within-class scatter `S_w` (average
+  spread inside each class) and between-class scatter `S_b` (spread of the class means), and finds the
+  projection `W` maximizing the Fisher ratio `Wᵀ S_b W / Wᵀ S_w W` (a generalized eigenproblem `S_w⁻¹ S_b`) —
+  i.e. the axes that push class means apart while keeping each class tight. Because it is *told* the labels and
+  optimizes exactly for separating them, the plot will **always** look clean; treat it as "is this attribute
+  linearly separable at all," and read the honest quantity off its (cross-validated) accuracy, not the picture.
+  PCA-pre-projected for numerical stability; yields ≤ (#classes − 1) axes.
+- **UMAP-sup-`<w>`** — UMAP with `target_weight w` blending the data graph (`0`) with a label graph (`1`).
+  `w=0.25` is a gentle nudge, `w=1.0` fully forced. If a *low* `w` already separates the classes, the structure
+  is readily present in the latent; high `w` is presentation-only (it separates because you told it to).
+
+**Reading them together:** PCA / `none_` = the honest self-organized geometry (the real evidence); UMAP & t-SNE =
+neighborhood/cluster structure; LDA & UMAP-sup = "how separable if pushed" (forced — for presentation, with
+LDA's accuracy as the number). If PCA *already* separates a factor, that's the strong result; if only the
+supervised views do, the info is present but isn't a dominant axis of the latent.
+
 ## Status / needs
 - Reuse seamstress `vlm_labeling.py` (Responses API + json_schema + base64 frames) + its per-env config pattern.
 - `OPENAI_API_KEY` (Isaac providing) in the run env.

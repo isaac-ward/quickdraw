@@ -18,6 +18,8 @@ dependencies = [
   "imageio[ffmpeg]",
   "pyvista",
   "umap-learn",
+  "scikit-learn",
+  "transformers",
 ]
 
 [build-system]

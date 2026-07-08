@@ -1,4 +1,4 @@
-"""Entrypoint: train the base world model. `python -m quickdraw.train`"""
+"""Entrypoint: train the base world model. `python -m quickdraw.train_world`"""
 
 from __future__ import annotations
 

@@ -33,7 +33,7 @@ uv run huggingface-cli download isaac-ronald-ward/quickdraw-torus --repo-type da
 #     -> set DATA=data/torus   (a split loads as LeRobotDataset("torus/<split>", root="$DATA/<split>"))
 
 # 2. train: train/val + the subscribed in-loop evals every N epochs   ->   set CKPT=logs/train_<ts>_$RUN
-uv run python -m quickdraw.train            experiment=$RUN data.root=$DATA
+uv run python -m quickdraw.train_world            experiment=$RUN data.root=$DATA
 
 # 3. post-hoc evals at the best checkpoint (each writes its own logs/ run dir of plots/videos)
 uv run python -m quickdraw.eval_ood_horizon experiment=$RUN data.root=$DATA checkpoint=$CKPT  # long-horizon open-loop rollout

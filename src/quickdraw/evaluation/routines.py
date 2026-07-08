@@ -578,7 +578,7 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     transform_ok = {}
 
     # ---- project once per (method, dim); emit an uncolored (none_) view + one recolor per factor; save each projection ----
-    for method in ("umap", "tsne", "pca"):
+    for method in ("pca", "tsne", "umap"):
         for nd in (3, 2):
             e, reducer = reduce_dims(pts, method, n_components=nd, seed=0, return_reducer=True)
             _np.save(os.path.join(pdir, f"{method}_{nd}d_embedding.npy"), e)
@@ -602,7 +602,8 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     # ---- SUPERVISED reducers: forced toward each factor's labels. Fit SEPARATELY per factor (you supervise by
     #      ONE label), coloring by that same factor. No `none_` view. lda = linear (PCA->LDA, no knob);
     #      umap-sup-<w> = UMAP nudged by target_weight w. ----
-    sup_specs = [("lda", "lda", None)] + [(f"umap-sup-{w}", "umap", float(w)) for w in ic.get("umap_sup_weights", [0.5, 1.0])]
+    # zero-pad the weight in the dir name (0.25 / 0.50 / 1.00) so the fractions sort correctly in a file browser
+    sup_specs = [("lda", "lda", None)] + [(f"umap-sup-{float(w):.2f}", "umap", float(w)) for w in ic.get("umap_sup_weights", [0.5, 1.0])]
     for mdir, meth, w in sup_specs:
         for nd in (3, 2):
             fig_fn = viz.fig_points_9view if nd == 3 else viz.fig_points_2d

@@ -8,6 +8,7 @@ defaults:
   - eval: default
   - control: mppi
   - interpret: torus
+  - reward: default
   - _self_
 
 # short experiment summary -> run dir is logs/<timestamp>_<experiment> (override on CLI)
