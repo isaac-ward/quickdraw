@@ -109,6 +109,15 @@ class ProgressPrinter(L.Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         self._t0 = time.time()
 
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        nb = trainer.num_val_batches
+        nb = int(nb[0]) if isinstance(nb, (list, tuple)) and nb else (int(nb) if nb and nb != float("inf") else None)
+        # explain the post-training-epoch pause: val is AUTOREGRESSIVE (p_tf=0), ~as slow as an AR train epoch
+        self._emit(f"[ep {trainer.current_epoch:>3}] validating (autoregressive"
+                   + (f", {nb} batches" if nb else "") + ") — this is ~as long as the train epoch...")
+
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
             return

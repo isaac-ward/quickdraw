@@ -1,0 +1,59 @@
+# Per-environment interpretability config (eval_interpret). Swap for another env: conf/interpret/<env>.yaml,
+# select on the CLI with interpret=<env>. eval_interpret imagines short clips, VLM-labels them by semantic
+# factor, and recolors the eval_manifold latent projections by those labels (see design/interpretability.md).
+
+n_clips: 384          # imagined clips to label + embed
+point: per_step       # per_step = every step's latent, clip label broadcast (dense, ~n_clips*clip_len points, comparable to eval_manifold); mean = one clip-mean latent per clip (sparse, clean)
+clip_len: 30          # frames per clip (0.5s @ 60 Hz)
+batch: 32             # clips imagined per forward pass (image-decode memory)
+vlm_frames: 6         # frames subsampled from each clip fed to the VLM
+seed: 0
+imaginations: true    # dump per-clip imaginations (one dir per clip, one file per trunk + manifest.json) for a web explorer
+umap_sup_weights: [0.25, 0.5, 1.0]   # supervised-UMAP target weights -> extra umap-sup-<w>/ dirs, each factor supervised by its own labels (forces separation; presentation, not evidence)
+
+vlm:
+  model: gpt-4o-mini
+  max_workers: 8      # concurrent Responses-API calls (labeling is I/O-bound)
+  # OPENAI_API_KEY is read from the environment (falls back to a repo-root .env)
+
+# semantic factors. each factor declares its label SOURCE (source of truth for the plot coloring):
+#   source: vlm      -> a VLM reads the RENDERED image (independent of the proprio-derived latent).
+#   source: analytic -> computed exactly from the imagined proprio (deterministic, no API).
+# `analytic` params double as the cross-check when source is vlm (VLM image reading graded vs proprio truth).
+# buckets = the label set (also the legend order); colors = a matplotlib color per bucket for the legend.
+factors:
+  color:                       # the surface the agent is standing on
+    source: vlm                # VLM reads the image -> the independent probe; analytic (hue at position) cross-checks it
+    buckets: [cyan, blue, purple, pink, red, orange, yellow, "light green", green]
+    colors:
+      cyan: "#00ffff"
+      blue: "#0000ff"
+      purple: "#800080"
+      pink: "#ff69b4"
+      red: "#ff0000"
+      orange: "#ffa500"
+      yellow: "#ffff00"
+      "light green": "#90ee90"
+      green: "#228b22"
+    analytic:
+      kind: hue_at_position    # hue at the agent's ring angle theta -> nearest color center (light-green/green are close in
+                               # hue; the VLM/image is the source of truth for that pair, so the analytic cross-check is approximate there).
+      hue_centers: {red: 0.0, orange: 0.06, yellow: 0.14, "light green": 0.22, green: 0.30, cyan: 0.5, blue: 0.60, purple: 0.78, pink: 0.90}
+  speed:                       # how fast the agent is moving
+    source: analytic           # exact from the imagined velocity; terciles self-calibrate per model/env (no magic thresholds)
+    buckets: [slow, medium, fast]
+    colors:  {slow: "#4363d8", medium: "#f58231", fast: "#e6194b"}
+    analytic:
+      kind: speed_quantile     # mean |velocity| over the clip, split at these quantile edges (thirds -> slow/medium/fast)
+      edges: [0.333, 0.667]
+
+prompt: |
+  You are labeling a short first-person video clip (about half a second) recorded by an agent moving on the
+  inside surface of a colorful torus world. The surface is painted with bands of color around a wheel:
+  cyan, blue, purple, pink, red, orange, yellow, light green, green. The frames may be LOW-RESOLUTION or BLURRY —
+  judge the dominant HUE, not fine texture. Report the color of the surface the agent is STANDING ON: look ONLY at
+  the immediate foreground floor at the BOTTOM-CENTER of the frame (ignore the walls, the far distance, and any
+  colors elsewhere in the view). Choose the single closest match from the listed colors; if it is between two,
+  pick the more dominant / more saturated one. In "reasoning", FIRST briefly describe what you see on the
+  bottom-center floor (a few words), THEN commit to the color. Also give a self_reported_confidence in [0,1]
+  (lower it when the frames are blurry or ambiguous). Return ONLY the structured fields.

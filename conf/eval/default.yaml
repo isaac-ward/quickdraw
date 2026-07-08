@@ -20,4 +20,5 @@ during_train:
     denoising_multistep: true  # diffusion ONLY: fixed-agent sequential-swarm flow-field video (self-skips for other models)
     denoising_aggregate: true  # diffusion ONLY: pooled next-states collapsing from noise onto the manifold (self-skips)
     manifold: true         # ANY method: recovered-manifold UMAPs (data + latent space, 2D + 3D)
+    interpret: false       # vision ONLY, POST-HOC (VLM-labeled latent manifolds); needs OPENAI_API_KEY -> run standalone (python -m quickdraw.eval_interpret), keep OFF in the train loop
     # (image FPV rollout/filmstrip/metrics are now part of ood_horizon — under eval_ood_horizon/<head>/)

@@ -472,6 +472,20 @@ def stitch_grid_video(paths, out_path, grid, fps):
             rd.close()
 
 
+def tile_clips(clips, grid):
+    """Array-input analogue of stitch_grid_video (SAME row-major layout): tile up to grid*grid clips, each
+    (T,H,W,3) uint8, into one (T, grid*H, grid*W, 3) composite. Cells fill row-major; missing cells stay
+    black; truncated to the shortest clip. For clips already in memory (no temp mp4s)."""
+    clips = [np.asarray(c) for c in clips][: grid * grid]
+    T = min(len(c) for c in clips)
+    h, w = clips[0].shape[1:3]
+    out = np.zeros((T, grid * h, grid * w, 3), np.uint8)
+    for i, c in enumerate(clips):
+        rr, cc = divmod(i, grid)
+        out[:, rr * h:(rr + 1) * h, cc * w:(cc + 1) * w] = c[:T, ..., :3]
+    return out
+
+
 def _fig_rgb(fig):
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
@@ -794,69 +808,107 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
     return fig
 
 
-def fig_points_6view(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="",
-                     depthshade=True):
-    """A 3D point cloud from 6 ORTHOGRAPHIC views in a 2x3 grid — SAME points + SAME embedding, 6 camera angles.
-    Top row: front on, side on, top down. Bottom row: an ISOMETRIC view (elev≈35.26°) rotated +0/+30/+60°
-    around the vertical (azimuth) axis. Each panel is titled so rotation consistency is legible.
-    pts: (N,3); lims like fig_points_4view."""
+def fig_points_9view(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="",
+                     depthshade=True, legend=None):
+    """A 3D point cloud from 9 ORTHOGRAPHIC views in a 3x3 grid — SAME points + SAME embedding.
+    Row 1: ISOMETRIC (elev≈35.26°) rotated +0/+15/+30° about the VERTICAL axis (azimuth).
+    Row 2: ISOMETRIC rotated +0/+15/+30° about a HORIZONTAL axis (elevation / tilt).
+    Row 3: axial views — front on, side on, top down.
+    Axes are forced to EQUAL length + equal aspect (a cube), so long-thin embeddings render at their TRUE
+    shape. pts: (N,3). legend: list of (label, color) for a CATEGORICAL scatter (per-point (N,3) RGB array)
+    -> a legend box instead of a colorbar."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
     from matplotlib.ticker import MaxNLocator
     pts = np.asarray(pts)
     if lims is not None and np.ndim(lims) == 1:
         lims = (tuple(lims), tuple(lims), tuple(lims))
+    if lims is not None:                                           # EQUAL-length axes (cube) centered per-axis -> true aspect
+        ctr = [(lo + hi) / 2 for lo, hi in lims]; half = max(hi - lo for lo, hi in lims) / 2
+        lims = tuple((c - half, c + half) for c in ctr)
     _ISO = 35.264                                                  # true isometric elevation (atan(1/sqrt(2)))
-    views = [(0, -90, "front on"), (0, 0, "side on"), (90, -90, "top down"),
-             (_ISO, 45, "isometric +0°"), (_ISO, 75, "isometric +30°"), (_ISO, 105, "isometric +60°")]
-    fig = plt.figure(figsize=(18, 12))
-    gs = GridSpec(2, 3, figure=fig, wspace=0.0, hspace=0.06)
+    views = [(_ISO, 45, "iso +0° abt vertical"), (_ISO, 60, "iso +15° abt vertical"), (_ISO, 75, "iso +30° abt vertical"),
+             (_ISO, 45, "iso +0° abt horizontal"), (_ISO + 15, 45, "iso +15° abt horizontal"), (_ISO + 30, 45, "iso +30° abt horizontal"),
+             (0, -90, "front on"), (0, 0, "side on"), (90, -90, "top down")]
+    fig = plt.figure(figsize=(18, 18))
+    gs = GridSpec(3, 3, figure=fig, wspace=0.0, hspace=0.08)
     sc = None
+    _cmap = None if (isinstance(color, np.ndarray) and color.ndim == 2) else cmap   # RGB array -> no colormap
     for i, (elev, azim, lbl) in enumerate(views):
         ax = fig.add_subplot(gs[i // 3, i % 3], projection="3d")
         ax.set_proj_type("ortho")                                  # orthographic (no perspective foreshortening)
         sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size,
-                        c=(color if color is not None else _POINT_PURPLE), cmap=cmap,
+                        c=(color if color is not None else _POINT_PURPLE), cmap=_cmap,
                         depthshade=depthshade, linewidths=0)
         ax.view_init(elev=elev, azim=azim)
         if lims is not None:
             (xl, yl, zl) = lims
             ax.set_xlim(xl); ax.set_ylim(yl); ax.set_zlim(zl)
-            ax.set_box_aspect((xl[1] - xl[0], yl[1] - yl[0], zl[1] - zl[0]))
-        else:
-            ax.set_box_aspect((1, 1, 1))
+        ax.set_box_aspect((1, 1, 1))                               # equal aspect always (lims are already a cube)
         for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
             axis.set_major_locator(MaxNLocator(5))
         ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
         ax.set_xlabel(""); ax.set_ylabel(""); ax.set_zlabel("")
         ax.set_title(lbl, fontsize=10, y=0.97)                     # named view (top row + rotated bottom row)
     fig.subplots_adjust(left=0.0, right=0.9, top=0.92, bottom=0.0, wspace=0.0, hspace=0.06)
-    if isinstance(color, np.ndarray) and sc is not None:
+    if legend is not None:
+        from matplotlib.patches import Patch
+        fig.legend(handles=[Patch(facecolor=c, edgecolor="black", linewidth=0.5, label=str(l)) for l, c in legend],
+                   loc="center left", bbox_to_anchor=(0.915, 0.5), frameon=False, fontsize=11)  # gap from the 0.9 grid edge
+    elif isinstance(color, np.ndarray) and color.ndim == 1 and sc is not None:
         cax = fig.add_axes([0.915, 0.30, 0.012, 0.40])
         fig.colorbar(sc, cax=cax, label=cbar_label)
     fig.suptitle(title, fontsize=11, y=0.99)
     return fig
 
 
-def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label=""):
-    """The 2D analogue of fig_points_4view: a single scatter, same styling (no tick/axis labels, right-side
-    colorbar). The cloud is STRETCHED to fill the panel — intended for UMAP/embedding coordinates, which
-    are arbitrary (no metric aspect to preserve). pts: (N,2). lims: ((xlo,xhi),(ylo,yhi)) or None."""
+def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="", legend=None):
+    """The 2D analogue of fig_points_6view: a single scatter, same styling (no tick/axis labels). Axes are
+    EQUAL length + equal aspect, so a long-thin embedding renders at its TRUE shape (not stretched to fill).
+    pts: (N,2). lims: ((xlo,xhi),(ylo,yhi)) or None. legend: list of (label, color) for a CATEGORICAL scatter
+    (color is a per-point (N,3) RGB array) -> legend box."""
     from matplotlib.ticker import MaxNLocator
     pts = np.asarray(pts)
     fig = plt.figure(figsize=(10, 9))
     ax = fig.add_subplot(1, 1, 1)
+    _cmap = None if (isinstance(color, np.ndarray) and color.ndim == 2) else cmap   # RGB array -> no colormap
     sc = ax.scatter(pts[:, 0], pts[:, 1], s=point_size,
-                    c=(color if color is not None else _POINT_PURPLE), cmap=cmap, linewidths=0)
+                    c=(color if color is not None else _POINT_PURPLE), cmap=_cmap, linewidths=0)
     if lims is not None:
-        (xl, yl) = lims
-        ax.set_xlim(xl); ax.set_ylim(yl)
+        ctr = [(lo + hi) / 2 for lo, hi in lims]; half = max(hi - lo for lo, hi in lims) / 2   # equal-length axes (square)
+        ax.set_xlim(ctr[0] - half, ctr[0] + half); ax.set_ylim(ctr[1] - half, ctr[1] + half)
+    ax.set_aspect("equal", adjustable="box")                       # equal aspect -> true shape (thin looks thin)
     ax.xaxis.set_major_locator(MaxNLocator(5)); ax.yaxis.set_major_locator(MaxNLocator(5))
     ax.set_xticklabels([]); ax.set_yticklabels([])
     fig.subplots_adjust(left=0.03, right=0.88, top=0.93, bottom=0.03)  # axes fills the region (no letterbox)
-    if isinstance(color, np.ndarray):                                # colorbar only for a scalar field
+    if legend is not None:
+        from matplotlib.patches import Patch
+        fig.legend(handles=[Patch(facecolor=c, edgecolor="black", linewidth=0.5, label=str(l)) for l, c in legend],
+                   loc="center left", bbox_to_anchor=(0.905, 0.5), frameon=False, fontsize=11)  # pad from the 0.88 axes edge
+    elif isinstance(color, np.ndarray) and color.ndim == 1:          # colorbar only for a scalar field
         cax = fig.add_axes([0.905, 0.30, 0.015, 0.40])               # dedicated right-side colorbar
         fig.colorbar(sc, cax=cax, label=cbar_label)
     fig.suptitle(title, fontsize=11, y=0.98)
+    return fig
+
+
+def fig_confusion(mat, labels, title="", xlabel="VLM", ylabel="analytic"):
+    """A confusion-count heatmap (rows=analytic, cols=VLM) with the count printed in each cell. mat: (K,K)
+    ints, labels: the K bucket names. Feeds eval_interpret's VLM-vs-analytic trust check."""
+    mat = np.asarray(mat)
+    n = len(labels)
+    fig, ax = plt.subplots(figsize=(1.6 + n, 1.6 + n))
+    im = ax.imshow(mat, cmap="Blues")
+    ax.set_xticks(range(n)); ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
+    ax.set_yticks(range(n)); ax.set_yticklabels(labels, fontsize=9)
+    thr = mat.max() / 2 if mat.max() else 1
+    for i in range(n):
+        for j in range(n):
+            ax.text(j, i, int(mat[i, j]), ha="center", va="center", fontsize=9,
+                    color="white" if mat[i, j] > thr else "black")
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=10)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
     return fig
 
 

@@ -267,12 +267,13 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     mm_eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)   # decodes proprio; latent = flattened bag
     _, latents, _, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
                                                   stride=1, seed=0, device=device)
-    sub = f"{latents.shape[0]:,} next-state predictions (of {n_avail:,} val contexts)"   # model-agnostic
+    sub = (f"each point = one committed 1-step next-state prediction from a real val context "
+           f"({latents.shape[0]:,} points over {n_avail:,} contexts)")   # model-agnostic; teacher-forced, not a rollout
     label = f"latent space (full {latents.shape[1]}D z)"
     for method in ("umap", "tsne", "pca"):     # PCA = global truth, UMAP = neighborhoods, t-SNE = local clusters
         for nd in (3, 2):
             e = reduce_dims(latents, method, n_components=nd, seed=0)
-            fig_fn = viz.fig_points_6view if nd == 3 else viz.fig_points_2d   # 3D = 6-view (front/side/top + 3 rotations)
+            fig_fn = viz.fig_points_9view if nd == 3 else viz.fig_points_2d   # 3D = 9-view (iso abt vertical/horizontal + axial)
             f = fig_fn(e, lims=pad_lims(e), point_size=2.5,            # no color/colorbar (structure only)
                        title=f"recovered manifold — {method.upper()} of {label} to {nd}D, seed=0\n{sub}")
             writer.figure(f"eval_manifold/{method}/latent_space_to_{nd}d", f, step); plt.close(f)
@@ -429,10 +430,263 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     return {}
 
 
+@torch.no_grad()
+def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
+    """VLM-labeled latent interpretability (vision models ONLY; self-skips otherwise). Imagine N short clips
+    from val, label each by semantic factor (color/speed/direction) with a VLM (OpenAI, cfg.interpret.vlm),
+    embed each clip as ONE latent point (mean over the imagined rollout of the encoded token bag), then recolor
+    the recovered-manifold projections (umap/tsne/pca, 2D+3D — the SAME projection per factor) by the VLM
+    labels. Also grades the VLM against analytic labels from the imagined proprio (confusion + agreement).
+    Config per env: conf/interpret/<env>.yaml. Products under eval_interpret/. See design/interpretability.md."""
+    import numpy as _np
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omegaconf import OmegaConf
+
+    from ..data.dataset import load_split_episodes_mm
+    from . import interpret as I
+    from .manifold import pad_lims, reduce_dims
+    m = getattr(model, "_orig_mod", model)
+    if not _is_mm(model):
+        return {}
+    img_head = next((n for n, _ in m.layout if n != "proprio"), None)
+    if img_head is None:
+        _plog(writer, f"[eval_interpret @ep{step}] no image head — eval_interpret is a vision probe, skipping")
+        return {}
+    ic = OmegaConf.to_container(cfg.interpret, resolve=True)
+    factors = ic["factors"]
+    was = m.training
+    m.eval()
+    t0 = time.perf_counter()
+    P, H, fps = cfg.data.P, int(ic["clip_len"]), round(1.0 / ecfg.dt)
+    dev = device if isinstance(device, str) else device.type
+    img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+
+    # ---- sample N clips (episode, t0): P context frames + H imagined steps ----
+    rng = _np.random.RandomState(int(ic["seed"]))
+    slices = [(ei, t) for ei in range(len(eps)) for t in range(P, len(eps[ei][0]) - H)]
+    rng.shuffle(slices)
+    slices = slices[: int(ic["n_clips"])]
+    _plog(writer, f"[eval_interpret @ep{step}] start: {len(slices)} clips x {H} frames ({H / fps:.2f}s) from val | vision head={img_head}")
+
+    # ---- imagine each clip (batched); decode EVERY trunk (keyed by trunk id, so multi-trunk models work),
+    #      keep raw actions + the mean-pooled internal-state series ----
+    heads = [n for n, _ in m.layout]                                    # every modality/trunk id, in bag order
+    img_trunks = [n for n in heads if hasattr(m.modalities[n], "ae")]   # image trunks (have a ViT AE) vs vector trunks
+    bs = int(ic["batch"])
+    bags, clip_acts = [], []
+    decoded = {n: [] for n in heads}                                    # per-trunk decoded imaginations, keyed by trunk id
+    for c0 in range(0, len(slices), bs):
+        chunk = slices[c0:c0 + bs]
+        ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(eps[ei][0][t - P:t])) for ei, t in chunk]).float().to(device),
+               img_head: torch.stack([torch.from_numpy(eps[ei][2][t - P:t]) for ei, t in chunk]).float().div(255.0).to(device)}
+        act = torch.stack([norm.norm_act(torch.from_numpy(eps[ei][1][t - P:t + H - 1])) for ei, t in chunk]).float().to(device)
+        # ONE open-loop rollout: bag = the model's INTERNAL predictive state at each imagined step (B,H,n_state,d);
+        # each trunk is DECODED from it. So the plotted latent is the state that PRODUCES the prediction, and
+        # velocity/color we color by are its open-loop OUTPUTS (decoded) — not encoder inputs. No re-encoding.
+        with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
+            bag = m._rollout(ctx, act, H, 0.0, None, 0)                                             # (b,H,n_state,d) internal state
+            out = m.to_obs(bag, heads=heads)
+        bags.extend(bag.float().reshape(len(chunk), H, -1).cpu().numpy())                           # per-clip (H,D) internal-state series
+        for n in heads:
+            a = out[n].float()
+            if n in img_trunks:
+                decoded[n].extend((a.clamp(0, 1).cpu().numpy() * 255).astype(_np.uint8))            # (b,H,size,size,3) uint8
+            else:
+                decoded[n].extend((norm.denorm_obs(a) if n == "proprio" else a).cpu().numpy())      # (b,H,dim) physical (proprio) or raw
+        clip_acts.extend([eps[ei][1][t:t + H] for ei, t in chunk])                                  # raw actions in-clip
+        _plog(writer, f"[eval_interpret @ep{step}] imagining {min(c0 + bs, len(slices))}/{len(slices)}")
+    frames, pro_all = decoded[img_head], decoded["proprio"]             # VLM reads the primary image trunk; analytic reads proprio
+    _plog(writer, f"[eval_interpret @ep{step}] imagined {len(slices)} clips ({len(heads)} trunks) in {time.perf_counter() - t0:.0f}s")
+
+    # ---- analytic labels (exact, from the imagined proprio): per-clip scalar -> bucket ----
+    # (quantile buckets like speed self-calibrate across the whole clip set; per-clip buckets like color don't)
+    ana = {}                                                          # factor -> per-clip bucket list (len == n_clips)
+    for f, fc in factors.items():
+        if "analytic" in fc:
+            kind = fc["analytic"]["kind"]
+            ana[f] = I.bucketize(kind, [I.analytic_scalar(kind, p, ecfg.R) for p in pro_all], fc)
+
+    # ---- VLM labels (only for source: vlm factors — reads the RENDERED image, independent of the latent) ----
+    vlm_factors = {f: fc for f, fc in factors.items() if fc.get("source") == "vlm"}
+    vlm = [None] * len(slices)
+    ok = list(range(len(slices)))
+    if vlm_factors:
+        key, schema = I.openai_api_key(), I.build_label_schema(vlm_factors)
+        fidx = _np.unique(_np.linspace(0, H - 1, int(ic["vlm_frames"])).round().astype(int))
+        prompt, vmodel = ic["prompt"], ic["vlm"]["model"]
+        _plog(writer, f"[eval_interpret @ep{step}] VLM labeling {list(vlm_factors)} ({vmodel}, {ic['vlm_frames']} frames/clip)...")
+
+        def _label(i):
+            return I.label_clip(api_key=key, model=vmodel, prompt=prompt, schema=schema,
+                                frames_uint8=[frames[i][k] for k in fidx], action_text=I.build_action_text(clip_acts[i]))
+
+        with ThreadPoolExecutor(max_workers=int(ic["vlm"]["max_workers"])) as ex:
+            for i, res in enumerate(ex.map(_label, range(len(slices)))):
+                vlm[i] = res
+                if (i + 1) % max(1, len(slices) // 8) == 0 or i + 1 == len(slices):
+                    _plog(writer, f"[eval_interpret @ep{step}] labeled {i + 1}/{len(slices)}")
+        ok = [i for i, v in enumerate(vlm) if v is not None]
+        _plog(writer, f"[eval_interpret @ep{step}] VLM labeled {len(ok)}/{len(slices)} clips ({len(slices) - len(ok)} failed)")
+        if not ok:
+            if was:
+                m.train()
+            _plog(writer, f"[eval_interpret @ep{step}] no VLM labels returned — aborting (check OPENAI_API_KEY / network)")
+            return {}
+
+    # ---- resolve each factor's plotted label from its configured source (aligned to `ok`) ----
+    labels_ok = {f: ([vlm[i][f] for i in ok] if fc["source"] == "vlm" else [ana[f][i] for i in ok])
+                 for f, fc in factors.items()}
+    counts = {f: {b: labels_ok[f].count(b) for b in factors[f]["buckets"]} for f in factors}
+    _plog(writer, f"[eval_interpret @ep{step}] label counts: "
+          + " | ".join(f"{f}({factors[f]['source']}){counts[f]}" for f in factors))
+
+    # ---- cross-check: only where a VLM (image) reading can be graded vs an analytic (proprio) truth ----
+    agree = {}
+    for f, fc in factors.items():
+        if fc["source"] == "vlm" and f in ana:
+            buckets = list(fc["buckets"])
+            cm = I.confusion([ana[f][i] for i in ok], labels_ok[f], buckets)
+            agree[f] = float(_np.trace(cm) / max(1, cm.sum()))
+            cf = viz.fig_confusion(cm, buckets, title=f"{f}: VLM(image) vs analytic(proprio) ({100 * agree[f]:.0f}% agree)")
+            writer.figure(f"eval_interpret/crosscheck/{f}_confusion", cf, step); plt.close(cf)
+    if agree:
+        _plog(writer, f"[eval_interpret @ep{step}] cross-check agreement: "
+              + " | ".join(f"{f} {100 * agree[f]:.0f}%" for f in agree))
+
+    # ---- assemble the points to plot: one clip-mean latent, OR every per-step latent with its clip's label ----
+    mode = str(ic.get("point", "mean"))
+    if mode == "per_step":                                  # dense, comparable to eval_manifold; clip label broadcast to its H steps
+        pts = _np.concatenate([bags[i] for i in ok], axis=0)         # (len(ok)*H, D)
+        clip_pos = _np.repeat(_np.arange(len(ok)), H)               # each point -> its clip's index within `ok`
+        psize = 2.5
+        sub = f"each point = one latent of an imagined rollout, all {H}-steps kept ({len(ok)} clips x {H} = {len(pts):,} points; label broadcast from its clip)"
+    else:                                                    # one mean latent per clip (clean)
+        pts = _np.stack([bags[i].mean(0) for i in ok])              # (len(ok), D)
+        clip_pos = _np.arange(len(ok))
+        psize = 6.0
+        sub = f"each point = the mean over {H}-steps of an imagined rollout ({len(ok)} clips = {len(pts):,} points)"
+
+    # ---- save the projected points + FITTED reducers so the projection is reusable/repeatable (e.g. later,
+    #      projecting MPPI candidate latents into the SAME embedding via reducer.transform — pca/umap only) ----
+    import pickle
+    pdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret", "projections")
+    os.makedirs(pdir, exist_ok=True)
+    _np.save(os.path.join(pdir, "latents.npy"), pts)                          # (N,D) points that were projected
+    _np.save(os.path.join(pdir, "clip_index.npy"), clip_pos)                  # each point -> its clip's index within `ok`
+    transform_ok = {}
+
+    # ---- project once per (method, dim); emit an uncolored (none_) view + one recolor per factor; save each projection ----
+    for method in ("umap", "tsne", "pca"):
+        for nd in (3, 2):
+            e, reducer = reduce_dims(pts, method, n_components=nd, seed=0, return_reducer=True)
+            _np.save(os.path.join(pdir, f"{method}_{nd}d_embedding.npy"), e)
+            try:
+                with open(os.path.join(pdir, f"{method}_{nd}d_reducer.pkl"), "wb") as fh:
+                    pickle.dump(reducer, fh)
+                transform_ok[f"{method}_{nd}d"] = hasattr(reducer, "transform")  # pca/umap: True; tsne: no out-of-sample
+            except Exception:
+                transform_ok[f"{method}_{nd}d"] = False
+            lims, fig_fn = pad_lims(e), (viz.fig_points_9view if nd == 3 else viz.fig_points_2d)
+            f0 = fig_fn(e, lims=lims, point_size=psize,            # uncolored (no color/legend), like eval_manifold
+                        title=f"eval_interpret — {method.upper()} of latent to {nd}D (no coloring)\n{sub}")
+            writer.figure(f"eval_interpret/plots/{method}/none_{nd}d", f0, step); plt.close(f0)
+            for f, fc in factors.items():
+                rgb, legend = I.point_colors([labels_ok[f][c] for c in clip_pos], fc)
+                fig = fig_fn(e, color=rgb, lims=lims, point_size=psize, legend=legend,
+                             title=f"eval_interpret — {method.upper()} of latent to {nd}D, colored by {f} ({fc['source']})\n{sub}")
+                writer.figure(f"eval_interpret/plots/{method}/{f}_{nd}d", fig, step); plt.close(fig)
+            _plog(writer, f"[eval_interpret @ep{step}] {method} {nd}D done ({time.perf_counter() - t0:.0f}s)")
+
+    # ---- SUPERVISED reducers: forced toward each factor's labels. Fit SEPARATELY per factor (you supervise by
+    #      ONE label), coloring by that same factor. No `none_` view. lda = linear (PCA->LDA, no knob);
+    #      umap-sup-<w> = UMAP nudged by target_weight w. ----
+    sup_specs = [("lda", "lda", None)] + [(f"umap-sup-{w}", "umap", float(w)) for w in ic.get("umap_sup_weights", [0.5, 1.0])]
+    for mdir, meth, w in sup_specs:
+        for nd in (3, 2):
+            fig_fn = viz.fig_points_9view if nd == 3 else viz.fig_points_2d
+            for f, fc in factors.items():
+                bmap = {b: k for k, b in enumerate(fc["buckets"])}          # bucket -> int label
+                yv = _np.array([bmap[labels_ok[f][c]] for c in clip_pos])   # supervise by THIS factor
+                kw = {"y": yv} if w is None else {"y": yv, "target_weight": w}
+                e, reducer = reduce_dims(pts, meth, n_components=nd, seed=0, return_reducer=True, **kw)
+                key = f"{mdir}_{f}_{nd}d"
+                _np.save(os.path.join(pdir, f"{key}_embedding.npy"), e)
+                try:
+                    with open(os.path.join(pdir, f"{key}_reducer.pkl"), "wb") as fh:
+                        pickle.dump(reducer, fh)
+                    transform_ok[key] = hasattr(reducer, "transform")
+                except Exception:
+                    transform_ok[key] = False
+                rgb, legend = I.point_colors([labels_ok[f][c] for c in clip_pos], fc)   # broadcast to per-step points
+                fig = fig_fn(e, color=rgb, lims=pad_lims(e), point_size=psize, legend=legend,
+                             title=f"eval_interpret — {mdir} to {nd}D, colored by {f} ({fc['source']})\n{sub}")
+                writer.figure(f"eval_interpret/plots/{mdir}/{f}_{nd}d", fig, step); plt.close(fig)
+            _plog(writer, f"[eval_interpret @ep{step}] {mdir} {nd}D done ({time.perf_counter() - t0:.0f}s)")
+    with open(os.path.join(pdir, "meta.json"), "w") as fh:
+        json.dump({"mode": mode, "n_points": int(len(pts)), "latent_dim": int(pts.shape[1]),
+                   "transform_available": transform_ok,
+                   "note": "load <method>_<nd>d_reducer.pkl and call .transform(new_latents) to project NEW points "
+                           "into the same embedding (pca/umap only; tsne has no out-of-sample map)."}, fh, indent=2)
+
+    # ---- example clips per bucket: a 4x4 grid composite (like the dataset composites), ~1s playback ----
+    from collections import defaultdict
+    grid, fps_ex = 4, max(1, fps // 2)                      # 0.5s clip at half fps -> ~1s (2x slow-mo)
+    by_bucket = defaultdict(list)
+    for f in factors:
+        for j, i in enumerate(ok):
+            b = labels_ok[f][j]
+            if b in factors[f]["buckets"] and len(by_bucket[(f, b)]) < grid * grid:
+                by_bucket[(f, b)].append(frames[i])
+    for (f, b), clips in by_bucket.items():
+        writer.video(f"eval_interpret/examples/{f}/{b}", viz.tile_clips(clips, grid), fps_ex, step)
+
+    # ---- per-clip imaginations, one dir per clip id, one file per TRUNK (keyed by trunk id, so multi-trunk
+    #      models generalize). manifest.json indexes it for a web explorer: click a point -> pop its imagination.
+    #      Aligns with projections/ (embedding rows -> clip via clip_index.npy -> manifest clips[] in `ok` order). ----
+    if bool(ic.get("imaginations", True)):
+        trunk_kind = {n: ("image" if n in img_trunks else "vector") for n in heads}
+        imdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret", "imaginations")
+        for j, i in enumerate(ok):
+            cd = os.path.join(imdir, str(i)); os.makedirs(cd, exist_ok=True)
+            for n in heads:
+                if trunk_kind[n] == "image":
+                    viz.save_mp4(os.path.join(cd, f"{n}.mp4"), decoded[n][i], fps)      # true 0.5s at native fps
+                else:
+                    _np.save(os.path.join(cd, f"{n}.npy"), decoded[n][i])               # (H,dim) physical/raw
+            _np.save(os.path.join(cd, "actions.npy"), _np.asarray(clip_acts[i], dtype=_np.float32))
+        json.dump({"clip_len": H, "fps": fps, "point_mode": mode,
+                   "trunks": [{"id": n, "kind": trunk_kind[n],
+                               "file": f"{n}.{'mp4' if trunk_kind[n] == 'image' else 'npy'}"} for n in heads],
+                   "clips": [{"id": int(i), "episode": int(slices[i][0]), "start": int(slices[i][1]),
+                              "labels": {f: labels_ok[f][j] for f in factors}} for j, i in enumerate(ok)]},
+                  open(os.path.join(imdir, "manifest.json"), "w"), indent=2)
+        _plog(writer, f"[eval_interpret @ep{step}] saved {len(ok)} per-clip imaginations ({len(heads)} trunks) -> imaginations/")
+
+    # ---- per-clip labels.json + crosscheck summary.json (drill into any point) ----
+    outdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret")
+    os.makedirs(os.path.join(outdir, "crosscheck"), exist_ok=True)
+    recs = [{"episode": int(slices[i][0]), "start": int(slices[i][1]),
+             "label": {f: labels_ok[f][j] for f in factors},
+             "vlm": vlm[i], "analytic": {f: ana[f][i] for f in ana}} for j, i in enumerate(ok)]
+    json.dump(recs, open(os.path.join(outdir, "labels.json"), "w"), indent=2)
+    json.dump({"agreement": agree, "counts": counts, "n_labeled": len(ok), "n_clips": len(slices),
+               "sources": {f: factors[f]["source"] for f in factors}},
+              open(os.path.join(outdir, "crosscheck", "summary.json"), "w"), indent=2)
+    writer.scalars({**{f"eval_interpret/agreement/{f}": v for f, v in agree.items()},
+                    "eval_interpret/n_labeled": float(len(ok))}, step)
+    if was:
+        m.train()
+    _plog(writer, f"[eval_interpret @ep{step}] done in {time.perf_counter() - t0:.1f}s -> eval_interpret/")
+    return {f"eval_interpret_agreement_{f}": v for f, v in agree.items()}
+
+
 REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
             "control": eval_control, "denoising_multistep": eval_denoising_multistep,
-            "denoising_aggregate": eval_denoising_aggregate, "manifold": eval_manifold}
+            "denoising_aggregate": eval_denoising_aggregate, "manifold": eval_manifold,
+            "interpret": eval_interpret}
 
 
 def _quiver_round_data(swarm, grow=10, collapse=5):

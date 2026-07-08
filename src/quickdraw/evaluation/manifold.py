@@ -51,23 +51,51 @@ def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
     return data6d, latents, speed, n_avail
 
 
-def reduce_dims(pts, method, *, n_components, seed=0):
+def reduce_dims(pts, method, *, n_components, seed=0, return_reducer=False, y=None, target_weight=0.0):
     """Reduce an (N, D) cloud -> (N, n_components) by 'umap' | 'tsne' | 'pca'. Complementary lenses:
     PCA = linear + deterministic + global-geometry-faithful (the arbiter of whether blobs are REALLY
     connected/separated); UMAP = nonlinear neighborhoods; t-SNE = local cluster structure (t-SNE is fed a
-    PCA-50 pre-projection, the standard denoise+speedup). fit_transform directly (no out-of-sample), honest."""
+    PCA-50 pre-projection, the standard denoise+speedup). fit_transform directly (no out-of-sample), honest.
+    return_reducer=True also returns the FITTED estimator: PCA/UMAP expose .transform() to project NEW points
+    into the same embedding repeatably (e.g. MPPI candidates in latent space); t-SNE has no transform.
+    y (umap only): integer labels for SUPERVISED UMAP — target_weight in [0,1] blends the data graph (0) with
+    the label graph (1), pulling same-label points together (forces separation; >0 => not unsupervised)."""
     if method == "pca":
         from sklearn.decomposition import PCA
-        return PCA(n_components=n_components, random_state=seed).fit_transform(pts)
-    if method == "umap":
+        red = PCA(n_components=n_components, random_state=seed); e = red.fit_transform(pts)
+    elif method == "umap":
         import umap
-        return umap.UMAP(n_components=n_components, random_state=seed, n_neighbors=30, min_dist=0.05).fit_transform(pts)
-    if method == "tsne":
+        kw = dict(n_components=n_components, random_state=seed, n_neighbors=30, min_dist=0.05)
+        if y is not None:
+            kw["target_weight"] = float(target_weight)                # supervise toward the labels
+        red = umap.UMAP(**kw)
+        e = red.fit_transform(pts, y=y) if y is not None else red.fit_transform(pts)
+    elif method == "lda":                                  # supervised LINEAR: max between-class / within-class separation
+        from sklearn.decomposition import PCA
+        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+        from sklearn.pipeline import make_pipeline
+        if y is None:
+            raise ValueError("lda requires y (it is supervised)")
+        ncls = len(np.unique(y))
+        ncomp = min(n_components, max(1, ncls - 1))        # LDA yields at most n_classes-1 discriminant axes
+        npc = min(50, pts.shape[1], max(2, pts.shape[0] - 1))
+        steps = ([PCA(n_components=npc, random_state=seed)] if pts.shape[1] > npc else []) + \
+                [LinearDiscriminantAnalysis(n_components=ncomp)]   # PCA pre-projection stabilizes LDA in high-D
+        red = make_pipeline(*steps)
+        e = red.fit_transform(pts, y)
+        if ncomp < n_components:                           # e.g. a 3-class factor -> 2 LDA dims; pad for a 3D plot
+            e = np.hstack([e, np.zeros((e.shape[0], n_components - ncomp), dtype=e.dtype)])
+        return (e, red) if return_reducer else e
+    elif method == "tsne":
         from sklearn.decomposition import PCA
         from sklearn.manifold import TSNE
-        x = PCA(n_components=min(50, pts.shape[1]), random_state=seed).fit_transform(pts) if pts.shape[1] > 50 else pts
-        return TSNE(n_components=n_components, random_state=seed, init="pca", perplexity=30).fit_transform(x)
-    raise ValueError(f"unknown reducer {method!r}")
+        npc = min(50, pts.shape[1], pts.shape[0])          # PCA can't take more components than samples OR features
+        x = PCA(n_components=npc, random_state=seed).fit_transform(pts) if pts.shape[1] > 50 else pts
+        perp = min(30, max(5, (pts.shape[0] - 1) // 3))   # perplexity must stay below the sample count
+        red = TSNE(n_components=n_components, random_state=seed, init="pca", perplexity=perp); e = red.fit_transform(x)
+    else:
+        raise ValueError(f"unknown reducer {method!r}")
+    return (e, red) if return_reducer else e
 
 
 def pad_lims(e, frac=0.05):
