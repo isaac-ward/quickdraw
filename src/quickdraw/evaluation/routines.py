@@ -562,8 +562,8 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     import pickle
     pdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret", "projections")
     os.makedirs(pdir, exist_ok=True)
-    # always drop a guide next to the plots so whoever gets the data knows what each projection is + how to read it
-    open(os.path.join(os.path.dirname(pdir), "PROJECTIONS_GUIDE.md"), "w").write(_PROJECTIONS_GUIDE)
+    # always drop a README next to the plots so whoever gets the data knows what each projection is + how to read it
+    open(os.path.join(os.path.dirname(pdir), "README.md"), "w").write(_PROJECTIONS_GUIDE)
     _np.save(os.path.join(pdir, "latents.npy"), pts)                          # (N,D) points that were projected
     _np.save(os.path.join(pdir, "clip_index.npy"), clip_pos)                  # each point -> its clip's index within `ok`
     transform_ok = {}

@@ -995,7 +995,7 @@ def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="pl
     hull: points whose convex hull outlines the request region (latent-animation extras)."""
     from matplotlib.ticker import MaxNLocator
     pts = np.asarray(pts)
-    fig = plt.figure(figsize=(10, 9))
+    fig = plt.figure(figsize=(11.5, 9))                            # extra width so the right-side legend isn't clipped
     ax = fig.add_subplot(1, 1, 1)
     _cmap = None if (isinstance(color, np.ndarray) and color.ndim == 2) else cmap   # RGB array -> no colormap
     sc = ax.scatter(pts[:, 0], pts[:, 1], s=point_size,
@@ -1007,13 +1007,13 @@ def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="pl
     ax.set_aspect("equal", adjustable="box")                       # equal aspect -> true shape (thin looks thin)
     ax.xaxis.set_major_locator(MaxNLocator(5)); ax.yaxis.set_major_locator(MaxNLocator(5))
     ax.set_xticklabels([]); ax.set_yticklabels([])
-    fig.subplots_adjust(left=0.03, right=0.88, top=0.93, bottom=0.03)  # axes fills the region (no letterbox)
+    fig.subplots_adjust(left=0.03, right=0.80, top=0.93, bottom=0.03)  # leave the right ~20% for the legend/colorbar
     if legend is not None:
         from matplotlib.patches import Patch
         fig.legend(handles=[Patch(facecolor=c, edgecolor="black", linewidth=0.5, label=str(l)) for l, c in legend],
-                   loc="center left", bbox_to_anchor=(0.905, 0.5), frameon=False, fontsize=11)  # pad from the 0.88 axes edge
+                   loc="center left", bbox_to_anchor=(0.815, 0.5), frameon=False, fontsize=11)
     elif isinstance(color, np.ndarray) and color.ndim == 1:          # colorbar only for a scalar field
-        cax = fig.add_axes([0.905, 0.30, 0.015, 0.40])               # dedicated right-side colorbar
+        cax = fig.add_axes([0.82, 0.30, 0.013, 0.40])                # dedicated right-side colorbar
         fig.colorbar(sc, cax=cax, label=cbar_label)
     fig.suptitle(title, fontsize=11, y=0.98)
     return fig
