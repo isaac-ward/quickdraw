@@ -770,18 +770,10 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
 _POINT_PURPLE = "#8E44AD"   # flat fill when no scalar `color` is given (color everything purple)
 
 
-def _hull_trim(p, frac=0.9):
-    """Drop the farthest (1-frac) of points from their centroid before hulling, so a few stray members of the
-    cluster don't balloon the boundary (the hull is otherwise the SMALLEST convex shape enclosing ALL points)."""
-    c = p.mean(0)
-    d = np.linalg.norm(p - c, axis=1)
-    return p[d <= np.quantile(d, frac)]
-
-
-def _draw_hull_2d(ax, hull_pts, frac=0.9):
-    """Black convex-hull outline of the request cluster (trimmed to the inner `frac`)."""
+def _draw_hull_2d(ax, hull_pts):
+    """Black convex-hull outline of the request cluster (the caller pre-trims which points count)."""
     from scipy.spatial import ConvexHull
-    p = _hull_trim(np.asarray(hull_pts)[:, :2], frac)
+    p = np.asarray(hull_pts)[:, :2]
     if len(p) < 3:
         return
     v = p[ConvexHull(p).vertices]
@@ -790,11 +782,11 @@ def _draw_hull_2d(ax, hull_pts, frac=0.9):
     ax.plot(v[:, 0], v[:, 1], color="black", lw=1.8, zorder=5)
 
 
-def _draw_hull_3d(ax, hull_pts, frac=0.9):
-    """Black translucent convex-hull surface of the request cluster (trimmed to the inner `frac`)."""
+def _draw_hull_3d(ax, hull_pts):
+    """Black translucent convex-hull surface of the request cluster (the caller pre-trims which points count)."""
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     from scipy.spatial import ConvexHull
-    p = _hull_trim(np.asarray(hull_pts)[:, :3], frac)
+    p = np.asarray(hull_pts)[:, :3]
     if len(p) < 4:
         return
     tris = [p[s] for s in ConvexHull(p).simplices]
@@ -814,18 +806,33 @@ def _draw_agent_2d(ax, trail, pos):
 
 
 def _draw_agent_3d(ax, trail, pos):
-    """3D analogue of _draw_agent_2d -> the created artists."""
+    """3D analogue of _draw_agent_2d -> the created artists (bigger sphere; 3d foreshortens)."""
     arts = []
     tr = np.asarray(trail)
     if len(tr) > 1:
-        arts += ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color="black", lw=1.4, alpha=0.9)
-    arts.append(ax.scatter([pos[0]], [pos[1]], [pos[2]], s=90, c="black", marker="o", depthshade=False))
+        arts += ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color="black", lw=1.6, alpha=0.9)
+    arts.append(ax.scatter([pos[0]], [pos[1]], [pos[2]], s=170, c="black", marker="o", depthshade=False))
     return arts
 
 
+def _marks_on_top_3d(ax, marks):
+    """Draw C/M as 2D overlays projected onto the CURRENT (fixed) view so they always sit ON TOP of the 3d
+    cloud — 3d has no true zorder (it depth-sorts), so an in-cloud marker is otherwise occluded. Each is a
+    black circle (a circular text bbox) with a white letter, matching the agent sphere. MUST be called AFTER
+    view_init + lims are set (so ax.get_proj() is final); it reads back like the static PNG otherwise."""
+    from mpl_toolkits.mplot3d import proj3d
+    for mk in (marks or []):
+        mp = np.asarray(mk["pos"])
+        xp, yp, _ = proj3d.proj_transform(mp[0], mp[1], mp[2], ax.get_proj())     # data -> 2D projected
+        fx, fy = ax.transAxes.inverted().transform(ax.transData.transform((xp, yp)))   # -> axes fraction (bbox-invariant)
+        ax.text2D(fx, fy, mk["text"], transform=ax.transAxes, ha="center", va="center",
+                  fontsize=8, fontweight="bold", color="white", zorder=1e6,
+                  bbox=dict(boxstyle="circle,pad=0.35", facecolor="black", edgecolor="white", linewidth=1.0))
+
+
 def _overlay_2d(ax, marks, agent, hull=None):
-    """Static latent-plot overlays on a 2D axis: request-region hull + C/M lettered circles (+ agent if given
-    one-shot, e.g. a static PNG). For animations the agent is drawn per-frame via _draw_agent_2d instead."""
+    """Static latent-plot overlays on a 2D axis: request-region hull + C/M lettered black circles (+ agent if
+    given one-shot, e.g. a static PNG). For animations the agent is drawn per-frame via _draw_agent_2d instead."""
     if hull is not None:
         _draw_hull_2d(ax, hull)
     for mk in (marks or []):                                       # black sphere (like the agent) + white C/M letter
@@ -837,27 +844,23 @@ def _overlay_2d(ax, marks, agent, hull=None):
         _draw_agent_2d(ax, agent["trail"], agent["pos"])
 
 
-def _overlay_3d(ax, marks, agent, hull=None):
-    """3D analogue of _overlay_2d."""
+def _overlay_3d(ax, agent, hull=None):
+    """3D backdrop overlays: request-region hull + agent (if given, one-shot). C/M are drawn separately via
+    _marks_on_top_3d AFTER the view is set, so they always sit on top of the cloud."""
     if hull is not None:
         _draw_hull_3d(ax, hull)
-    for mk in (marks or []):                                       # black sphere (like the agent) + white C/M letter
-        mp = np.asarray(mk["pos"])
-        ax.scatter([mp[0]], [mp[1]], [mp[2]], s=90, c="black", marker="o", edgecolors="white",
-                   linewidths=1.0, depthshade=False)
-        ax.text(mp[0], mp[1], mp[2], mk["text"], ha="center", va="center", fontsize=7, fontweight="bold",
-                color="white")
     if agent is not None:
         _draw_agent_3d(ax, agent["trail"], agent["pos"])
 
 
-def animate_latent(fig, traj, is3d, idx, log=None):
+def animate_latent(fig, traj, is3d, idx, log=None, tail=60):
     """Efficient agent-overlay animation over a STATIC latent-plot backdrop `fig` (built once by
     fig_points_2d/fig_points_9view with the cloud + C/M marks + hull). Mirrors the persistent-renderer pattern
     of the torus videos: the expensive backdrop (10k+ points x up-to-9 views) is rasterized ONCE, then each
     frame only BLITS the agent (trail + sphere) on top — so a full-length 9-view clip costs ~one backdrop
     raster, not one per frame. traj: (T, dim) agent path in the embedding; idx: 1-based step indices to render.
-    Returns (len(idx), H, W, 3) uint8."""
+    `tail`: only the last `tail` steps of trail are drawn, so it fades out BEHIND the agent (like the control
+    videos). Returns (len(idx), H, W, 3) uint8."""
     fig.canvas.draw()
     bg = fig.canvas.copy_from_bbox(fig.bbox)                          # cache the rendered backdrop
     axes = list(fig.axes)
@@ -871,7 +874,7 @@ def animate_latent(fig, traj, is3d, idx, log=None):
         fig.canvas.restore_region(bg)
         arts = []
         for ax in axes:
-            for a in draw_agent(ax, traj[:k], traj[k - 1]):
+            for a in draw_agent(ax, traj[max(0, k - tail):k], traj[k - 1]):   # only the last `tail` steps of trail
                 ax.draw_artist(a)
                 arts.append(a)
         fig.canvas.blit(fig.bbox)
@@ -952,12 +955,13 @@ def fig_points_9view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
         sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size,
                         c=(color if color is not None else _POINT_PURPLE), cmap=_cmap,
                         depthshade=depthshade, linewidths=0, alpha=alpha)
-        _overlay_3d(ax, marks, agent, hull=hull)
+        _overlay_3d(ax, agent, hull=hull)                          # hull + (one-shot) agent
         ax.view_init(elev=elev, azim=azim)
         if lims is not None:
             (xl, yl, zl) = lims
             ax.set_xlim(xl); ax.set_ylim(yl); ax.set_zlim(zl)
         ax.set_box_aspect((1, 1, 1))                               # equal aspect always (lims are already a cube)
+        _marks_on_top_3d(ax, marks)                                # C/M projected onto this view -> always on top
         for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
             axis.set_major_locator(MaxNLocator(5))
         ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])

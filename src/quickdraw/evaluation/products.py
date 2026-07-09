@@ -115,7 +115,7 @@ def log_torus_paths(writer, routine, i, *, R, r, coloring, ctx_xyz, true_xyz, pr
                              action_arrow_per_step={"origins_xyz": true_full[:len(avec)], "vectors_xyz": avec}), step)
 
 
-def load_latent_projection(interpret_run, method, factor, dim, *, fc, reward, request):
+def load_latent_projection(interpret_run, method, factor, dim, *, fc, reward, request, hull_frac=0.8):
     """Prepare a latent-space-animation backdrop from an eval_interpret run's saved projection for
     (method, factor, dim): the point cloud + per-point colors/legend/lims (colored by `factor`), plus the two
     target crosses X_c (centroid of the request-labeled points) and X_r (the highest-reward point). Returns
@@ -149,7 +149,10 @@ def load_latent_projection(interpret_run, method, factor, dim, *, fc, reward, re
     with torch.no_grad():
         R = reward.score(torch.from_numpy(latents.astype(np.float32)), t_e).cpu().numpy()   # (N,)
     xr = emb[int(R.argmax())]                                          # highest-reward point
-    red = emb[labels == request]                                       # the request cluster -> convex-hull region
+    red = emb[labels == request]                                       # the request cluster (semantic label == request)
+    if len(red):                                                       # trim to the inner hull_frac by distance from
+        d = np.linalg.norm(red - red.mean(0), axis=1)                  # the centroid, so stray members don't balloon it
+        red = red[d <= np.quantile(d, hull_frac)]
     return {"emb": emb, "reducer": reducer, "rgb": rgb, "legend": legend, "lims": pad_lims(emb), "dim": dim,
             "marks": [{"pos": xc, "text": "C"}, {"pos": xr, "text": "M"}],   # C=centroid, M=max-reward
             "hull": red if len(red) >= (4 if dim == 3 else 3) else None}

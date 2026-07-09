@@ -162,7 +162,8 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
             method, factor = str(spec["method"]), str(spec["factor"])
             fc = OmegaConf.to_container(cfg.interpret.factors[factor], resolve=True)
             for dim in [int(d) for d in spec.get("dims", [2, 3])]:
-                proj = load_latent_projection(lrun, method, factor, dim, fc=fc, reward=reward, request=request)
+                proj = load_latent_projection(lrun, method, factor, dim, fc=fc, reward=reward, request=request,
+                                               hull_frac=float(lang.get("hull_frac", 0.8)))
                 if proj is None:
                     _plog(writer, f"[eval_control @ep{step}] latent anim: {method} {dim}d has no out-of-sample map (skip)")
                     continue
