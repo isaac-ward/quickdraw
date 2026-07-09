@@ -24,8 +24,8 @@ language:
   interpret_plots:      # which projections to animate (method needs an out-of-sample map: pca/lda/umap/umap-sup-*; NOT tsne)
     - {method: lda, factor: color, dims: [2, 3]}   # default: 2 animations/episode (color LDA, 2d + 3d)
   overrides:
-    n_episodes: 4     # parallel MPPI episodes from different inits (all steered to the request); ALL rendered
-    n_plot: 4         # how many episodes to render products for (control_video_i / rollout_i / distance_i)
+    n_episodes: 1     # a single steered episode (raise n_episodes + n_plot together to render several)
+    n_plot: 1         # how many episodes to render products for (control_video_i / rollout_i / distance_i / interpret)
     max_steps: 500    # give the reward-max controller room to migrate across the torus
     # (settling relies on the long horizon, like goal mode — beta_vel=0 by default, so r_settle is a no-op here)
 

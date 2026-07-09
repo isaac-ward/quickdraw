@@ -770,28 +770,36 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
 _POINT_PURPLE = "#8E44AD"   # flat fill when no scalar `color` is given (color everything purple)
 
 
-def _draw_hull_2d(ax, hull_pts):
-    """Filled convex-hull outline of a subset of points (e.g. the 'red' cluster) — the request's region."""
+def _hull_trim(p, frac=0.9):
+    """Drop the farthest (1-frac) of points from their centroid before hulling, so a few stray members of the
+    cluster don't balloon the boundary (the hull is otherwise the SMALLEST convex shape enclosing ALL points)."""
+    c = p.mean(0)
+    d = np.linalg.norm(p - c, axis=1)
+    return p[d <= np.quantile(d, frac)]
+
+
+def _draw_hull_2d(ax, hull_pts, frac=0.9):
+    """Black convex-hull outline of the request cluster (trimmed to the inner `frac`)."""
     from scipy.spatial import ConvexHull
-    p = np.asarray(hull_pts)
+    p = _hull_trim(np.asarray(hull_pts)[:, :2], frac)
     if len(p) < 3:
         return
-    v = p[ConvexHull(p[:, :2]).vertices][:, :2]
+    v = p[ConvexHull(p).vertices]
     v = np.vstack([v, v[:1]])
-    ax.fill(v[:, 0], v[:, 1], facecolor="black", alpha=0.06, zorder=1)
-    ax.plot(v[:, 0], v[:, 1], color="black", lw=1.6, alpha=0.6, zorder=5)
+    ax.fill(v[:, 0], v[:, 1], facecolor="black", alpha=0.05, zorder=1)
+    ax.plot(v[:, 0], v[:, 1], color="black", lw=1.8, zorder=5)
 
 
-def _draw_hull_3d(ax, hull_pts):
-    """Translucent convex-hull surface of a subset of points (the request's region) in a 3D view."""
+def _draw_hull_3d(ax, hull_pts, frac=0.9):
+    """Black translucent convex-hull surface of the request cluster (trimmed to the inner `frac`)."""
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     from scipy.spatial import ConvexHull
-    p = np.asarray(hull_pts)[:, :3]
+    p = _hull_trim(np.asarray(hull_pts)[:, :3], frac)
     if len(p) < 4:
         return
     tris = [p[s] for s in ConvexHull(p).simplices]
     ax.add_collection3d(Poly3DCollection(tris, facecolor="black", edgecolor="black",
-                                         alpha=0.05, linewidths=0.2))
+                                         alpha=0.06, linewidths=0.4))
 
 
 def _draw_agent_2d(ax, trail, pos):
@@ -820,11 +828,11 @@ def _overlay_2d(ax, marks, agent, hull=None):
     one-shot, e.g. a static PNG). For animations the agent is drawn per-frame via _draw_agent_2d instead."""
     if hull is not None:
         _draw_hull_2d(ax, hull)
-    for mk in (marks or []):
+    for mk in (marks or []):                                       # black sphere (like the agent) + white C/M letter
         mp = np.asarray(mk["pos"])
-        ax.scatter([mp[0]], [mp[1]], s=mk.get("size", 430), facecolors="white", edgecolors="black",
-                   linewidths=2.5, marker="o", zorder=7)
-        ax.text(mp[0], mp[1], mk["text"], ha="center", va="center", fontsize=13, fontweight="bold", zorder=9)
+        ax.scatter([mp[0]], [mp[1]], s=140, c="black", marker="o", edgecolors="white", linewidths=1.0, zorder=7)
+        ax.text(mp[0], mp[1], mk["text"], ha="center", va="center", fontsize=8, fontweight="bold",
+                color="white", zorder=9)
     if agent is not None:
         _draw_agent_2d(ax, agent["trail"], agent["pos"])
 
@@ -833,11 +841,12 @@ def _overlay_3d(ax, marks, agent, hull=None):
     """3D analogue of _overlay_2d."""
     if hull is not None:
         _draw_hull_3d(ax, hull)
-    for mk in (marks or []):
+    for mk in (marks or []):                                       # black sphere (like the agent) + white C/M letter
         mp = np.asarray(mk["pos"])
-        ax.scatter([mp[0]], [mp[1]], [mp[2]], s=mk.get("size", 240), facecolors="white", edgecolors="black",
-                   linewidths=2.2, marker="o", depthshade=False)
-        ax.text(mp[0], mp[1], mp[2], mk["text"], ha="center", va="center", fontsize=11, fontweight="bold")
+        ax.scatter([mp[0]], [mp[1]], [mp[2]], s=90, c="black", marker="o", edgecolors="white",
+                   linewidths=1.0, depthshade=False)
+        ax.text(mp[0], mp[1], mp[2], mk["text"], ha="center", va="center", fontsize=7, fontweight="bold",
+                color="white")
     if agent is not None:
         _draw_agent_3d(ax, agent["trail"], agent["pos"])
 
