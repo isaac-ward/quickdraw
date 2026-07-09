@@ -9,7 +9,7 @@ batch: 32             # clips imagined per forward pass (image-decode memory)
 vlm_frames: 6         # frames subsampled from each clip fed to the VLM
 seed: 0
 imaginations: true    # dump per-clip imaginations (one dir per clip, one file per trunk + manifest.json) for a web explorer
-umap_sup_weights: [0.25, 0.5, 1.0]   # supervised-UMAP target weights -> extra umap-sup-<w>/ dirs, each factor supervised by its own labels (forces separation; presentation, not evidence)
+umap_sup_weights: [0.1, 0.3, 0.9]    # supervised-UMAP target weights -> extra umap-sup-<w>/ dirs, each supervised by its own labels (forces separation; presentation, not evidence). Plain unsupervised umap is always produced too. NOTE >=~0.99 is degenerate (fully-supervised graph disconnects -> NaN layout); 0.9 is the practical "maximally forced".
 
 vlm:
   model: gpt-4o-mini

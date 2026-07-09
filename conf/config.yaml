@@ -13,9 +13,21 @@ defaults:
 
 # language-steered control: set head (+ request) to make `eval_control` steer MPPI toward the request instead
 # of the goal race. head=null (default) -> normal goal-based control (so in-training eval_control is unaffected).
+# When head is set, `overrides` below are applied on top of `control:` (mppi) so language mode gets its own
+# knobs without touching the goal-race defaults — only episode 0 is ever rendered, so running >1 episode (and
+# the goal-race step budget) is wasted here. Add any other control key to override just for language mode.
 language:
   request: red
   head: null   # path to a train_reward run's reward_head.pt (only then does eval_control do language steering)
+  interpret_run: null   # eval_interpret run dir; when set (reward mode), animate the agent moving through its
+                        # saved latent projections (backdrop cloud + X_c/X_r target crosses + agent sphere & tail)
+  interpret_plots:      # which projections to animate (method needs an out-of-sample map: pca/lda/umap/umap-sup-*; NOT tsne)
+    - {method: lda, factor: color, dims: [2, 3]}   # default: 2 animations/episode (color LDA, 2d + 3d)
+  overrides:
+    n_episodes: 4     # parallel MPPI episodes from different inits (all steered to the request); ALL rendered
+    n_plot: 4         # how many episodes to render products for (control_video_i / rollout_i / distance_i)
+    max_steps: 500    # give the reward-max controller room to migrate across the torus
+    # (settling relies on the long horizon, like goal mode — beta_vel=0 by default, so r_settle is a no-op here)
 
 # short experiment summary -> run dir is logs/<timestamp>_<experiment> (override on CLI)
 experiment: base

@@ -6,6 +6,7 @@ factor: color            # which factor to align to (must be a source: vlm/analy
 embed_dim: 128           # shared f_z/f_t projection dim
 hidden: 256              # MLP hidden width
 epochs: 300
+report_every: 10         # log train/val metrics (+ progress.log line) every N epochs
 lr: 1.0e-3
 batch: 512
 temperature: 0.07        # cosine-logit temperature for the cross-entropy

@@ -32,51 +32,15 @@ def _plog(writer, msg: str):
         pass
 
 
-def _agent(res, color, R, r):
-    """Build a control_compare_frames agent dict (pads actions to the path length for the arrow)."""
-    path, act = res["path"], res["actions"]               # (T,3), (T-1,2)
+def _agent(res, i, color, R, r):
+    """Build a control_compare_frames agent dict for episode i (pads actions to the path length for the arrow)."""
+    path, act = res["paths"][i], res["actions"][i]        # (T,3), (T-1,2)
     act = np.concatenate([act, act[-1:]], axis=0) if len(act) else np.zeros((len(path), 2))
-    return {"path": path, "goal_seq": res["goal_seq"], "color": color,
+    return {"path": path, "goal_seq": res["goal_seqs"][i], "color": color,
             "avec": viz.action_ambient(path, act, R, r)}  # ambient applied action (T,3)
 
 
-def _run_language(cfg, model, normalizer, ecfg, writer, device, step, mppi, fpv) -> dict:
-    """Language-steered variant of eval_control: MPPI maximizes R(latent, request) (no goal race).
-    Logs the pred-vs-actual FPV video, realized-reward curve, and ep0 path under eval_control/language/."""
-    from ..language.reward import LanguageReward
-    from .language_control import run_language_control
-    request = str(cfg.language.request)
-    reward = LanguageReward(cfg.language.head, device=device)
-    assert request in reward.buckets, f"request {request!r} not in reward vocab {reward.buckets}"
-    _plog(writer, f"[eval_control @ep{step}] LANGUAGE steering -> '{request}' ({os.path.basename(cfg.language.head)})")
-    res = run_language_control(model, normalizer, ecfg, reward, request, mppi, device=device, fpv=fpv,
-                               log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"))
-    fps, rc = round(1.0 / ecfg.dt), res["reward_curve"]
-    if "fpv_video" in res:
-        pv, av = res["fpv_video"]["pred"], res["fpv_video"]["actual"]
-        stacked = (np.concatenate([np.clip(pv, 0, 1), np.clip(av, 0, 1)], axis=1) * 255).astype(np.uint8)
-        writer.video(f"eval_control/language/{request}/fpv_pred_top_actual_bottom", stacked, fps, step)
-    f = plt.figure(figsize=(9, 4)); ax = f.add_subplot(111); ax.plot(rc); ax.grid(alpha=0.3)
-    ax.set_xlabel("control step"); ax.set_ylabel(f"R(state, '{request}')")
-    ax.set_title(f"language steering: realized reward for '{request}' over the run (ep0)")
-    writer.figure(f"eval_control/language/{request}/reward_curve", f, step); plt.close(f)
-    fp = viz.fig_torus_atlas(ecfg.R, ecfg.r, coloring="hsv", torus_opacity=viz.TORUS_OPACITY,
-                             title=f"language steering '{request}' — ep0 path",
-                             trajs=[{"xyz": res["path"], "color": "black", "start_sphere": True,
-                                     "end_sphere": True, "start_scale": 0.5}])
-    writer.figure(f"eval_control/language/{request}/path", fp, step); plt.close(fp)
-    summary = {f"language/{request}/reward_start": float(rc[0]), f"language/{request}/reward_end": float(rc[-1]),
-               f"language/{request}/reward_delta": float(rc[-1] - rc[0]), "n_steps": res["n_steps"]}
-    writer.scalars({f"eval_control/{k}": v for k, v in summary.items()}, step)
-    _plog(writer, f"[eval_control @ep{step}] language '{request}' reward {rc[0]:+.3f} -> {rc[-1]:+.3f} "
-                  f"(delta {rc[-1] - rc[0]:+.3f})")
-    return summary
-
-
 def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) -> dict:
-    _plog(writer, f"[eval_control @ep{step}] start: MPPI {cfg.control.n_episodes} eps x 2 controllers, "
-                  f"{cfg.control.num_samples} samples, H={cfg.control.horizon}, max_steps={cfg.control.max_steps}")
-    t = time.perf_counter()
     # reuse_render is a RENDER knob living in the control config; strip it before building MPPIConfig
     # (which has no such field) so MPPIConfig(**...) doesn't choke on the extra key.
     mppi_kwargs = {k: v for k, v in cfg.control.items() if k != "reuse_render"}
@@ -92,88 +56,149 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         fpv = {"coloring": coloring, "fov": float(cfg.data.fpv_fov), "size": int(img_size)}
         _plog(writer, f"[eval_control @ep{step}] multimodal: FPV render in the MPPI loop (coloring={coloring}, size={img_size})")
 
-    # language steering: a request + reward head -> steer MPPI toward it instead of the goal race (same eval_control)
+    # language steering: request + reward head -> the LEARNED controller maximizes R(latent, request) with the
+    # oracle OFF (a single controller, same code spine). Otherwise the default dual goal race (oracle vs learned).
     lang = cfg.get("language")
+    reward, request = None, None
     if lang is not None and lang.get("request") and lang.get("head"):
-        return _run_language(cfg, model, normalizer, ecfg, writer, device, step, MPPIConfig(**mppi_kwargs), fpv)
-
+        from ..language.reward import LanguageReward
+        request = str(lang.request)
+        reward = LanguageReward(lang.head, device=device)
+        assert request in reward.buckets, f"request {request!r} not in reward vocab {reward.buckets}"
+        ov = dict(lang.get("overrides") or {})   # language-mode control knobs (n_episodes/max_steps/...) over `control:`
+        mppi_kwargs.update(ov)
+        _plog(writer, f"[eval_control @ep{step}] LANGUAGE steering -> '{request}' "
+                      f"({os.path.basename(lang.head)}); oracle OFF, single learned controller"
+                      + (f"; overrides {ov}" if ov else ""))
+    n_ctrl = 1 if reward is not None else 2
+    n_plot = int(mppi_kwargs.pop("n_plot", 1))    # NOT an MPPIConfig field: how many episodes to render products for
+    _plog(writer, f"[eval_control @ep{step}] start: MPPI {mppi_kwargs['n_episodes']} eps x {n_ctrl} controller(s), "
+                  f"{mppi_kwargs['num_samples']} samples, H={mppi_kwargs['horizon']}, max_steps={mppi_kwargs['max_steps']}, "
+                  f"render {n_plot} episode(s)")
+    t = time.perf_counter()
     res, _ = run_control(model, normalizer, ecfg, MPPIConfig(**mppi_kwargs), device=device,
-                         log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv)
+                         log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv,
+                         reward=reward, request=request, oracle=(reward is None), n_plot=n_plot)
     t_ctrl = time.perf_counter() - t
-    # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers both controllers + chunk
+    # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers the controller(s) + chunk
     # execution over n_chunks replans, so per-chunk wall time = t_ctrl / n_chunks.
     mppi_chunk_s = t_ctrl / max(1, res["n_chunks"])
     mppi_chunk_hz = 1.0 / mppi_chunk_s if mppi_chunk_s > 0 else 0.0
     _plog(writer, f"[eval_control @ep{step}] MPPI done: {res['n_chunks']} replans over {res['n_steps']} steps "
                   f"-> {mppi_chunk_s * 1000:.0f} ms/chunk ({mppi_chunk_hz:.1f} hz)")
     R, r, fps = ecfg.R, ecfg.r, round(1.0 / ecfg.dt)
+    from ..evaluation.products import log_image_head, product_tag
 
-    # one race video: true-dynamics oracle (black) vs learned controller (grey), each with its action
-    # arrow and a small current-goal marker in its own colour
-    t = time.perf_counter()
-    nf = len(res["true"]["path"])
-    _plog(writer, f"[eval_control @ep{step}] rendering control video ({nf} frames, GPU/EGL)...")
-    agents = [_agent(res["true"], "black", R, r), _agent(res["pred"], "dimgray", R, r)]
-    frames = viz.control_compare_frames(R, r, "hsv", agents,
-                                        n_frames=nf, title="control: true vs pred",
-                                        fan_seq=res["fan_seq"],  # pred's MPPI candidate fan, colored by cost
-                                        reuse=bool(cfg.control.get("reuse_render", False)),
-                                        log=lambda m: _plog(writer, f"[eval_control @ep{step}]   video {m}"))
-    writer.video("eval_control/control_video_0", frames, fps, step)  # _0: we show episode 0 only
-    writer.scene("eval_control/control_video_0", {  # 3D geometry for Blender (plain-language keys)
-        "description": "Dual MPPI control on the torus: a BLACK oracle agent (true dynamics) and a GREY "
-                       "learned-model agent, each navigating to a sequence of goals. Each goal is a RING zone "
-                       "on the surface; the action arrow per step is the applied control.",
-        "coordinate_system": "world xyz, same space as the torus",
-        "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
-        "goal_zone_ring_radius": float(0.0675 * (R + r)),
-        "agents": [{"name": nm, "color": a["color"], "path_xyz": a["path"], "goal_per_step_xyz": a["goal_seq"],
-                    "action_arrow_per_step": {"origins_xyz": a["path"], "vectors_xyz": a["avec"]}}
-                   for a, nm in zip(agents, ("oracle", "learned"))],
-    }, step)
-    t_video = time.perf_counter() - t
-    _plog(writer, f"[eval_control @ep{step}] video rendered in {t_video:.1f}s")
+    # controllers present: 'pred' (learned) always; 'true' (oracle) only in the goal race (oracle on).
+    kinds = [k for k in ("true", "pred") if k in res]
+    colors = {"true": "black", "pred": "dimgray"}
+    labels = {"true": "oracle", "pred": "learned"}
+    NP = res["n_plot"]
 
-    # (MM) predictor-in-the-loop video: over the WHOLE control run (ep0), the model's imagined FPV for the
-    # SELECTED plan (top) vs the actual FPV (bottom). Shows whether MPPI planned against reality or a fantasy.
-    if res.get("pred_fpv_video") is not None:
-        pv = res["pred_fpv_video"]
-        pvid = viz.image_rollout_video(pv["actual"], pv["pred"], context_len=0)   # context_len=0 -> top=pred, bottom=actual
-        writer.video(f"eval_control/{img_head}/prediction_video", pvid, fps, step)   # <head> organization (like eval_ood_horizon)
-        _plog(writer, f"[eval_control @ep{step}] {img_head}/prediction_video: {len(pv['pred'])} steps (pred top / actual bottom)")
-
-    # realized cost over time: episode-0 distance to the current goal per control step
-    # colours match the race video: oracle = black, learned = dimgray. Dotted verticals mark the steps
-    # where episode-0's goal advances (explains the sharp jumps: distance re-targets to the next goal).
-    def _goal_changes(goal_seq):
+    def _goal_changes(goal_seq):   # steps where the episode's goal marker jumps (explain the distance sawtooth)
         g = np.asarray(goal_seq)
         return (np.where(np.any(g[1:] != g[:-1], axis=-1))[0] + 1).tolist()
-    k_true, k_pred = "true (oracle): dist to current goal", "pred (learned): dist to current goal"
-    curve = viz.fig_error_vs_step({k_true: res["true"]["dist_curve"], k_pred: res["pred"]["dist_curve"]},
-                                  colors={k_true: "black", k_pred: "dimgray"},
-                                  vlines={"black": _goal_changes(res["true"]["goal_seq"]),
-                                          "dimgray": _goal_changes(res["pred"]["goal_seq"])},
-                                  yscale="linear")  # distance to goal is bounded -> linear reads better
-    writer.figure("eval_control/distance_to_goal_0", curve, step)  # _0: episode 0 only
-    plt.close(curve)
 
-    # only the MPPI-step timing matters (render times intentionally not logged); + n_steps for context.
+    # per-episode products (parallel episodes from different inits): control_video_i (+scene), <head>/rollout_i
+    # (+filmstrip), and a distance curve_i. goal race: black oracle vs grey learned; language: single grey agent.
+    for i in range(NP):
+        ti = time.perf_counter()
+        agents = [_agent(res[k], i, colors[k], R, r) for k in kinds]
+        nf = len(agents[0]["path"])
+        _plog(writer, f"[eval_control @ep{step}] rendering control video #{i} ({nf} frames, GPU/EGL)...")
+        vtitle = (f"language steering: '{request}' #{i}" if reward is not None else f"control: true vs pred #{i}")
+        frames = viz.control_compare_frames(R, r, "hsv", agents, n_frames=nf, title=vtitle,
+                                            fan_seq=res["fan_seqs"][i],  # pred's MPPI candidate fan, colored by score
+                                            reuse=bool(cfg.control.get("reuse_render", False)),
+                                            show_goals=(reward is None),  # language mode has no target -> no goal ring
+                                            log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}"))
+        writer.video(product_tag("eval_control", "control_video", i=i), frames, fps, step)
+        scene_desc = (f"Language-steered MPPI on the torus (episode {i}): a single GREY learned-model agent "
+                      f"steering to maximize the language reward R(latent, '{request}'). The action arrow per step "
+                      f"is the applied control."
+                      if reward is not None else
+                      f"Dual MPPI control on the torus (episode {i}): a BLACK oracle agent (true dynamics) and a "
+                      f"GREY learned-model agent, each navigating to a sequence of goals. Each goal is a RING zone "
+                      f"on the surface; the action arrow per step is the applied control.")
+        writer.scene(product_tag("eval_control", "control_video", i=i), {
+            "description": scene_desc,
+            "coordinate_system": "world xyz, same space as the torus",
+            "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
+            "goal_zone_ring_radius": float(0.0675 * (R + r)),
+            "agents": [{"name": labels[k], "color": a["color"], "path_xyz": a["path"], "goal_per_step_xyz": a["goal_seq"],
+                        "action_arrow_per_step": {"origins_xyz": a["path"], "vectors_xyz": a["avec"]}}
+                       for k, a in zip(kinds, agents)],
+        }, step)
+
+        # (MM) predictor-in-the-loop video: the model's imagined FPV for the SELECTED plan vs the actual FPV.
+        if res.get("pred_fpv_videos") is not None:
+            pv = res["pred_fpv_videos"][i]   # context_len=0 -> top=pred, bottom=actual over the whole run
+            log_image_head(writer, "eval_control", img_head, i, pv["actual"], pv["pred"], step, fps,
+                           context_len=0, title=f"{img_head} #{i} pred(top)/actual(bottom)")
+
+        # per-episode realized-distance curve
+        if reward is not None:   # language: realized distance 1 - R(state, request) (lower = redder, 0 = on target)
+            rc = res["pred"]["dist_curves"][i]
+            klab = f"learned: distance to '{request}' (1 - R)"
+            curve = viz.fig_error_vs_step({klab: rc}, colors={klab: "dimgray"}, yscale="linear")
+            writer.figure(product_tag("eval_control", "distance_to_request", i=i), curve, step); plt.close(curve)
+        else:                    # goal race: distance to current goal, verticals at goal switches
+            k_true, k_pred = "true (oracle): dist to current goal", "pred (learned): dist to current goal"
+            curve = viz.fig_error_vs_step({k_true: res["true"]["dist_curves"][i], k_pred: res["pred"]["dist_curves"][i]},
+                                          colors={k_true: "black", k_pred: "dimgray"},
+                                          vlines={"black": _goal_changes(res["true"]["goal_seqs"][i]),
+                                                  "dimgray": _goal_changes(res["pred"]["goal_seqs"][i])},
+                                          yscale="linear")  # distance to goal is bounded -> linear reads better
+            writer.figure(product_tag("eval_control", "distance_to_goal", i=i), curve, step); plt.close(curve)
+        _plog(writer, f"[eval_control @ep{step}] episode #{i} rendered in {time.perf_counter() - ti:.1f}s")
+
+    # (language) latent-space animations: agent moving through the eval_interpret projections toward X_c/X_r.
+    if reward is not None and lang.get("interpret_run") and res.get("agent_latents") is not None:
+        from omegaconf import OmegaConf
+
+        from ..evaluation.products import load_latent_projection, render_latent_video
+        lrun = str(lang.interpret_run)
+        for spec in (lang.get("interpret_plots") or [{"method": "lda", "factor": "color", "dims": [2, 3]}]):
+            method, factor = str(spec["method"]), str(spec["factor"])
+            fc = OmegaConf.to_container(cfg.interpret.factors[factor], resolve=True)
+            for dim in [int(d) for d in spec.get("dims", [2, 3])]:
+                proj = load_latent_projection(lrun, method, factor, dim, fc=fc, reward=reward, request=request)
+                if proj is None:
+                    _plog(writer, f"[eval_control @ep{step}] latent anim: {method} {dim}d has no out-of-sample map (skip)")
+                    continue
+                for i in range(NP):
+                    ti = time.perf_counter()
+                    vid = render_latent_video(proj, res["agent_latents"][i],
+                                              title=f"{method} · {factor} {dim}d — '{request}' steering #{i}",
+                                              log=lambda m, i=i, method=method, dim=dim:
+                                                  _plog(writer, f"[eval_control @ep{step}]   anim {method}/{factor}_{dim}d #{i} {m}"))
+                    writer.video(product_tag("eval_control/interpret", f"{factor}_{dim}d", head=method, i=i), vid, fps, step)
+                    _plog(writer, f"[eval_control @ep{step}] interpret/{method}/{factor}_{dim}d_{i} "
+                                  f"({len(vid)} frames, {time.perf_counter() - ti:.0f}s)")
+
+    # aggregate scalars (over ALL episodes, once)
     summary = {"n_steps": res["n_steps"], "time/mppi_chunk_s": mppi_chunk_s, "time/mppi_chunk_hz": mppi_chunk_hz}
-    # {true,pred,diff}/{metric} (slash org; diff = true - pred). Only these — no underscore duplicates.
-    for m in ("success_rate", "mean_goals_reached", "mean_steps_to_complete", "mean_seconds_to_complete"):
-        summary[f"true/{m}"] = res["true"][m]
-        summary[f"pred/{m}"] = res["pred"][m]
-        summary[f"diff/{m}"] = res["true"][m] - res["pred"][m]
+    if reward is not None:   # representative (episode 0) realized-distance start/end/delta
+        rc = res["pred"]["dist_curves"][0]
+        summary |= {f"distance/{request}/start": float(rc[0]), f"distance/{request}/end": float(rc[-1]),
+                    f"distance/{request}/delta": float(rc[-1] - rc[0])}
+        _plog(writer, f"[eval_control @ep{step}] language '{request}' distance (ep0) "
+                      f"{rc[0]:.3f} -> {rc[-1]:.3f} (delta {rc[-1] - rc[0]:+.3f})")
+    else:
+        # {true,pred,diff}/{metric} (slash org; diff = true - pred). Only these — no underscore duplicates.
+        for m in ("success_rate", "mean_goals_reached", "mean_steps_to_complete", "mean_seconds_to_complete"):
+            summary[f"true/{m}"] = res["true"][m]
+            summary[f"pred/{m}"] = res["pred"][m]
+            summary[f"diff/{m}"] = res["true"][m] - res["pred"][m]
+        # goals-reached is meaningful even when seconds-to-complete is NaN (nothing settled all goals)
+        _plog(writer, f"[eval_control @ep{step}] goals reached / {res['n_goals']}: "
+                      f"oracle={res['true']['mean_goals_reached']:.2f} (success {res['true']['success_rate']:.2f}, "
+                      f"{res['true']['mean_seconds_to_complete']:.2f}s) "
+                      f"pred={res['pred']['mean_goals_reached']:.2f} (success {res['pred']['success_rate']:.2f})")
     writer.scalars({f"eval_control/{k}": v for k, v in summary.items()}, step)
-    # goals-reached is meaningful even when seconds-to-complete is NaN (nothing settled all goals)
-    g8 = res["n_goals"]
-    _plog(writer, f"[eval_control @ep{step}] goals reached / {g8}: "
-                  f"oracle={res['true']['mean_goals_reached']:.2f} (success {res['true']['success_rate']:.2f}, "
-                  f"{res['true']['mean_seconds_to_complete']:.2f}s) "
-                  f"pred={res['pred']['mean_goals_reached']:.2f} (success {res['pred']['success_rate']:.2f})")
     # write the raw summary next to THIS epoch's control media (logs/epoch_<i>/eval_control/), not the flat run
     # root — mirrors how writer.video/figure organize by epoch, so it's per-epoch (not clobbered each eval).
-    ep_dir = os.path.join(writer.dir, "logs", f"epoch_{step:04d}", "eval_control")
+    ep_dir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_control")   # writer.dir is already run_dir/logs
     os.makedirs(ep_dir, exist_ok=True)
     with open(os.path.join(ep_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)

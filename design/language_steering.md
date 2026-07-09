@@ -1,9 +1,10 @@
 # Language-steered MPPI via a learned reward `R(latent, text)` — build plan
 
-**Status: to build.** Steer the MPPI planner with a natural-language request ("red") by scoring candidate
+**Status: built.** Steer the MPPI planner with a natural-language request ("red") by scoring candidate
 rollouts **in latent space** with a learned reward `R(latent, text)`, **distilled** from `eval_interpret`'s
 `(latent, VLM-label)` pairs. Decode-free, real-time, multi-modal-native — chosen over the text→target
-variant because a learned reward needs no target points, no `k`, no centroids.
+variant because a learned reward needs no target points, no `k`, no centroids. It is **not** a separate eval:
+it is `eval_control` with the oracle turned off and a reward objective swapped in (see MPPI integration).
 
 Naming: the world-model trainer is `train_world.py` (was `train.py`); the reward trainer is `train_reward.py`
 (new), reusing `train_world.py`'s logging path (`make_writer` → local mirror + wandb, identical keys).
@@ -78,27 +79,44 @@ Needs a tiny text encoder — `sentence-transformers/paraphrase-MiniLM-L3-v2` (~
 
 ## MPPI integration (per step, decode-free)
 
-- Once per episode: `t_e = f_t(MiniLM(request))`.
-- Per candidate per step: `r = cos(f_z(z_t), t_e)`; `cost = −Σ_t r (+ λ·offmanifold)`.
-- Configurable:
+- Once per episode: `t_e = f_t(MiniLM(request))` (known-vocab requests reuse the precomputed prototype, so no
+  text encoder is needed at plan time; open-vocab would need live MiniLM — deferred).
+- Per candidate per step: `r = cos(f_z(z_t), t_e)`; the candidate's MPPI return is `Σ_t r` (higher = better,
+  softmax-weighted like the goal-distance return). No separate cost sign to manage — it slots straight into the
+  existing `_mppi_step` where a per-candidate return replaces the goal-distance `_score`.
+- Config is just the shared `language:` block in `conf/config.yaml` (no `reward:` cost block):
   ```yaml
-  reward:
-    embed_dim: 128
-    paraphrases: true
-    distance: cosine            # the head trains on cosine; kept for parity with the text→target variant
-    offmanifold_lambda: 0.0     # >0 turns on guardrail #2 in the cost
-    temperature: 1.0            # optional cosine sharpening
+  language:
+    request: red     # a bucket in the reward head's vocab
+    head: null       # path to a train_reward run's reward_head.pt; null -> normal goal-race eval_control
   ```
 
-## Blast radius / build order
+## Blast radius / build order — as shipped
 
-New: `train_reward.py` (trains `f_z/f_t`, saves the head + `f_t` precompute), `language/reward.py` (loads the
-head, resolves request→`t_e`, the cost fn). Modified, 3 surgical spots:
-1. `controller/mppi.py` — make the cost **pluggable** (`cost_fn`); today it's hardwired to −distance-to-goal.
-2. `imagine_shared` — expose the rolled **latent bag** to the scorer (today it only decodes proprio).
-3. `eval_control.py` — accept `language.request=...` and select the reward cost.
+The steering path **reuses `run_control`'s spine** via an `oracle` toggle rather than a parallel controller.
+New: `train_reward.py` (trains `f_z/f_t`, saves the head + `f_t` prototypes), `language/reward.py`
+(`LanguageReward`: loads the head, `request→t_e`, `score(latent, t_e)`). Modified, surgically:
+1. `controller/mppi.py` — `run_control(reward=None, request=None, oracle=True)`. `oracle=True` builds the
+   `true`+`pred` controllers (unchanged dual race); `oracle=False` builds only the learned `pred` controller.
+   The rollout functions return a third value `dist` — a per-step distance `(G,K,H)`, or `None` → use the
+   Euclidean goal distance. **Reward-as-distance:** in reward mode the learned rollout sets `dist = 1 - R(bag_t,
+   t_e)` and feeds it through the SAME `_score` as the goal controller, so `beta_vel`/`r_settle` (near-target
+   velocity braking) and `beta_ctrl` apply identically — the agent brakes as it nears the request instead of
+   orbiting it, and the "score" reads honestly as a distance (0 = perfectly on the request). Goal advancement /
+   settle / early-break are gated to goal mode. `reward=None, oracle=True` is byte-for-byte the old behavior.
+2. `imagine_shared(..., return_bag=True)` — exposes the rolled **latent bag** (`_bag`, `(B·K,H,n_state,d)`) so
+   the reward can score it; default `return_bag=False` decodes proprio only (unchanged).
+3. `controller/run.py` — one `run_and_log_control` handles both modes: it detects `cfg.language.{request,head}`,
+   applies `language.overrides` (n_episodes=1, max_steps=500) onto the control config, loads `LanguageReward`,
+   calls `run_control(oracle=False, reward=…)`, and logs the SAME products (`control_video_0` without goal rings,
+   `<head>/rollout_0` via the shared `products.log_image_head`) plus a `distance_to_request_0` curve (realized
+   `1 - R`) in place of `distance_to_goal_0`. (The earlier standalone `language_control.py` / `_run_language`
+   were deleted.)
 World-model spine/training untouched.
 
-Build order: (a) `train_reward.py` + logging + the held-out gate on an eval_interpret run; (b) wire the
-pluggable cost + latent-bag exposure; (c) `eval_control language.request=...` demo; (d) optional guardrail #2
-and the LDA-subspace distance refinement.
+The realized `dist_curve` re-grounds on the real last-P states and rolls ONE dynamics step (`core._rollout`,
+the exact path the reward was trained on) rather than `encode_state`, so the curve is measured in the same
+latent subspace the planner optimizes.
+
+Deferred: guardrail #2 (off-manifold penalty); the LDA-subspace distance refinement; a `r_settle`/`beta_vel`
+sweep for the cosine-distance scale (default `r_settle=0.5` only brakes at `R>0.5` — likely want ~1.0).

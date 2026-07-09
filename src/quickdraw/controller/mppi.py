@@ -39,10 +39,13 @@ class MPPIConfig:
     n_goals: int = 5           # goals visited per episode (random subset of the 8 NESW in/out goals)
 
 
-def _score(p_xyz, v_xyz, cand, goal, mppi):
-    """MPPI return for each candidate: -distance, a near-goal velocity penalty so it settles, and an
-    optional control (action-magnitude) cost. p_xyz/v_xyz: (G,K,H,3); cand: (G,K,H,2); goal: (G,3) -> (G,K)."""
-    d = (p_xyz - goal[:, None, None]).norm(dim=-1)            # (G,K,H)
+def _score(p_xyz, v_xyz, cand, goal, mppi, dist=None):
+    """MPPI return for each candidate: -distance, a near-target velocity penalty so it settles, and an
+    optional control (action-magnitude) cost. p_xyz/v_xyz: (G,K,H,3); cand: (G,K,H,2); goal: (G,3) -> (G,K).
+    dist (G,K,H) optional: use this precomputed per-step distance INSTEAD of the goal distance (language
+    steering passes 1 - reward, so 'closer' == 'redder') — the velocity-settling + control shaping below is
+    then applied identically, which is what makes language control structurally the same as goal control."""
+    d = dist if dist is not None else (p_xyz - goal[:, None, None]).norm(dim=-1)   # (G,K,H)
     gate = (d < mppi.r_settle).float()
     ret = (-d - mppi.beta_vel * gate * v_xyz.norm(dim=-1)).sum(dim=-1)
     if mppi.beta_ctrl > 0.0:                                   # cheaper thrust preferred (energy/jitter)
@@ -52,13 +55,15 @@ def _score(p_xyz, v_xyz, cand, goal, mppi):
 
 def _mppi_step(rollout_fn, mean, goal, mppi, a_max, g):
     """One MPPI update: sample candidates, score via rollout_fn, return the new weighted mean (G,H,2)
-    and the first action (G,2). rollout_fn(cand) -> (p_xyz, v_xyz), both (G,K,H,3)."""
+    and the first action (G,2). rollout_fn(cand) -> (p_xyz, v_xyz, dist): dist is a per-step distance
+    override (G,K,H) for the language reward, or None -> use the goal distance. _score applies the same
+    velocity/control shaping either way."""
     G, H = mean.shape[0], mppi.horizon
     K = mppi.num_samples
     noise = torch.randn(G, K, H, 2, device=mean.device, generator=g) * mppi.noise_sigma
     cand = (mean[:, None] + noise).clamp(-a_max, a_max)        # (G,K,H,2)
-    p_xyz, v_xyz = rollout_fn(cand)
-    ret = _score(p_xyz, v_xyz, cand, goal, mppi)              # (G,K) higher = better (lower cost)
+    p_xyz, v_xyz, dist = rollout_fn(cand)                     # dist: per-step (G,K,H) override, or None
+    ret = _score(p_xyz, v_xyz, cand, goal, mppi, dist=dist)   # (G,K) higher = better (lower cost)
     w = torch.softmax(ret / max(mppi.lambda_, 1e-6), dim=1)   # (G,K)
     new_mean = (w[..., None, None] * cand).sum(dim=1)         # (G,H,2)
     return new_mean, new_mean[:, 0], p_xyz, ret               # p_xyz/ret expose the candidate fan
@@ -76,14 +81,15 @@ def _true_rollout_fn(env: TorusEnv, cfg: TorusConfig, device):
         a = cand.reshape(G * K, H, 2)
         obs = torch.stack([sim.step(a[:, h]) for h in range(H)], dim=1)   # (G*K,H,6)
         obs = obs.view(G, K, H, 6)
-        return obs[..., :3], obs[..., 3:]
+        return obs[..., :3], obs[..., 3:], None               # dist=None -> goal distance (true dynamics = oracle only)
     return fn
 
 
-def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa, img_head):
+def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa, img_head, dist_bag=None):
     """Learned rollout for the spine: proprio (+ rendered FPV context when img_head is set). The image
-    context is encoded ONCE and shared across the K candidates (imagine_shared); candidates score on decoded
-    PROPRIO only. img_head=None -> proprio-only control (no image stream)."""
+    context is encoded ONCE and shared across the K candidates (imagine_shared). Returns (p_xyz, v_xyz, dist):
+    dist = dist_bag(rolled latent bag) is a per-step (G,K,H) distance for the learned-reward objective
+    (1 - reward), else None (goal-distance). Either way _score applies its velocity/control shaping."""
     def fn(cand):                                           # cand: (G,K,H,2)
         G, K, H = cand.shape[:3]
         ctx = {"proprio": normalizer.norm_obs(ctx_pro)}                      # (G,p,6)
@@ -91,9 +97,10 @@ def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa, img_head):
             ctx[img_head] = ctx_fpv                                          # (G,p,s,s,3) rendered FPV context
         paK = pa[:, None].expand(G, K, pa.shape[1], 2).reshape(G * K, pa.shape[1], 2)
         actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, 2)], dim=1))  # (G*K, p-1+H, 2)
-        pr = normalizer.denorm_obs(model.imagine_shared(ctx, actK, H, K, heads=["proprio"])["proprio"])
-        pr = pr.view(G, K, H, 6)
-        return pr[..., :3], pr[..., 3:]
+        out = model.imagine_shared(ctx, actK, H, K, heads=["proprio"], return_bag=(dist_bag is not None))
+        pr = normalizer.denorm_obs(out["proprio"]).view(G, K, H, 6)
+        dist = dist_bag(out["_bag"].view(G, K, H, -1)) if dist_bag is not None else None   # (G,K,H) reward distance
+        return pr[..., :3], pr[..., 3:], dist
     return fn
 
 
@@ -106,11 +113,15 @@ def _init_controller(cfg, B, device, seed):
 
 
 @torch.no_grad()
-def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, device="cpu", log=None, fpv=None):
-    """Race the oracle (true-dynamics) and the learned controller through 8 goals. Returns both
-    controllers' per-step paths/actions/goals (episode 0 for the video) and aggregate stats.
-    `fpv` (dict {coloring, fov, size}) enables the MULTIMODAL learned controller: the FPV is rendered per
-    step for the model's image context (proprio comes from the env)."""
+def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, device="cpu", log=None, fpv=None,
+                reward=None, request=None, oracle=True, n_plot=1):
+    """MPPI control on the torus. Default: race the oracle (true dynamics) vs the learned model through
+    spatial goals. `oracle=False` -> learned controller only (same code spine). `reward` (a
+    language.reward.LanguageReward) + `request` -> the learned controller maximizes R(latent, request)
+    instead of reaching goals: goal advancement is OFF and each controller's `dist_curve` holds the realized
+    reward per step (this is the language-steered eval_control). `fpv` renders FPV context in the loop.
+    n_plot: render per-episode products (paths/fan/FPV) for the first n_plot of the n_episodes parallel
+    episodes (all run in ONE batched rollout; n_plot only controls how many we keep for visuals)."""
     core = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
     use_fpv = img_head is not None and fpv is not None                     # render FPV in the loop ONLY with a real image head
@@ -124,29 +135,37 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     n_goals = min(mppi.n_goals, len(goals))                   # visit this many per episode (subset of the 8)
     tgt = torch.stack([p for _, p in goals]).to(device)       # (8,3) all goal points
     B, P, H, a_max = mppi.n_episodes, model.window, mppi.horizon, env_cfg.a_max
+    NP = max(1, min(n_plot, B))                               # episodes to keep per-episode visuals for
     g = torch.Generator(device=device).manual_seed(0)         # candidate-noise stream
     # per episode: a random n_goals-subset of the 8 goals, in random order (variety across episodes)
     order = torch.rand(B, len(goals), generator=torch.Generator(device=device).manual_seed(1),
                        device=device).argsort(dim=1)[:, :n_goals]    # (B, n_goals)
     chunk = max(1, min(mppi.chunk, H))
-    ctrls = {"true": _init_controller(env_cfg, B, device, 2),    # oracle: plans with true dynamics
-             "pred": _init_controller(env_cfg, B, device, 2)}    # learned: plans with the model (SAME init)
+    t_e = reward.text_embedding(request).to(device) if reward is not None else None
+    # language reward as a DISTANCE: d = 1 - cos(f_z(z), t_e) per step (G,K,H). Fed to _score exactly like
+    # the goal distance, so beta_vel/r_settle (near-target braking) + beta_ctrl apply identically -> the agent
+    # settles ON red instead of orbiting it, and the "score" reads as a distance (0 = perfectly red).
+    dist_bag = (lambda bag: 1.0 - reward.score(bag, t_e)) if reward is not None else None   # (G,K,H,D)->(G,K,H)
+    kinds = ["true", "pred"] if oracle else ["pred"]          # oracle=False -> learned controller only (same spine)
+    ctrls = {k: _init_controller(env_cfg, B, device, 2) for k in kinds}
     arange = torch.arange(B, device=device)
     for c in ctrls.values():
         c["mean"] = torch.zeros(B, H, 2, device=device)
         c["done_step"] = torch.full((B,), -1, dtype=torch.long, device=device)
-        c["dist_log"] = []  # per executed step: distance of each episode to its current goal
-    if use_fpv:             # learned controller needs the FPV context (proprio comes from the env)
+        c["dist_log"] = []  # per executed step: distance to current goal, OR (reward mode) the realized reward
+    if use_fpv and "pred" in ctrls:   # learned controller needs the FPV context (proprio comes from the env)
         ctrls["pred"]["fpv"] = [_fpv(ctrls["pred"]["obs"][-1])]   # GPU: last P frames only (context)
-        ctrls["pred"]["fpv_ep0"] = []                            # CPU: ep0 frame per executed step (for the video)
 
     t0 = time.perf_counter()
     step = 0
     n_chunks = 0        # number of MPPI replans (one per action chunk) — for per-step timing
     next_log = 100
-    fan_log = []        # per executed step: episode-0 pred candidate fan {pts (K,H,3), ret (K,)} for the viz
-    cur_fan = None
-    pred_fpv_log = []   # (MM) per executed step: ep0 model-imagined FPV for the SELECTED plan (pred vs actual video)
+    fan_logs = [[] for _ in range(NP)]        # per episode: per-step pred candidate fan {pts (K,H+1,3), ret (K,)}
+    cur_fans = [None] * NP
+    pred_fpv_logs = [[] for _ in range(NP)]   # (MM) per episode: per-step model-imagined FPV for the SELECTED plan
+    fpv_actual_logs = [[] for _ in range(NP)] # (MM) per episode: per-step actual rendered FPV
+    latent_logs = [[] for _ in range(NP)]     # (reward mode) per episode: per-step agent latent (the rolled bag, the
+    #                                           same space eval_interpret fit its reducers on) -> latent-space animation
     cur_plan_fpv = None
     while step < mppi.max_steps:
         n_chunks += 1
@@ -156,43 +175,68 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                 ctx = torch.stack(c["obs"][-P:], dim=1)
                 pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, 2, device=device)
                 ctx_fpv = torch.stack(c["fpv"][-P:], dim=1) if use_fpv else None   # (B,p,s,s,3) FPV context, or None (proprio-only)
-                rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa, img_head if use_fpv else None)
+                rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa, img_head if use_fpv else None,
+                                               dist_bag=dist_bag)   # reward mode -> per-step distance 1-R on the rolled bag
             else:
                 rollout = _true_rollout_fn(c["env"], env_cfg, device)
             c["plan"], _, p_xyz, ret = _mppi_step(rollout, c["mean"], cur, mppi, a_max, g)
-            if kind == "pred":  # episode-0 candidate fan, ANCHORED at the current known position: prepend
+            if kind == "pred":  # per-episode candidate fan, ANCHORED at the current known position: prepend
                 # the dot (last true obs) so the first segment joins where-we-are -> first prediction.
-                anchor = c["obs"][-1][0, :3].cpu().numpy()                      # (3,) ep0 current position
-                pts = p_xyz[0].cpu().numpy()                                    # (K, H, 3)
-                anchored = np.concatenate([np.broadcast_to(anchor, (pts.shape[0], 1, 3)), pts], axis=1)
-                cur_fan = {"pts": anchored, "ret": ret[0].cpu().numpy()}        # (K, H+1, 3)
-                if use_fpv:  # ep0 model-imagined FPV for the SELECTED plan (why MPPI chose it) -> pred-vs-actual video
-                    ctx0 = {"proprio": normalizer.norm_obs(ctx[0:1]), img_head: ctx_fpv[0:1]}
-                    act0 = normalizer.norm_act(torch.cat([pa[0:1], c["plan"][0:1]], dim=1))  # (1, p-1+H, 2)
-                    cur_plan_fpv = model.imagine_eval(ctx0, act0, H, heads=[img_head])[img_head][0].clamp(0, 1)  # (H,s,s,3)
+                anchor = c["obs"][-1][:NP, :3].cpu().numpy()                    # (NP,3) current positions
+                pts = p_xyz[:NP].cpu().numpy()                                  # (NP,K,H,3)
+                retn = ret[:NP].cpu().numpy()                                   # (NP,K)
+                cur_fans = [{"pts": np.concatenate([np.broadcast_to(anchor[e], (pts.shape[1], 1, 3)), pts[e]], axis=1),
+                             "ret": retn[e]} for e in range(NP)]                # each (K, H+1, 3)
+                if use_fpv:  # per-episode model-imagined FPV for the SELECTED plan -> pred-vs-actual video
+                    ctxN = {"proprio": normalizer.norm_obs(ctx[:NP]), img_head: ctx_fpv[:NP]}
+                    actN = normalizer.norm_act(torch.cat([pa[:NP], c["plan"][:NP]], dim=1))  # (NP, p-1+H, 2)
+                    cur_plan_fpv = model.imagine_eval(ctxN, actN, H, heads=[img_head])[img_head].clamp(0, 1)  # (NP,H,s,s,3)
         for j in range(chunk):  # execute `chunk` actions of each plan open-loop, then replan
             if step >= mppi.max_steps:
                 break
-            fan_log.append(cur_fan)  # same plan's fan governs each of the chunk's executed steps
+            for e in range(NP):
+                fan_logs[e].append(cur_fans[e])  # same plan's fan governs each of the chunk's executed steps
             for kind, c in ctrls.items():
                 cur = tgt[order[arange, c["gidx"].clamp(max=n_goals - 1)]]   # (B,3)
-                c["goal_log"].append(cur.cpu().numpy())
                 new_obs = c["env"].step(c["plan"][:, j])
                 c["obs"].append(new_obs)
                 if use_fpv and kind == "pred":                 # render the new FPV for the model's context
                     c["fpv"].append(_fpv(new_obs))
-                    c["fpv_ep0"].append(c["fpv"][-1][0].detach().cpu().numpy())  # ep0 frame -> CPU (video, full run)
+                    frame = c["fpv"][-1][:NP].detach().cpu().numpy()             # (NP,s,s,3) actual frames -> CPU
                     c["fpv"] = c["fpv"][-P:]                     # keep ONLY the last P frames on GPU (context) — bounds memory
-                    pred_fpv_log.append(cur_plan_fpv[j].detach().cpu().numpy())  # ep0 predicted FPV for this executed obs
+                    for e in range(NP):
+                        fpv_actual_logs[e].append(frame[e])
+                        pred_fpv_logs[e].append(cur_plan_fpv[e, j].detach().cpu().numpy())  # predicted FPV for this obs
                 c["act"].append(c["plan"][:, j])
-                d = (new_obs[:, :3] - cur).norm(dim=-1)                 # (B,)
-                c["dist_log"].append(d.cpu().numpy())
-                c["settle"] = torch.where(d < mppi.tol, c["settle"] + 1, torch.zeros_like(c["settle"]))
-                advance = (c["settle"] >= mppi.settle_steps) & (c["gidx"] < n_goals)
-                c["gidx"] = c["gidx"] + advance.long()
-                c["settle"] = torch.where(advance, torch.zeros_like(c["settle"]), c["settle"])
-                just_done = (c["gidx"] >= n_goals) & (c["done_step"] < 0)
-                c["done_step"] = torch.where(just_done, torch.full_like(c["done_step"], step + 1), c["done_step"])
+                if reward is not None:   # LANGUAGE steering: no goals; log the realized reward of the ACTUAL state.
+                    # FAITHFUL latent: re-ground on the real last-P states and roll ONE dynamics step via the SAME
+                    # open-loop rollout path eval_interpret trained the reward on (core._rollout) — NOT encode_state,
+                    # whose encoder latent lives in a different subspace than the rolled bags the reward/planner use.
+                    o_ctx = torch.stack(c["obs"][-P:], dim=1)                   # (B,nc,6) real states ending at new_obs
+                    nc = o_ctx.shape[1]
+                    rc_obs = {"proprio": normalizer.norm_obs(o_ctx)}
+                    if use_fpv and kind == "pred":
+                        rc_obs[img_head] = torch.stack(c["fpv"][-P:], dim=1)    # (B,nc,s,s,3) real rendered FPV context
+                    a_ctx = c["act"][-(nc - 1):] if nc > 1 else []              # nc-1 real inter-state actions
+                    a_roll = normalizer.norm_act(torch.stack(a_ctx + [c["plan"][:, min(j + 1, H - 1)]], dim=1))  # (B,nc,2): +1 to roll
+                    with torch.autocast(device_type=("cuda" if "cuda" in str(device) else "cpu"),
+                                        dtype=torch.bfloat16, enabled=("cuda" in str(device))):
+                        bag = core._rollout(rc_obs, a_roll, 1, 0.0, None, 0)    # (B,1,n_state,d) rolled bag (step 0)
+                    bf = bag.reshape(B, -1).float()                             # (B, n_state*d) the reward-space input latent
+                    c["dist_log"].append((1.0 - reward.score(bf, t_e)).cpu().numpy())  # (B,) realized dist 1-R
+                    for e in range(NP):
+                        latent_logs[e].append(bf[e].cpu().numpy())              # per-episode agent latent -> LDA animation
+                    c["goal_log"].append(new_obs[:, :3].cpu().numpy())          # no target -> mark the agent itself
+                else:                    # goal-reaching control: distance to current goal + advance on settle
+                    c["goal_log"].append(cur.cpu().numpy())
+                    d = (new_obs[:, :3] - cur).norm(dim=-1)                      # (B,)
+                    c["dist_log"].append(d.cpu().numpy())
+                    c["settle"] = torch.where(d < mppi.tol, c["settle"] + 1, torch.zeros_like(c["settle"]))
+                    advance = (c["settle"] >= mppi.settle_steps) & (c["gidx"] < n_goals)
+                    c["gidx"] = c["gidx"] + advance.long()
+                    c["settle"] = torch.where(advance, torch.zeros_like(c["settle"]), c["settle"])
+                    just_done = (c["gidx"] >= n_goals) & (c["done_step"] < 0)
+                    c["done_step"] = torch.where(just_done, torch.full_like(c["done_step"], step + 1), c["done_step"])
             step += 1
         for c in ctrls.values():  # warm-start: shift the executed chunk off the plan
             c["mean"] = torch.cat([c["plan"][:, chunk:], torch.zeros(B, chunk, 2, device=device)], dim=1) * mppi.mean_decay
@@ -200,34 +244,43 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
             el = time.perf_counter() - t0
             eta = el / max(1, step) * max(0, mppi.max_steps - step)   # upper bound (may end early once all goals hit)
             finish = time.strftime("%H:%M:%S", time.localtime(time.time() + eta))
-            gr = {k: float(c["gidx"].clamp(max=n_goals).float().mean()) for k, c in ctrls.items()}
+            if reward is not None:
+                msg = f"distance to '{request}' pred={float(np.mean(ctrls['pred']['dist_log'][-1])):.3f}"
+            else:
+                msg = "mean goals " + " ".join(f"{k}={float(c['gidx'].clamp(max=n_goals).float().mean()):.1f}"
+                                                for k, c in ctrls.items()) + f"/{n_goals}"
             log(f"step {step}/{mppi.max_steps} ({int(100 * step / mppi.max_steps)}%) | elapsed {el:.0f}s "
-                f"ETA {eta:.0f}s (~{finish}) | {n_chunks} replans ({1000 * el / max(1, n_chunks):.0f} ms/replan) "
-                f"| mean goals true={gr['true']:.1f} pred={gr['pred']:.1f}/{n_goals}")
+                f"ETA {eta:.0f}s (~{finish}) | {n_chunks} replans ({1000 * el / max(1, n_chunks):.0f} ms/replan) | {msg}")
             next_log += 50                                            # every 50 steps (was 100) — denser live progress
-        if all((c["gidx"] >= n_goals).all() for c in ctrls.values()):
+        if reward is None and all((c["gidx"] >= n_goals).all() for c in ctrls.values()):
             break
-    elapsed = time.perf_counter() - t0
     dt = env_cfg.dt
 
     out = {"goals": [(n, p.cpu().numpy()) for n, p in goals], "n_goals": n_goals, "n_chunks": n_chunks,
-           "n_steps": step, "dt": dt, "fan_seq": fan_log}  # pred candidate fan per executed step (ep 0)
-    if use_fpv and pred_fpv_log:  # ep0 pred-vs-actual FPV over the whole control run (from the selected plans)
-        actual = np.stack(ctrls["pred"]["fpv_ep0"])   # CPU-accumulated ep0 frames (full run; GPU kept only last P)
-        n = min(len(pred_fpv_log), len(actual))
-        out["pred_fpv_video"] = {"pred": np.stack(pred_fpv_log)[:n], "actual": actual[:n]}
+           "n_steps": step, "dt": dt, "n_plot": NP,
+           "fan_seqs": fan_logs}       # per episode: pred candidate fan per executed step
+    if use_fpv and pred_fpv_logs[0]:   # per episode: pred-vs-actual FPV over the whole run (from the selected plans)
+        out["pred_fpv_videos"] = []
+        for e in range(NP):
+            pred, actual = np.stack(pred_fpv_logs[e]), np.stack(fpv_actual_logs[e])
+            n = min(len(pred), len(actual))
+            out["pred_fpv_videos"].append({"pred": pred[:n], "actual": actual[:n]})
+    if reward is not None and latent_logs[0]:   # per episode: (T, n_state*d) agent latent trajectory (reward space)
+        out["agent_latents"] = [np.stack(latent_logs[e]) for e in range(NP)]
     for kind, c in ctrls.items():
         done = c["done_step"]
         completed = done >= 0
         steps_tc = float(done[completed].float().mean()) if completed.any() else float("nan")
+        gseq = np.stack(c["goal_log"])                                          # (T,B,3)
+        dcur = np.stack(c["dist_log"])                                          # (T,B)
         out[kind] = {
-            "path": np.stack([o[0, :3].cpu().numpy() for o in c["obs"]]),       # episode 0 (T,3)
-            "actions": np.stack([a[0].cpu().numpy() for a in c["act"]]),        # episode 0 (T-1,2)
-            "goal_seq": np.stack(c["goal_log"])[:, 0],                          # episode 0 (T,3)
-            "dist_curve": np.stack(c["dist_log"])[:, 0],                        # episode 0 (T,) — smooth,
-            # matches the video + goal-change markers. (Mean over episodes was jagged: 16 episodes switch
-            # goals at different steps, so each switch-jump lands at a different step -> spurious sawtooth.)
-            "success_rate": float(completed.float().mean()),                   # frac reaching all 8
+            # per episode e<NP: (NP,T,3)/(NP,T-1,2)/(NP,T,3)/(NP,T). Per-episode (not mean) is smooth and
+            # matches each episode's own video + goal-change markers.
+            "paths": np.stack([np.stack([o[e, :3].cpu().numpy() for o in c["obs"]]) for e in range(NP)]),
+            "actions": np.stack([np.stack([a[e].cpu().numpy() for a in c["act"]]) for e in range(NP)]),
+            "goal_seqs": gseq[:, :NP].transpose(1, 0, 2),
+            "dist_curves": dcur[:, :NP].T,
+            "success_rate": float(completed.float().mean()),                   # aggregate over ALL B episodes
             "mean_goals_reached": float(c["gidx"].clamp(max=n_goals).float().mean()),
             "mean_steps_to_complete": steps_tc,                                # over completed episodes
             "mean_seconds_to_complete": steps_tc * dt,

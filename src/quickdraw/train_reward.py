@@ -144,7 +144,7 @@ def main(cfg):
             tc = F.normalize(f_t(T), dim=-1)
             loss = F.cross_entropy((zc @ tc.T) / temp, yd[b])
             opt.zero_grad(); loss.backward(); opt.step()
-        if ep % 10 == 0 or ep == int(rc.epochs) - 1:
+        if ep % int(rc.get("report_every", 10)) == 0 or ep == int(rc.epochs) - 1:
             m = {"train": evaluate(tr.to(dev)), "val": evaluate(va.to(dev))}
             writer.scalars({f"{s}/loss/total": m[s]["loss"] for s in m} |
                            {f"{s}/acc/argmax": m[s]["acc"] for s in m} |
