@@ -562,12 +562,13 @@ def traj_compare_frames(R, r, coloring, true_full, pred_full, avec_true, P, n_fr
 
 def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
                            smooth_window=ACTION_SMOOTH_WINDOW, torus_opacity=TORUS_OPACITY, fan_seq=None,
-                           log=None, reuse=False):
+                           log=None, reuse=False, show_goals=True):
     """Animated dual-controller race (eval_control). Each agent = {path (T,3), avec (T,3) ambient
     applied action, goal_seq (T,3) its current goal, color}. Per frame each agent gets a flat moving
     head + trailing tail + a colored action arrow, plus a same-color RING marking ITS current goal ZONE
     on the surface (so it's clear who targets what). Reuses fig_torus_atlas like traj_compare_frames, so
-    layout/sizing are unchanged. fan_seq (optional, len ~T): per-step pred candidate fan to overlay."""
+    layout/sizing are unchanged. fan_seq (optional, len ~T): per-step pred candidate fan to overlay.
+    show_goals=False drops the goal rings (language steering has no target point, only a reward direction)."""
     tail = 60
     agents = [{"color": a["color"], "path": np.asarray(a["path"]), "goal_seq": np.asarray(a["goal_seq"]),
                "avec": _moving_avg(np.asarray(a["avec"]), smooth_window)} for a in agents]
@@ -591,9 +592,10 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
                 gi = min(k - 1, len(a["goal_seq"]) - 1)  # goal_seq/avec have one fewer entry than path
                 ai = min(k - 1, len(a["avec"]) - 1)
                 trajs.append({"xyz": a["path"][lo:k], "color": c, "tip": {"color": c, "lighting": False}})
-                trajs.append({"xyz": _tangent_ring(a["goal_seq"][gi], R, 0.0675 * sc), "color": c,
-                              "radius": 0.008 * sc, "start_sphere": False, "end_sphere": False})  # goal ring (1.5x agent
-                #                                       diam; tube thickness == the main agent tail thickness)
+                if show_goals:
+                    trajs.append({"xyz": _tangent_ring(a["goal_seq"][gi], R, 0.0675 * sc), "color": c,
+                                  "radius": 0.008 * sc, "start_sphere": False, "end_sphere": False})  # goal ring (1.5x agent
+                    #                                     diam; tube thickness == the main agent tail thickness)
                 arrows.append((a["path"][k - 1], a["avec"][ai], c))
             fan = fan_seq[min(k - 1, len(fan_seq) - 1)] if fan_seq else None  # this step's candidate fan
             fig = fig_torus_atlas(R, r, trajs=trajs, arrows=arrows, coloring=coloring, title=title,
@@ -768,6 +770,108 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
 _POINT_PURPLE = "#8E44AD"   # flat fill when no scalar `color` is given (color everything purple)
 
 
+def _draw_hull_2d(ax, hull_pts):
+    """Filled convex-hull outline of a subset of points (e.g. the 'red' cluster) — the request's region."""
+    from scipy.spatial import ConvexHull
+    p = np.asarray(hull_pts)
+    if len(p) < 3:
+        return
+    v = p[ConvexHull(p[:, :2]).vertices][:, :2]
+    v = np.vstack([v, v[:1]])
+    ax.fill(v[:, 0], v[:, 1], facecolor="black", alpha=0.06, zorder=1)
+    ax.plot(v[:, 0], v[:, 1], color="black", lw=1.6, alpha=0.6, zorder=5)
+
+
+def _draw_hull_3d(ax, hull_pts):
+    """Translucent convex-hull surface of a subset of points (the request's region) in a 3D view."""
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    from scipy.spatial import ConvexHull
+    p = np.asarray(hull_pts)[:, :3]
+    if len(p) < 4:
+        return
+    tris = [p[s] for s in ConvexHull(p).simplices]
+    ax.add_collection3d(Poly3DCollection(tris, facecolor="black", edgecolor="black",
+                                         alpha=0.05, linewidths=0.2))
+
+
+def _draw_agent_2d(ax, trail, pos):
+    """Agent trail (line) + current position (sphere) on a 2D axis -> the created artists (for blit remove)."""
+    arts = []
+    tr = np.asarray(trail)
+    if len(tr) > 1:
+        arts += ax.plot(tr[:, 0], tr[:, 1], color="black", lw=1.3, alpha=0.8, zorder=10)
+    arts.append(ax.scatter([pos[0]], [pos[1]], s=140, c="black", marker="o",
+                           edgecolors="white", linewidths=1.0, zorder=11))
+    return arts
+
+
+def _draw_agent_3d(ax, trail, pos):
+    """3D analogue of _draw_agent_2d -> the created artists."""
+    arts = []
+    tr = np.asarray(trail)
+    if len(tr) > 1:
+        arts += ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color="black", lw=1.4, alpha=0.9)
+    arts.append(ax.scatter([pos[0]], [pos[1]], [pos[2]], s=90, c="black", marker="o", depthshade=False))
+    return arts
+
+
+def _overlay_2d(ax, marks, agent, hull=None):
+    """Static latent-plot overlays on a 2D axis: request-region hull + C/M lettered circles (+ agent if given
+    one-shot, e.g. a static PNG). For animations the agent is drawn per-frame via _draw_agent_2d instead."""
+    if hull is not None:
+        _draw_hull_2d(ax, hull)
+    for mk in (marks or []):
+        mp = np.asarray(mk["pos"])
+        ax.scatter([mp[0]], [mp[1]], s=mk.get("size", 430), facecolors="white", edgecolors="black",
+                   linewidths=2.5, marker="o", zorder=7)
+        ax.text(mp[0], mp[1], mk["text"], ha="center", va="center", fontsize=13, fontweight="bold", zorder=9)
+    if agent is not None:
+        _draw_agent_2d(ax, agent["trail"], agent["pos"])
+
+
+def _overlay_3d(ax, marks, agent, hull=None):
+    """3D analogue of _overlay_2d."""
+    if hull is not None:
+        _draw_hull_3d(ax, hull)
+    for mk in (marks or []):
+        mp = np.asarray(mk["pos"])
+        ax.scatter([mp[0]], [mp[1]], [mp[2]], s=mk.get("size", 240), facecolors="white", edgecolors="black",
+                   linewidths=2.2, marker="o", depthshade=False)
+        ax.text(mp[0], mp[1], mp[2], mk["text"], ha="center", va="center", fontsize=11, fontweight="bold")
+    if agent is not None:
+        _draw_agent_3d(ax, agent["trail"], agent["pos"])
+
+
+def animate_latent(fig, traj, is3d, idx, log=None):
+    """Efficient agent-overlay animation over a STATIC latent-plot backdrop `fig` (built once by
+    fig_points_2d/fig_points_9view with the cloud + C/M marks + hull). Mirrors the persistent-renderer pattern
+    of the torus videos: the expensive backdrop (10k+ points x up-to-9 views) is rasterized ONCE, then each
+    frame only BLITS the agent (trail + sphere) on top — so a full-length 9-view clip costs ~one backdrop
+    raster, not one per frame. traj: (T, dim) agent path in the embedding; idx: 1-based step indices to render.
+    Returns (len(idx), H, W, 3) uint8."""
+    fig.canvas.draw()
+    bg = fig.canvas.copy_from_bbox(fig.bbox)                          # cache the rendered backdrop
+    axes = list(fig.axes)
+    draw_agent = _draw_agent_3d if is3d else _draw_agent_2d
+    w, h = fig.canvas.get_width_height()
+    frames = []
+    every = max(1, len(idx) // 10)
+    for fi, k in enumerate(idx):
+        if log is not None and fi % every == 0:
+            log(f"{fi}/{len(idx)} frames")
+        fig.canvas.restore_region(bg)
+        arts = []
+        for ax in axes:
+            for a in draw_agent(ax, traj[:k], traj[k - 1]):
+                ax.draw_artist(a)
+                arts.append(a)
+        fig.canvas.blit(fig.bbox)
+        frames.append(np.frombuffer(fig.canvas.buffer_rgba(), np.uint8).reshape(h, w, 4)[..., :3].copy())
+        for a in arts:
+            a.remove()
+    return np.stack(frames)
+
+
 def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="",
                      depthshade=True):
     """A 3D point cloud from 4 ORTHOGRAPHIC views in a 2x2 GridSpec (plain matplotlib 3D scatter — no torus
@@ -809,7 +913,7 @@ def fig_points_4view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
 
 
 def fig_points_9view(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="",
-                     depthshade=True, legend=None):
+                     depthshade=True, legend=None, marks=None, agent=None, alpha=1.0, hull=None):
     """A 3D point cloud from 9 ORTHOGRAPHIC views in a 3x3 grid — SAME points + SAME embedding.
     Row 1: ISOMETRIC (elev≈35.26°) rotated +0/+15/+30° about the VERTICAL axis (azimuth).
     Row 2: ISOMETRIC rotated +0/+15/+30° about a HORIZONTAL axis (elevation / tilt).
@@ -838,7 +942,8 @@ def fig_points_9view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
         ax.set_proj_type("ortho")                                  # orthographic (no perspective foreshortening)
         sc = ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size,
                         c=(color if color is not None else _POINT_PURPLE), cmap=_cmap,
-                        depthshade=depthshade, linewidths=0)
+                        depthshade=depthshade, linewidths=0, alpha=alpha)
+        _overlay_3d(ax, marks, agent, hull=hull)
         ax.view_init(elev=elev, azim=azim)
         if lims is not None:
             (xl, yl, zl) = lims
@@ -861,18 +966,22 @@ def fig_points_9view(pts, color=None, title="", lims=None, point_size=4.0, cmap=
     return fig
 
 
-def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="", legend=None):
+def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="plasma", cbar_label="", legend=None,
+                  marks=None, agent=None, alpha=1.0, hull=None):
     """The 2D analogue of fig_points_6view: a single scatter, same styling (no tick/axis labels). Axes are
     EQUAL length + equal aspect, so a long-thin embedding renders at its TRUE shape (not stretched to fill).
     pts: (N,2). lims: ((xlo,xhi),(ylo,yhi)) or None. legend: list of (label, color) for a CATEGORICAL scatter
-    (color is a per-point (N,3) RGB array) -> legend box."""
+    (color is a per-point (N,3) RGB array) -> legend box.
+    marks: list of {"pos": (2,), "text": str} -> C/M lettered circles; agent: {"pos","trail"} one-shot overlay;
+    hull: points whose convex hull outlines the request region (latent-animation extras)."""
     from matplotlib.ticker import MaxNLocator
     pts = np.asarray(pts)
     fig = plt.figure(figsize=(10, 9))
     ax = fig.add_subplot(1, 1, 1)
     _cmap = None if (isinstance(color, np.ndarray) and color.ndim == 2) else cmap   # RGB array -> no colormap
     sc = ax.scatter(pts[:, 0], pts[:, 1], s=point_size,
-                    c=(color if color is not None else _POINT_PURPLE), cmap=_cmap, linewidths=0)
+                    c=(color if color is not None else _POINT_PURPLE), cmap=_cmap, linewidths=0, alpha=alpha)
+    _overlay_2d(ax, marks, agent, hull=hull)
     if lims is not None:
         ctr = [(lo + hi) / 2 for lo, hi in lims]; half = max(hi - lo for lo, hi in lims) / 2   # equal-length axes (square)
         ax.set_xlim(ctr[0] - half, ctr[0] + half); ax.set_ylim(ctr[1] - half, ctr[1] + half)

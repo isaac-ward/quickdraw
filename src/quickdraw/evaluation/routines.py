@@ -19,7 +19,8 @@ from ..logging import viz
 from ..training.setup import eval_episodes
 import torch
 
-from .openloop import eval_batched
+from .openloop import eval_batched, proprio_curves
+from .products import emit_openloop
 
 
 def _is_mm(model):
@@ -43,49 +44,14 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
     res = eval_batched(model, norm, R, r, v_scale, P, obs, act)
     _plog(writer, f"[{prefix} @ep{step}] rollout done in {time.perf_counter() - t0:.1f}s; rendering...")
 
-    for i in range(n_plot):
-        ctx_xyz = res["ctx_xyz"][i]
-        anchor = ctx_xyz[-1:]  # shared launch state o_{P-1}; truth & prediction branch from here
-        true_xyz = np.concatenate([anchor, res["p_true_xyz"][i]], axis=0)
-        pred_xyz = np.concatenate([anchor, res["p_hat_xyz"][i]], axis=0)
-        # PNG: context (light grey) -> ground truth (black) -> prediction (dark grey), all solid.
-        # Half-size start sphere on the context (matches summary plots), end spheres on truth + pred.
-        trajs = [{"xyz": ctx_xyz, "color": "lightgray", "start_sphere": True, "end_sphere": False,
-                  "marker_color": "black", "start_scale": 0.5},
-                 {"xyz": true_xyz, "color": "black", "start_sphere": False, "end_sphere": True},
-                 {"xyz": pred_xyz, "color": "dimgray", "start_sphere": False, "end_sphere": True}]
-        f_traj = viz.fig_torus_atlas(R, r, trajs=trajs, coloring=coloring, title=f"{split} #{i}",
-                                     view_pad=viz.EVAL_VIEW_PAD, torus_opacity=viz.TORUS_OPACITY)
-        writer.figure(f"{prefix}/trajectory_plot_{i}", f_traj, step)   # per-rollout error curve dropped (avg-only)
-        plt.close(f_traj)
-        # MP4 mirror: full true/pred paths (context + branch) + the true applied-action arrow
-        true_full = np.concatenate([ctx_xyz, true_xyz[1:]], axis=0)
-        pred_full = np.concatenate([ctx_xyz, pred_xyz[1:]], axis=0)
-        avec = viz.action_ambient(true_full, res["actions"][i], R, r)
-        _plog(writer, f"[{prefix} @ep{step}]   episode {i + 1}/{n_plot} video ({len(true_full)} frames)")
-        frames = viz.traj_compare_frames(R, r, coloring, true_full, pred_full, avec, P,
-                                         n_frames=len(true_full), title=f"{split} #{i}", smooth_window=win,
-                                         log=lambda m, i=i: _plog(writer, f"[{prefix} @ep{step}]     ep{i} {m}"))
-        writer.video(f"{prefix}/trajectory_video_{i}", frames, fps, step)
-        writer.scene(f"{prefix}/trajectory_video_{i}", {  # 3D geometry for Blender (plain-language keys)
-            "description": "Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a "
-                           "GREY agent on the model's PREDICTED path. They share the context, then diverge at "
-                           "the fork step. The action arrow is the applied action along the true path.",
-            "coordinate_system": "world xyz, same space as the torus",
-            "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
-            "true_path_xyz": true_full,                 # (T,3)
-            "predicted_path_xyz": pred_full,            # (T,3)
-            "fork_step_index": int(P),                  # prediction diverges from truth at this index
-            "action_arrow_per_step": {"origins_xyz": true_full[:len(avec)], "vectors_xyz": avec},
-        }, step)
-
-    # dataset-aggregated error vs rollout step (mean of each metric over all episodes), both y-scales
-    for ys in ("linear", "log"):
-        f_avg = viz.fig_error_vs_step(res["agg"], yscale=ys)
-        writer.figure(f"{prefix}/error_vs_step_avg_{ys}", f_avg, step)
-        plt.close(f_avg)
-    summary = {m: float(res["agg"][m].mean()) for m in res["agg"]}  # mean over the rollout
-    writer.scalars({f"{prefix}/{m}_mean": v for m, v in summary.items()}, step)
+    desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
+            "the model's PREDICTED path. They share the context, then diverge at the fork step. The action "
+            "arrow is the applied action along the true path.")
+    emit_openloop(writer, prefix, step, R=R, r=r, coloring=coloring, fps=fps, P=P, smooth_window=win,
+                  description=desc, ctx_xyz=res["ctx_xyz"], p_true_xyz=res["p_true_xyz"],
+                  p_hat_xyz=res["p_hat_xyz"], actions=res["actions"], curves=res["agg"], n_plot=n_plot,
+                  title_fn=lambda i: f"{split} #{i}", log=lambda m: _plog(writer, f"[{prefix} @ep{step}]   {m}"))
+    summary = {m: float(res["agg"][m].mean()) for m in res["agg"]}  # mean over the rollout (routine return value)
     _plog(writer, f"[{prefix} @ep{step}] done in {time.perf_counter() - t0:.1f}s")
     return summary
 
@@ -93,16 +59,16 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
 @torch.no_grad()
 def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     """The ONE open-loop long-horizon eval for every model (OOD: horizon >> trained). One rollout over
-    held-out val episodes decodes proprio (always) + any image head. All products under eval_ood_horizon/:
-      - proprio: error_vs_step curves (obs_error/manifold/pointwise/tangent, linear+log) + means, a torus
-        pred-vs-true trajectory PLOT + VIDEO + Blender SCENE (episode 0).
-      - per image head <head>/: psnr/ssim/mse/l1 curves + means, an 8-step FILMSTRIP, a synced FPV rollout VIDEO.
-    Progress ('% — product') is logged per product. Image decode is the cost, so n_ep=8 when an image head
-    is present (else eval.n_episodes)."""
+    held-out val episodes decodes proprio (always) + any image head; proprio and image outputs MIRROR each
+    other and the code generalizes over arbitrary trunks. All under eval_ood_horizon/:
+      - AVERAGED (over episodes, not per-instance) error_vs_step_avg_{linear,log} curves + *_mean scalars, one
+        block per head: proprio (obs_error/manifold/pointwise/tangent) and each image <head>/ (psnr/ssim/mse/l1).
+      - per-episode visuals for the first n_plot(=4) episodes: proprio trajectory_plot_{i}/video_{i}/scene_{i},
+        and each image <head>/filmstrip_{i} + <head>/rollout_{i}.
+    Image decode is the cost, so n_ep=8 when an image head is present (else eval.n_episodes)."""
     import numpy as _np
 
     from ..data.dataset import load_split_episodes_mm
-    from ..environments import torus as T
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
     was = m.training
@@ -129,76 +95,42 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     out = m.imagine_eval(ctx, acts, H, heads=["proprio"] + img_heads)
     prog(30, "rollout done")
 
-    # ---- proprio: metrics + curves + means ----
+    n_plot = min(4, n_ep)                                                    # per-episode visuals for the first few
+
+    # ---- AVERAGED error-vs-step curves, one block per head (proprio + each image), mirrored. Averaged over
+    #      episodes (NOT per-instance) — same policy as proprio: no per-episode curves. ----
     pred = out["proprio"]
     p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
     p_true = torch.stack([torch.from_numpy(o[P:P + H]) for o, _, _ in eps]).float().to(device)
-    per_step = {
-        "obs_error": ((pred - norm.norm_obs(p_true)) ** 2).mean(-1),          # normalized 6-vec MSE (== the loss)
-        "manifold_distance_error": T.manifold_distance_error(p_hat, ecfg.R, ecfg.r),        # dimensionless (÷ r)
-        "pointwise_error": T.pointwise_error(p_hat, p_true),                  # ‖p̂ − p‖ (physical units)
-        "tangent_velocity_error": T.tangent_velocity_error(p_hat, ecfg.R, ecfg.init_speed),  # dimensionless (÷ v_scale)
-    }
+    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, ecfg.R, ecfg.r, ecfg.init_speed)
     curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}        # mean over episodes -> (H,)
-    for ys in ("linear", "log"):
-        f = viz.fig_error_vs_step(curves, yscale=ys)
-        writer.figure(f"eval_ood_horizon/error_vs_step_avg_{ys}", f, step); plt.close(f)
-    writer.scalars({f"eval_ood_horizon/{k}_mean": float(v.mean()) for k, v in curves.items()}, step)
-    prog(45, "proprio metrics + curves")
 
-    # ---- proprio: torus trajectory plot + video + scene (episode 0) ----
-    ctx_xyz = norm.denorm_obs(pro[0]).cpu().numpy()[:, :3]
-    true_xyz = _np.concatenate([ctx_xyz[-1:], p_true[0, :, :3].cpu().numpy()])
-    pred_xyz = _np.concatenate([ctx_xyz[-1:], p_hat[0, :, :3].cpu().numpy()])
-    trajs = [{"xyz": ctx_xyz, "color": "lightgray", "start_sphere": True, "end_sphere": False, "start_scale": 0.5,
-              "marker_color": "black"},   # marker_color colors ONLY the START sphere here (end_sphere is off): black. context line stays light grey; pred untouched
-             {"xyz": true_xyz, "color": "black", "start_sphere": False, "end_sphere": True},
-             {"xyz": pred_xyz, "color": "dimgray", "start_sphere": False, "end_sphere": True}]
-    fp = viz.fig_torus_atlas(ecfg.R, ecfg.r, trajs=trajs, title=f"eval_ood_horizon H={H}",
-                             view_pad=viz.EVAL_VIEW_PAD, torus_opacity=viz.TORUS_OPACITY)
-    writer.figure("eval_ood_horizon/trajectory_plot_0", fp, step); plt.close(fp)
-    prog(55, "trajectory plot")
-    true_full = _np.concatenate([ctx_xyz, true_xyz[1:]], axis=0)
-    pred_full = _np.concatenate([ctx_xyz, pred_xyz[1:]], axis=0)
-    avec = viz.action_ambient(true_full, eps[0][1][:len(true_full)].astype(_np.float32), ecfg.R, ecfg.r)  # raw actions, aligned to path
-    frames = viz.traj_compare_frames(ecfg.R, ecfg.r, "hsv", true_full, pred_full, avec, P,
-                                     n_frames=len(true_full), title="eval_ood_horizon",
-                                     smooth_window=int(cfg.data.action_smooth_window),
-                                     log=lambda msg: prog(60, f"trajectory video {msg}"))
-    writer.video("eval_ood_horizon/trajectory_video_0", frames, fps, step)
-    writer.scene("eval_ood_horizon/trajectory_video_0", {
-        "description": "Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY "
-                       "agent on the model's PREDICTED path, sharing the context then diverging at the fork.",
-        "coordinate_system": "world xyz, same space as the torus",
-        "torus": {"major_radius_R": float(ecfg.R), "tube_radius_r": float(ecfg.r)},
-        "true_path_xyz": true_full, "predicted_path_xyz": pred_full, "fork_step_index": int(P),
-        "action_arrow_per_step": {"origins_xyz": true_full[:len(avec)], "vectors_xyz": avec},
-    }, step)
-    prog(70, "trajectory video + scene")
-
-    # ---- image heads: per-step metrics + filmstrip + synced FPV rollout video ----
+    images = {}                                                              # per image head: curves + frames for the emitter
     for head in img_heads:
-        predi = out[head].clamp(0, 1)                                        # (n_ep,H,size,size,3)
-        true = torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
+        ipred = out[head].clamp(0, 1)                                        # (n_ep,H,s,s,3)
+        itrue = torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
         psnr_s, ssim_s, mse_s, l1_s = [], [], [], []
         for t in range(H):
-            mse = float(torch.mean((predi[:, t] - true[:, t]) ** 2)); mse_s.append(mse)
-            l1_s.append(float(torch.mean((predi[:, t] - true[:, t]).abs())))
+            mse = float(torch.mean((ipred[:, t] - itrue[:, t]) ** 2)); mse_s.append(mse)
+            l1_s.append(float(torch.mean((ipred[:, t] - itrue[:, t]).abs())))
             psnr_s.append(-10.0 * _np.log10(max(mse, 1e-12)))
-            ssim_s.append(max(0.0, min(1.0, _ssim(predi[:, t], true[:, t]))))    # clamp SSIM to [0,1] for the shared left axis
-        icurves = {"psnr": _np.array(psnr_s), "ssim": _np.array(ssim_s), "mse": _np.array(mse_s), "l1": _np.array(l1_s)}
-        for ys in ("linear", "log"):
-            f = viz.fig_error_vs_step(icurves, yscale=ys, split_top={"psnr"}, colors={"psnr": "red"})   # PSNR (dB, red) top; ssim/mse/l1 below
-            writer.figure(f"eval_ood_horizon/{head}/metric_vs_step_{ys}", f, step); plt.close(f)
-        writer.scalars({f"eval_ood_horizon/{head}/{k}_mean": float(_np.mean(v)) for k, v in icurves.items()}, step)
-        prog(80, f"{head} metrics")
-        p0 = predi[0].cpu().numpy()
-        full_true = eps[0][2][: P + H].astype(_np.float32) / 255.0
-        ff = viz.fig_image_filmstrip(p0, true[0].cpu().numpy(), n_cols=8,
-                                     title=f"{head} pred(top)/GT(bottom) H={H} PSNR {_np.mean(psnr_s):.1f}dB")
-        writer.figure(f"eval_ood_horizon/{head}/filmstrip", ff, step); plt.close(ff)
-        writer.video(f"eval_ood_horizon/{head}/rollout", viz.image_rollout_video(full_true, p0, context_len=P).astype(_np.uint8), fps, step)
-        prog(90, f"{head} filmstrip + rollout video")
+            ssim_s.append(max(0.0, min(1.0, _ssim(ipred[:, t], itrue[:, t]))))   # clamp SSIM to [0,1]
+        images[head] = {"icurves": {"psnr": _np.array(psnr_s), "ssim": _np.array(ssim_s),
+                                    "mse": _np.array(mse_s), "l1": _np.array(l1_s)},
+                        "full_true": _np.stack([eps[i][2][:P + H].astype(_np.float32) / 255.0 for i in range(n_plot)]),
+                        "ipred": ipred[:n_plot].cpu().numpy()}
+    prog(45, f"averaged curves (proprio + {len(img_heads)} image head(s))")
+
+    # ---- everything (curves + per-episode trajectory/image visuals) via the shared open-loop emitter ----
+    desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
+            "the model's PREDICTED path, sharing the context then diverging at the fork.")
+    emit_openloop(writer, "eval_ood_horizon", step, R=ecfg.R, r=ecfg.r, coloring="hsv", fps=fps, P=P,
+                  smooth_window=int(cfg.data.action_smooth_window), description=desc,
+                  ctx_xyz=norm.denorm_obs(pro[:n_plot]).cpu().numpy()[:, :, :3],
+                  p_true_xyz=p_true[:n_plot, :, :3].cpu().numpy(), p_hat_xyz=p_hat[:n_plot, :, :3].cpu().numpy(),
+                  actions=[eps[i][1][:P + H].astype(_np.float32) for i in range(n_plot)],
+                  curves=curves, n_plot=n_plot, images=(images or None),
+                  title_fn=lambda i: f"eval_ood_horizon #{i} H={H}", log=lambda msg: prog(50, msg))
 
     if was:
         m.train()

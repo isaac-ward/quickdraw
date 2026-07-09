@@ -68,8 +68,14 @@ def reduce_dims(pts, method, *, n_components, seed=0, return_reducer=False, y=No
         kw = dict(n_components=n_components, random_state=seed, n_neighbors=30, min_dist=0.05)
         if y is not None:
             kw["target_weight"] = float(target_weight)                # supervise toward the labels
+            kw["init"] = "random"                                     # spectral init -> NaN on the near-degenerate
+            #                                                           fully-supervised graph (target_weight~1); random is robust
         red = umap.UMAP(**kw)
         e = red.fit_transform(pts, y=y) if y is not None else red.fit_transform(pts)
+        if y is not None and not np.isfinite(e).all():                # near-full supervision (target_weight >= ~0.99)
+            raise ValueError(f"supervised UMAP target_weight={target_weight} gave a non-finite embedding: the "
+                             f"fully-supervised graph disconnects into per-class cliques and the layout diverges; "
+                             f"use target_weight <= ~0.95")
     elif method == "lda":                                  # supervised LINEAR: max between-class / within-class separation
         from sklearn.decomposition import PCA
         from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
