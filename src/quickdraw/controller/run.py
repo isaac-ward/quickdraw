@@ -40,6 +40,39 @@ def _agent(res, color, R, r):
             "avec": viz.action_ambient(path, act, R, r)}  # ambient applied action (T,3)
 
 
+def _run_language(cfg, model, normalizer, ecfg, writer, device, step, mppi, fpv) -> dict:
+    """Language-steered variant of eval_control: MPPI maximizes R(latent, request) (no goal race).
+    Logs the pred-vs-actual FPV video, realized-reward curve, and ep0 path under eval_control/language/."""
+    from ..language.reward import LanguageReward
+    from .language_control import run_language_control
+    request = str(cfg.language.request)
+    reward = LanguageReward(cfg.language.head, device=device)
+    assert request in reward.buckets, f"request {request!r} not in reward vocab {reward.buckets}"
+    _plog(writer, f"[eval_control @ep{step}] LANGUAGE steering -> '{request}' ({os.path.basename(cfg.language.head)})")
+    res = run_language_control(model, normalizer, ecfg, reward, request, mppi, device=device, fpv=fpv,
+                               log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"))
+    fps, rc = round(1.0 / ecfg.dt), res["reward_curve"]
+    if "fpv_video" in res:
+        pv, av = res["fpv_video"]["pred"], res["fpv_video"]["actual"]
+        stacked = (np.concatenate([np.clip(pv, 0, 1), np.clip(av, 0, 1)], axis=1) * 255).astype(np.uint8)
+        writer.video(f"eval_control/language/{request}/fpv_pred_top_actual_bottom", stacked, fps, step)
+    f = plt.figure(figsize=(9, 4)); ax = f.add_subplot(111); ax.plot(rc); ax.grid(alpha=0.3)
+    ax.set_xlabel("control step"); ax.set_ylabel(f"R(state, '{request}')")
+    ax.set_title(f"language steering: realized reward for '{request}' over the run (ep0)")
+    writer.figure(f"eval_control/language/{request}/reward_curve", f, step); plt.close(f)
+    fp = viz.fig_torus_atlas(ecfg.R, ecfg.r, coloring="hsv", torus_opacity=viz.TORUS_OPACITY,
+                             title=f"language steering '{request}' — ep0 path",
+                             trajs=[{"xyz": res["path"], "color": "black", "start_sphere": True,
+                                     "end_sphere": True, "start_scale": 0.5}])
+    writer.figure(f"eval_control/language/{request}/path", fp, step); plt.close(fp)
+    summary = {f"language/{request}/reward_start": float(rc[0]), f"language/{request}/reward_end": float(rc[-1]),
+               f"language/{request}/reward_delta": float(rc[-1] - rc[0]), "n_steps": res["n_steps"]}
+    writer.scalars({f"eval_control/{k}": v for k, v in summary.items()}, step)
+    _plog(writer, f"[eval_control @ep{step}] language '{request}' reward {rc[0]:+.3f} -> {rc[-1]:+.3f} "
+                  f"(delta {rc[-1] - rc[0]:+.3f})")
+    return summary
+
+
 def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) -> dict:
     _plog(writer, f"[eval_control @ep{step}] start: MPPI {cfg.control.n_episodes} eps x 2 controllers, "
                   f"{cfg.control.num_samples} samples, H={cfg.control.horizon}, max_steps={cfg.control.max_steps}")
@@ -58,6 +91,12 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
             coloring = "rainbow"
         fpv = {"coloring": coloring, "fov": float(cfg.data.fpv_fov), "size": int(img_size)}
         _plog(writer, f"[eval_control @ep{step}] multimodal: FPV render in the MPPI loop (coloring={coloring}, size={img_size})")
+
+    # language steering: a request + reward head -> steer MPPI toward it instead of the goal race (same eval_control)
+    lang = cfg.get("language")
+    if lang is not None and lang.get("request") and lang.get("head"):
+        return _run_language(cfg, model, normalizer, ecfg, writer, device, step, MPPIConfig(**mppi_kwargs), fpv)
+
     res, _ = run_control(model, normalizer, ecfg, MPPIConfig(**mppi_kwargs), device=device,
                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv)
     t_ctrl = time.perf_counter() - t

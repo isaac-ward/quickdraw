@@ -11,10 +11,11 @@ defaults:
   - reward: default
   - _self_
 
-# language-steered control (eval_language): steer MPPI toward a natural-language request via a trained reward head
+# language-steered control: set head (+ request) to make `eval_control` steer MPPI toward the request instead
+# of the goal race. head=null (default) -> normal goal-based control (so in-training eval_control is unaffected).
 language:
   request: red
-  head: logs/train_reward_2026_07_08_07_25_06_reward_color/reward_head.pt   # a train_reward run's reward_head.pt
+  head: null   # path to a train_reward run's reward_head.pt (only then does eval_control do language steering)
 
 # short experiment summary -> run dir is logs/<timestamp>_<experiment> (override on CLI)
 experiment: base
