@@ -806,12 +806,18 @@ def _draw_agent_2d(ax, trail, pos):
 
 
 def _draw_agent_3d(ax, trail, pos):
-    """3D analogue of _draw_agent_2d -> the created artists (bigger sphere; 3d foreshortens)."""
+    """3D agent: trail as a 3d line + the current-position SPHERE as a 2D circle projected onto the current
+    view. A 3d scatter marker doesn't blit reliably via draw_artist (it reads as just the trail line), so the
+    sphere is a text2D circular bbox (same trick as the C/M marks) -> always visible, on top. Returns the artists."""
+    from mpl_toolkits.mplot3d import proj3d
     arts = []
     tr = np.asarray(trail)
     if len(tr) > 1:
         arts += ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color="black", lw=1.6, alpha=0.9)
-    arts.append(ax.scatter([pos[0]], [pos[1]], [pos[2]], s=170, c="black", marker="o", depthshade=False))
+    xp, yp, _ = proj3d.proj_transform(pos[0], pos[1], pos[2], ax.get_proj())
+    fx, fy = ax.transAxes.inverted().transform(ax.transData.transform((xp, yp)))
+    arts.append(ax.text2D(fx, fy, " ", transform=ax.transAxes, fontsize=7, zorder=1e6,
+                          bbox=dict(boxstyle="circle,pad=0.45", facecolor="black", edgecolor="white", linewidth=1.2)))
     return arts
 
 
