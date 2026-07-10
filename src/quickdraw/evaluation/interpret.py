@@ -42,14 +42,18 @@ def encode_frame_to_data_url(frame_hwc_uint8: np.ndarray) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def build_label_schema(factors: dict) -> dict:
+def build_label_schema(factors: dict, n_captions: int = 0) -> dict:
     """Strict json_schema for the structured VLM output. A free-text `reasoning` field comes FIRST
     (reason-then-answer: describing what it sees before committing lifts accuracy), then one enum field per
-    factor, then a confidence."""
+    factor, then a confidence. n_captions>0 adds a `captions` array of exactly that many detailed free-form
+    descriptions of the clip (for CLIP-style reward training — f_t learns to map real phrasings -> the region)."""
     props: dict = {"reasoning": {"type": "string"}}
     for name, fc in factors.items():
         props[name] = {"type": "string", "enum": list(fc["buckets"])}
     props["self_reported_confidence"] = {"type": "number"}
+    if n_captions:
+        props["captions"] = {"type": "array", "items": {"type": "string"},
+                             "minItems": n_captions, "maxItems": n_captions}
     return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
 
 
@@ -112,13 +116,16 @@ def analytic_scalar(kind: str, pro_phys: np.ndarray, R: float) -> float:
         return float((np.arctan2(pos[1], pos[0]) / (2 * np.pi)) % 1.0)
     if kind == "speed_quantile":                                  # mean |velocity| over the clip (proprio dims 3:6)
         return float(np.linalg.norm(pro_phys[:, 3:6], axis=1).mean())
+    if kind == "z_band":                                          # ambient height z at mid-clip (z in [-r, +r])
+        return float(pro_phys[len(pro_phys) // 2, 2])
     raise ValueError(f"unknown analytic kind {kind!r}")
 
 
-def bucketize(kind: str, scalars, fc: dict) -> list[str]:
+def bucketize(kind: str, scalars, fc: dict, r: float | None = None) -> list[str]:
     """Per-clip scalars -> bucket labels. hue_at_position maps each hue to its nearest color center (per-clip,
-    independent). speed_quantile splits the scalar distribution at the configured quantile EDGES, so the bands
-    are self-calibrating thirds of the observed data (no magic thresholds)."""
+    independent). speed_quantile splits the scalar distribution at the configured quantile EDGES (self-calibrating
+    thirds). z_band thresholds the ambient height against the torus tube radius `r`: |z| > (1-2*frac)*r is the
+    outer top/bottom `frac` of the z-range [-r, +r]; everything else is middle."""
     scalars = np.asarray(scalars, dtype=float)
     buckets = list(fc["buckets"])
     if kind == "hue_at_position":
@@ -127,6 +134,9 @@ def bucketize(kind: str, scalars, fc: dict) -> list[str]:
     if kind == "speed_quantile":
         edges = np.quantile(scalars, fc["analytic"]["edges"])     # e.g. [q33, q66] -> 3 bands
         return [buckets[int(np.searchsorted(edges, s, side="right"))] for s in scalars]
+    if kind == "z_band":
+        thr = (1.0 - 2.0 * float(fc["analytic"].get("frac", 0.1))) * float(r)   # |z| above this -> top/bottom
+        return ["top" if z > thr else "bottom" if z < -thr else "middle" for z in scalars]
     raise ValueError(f"unknown analytic kind {kind!r}")
 
 

@@ -2,7 +2,9 @@
 # select on the CLI with interpret=<env>. eval_interpret imagines short clips, VLM-labels them by semantic
 # factor, and recolors the eval_manifold latent projections by those labels (see design/interpretability.md).
 
-n_clips: 384          # imagined clips to label + embed
+n_clips: 2048         # imagined clips to label + embed (more (latent,label) pairs -> a better-generalizing reward head)
+n_captions: 16        # detailed free-form VLM captions per clip (0 = off). CLIP-style reward training aligns f_z(latent)
+#                       with f_t(MiniLM(caption)); varied real phrasings -> open-vocab steering. Same VLM call as labeling.
 point: per_step       # per_step = every step's latent, clip label broadcast (dense, ~n_clips*clip_len points, comparable to eval_manifold); mean = one clip-mean latent per clip (sparse, clean)
 clip_len: 30          # frames per clip (0.5s @ 60 Hz)
 batch: 32             # clips imagined per forward pass (image-decode memory)
@@ -12,7 +14,7 @@ imaginations: true    # dump per-clip imaginations (one dir per clip, one file p
 umap_sup_weights: [0.1, 0.3, 0.9]    # supervised-UMAP target weights -> extra umap-sup-<w>/ dirs, each supervised by its own labels (forces separation; presentation, not evidence). Plain unsupervised umap is always produced too. NOTE >=~0.99 is degenerate (fully-supervised graph disconnects -> NaN layout); 0.9 is the practical "maximally forced".
 
 vlm:
-  model: gpt-4o-mini
+  model: gpt-4o
   max_workers: 8      # concurrent Responses-API calls (labeling is I/O-bound)
   # OPENAI_API_KEY is read from the environment (falls back to a repo-root .env)
 
@@ -39,13 +41,13 @@ factors:
       kind: hue_at_position    # hue at the agent's ring angle theta -> nearest color center (light-green/green are close in
                                # hue; the VLM/image is the source of truth for that pair, so the analytic cross-check is approximate there).
       hue_centers: {red: 0.0, orange: 0.06, yellow: 0.14, "light green": 0.22, green: 0.30, cyan: 0.5, blue: 0.60, purple: 0.78, pink: 0.90}
-  speed:                       # how fast the agent is moving
-    source: analytic           # exact from the imagined velocity; terciles self-calibrate per model/env (no magic thresholds)
-    buckets: [slow, medium, fast]
-    colors:  {slow: "#4363d8", medium: "#f58231", fast: "#e6194b"}
+  positioning:                 # where the agent is on the torus vertically (ambient height z)
+    source: analytic           # exact from the imagined position; z = r*sin(phi) in [-r, +r] (r = tube radius)
+    buckets: [top, middle, bottom]
+    colors:  {top: "#d62728", middle: "#7f7f7f", bottom: "#1f77b4"}
     analytic:
-      kind: speed_quantile     # mean |velocity| over the clip, split at these quantile edges (thirds -> slow/medium/fast)
-      edges: [0.333, 0.667]
+      kind: z_band             # top/bottom = outer `frac` of the z-range (|z| > (1-2*frac)*r); else middle
+      frac: 0.1                # top 10% and bottom 10% of the vertical extent are 'top'/'bottom'
 
 prompt: |
   You are labeling a short first-person video clip (about half a second) recorded by an agent moving on the
@@ -57,3 +59,16 @@ prompt: |
   pick the more dominant / more saturated one. In "reasoning", FIRST briefly describe what you see on the
   bottom-center floor (a few words), THEN commit to the color. Also give a self_reported_confidence in [0,1]
   (lower it when the frames are blurry or ambiguous). Return ONLY the structured fields.
+
+# appended to `prompt` when n_captions>0 (asks for exactly {n} detailed, diverse captions of THIS clip). These
+# train f_t on real phrasings (CLIP-style), so any wording steers — NOT a fixed template set.
+caption_prompt: |
+  ALSO write exactly {n} short, natural-language captions, each describing THIS specific clip in a DIFFERENT
+  way, as if telling someone what the agent is seeing and doing. Take into account the color of the surface it
+  is standing on and where it sits on the ring vertically (near the top, around the middle, or near the bottom),
+  and mention any motion you can see (climbing, descending, drifting left or right, fast or slow). Vary the
+  wording, word order, and level of detail across the {n} captions — some terse ("red floor, near the top"),
+  some fuller ("moving along a bright red band high up on the ring, drifting to the left"). Do NOT number them
+  or reuse a fixed template; make them read like distinct human descriptions of the same moment. If any "Known
+  exact facts" are given (e.g. the vertical position on the ring), treat them as ground truth and make EVERY
+  caption consistent with them — the frames can be misleading about position, so trust the stated facts there.

@@ -783,11 +783,18 @@ def _draw_hull_2d(ax, hull_pts):
 
 
 def _draw_hull_3d(ax, hull_pts):
-    """Black translucent convex-hull surface of the request cluster (the caller pre-trims which points count)."""
+    """Black convex hull of the request cluster (the caller pre-trims which points count). If the points are
+    COPLANAR (e.g. a 3-class LDA gives only 2 axes, zero-padded to 3D — no 3D volume), draw the 2D hull polygon
+    in that plane instead of asking Qhull for an impossible 3D hull."""
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     from scipy.spatial import ConvexHull
     p = np.asarray(hull_pts)[:, :3]
     if len(p) < 4:
+        return
+    if np.linalg.matrix_rank(p - p.mean(0), tol=1e-6) < 3:            # coplanar/degenerate -> 2D hull in-plane
+        v = p[ConvexHull(p[:, :2]).vertices]
+        v = np.vstack([v, v[:1]])
+        ax.plot(v[:, 0], v[:, 1], v[:, 2], color="black", lw=1.6, alpha=0.7)
         return
     tris = [p[s] for s in ConvexHull(p).simplices]
     ax.add_collection3d(Poly3DCollection(tris, facecolor="black", edgecolor="black",

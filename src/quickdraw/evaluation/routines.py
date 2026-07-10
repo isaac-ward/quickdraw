@@ -362,63 +362,6 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     return {}
 
 
-_PROJECTIONS_GUIDE = r"""# eval_interpret — projection plots guide
-
-Each plot reduces the model's recovered-manifold LATENT (the flattened world-model token bag, dim n_state*d;
-one point per imagined-rollout step) to 2D/3D and colors it by a semantic factor (e.g. color), whose label is
-read by a VLM from the imagined image (source: vlm) or computed from the imagined proprio (source: analytic).
-Files: `plots/<method>/<factor>_<nd>d.png` (+ an uncolored `none_<nd>d` for unsupervised methods). The fitted
-reducers + embeddings are in `projections/` (`<key>_{reducer.pkl,embedding.npy}`); pca/lda/umap expose
-`.transform()` to project NEW points into the SAME embedding (t-SNE has no out-of-sample map).
-
-## The reducers (what each optimizes, how to read it)
-
-### PCA — linear, UNSUPERVISED  (the honest arbiter of global geometry)
-- Optimizes VARIANCE: project onto the top eigenvectors of the covariance, max_W Var(Wᵀz) s.t. WᵀW = I.
-- Axes: real orthogonal linear directions (axis 1 = most-spread). Unitless, but directions are meaningful.
-- Distances: ~faithful to true latent distances (a rotation + truncation, no warping). Trust "are these blobs
-  really far apart / connected?" HERE above any nonlinear method.
-- Read: global layout; whether classes are linearly separable; how much structure survives in 2–3 dims.
-
-### LDA — linear, SUPERVISED (by the factor's labels)
-- Optimizes CLASS SEPARATION: max_W |Wᵀ S_B W| / |Wᵀ S_W W|  (S_B between-class, S_W within-class scatter).
-  Fit as a PCA→LDA pipeline. At most (#classes − 1) axes.
-- Axes: the most class-discriminative linear directions.
-- Distances: OPTIMISTIC — the projection was chosen to pull the LABELED classes apart, so clean separation
-  here does NOT prove the raw latent separates. It shows the factor is linearly DECODABLE, not intrinsic structure.
-- Read: how linearly separable the factor is; which classes still overlap under the best linear split.
-
-### t-SNE — nonlinear, UNSUPERVISED, LOCAL
-- Optimizes NEIGHBORHOODS: match pairwise neighbor probabilities (Gaussian in latent, Student-t in 2D),
-  minimize KL(P‖Q). Fed a PCA-50 pre-projection. No `.transform()`.
-- Axes: MEANINGLESS. Only local who-is-near-whom is trustworthy.
-- Distances: GLOBAL distances, gaps and cluster sizes are NOT meaningful (dense regions inflate; gaps arbitrary).
-- Read: fine cluster membership; do NOT read absolute positions or inter-cluster distances.
-
-### UMAP — nonlinear, UNSUPERVISED
-- Optimizes a fuzzy-topological graph match (cross-entropy of high-D vs low-D fuzzy simplicial sets); keeps
-  more GLOBAL structure than t-SNE but still warps. Has `.transform()`.
-- Axes: arbitrary. Neighborhoods trustworthy; distances semi-quantitative at best.
-- Read: cluster structure + rough global relations; treat gaps qualitatively.
-
-### umap-sup-<w> — nonlinear, SUPERVISED (target_weight w ∈ [0,1])
-- UMAP with the graph blended toward the labels: w=0 is plain UMAP; w→1 forces same-label points together.
-- Distances: increasingly OPTIMISTIC as w rises (presentation, not evidence). w≈0.9 = "maximally forced";
-  ≥~0.99 degenerates (per-class cliques → NaN layout).
-- Read: same caveat as LDA — separation is imposed, not discovered.
-
-## Reading any plot
-- SUPERVISED (lda, umap-sup): separation was optimized FOR → shows decodability, not intrinsic structure.
-  UNSUPERVISED (pca, tsne, umap): structure the model found on its own.
-- For "are two states really similar in the model?", trust PCA distances first; use t-SNE/UMAP only for
-  who-clusters-with-whom.
-- Color = the factor label; tight same-color islands ⇒ the factor is strongly encoded in the latent.
-- Axis numbers are unitless — only RELATIVE positions matter. PCA/LDA axes are linear combinations of latent
-  features; t-SNE/UMAP axes carry no meaning.
-- `none_<nd>d` = the same embedding with no coloring (the shape of the manifold itself).
-"""
-
-
 @torch.no_grad()
 def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     """VLM-labeled latent interpretability (vision models ONLY; self-skips otherwise). Imagine N short clips
@@ -434,7 +377,6 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
 
     from ..data.dataset import load_split_episodes_mm
     from . import interpret as I
-    from .manifold import pad_lims, reduce_dims
     m = getattr(model, "_orig_mod", model)
     if not _is_mm(model):
         return {}
@@ -495,21 +437,39 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     for f, fc in factors.items():
         if "analytic" in fc:
             kind = fc["analytic"]["kind"]
-            ana[f] = I.bucketize(kind, [I.analytic_scalar(kind, p, ecfg.R) for p in pro_all], fc)
+            ana[f] = I.bucketize(kind, [I.analytic_scalar(kind, p, ecfg.R) for p in pro_all], fc, r=ecfg.r)
 
-    # ---- VLM labels (only for source: vlm factors — reads the RENDERED image, independent of the latent) ----
+    # ---- VLM labels (source: vlm factors — reads the RENDERED image) + N free-form captions (CLIP-style reward
+    #      training, same call). ok = clips the VLM successfully returned. ----
     vlm_factors = {f: fc for f, fc in factors.items() if fc.get("source") == "vlm"}
+    n_captions = int(ic.get("n_captions", 0))
     vlm = [None] * len(slices)
     ok = list(range(len(slices)))
-    if vlm_factors:
-        key, schema = I.openai_api_key(), I.build_label_schema(vlm_factors)
+    if vlm_factors or n_captions:
+        key, schema = I.openai_api_key(), I.build_label_schema(vlm_factors, n_captions=n_captions)
         fidx = _np.unique(_np.linspace(0, H - 1, int(ic["vlm_frames"])).round().astype(int))
-        prompt, vmodel = ic["prompt"], ic["vlm"]["model"]
-        _plog(writer, f"[eval_interpret @ep{step}] VLM labeling {list(vlm_factors)} ({vmodel}, {ic['vlm_frames']} frames/clip)...")
+        vmodel = ic["vlm"]["model"]
+        prompt = ic["prompt"]
+        if n_captions and ic.get("caption_prompt"):
+            prompt = prompt + "\n\n" + ic["caption_prompt"].format(n=n_captions)   # append the caption instructions
+        # analytic-sourced factors (e.g. positioning) are EXACT from proprio and the VLM can't read them from the
+        # FPV — pass them in as ground truth so captions don't assert the wrong position (color stays visual).
+        known_factors = [f for f in ana if factors[f].get("source") == "analytic"]
+
+        def _known(i):
+            if not known_factors:
+                return ""
+            facts = "; ".join(f"{f} = {ana[f][i]}" for f in known_factors)
+            return ("\n\nKnown exact facts about this clip (from the simulator — MORE reliable than the frames, do "
+                    f"NOT contradict them): {facts}.")
+
+        _plog(writer, f"[eval_interpret @ep{step}] VLM labeling {list(vlm_factors)} + {n_captions} captions "
+                      f"(grounding {known_factors}, {vmodel}, {ic['vlm_frames']} frames/clip)...")
 
         def _label(i):
             return I.label_clip(api_key=key, model=vmodel, prompt=prompt, schema=schema,
-                                frames_uint8=[frames[i][k] for k in fidx], action_text=I.build_action_text(clip_acts[i]))
+                                frames_uint8=[frames[i][k] for k in fidx],
+                                action_text=I.build_action_text(clip_acts[i]) + _known(i))
 
         with ThreadPoolExecutor(max_workers=int(ic["vlm"]["max_workers"])) as ex:
             for i, res in enumerate(ex.map(_label, range(len(slices)))):
@@ -544,6 +504,21 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
         _plog(writer, f"[eval_interpret @ep{step}] cross-check agreement: "
               + " | ".join(f"{f} {100 * agree[f]:.0f}%" for f in agree))
 
+    # ---- persist per-clip labels.json + crosscheck summary BEFORE the (slow) projections, so a crash in the
+    #      reducers never loses the expensive VLM labels (the reward head only needs labels.json + latents) ----
+    outdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret")
+    os.makedirs(os.path.join(outdir, "crosscheck"), exist_ok=True)
+    recs = [{"episode": int(slices[i][0]), "start": int(slices[i][1]),
+             "label": {f: labels_ok[f][j] for f in factors},
+             "captions": (vlm[i].get("captions", []) if vlm[i] else []),   # N free-form captions (CLIP reward training)
+             "vlm": vlm[i], "analytic": {f: ana[f][i] for f in ana}} for j, i in enumerate(ok)]
+    json.dump(recs, open(os.path.join(outdir, "labels.json"), "w"), indent=2)
+    json.dump({"agreement": agree, "counts": counts, "n_labeled": len(ok), "n_clips": len(slices),
+               "sources": {f: factors[f]["source"] for f in factors}},
+              open(os.path.join(outdir, "crosscheck", "summary.json"), "w"), indent=2)
+    writer.scalars({**{f"eval_interpret/agreement/{f}": v for f, v in agree.items()},
+                    "eval_interpret/n_labeled": float(len(ok))}, step)
+
     # ---- assemble the points to plot: one clip-mean latent, OR every per-step latent with its clip's label ----
     mode = str(ic.get("point", "mean"))
     if mode == "per_step":                                  # dense, comparable to eval_manifold; clip label broadcast to its H steps
@@ -557,65 +532,18 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
         psize = 6.0
         sub = f"each point = the mean over {H}-steps of an imagined rollout ({len(ok)} clips = {len(pts):,} points)"
 
-    # ---- save the projected points + FITTED reducers so the projection is reusable/repeatable (e.g. later,
-    #      projecting MPPI candidate latents into the SAME embedding via reducer.transform — pca/umap only) ----
-    import pickle
+    # ---- project + plot every reducer via the shared library (evaluation/projection.py); it saves the fitted
+    #      reducers too, so a projection is reusable later (reducer.transform(new_latents) — pca/umap/lda only) ----
+    from .projection import project_and_plot
     pdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret", "projections")
     os.makedirs(pdir, exist_ok=True)
-    # always drop a README next to the plots so whoever gets the data knows what each projection is + how to read it
-    open(os.path.join(os.path.dirname(pdir), "README.md"), "w").write(_PROJECTIONS_GUIDE)
-    _np.save(os.path.join(pdir, "latents.npy"), pts)                          # (N,D) points that were projected
     _np.save(os.path.join(pdir, "clip_index.npy"), clip_pos)                  # each point -> its clip's index within `ok`
-    transform_ok = {}
-
-    # ---- project once per (method, dim); emit an uncolored (none_) view + one recolor per factor; save each projection ----
-    for method in ("pca", "tsne", "umap"):
-        for nd in (3, 2):
-            e, reducer = reduce_dims(pts, method, n_components=nd, seed=0, return_reducer=True)
-            _np.save(os.path.join(pdir, f"{method}_{nd}d_embedding.npy"), e)
-            try:
-                with open(os.path.join(pdir, f"{method}_{nd}d_reducer.pkl"), "wb") as fh:
-                    pickle.dump(reducer, fh)
-                transform_ok[f"{method}_{nd}d"] = hasattr(reducer, "transform")  # pca/umap: True; tsne: no out-of-sample
-            except Exception:
-                transform_ok[f"{method}_{nd}d"] = False
-            lims, fig_fn = pad_lims(e), (viz.fig_points_9view if nd == 3 else viz.fig_points_2d)
-            f0 = fig_fn(e, lims=lims, point_size=psize,            # uncolored (no color/legend), like eval_manifold
-                        title=f"eval_interpret — {method.upper()} of latent to {nd}D (no coloring)\n{sub}")
-            writer.figure(f"eval_interpret/plots/{method}/none_{nd}d", f0, step); plt.close(f0)
-            for f, fc in factors.items():
-                rgb, legend = I.point_colors([labels_ok[f][c] for c in clip_pos], fc)
-                fig = fig_fn(e, color=rgb, lims=lims, point_size=psize, legend=legend,
-                             title=f"eval_interpret — {method.upper()} of latent to {nd}D, colored by {f} ({fc['source']})\n{sub}")
-                writer.figure(f"eval_interpret/plots/{method}/{f}_{nd}d", fig, step); plt.close(fig)
-            _plog(writer, f"[eval_interpret @ep{step}] {method} {nd}D done ({time.perf_counter() - t0:.0f}s)")
-
-    # ---- SUPERVISED reducers: forced toward each factor's labels. Fit SEPARATELY per factor (you supervise by
-    #      ONE label), coloring by that same factor. No `none_` view. lda = linear (PCA->LDA, no knob);
-    #      umap-sup-<w> = UMAP nudged by target_weight w. ----
-    # zero-pad the weight in the dir name (0.25 / 0.50 / 1.00) so the fractions sort correctly in a file browser
-    sup_specs = [("lda", "lda", None)] + [(f"umap-sup-{float(w):.2f}", "umap", float(w)) for w in ic.get("umap_sup_weights", [0.5, 1.0])]
-    for mdir, meth, w in sup_specs:
-        for nd in (3, 2):
-            fig_fn = viz.fig_points_9view if nd == 3 else viz.fig_points_2d
-            for f, fc in factors.items():
-                bmap = {b: k for k, b in enumerate(fc["buckets"])}          # bucket -> int label
-                yv = _np.array([bmap[labels_ok[f][c]] for c in clip_pos])   # supervise by THIS factor
-                kw = {"y": yv} if w is None else {"y": yv, "target_weight": w}
-                e, reducer = reduce_dims(pts, meth, n_components=nd, seed=0, return_reducer=True, **kw)
-                key = f"{mdir}_{f}_{nd}d"
-                _np.save(os.path.join(pdir, f"{key}_embedding.npy"), e)
-                try:
-                    with open(os.path.join(pdir, f"{key}_reducer.pkl"), "wb") as fh:
-                        pickle.dump(reducer, fh)
-                    transform_ok[key] = hasattr(reducer, "transform")
-                except Exception:
-                    transform_ok[key] = False
-                rgb, legend = I.point_colors([labels_ok[f][c] for c in clip_pos], fc)   # broadcast to per-step points
-                fig = fig_fn(e, color=rgb, lims=pad_lims(e), point_size=psize, legend=legend,
-                             title=f"eval_interpret — {mdir} to {nd}D, colored by {f} ({fc['source']})\n{sub}")
-                writer.figure(f"eval_interpret/plots/{mdir}/{f}_{nd}d", fig, step); plt.close(fig)
-            _plog(writer, f"[eval_interpret @ep{step}] {mdir} {nd}D done ({time.perf_counter() - t0:.0f}s)")
+    labels_pp = {f: [labels_ok[f][c] for c in clip_pos] for f in factors}     # per-POINT labels (broadcast from clips)
+    transform_ok = project_and_plot(writer, "eval_interpret", pts, labels_pp, factors, step=step,
+                                    point_size=psize, subtitle=sub, methods=("pca", "tsne", "umap"),
+                                    umap_sup_weights=[float(w) for w in ic.get("umap_sup_weights", [0.5, 1.0])],
+                                    save_dir=pdir,
+                                    log=lambda m: _plog(writer, f"[eval_interpret @ep{step}] {m} ({time.perf_counter() - t0:.0f}s)"))
     with open(os.path.join(pdir, "meta.json"), "w") as fh:
         json.dump({"mode": mode, "n_points": int(len(pts)), "latent_dim": int(pts.shape[1]),
                    "transform_available": transform_ok,
@@ -656,18 +584,6 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
                   open(os.path.join(imdir, "manifest.json"), "w"), indent=2)
         _plog(writer, f"[eval_interpret @ep{step}] saved {len(ok)} per-clip imaginations ({len(heads)} trunks) -> imaginations/")
 
-    # ---- per-clip labels.json + crosscheck summary.json (drill into any point) ----
-    outdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret")
-    os.makedirs(os.path.join(outdir, "crosscheck"), exist_ok=True)
-    recs = [{"episode": int(slices[i][0]), "start": int(slices[i][1]),
-             "label": {f: labels_ok[f][j] for f in factors},
-             "vlm": vlm[i], "analytic": {f: ana[f][i] for f in ana}} for j, i in enumerate(ok)]
-    json.dump(recs, open(os.path.join(outdir, "labels.json"), "w"), indent=2)
-    json.dump({"agreement": agree, "counts": counts, "n_labeled": len(ok), "n_clips": len(slices),
-               "sources": {f: factors[f]["source"] for f in factors}},
-              open(os.path.join(outdir, "crosscheck", "summary.json"), "w"), indent=2)
-    writer.scalars({**{f"eval_interpret/agreement/{f}": v for f, v in agree.items()},
-                    "eval_interpret/n_labeled": float(len(ok))}, step)
     if was:
         m.train()
     _plog(writer, f"[eval_interpret @ep{step}] done in {time.perf_counter() - t0:.1f}s -> eval_interpret/")

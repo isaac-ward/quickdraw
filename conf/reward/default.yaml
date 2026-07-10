@@ -1,15 +1,29 @@
 # Language reward head R(latent, text): distilled from an eval_interpret run's (latent, label) pairs.
 # Trained torch-only (MiniLM embeds text via `transformers`, mean-pooled). See design/language_steering.md.
 
-interpret_run: logs/eval_interpret_2026_07_08_04_07_28_interpret_r3diff_v4   # source run (has projections/ + labels.json)
-factor: color            # which factor to align to (must be a source: vlm/analytic factor in conf/interpret)
+interpret_run: logs/eval_interpret_2026_07_08_04_07_28_interpret_r3diff_v4   # source run (has projections/ + labels.json + captions)
+# ---- objective: CLIP-style caption contrastive. Align f_z(latent) with f_t(MiniLM(caption)) over each clip's N
+#      captions; the loss is (latent, caption) pairs — NO per-factor prototypes. `factors` here is used only for
+#      eval coloring + the steering-readiness probe (score latents vs bucket words), never for the training loss. ----
+factors: [color, positioning]   # factors for eval/coloring/probe only (the loss is caption-contrastive)
+factor: color            # fallback if `factors` is unset (single-factor). Must be conf/interpret factors.
+soft_targets: false      # false = vanilla CLIP InfoNCE (own caption = the only positive; same-combo captions are
+#                          false negatives). true = soft targets: the per-batch caption-caption MiniLM similarity
+#                          IS the target distribution, so semantically-equal captions share credit (no false neg).
+caption_tau: 0.1         # soft-target temperature (only used when soft_targets=true): low -> only near-identical
+#                          captions count as soft-positive (~vanilla); high -> broader semantic neighborhoods share.
 embed_dim: 128           # shared f_z/f_t projection dim
 hidden: 256              # MLP hidden width
 epochs: 300
 report_every: 10         # log train/val metrics (+ progress.log line) every N epochs
 lr: 1.0e-3
-batch: 512
-temperature: 0.07        # cosine-logit temperature for the cross-entropy
+batch: 512               # also the contrastive batch = number of in-batch negatives
+temperature: 0.07        # cosine-logit temperature for the contrastive softmax
+# ---- regularization (the reward head overfits badly: train loss ~0.1 vs val ~1.9; more data didn't help) ----
+weight_decay: 0.01       # Adam L2 penalty -> smoother f_z/f_t
+dropout: 0.1             # dropout after the GELU in f_z/f_t (inert at eval; saved in reward_head.pt for reload)
+latent_noise: 0.1        # train-time Gaussian noise on the latent (× its global std) -> f_z invariant to jitter
+early_stop_patience: 8   # stop after this many report intervals w/o val-loss improvement; deploy the best checkpoint (0 = off)
 val_frac: 0.15           # held-out fraction, split BY CLIP (no per-step leakage)
 seed: 0
 text_model: sentence-transformers/paraphrase-MiniLM-L3-v2

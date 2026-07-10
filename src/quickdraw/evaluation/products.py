@@ -142,16 +142,22 @@ def load_latent_projection(interpret_run, method, factor, dim, *, fc, reward, re
     clip_idx = np.load(os.path.join(pdir, "clip_index.npy"))
     latents = np.load(os.path.join(pdir, "latents.npy"))               # (N, D) — for the reward argmax (X_r)
     recs = json.load(open(os.path.join(base[0], "labels.json")))
-    labels = np.array([recs[int(c)]["label"][factor] for c in clip_idx])   # per-point factor label
+    labels = np.array([recs[int(c)]["label"][factor] for c in clip_idx])   # per-point label for THIS factor
     rgb, legend = I.point_colors(list(labels), fc)
-    xc = emb[labels == request].mean(0) if (labels == request).any() else emb.mean(0)   # centroid of request points
-    t_e = reward.text_embedding(request)
+    # a compound request ("top red") mentions >=1 of THIS factor's buckets; C/hull = those points (color plot ->
+    # 'red', positioning plot -> 'top'). If the request names none of this factor's buckets, fall back to all.
+    rq = str(request).lower()
+    relevant = [b for b in fc["buckets"] if b.lower() in rq]
+    mask = np.isin(labels, relevant) if relevant else np.ones(len(labels), bool)
+    cluster = emb[mask]
+    xc = cluster.mean(0) if len(cluster) else emb.mean(0)             # centroid of the request's relevant-bucket points
+    t_e = reward.text_embedding(request)                             # full compound direction (all factors)
     with torch.no_grad():
         R = reward.score(torch.from_numpy(latents.astype(np.float32)), t_e).cpu().numpy()   # (N,)
-    xr = emb[int(R.argmax())]                                          # highest-reward point
-    red = emb[labels == request]                                       # the request cluster (semantic label == request)
-    if len(red):                                                       # trim to the inner hull_frac by distance from
-        d = np.linalg.norm(red - red.mean(0), axis=1)                  # the centroid, so stray members don't balloon it
+    xr = emb[int(R.argmax())]                                          # highest-(compound-)reward point
+    red = cluster
+    if len(red):                                                      # trim to the inner hull_frac by distance from
+        d = np.linalg.norm(red - red.mean(0), axis=1)                 # the centroid, so stray members don't balloon it
         red = red[d <= np.quantile(d, hull_frac)]
     return {"emb": emb, "reducer": reducer, "rgb": rgb, "legend": legend, "lims": pad_lims(emb), "dim": dim,
             "marks": [{"pos": xc, "text": "C"}, {"pos": xr, "text": "M"}],   # C=centroid, M=max-reward
@@ -164,7 +170,10 @@ def render_latent_video(proj, agent_latents, *, n_frames=None, point_size=2.5, t
     eval_interpret PNG uses (fig_points_9view for 3D — all 9 views — or fig_points_2d), built ONCE with the
     cloud + C/M circles + request hull. 3D uses a translucent cloud (alpha 0.5) so the agent shows through.
     n_frames=None -> one frame per control step (syncs 1:1 with the control video at the same fps). (T,H,W,3)."""
-    traj = np.asarray(proj["reducer"].transform(agent_latents))[:, :proj["dim"]]   # (T, dim) in the SAME embedding
+    traj = np.asarray(proj["reducer"].transform(agent_latents))                    # (T, ncomp)
+    if traj.shape[1] < proj["dim"]:                                                # LDA gives only n_classes-1 axes;
+        traj = np.hstack([traj, np.zeros((len(traj), proj["dim"] - traj.shape[1]))])   # zero-pad to match the (padded) embedding
+    traj = traj[:, :proj["dim"]]                                                    # (T, dim), SAME space as the backdrop
     T = len(traj)
     idx = list(range(1, T + 1)) if n_frames is None else list(np.linspace(1, T, min(n_frames, T)).astype(int))
     is3d = proj["dim"] == 3

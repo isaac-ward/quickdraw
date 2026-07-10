@@ -64,7 +64,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         from ..language.reward import LanguageReward
         request = str(lang.request)
         reward = LanguageReward(lang.head, device=device)
-        assert request in reward.buckets, f"request {request!r} not in reward vocab {reward.buckets}"
+        reward.text_embedding(request)   # validate up front: raises if the request matches no known buckets (compound OK)
         ov = dict(lang.get("overrides") or {})   # language-mode control knobs (n_episodes/max_steps/...) over `control:`
         mppi_kwargs.update(ov)
         _plog(writer, f"[eval_control @ep{step}] LANGUAGE steering -> '{request}' "
@@ -106,7 +106,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         agents = [_agent(res[k], i, colors[k], R, r) for k in kinds]
         nf = len(agents[0]["path"])
         _plog(writer, f"[eval_control @ep{step}] rendering control video #{i} ({nf} frames, GPU/EGL)...")
-        vtitle = (f"language steering: '{request}' #{i}" if reward is not None else f"control: true vs pred #{i}")
+        vtitle = (f'"{request}"  #{i}' if reward is not None else f"control: true vs pred #{i}")
         frames = viz.control_compare_frames(R, r, "hsv", agents, n_frames=nf, title=vtitle,
                                             fan_seq=res["fan_seqs"][i],  # pred's MPPI candidate fan, colored by score
                                             reuse=bool(cfg.control.get("reuse_render", False)),
@@ -170,11 +170,12 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 for i in range(NP):
                     ti = time.perf_counter()
                     vid = render_latent_video(proj, res["agent_latents"][i],
-                                              title=f"{method} · {factor} {dim}d — '{request}' steering #{i}",
+                                              title=f'"{request}"  ·  {factor} ({method} {dim}d)  #{i}',
                                               log=lambda m, i=i, method=method, dim=dim:
-                                                  _plog(writer, f"[eval_control @ep{step}]   anim {method}/{factor}_{dim}d #{i} {m}"))
-                    writer.video(product_tag("eval_control/interpret", f"{factor}_{dim}d", head=method, i=i), vid, fps, step)
-                    _plog(writer, f"[eval_control @ep{step}] interpret/{method}/{factor}_{dim}d_{i} "
+                                                  _plog(writer, f"[eval_control @ep{step}]   anim {factor}/{method}/{dim}d #{i} {m}"))
+                    # eval_control/interpret/<categorical>/<reducer>/<nd>d_<i> (mirrors the plots/<cat>/<reducer> layout)
+                    writer.video(product_tag(f"eval_control/interpret/{factor}/{method}", f"{dim}d", i=i), vid, fps, step)
+                    _plog(writer, f"[eval_control @ep{step}] interpret/{factor}/{method}/{dim}d_{i} "
                                   f"({len(vid)} frames, {time.perf_counter() - ti:.0f}s)")
 
     # aggregate scalars (over ALL episodes, once)

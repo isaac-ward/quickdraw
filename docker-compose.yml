@@ -18,6 +18,8 @@ services:
     volumes:
       - ./src:/app/src             # editable install -> code edits go live without rebuilding
       - ./conf:/app/conf           # edit configs without rebuilding
+      - ./.env:/app/.env           # live host .env (repo root isn't mounted, so the baked copy is stale);
+      #                              also loaded into the env via `env_file: .env` above (needs `up -d` to refresh)
       - ./datasets:/app/datasets   # generated once, reused
       - ./logs:/app/logs           # run folders, checkpoints, media
       - caches:/caches             # persist torch.compile + HF caches across runs

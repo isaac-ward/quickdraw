@@ -22,13 +22,15 @@ language:
   interpret_run: null   # eval_interpret run dir; when set (reward mode), animate the agent moving through its
                         # saved latent projections (backdrop cloud + X_c/X_r target crosses + agent sphere & tail)
   interpret_plots:      # which projections to animate (method needs an out-of-sample map: pca/lda/umap/umap-sup-*; NOT tsne)
-    - {method: lda, factor: color, dims: [2, 3]}   # default: 2 animations/episode (color LDA, 2d + 3d)
+    - {method: lda, factor: color, dims: [2, 3]}         # color LDA, 2d + 3d
+    - {method: lda, factor: positioning, dims: [2, 3]}   # positioning LDA, 2d + 3d
   hull_frac: 0.8        # request-region hull: keep the inner this-fraction of cluster points (drop outliers) before hulling
   overrides:
-    n_episodes: 2     # steered episodes from different inits (raise n_episodes + n_plot together for more)
-    n_plot: 2         # how many episodes to render products for (control_video_i / rollout_i / distance_i / interpret)
+    n_episodes: 4     # steered episodes from different inits (all rendered)
+    n_plot: 4         # how many episodes to render products for (control_video_i / rollout_i / distance_i / interpret)
     max_steps: 500    # give the reward-max controller room to migrate across the torus
-    # (settling relies on the long horizon, like goal mode — beta_vel=0 by default, so r_settle is a no-op here)
+    lambda_: 0.05     # MPPI temperature, LANGUAGE STEERING ONLY: low -> commit to the reward max instead of averaging
+    #                   over the reward plateau (the goal race keeps mppi.yaml's 0.3). beta_vel=0, so r_settle is n/a here.
 
 # short experiment summary -> run dir is logs/<timestamp>_<experiment> (override on CLI)
 experiment: base
