@@ -5,8 +5,12 @@
 # window=32, 100 epochs, evals every 20).
 #
 # NOTE: flow decode is ~2-4x costlier than the old linear-MSE decode (a ViT denoiser per frame), so the
-# batch=1024 baseline OOMs. batch=128 + recon_frac=0.25 (decode 1/4 of the F frames, unbiased over epochs)
-# runs cleanly (verified). Optional noise injection (existing additive site): +variations.noise_injection.std=0.05
+# batch=1024 baseline OOMs. batch=128 + recon_frac=0.25 (decode 1/4 of the F frames, unbiased over epochs).
+# model.p_tf_end=1.0 => TEACHER-FORCED training (p_tf stays 1). The default schedule (p_tf_end=0) does
+# autoregressive IN-ROLLOUT training, which backprops through the flow sampler every step -> with dynamics
+# shortcut off (K=6) that's ~9x slower + growing memory (the "in-rollout only sane at K=1" coupling).
+# Teacher-forced is fast + memory-stable, and DF is the drift-robustness mechanism we're actually testing.
+# Optional noise injection (existing additive site): +variations.noise_injection.std=0.05
 #
 # Run INSIDE the container:  docker exec quickdraw-app-1 bash -lc 'cd /app && CUDA_VISIBLE_DEVICES=0 bash src/quickdraw/scripts/launch_flowdec.sh flowdec_v1'
 set -euo pipefail
@@ -15,7 +19,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 
 uv run python -m quickdraw.train_world \
   model=mm_flow model.d=128 model.depth=4 model.heads=8 model.window=32 \
-  data.batch=128 model.recon_frac=0.25 \
+  data.batch=64 model.recon_frac=0.25 model.p_tf_end=1.0 \
   data.root="$DATA" \
   trainer.max_epochs=100 eval.during_train.every_epochs=20 \
   +run_summary.problem="MSE_image_decode_blur_prone_deterministic_readout_cannot_commit_to_sharp_detail" \
