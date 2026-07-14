@@ -84,10 +84,10 @@ class LitWorldModel(L.LightningModule):
             src, fut = recon_src[:, idx], {kk: v[:, idx] for kk, v in future.items()}
         else:
             src, fut = recon_src, future
-        dec = m.to_obs(src)
-        recon = {name: F.mse_loss(dec[name], fut[name]) for name, _ in m.layout}
+        dec = m.to_obs(src)                                   # decoded obs (mse: decode; flow: 1-step sample) — metrics/media
+        recon = m.recon_losses(src, fut)                      # per-head decode LOSS: {name} (mse) or {flow/name,shortcut/name}
         raw, w = m.loss_terms(preds, future, obs, p_tf, act)
-        loss = sum(w[k] * raw[k] for k in raw) + sum(wts[k] * recon[k] for k in recon)
+        loss = sum(w[k] * raw[k] for k in raw) + sum(wts[k.split("/")[-1]] * recon[k] for k in recon)
 
         # train-time shaping variations (per-stream input noise applied inline above; here the LOSS terms:
         # physical_loss on the proprio decode, contraction on the one-step token-bag map). Routed through the
@@ -120,7 +120,7 @@ class LitWorldModel(L.LightningModule):
                 self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
                 self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
                 self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
-                self.log("val/metric/proprio/obs_error", recon["proprio"])   # decoded-proprio MSE (normalized) — comparable across models
+                self.log("val/metric/proprio/obs_error", F.mse_loss(dec["proprio"], future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
                 for name, _ in m.layout:
                     if name == "proprio":
                         continue

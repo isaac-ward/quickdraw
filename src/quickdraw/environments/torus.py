@@ -205,3 +205,83 @@ class OUActionSampler:
         noise = torch.randn(self.state.shape, device=self.device, generator=generator)
         self.state = self.state + self.theta_ou * (-self.state) + self.sigma * noise
         return (self.state * self.a_max).clamp(-self.a_max, self.a_max)
+
+
+# --------------------------------------------------------------------------------------
+# Surface COLOR + vertical POSITION — the analytic ground truth (single source of truth),
+# matching the RENDERER exactly (logging/viz.py `_texture_array`): the ring is painted with
+# plt.cm.hsv in N_SEG discrete bands by the major angle theta (texture U = theta/2pi, no offset).
+# These replace the old hand-set, miscalibrated `hue_centers`. Everything is derived from the paint
+# + the named-color hexes; nothing hand-tuned. Reused by eval_interpret analytic labels, the
+# language-reward ground-truth check, and any controller wanting an analytic color/position reward.
+# numpy in/out (xyz world points, shape (...,3)); validated in smoke/torus_env.py against the renderer.
+# --------------------------------------------------------------------------------------
+import colorsys as _colorsys  # noqa: E402
+
+import numpy as _np  # noqa: E402
+
+N_SEG = 16  # discrete hue bands around the ring — MUST equal logging/viz.N_SEG (asserted in the smoke)
+# 9 human color names -> hex (must match conf/interpret/torus.yaml factors.color.colors). NOTE the paint is
+# pure-hue in 16 bands, so only ~7 of these are producible: "light green" (shares green's hue) and "purple"
+# (falls between the blue-violet and magenta bands) are NEVER the nearest to a real band — a lossy naming,
+# surfaced (not hidden) by the smoke.
+NAMED_COLORS = {
+    "red": "#ff0000", "orange": "#ffa500", "yellow": "#ffff00", "light green": "#90ee90",
+    "green": "#228b22", "cyan": "#00ffff", "blue": "#0000ff", "purple": "#800080", "pink": "#ff69b4",
+}
+
+
+def _hex_rgb(h: str) -> _np.ndarray:
+    h = h.lstrip("#")
+    return _np.array([int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)])
+
+
+def hue_at(xyz) -> _np.ndarray:
+    """Painted hue at a world point = texture U = (theta/2pi) mod 1 (this IS the hsv colormap input)."""
+    xyz = _np.asarray(xyz, dtype=float)
+    return (_np.arctan2(xyz[..., 1], xyz[..., 0]) / TWO_PI) % 1.0
+
+
+def band_at(xyz, n_seg: int = N_SEG) -> _np.ndarray:
+    return (_np.floor(hue_at(xyz) * n_seg).astype(int)) % n_seg
+
+
+def rgb_at(xyz, n_seg: int = N_SEG) -> _np.ndarray:
+    """Exact rendered RGB at a world point: plt.cm.hsv of the quantized band — identical to viz._texture_array."""
+    import matplotlib.cm as cm
+    return _np.asarray(cm.hsv(band_at(xyz, n_seg) / n_seg))[..., :3]
+
+
+def color_at(xyz, colors: dict | None = None, n_seg: int = N_SEG):
+    """Nearest NAMED color to the actual painted RGB — 'what it looks like'. Rarely returns
+    'light green'/'purple' (the paint can't produce them distinctly). Scalar name, or list for a batch."""
+    colors = {k: _hex_rgb(v) for k, v in (colors or NAMED_COLORS).items()}
+    rgb = rgb_at(xyz, n_seg)
+    names = list(colors)
+    mat = _np.stack([colors[n] for n in names])
+    idx = _np.linalg.norm(rgb[..., None, :] - mat, axis=-1).argmin(-1)
+    return names[int(idx)] if _np.ndim(idx) == 0 else [names[int(i)] for i in _np.asarray(idx).ravel()]
+
+
+def position_band(xyz, r: float, top_frac: float = 0.1):
+    """Vertical band from ambient z: |z| > (1-2*top_frac)*r -> outer top/bottom frac; else middle."""
+    z = _np.asarray(xyz, dtype=float)[..., 2]
+    thr = (1.0 - 2.0 * top_frac) * r
+    f = lambda zz: "top" if zz > thr else "bottom" if zz < -thr else "middle"
+    return f(float(z)) if _np.ndim(z) == 0 else [f(float(zz)) for zz in _np.asarray(z).ravel()]
+
+
+def color_reward(xyz, name: str, colors: dict | None = None) -> _np.ndarray:
+    """Graded [0,1]: 1 - (circular hue distance to the target color's true hue)/0.5. Smooth around the ring."""
+    colors = colors or NAMED_COLORS
+    t = _colorsys.rgb_to_hsv(*_hex_rgb(colors[name]))[0]
+    d = _np.abs(hue_at(xyz) - t) % 1.0
+    d = _np.minimum(d, 1.0 - d)
+    return _np.clip(1.0 - d / 0.5, 0.0, 1.0)
+
+
+def position_reward(xyz, r: float, band: str) -> _np.ndarray:
+    """Graded [0,1]: 1 at the target band's z-center (top:+r, middle:0, bottom:-r), decaying over the tube."""
+    z = _np.asarray(xyz, dtype=float)[..., 2]
+    ctr = {"top": r, "middle": 0.0, "bottom": -r}[band]
+    return _np.clip(1.0 - _np.abs(z - ctr) / (2.0 * r), 0.0, 1.0)

@@ -95,6 +95,23 @@ class MultiModalSequenceModel(nn.Module):
             off += n
         return out
 
+    def recon_losses(self, bag: Tensor, targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Per-modality DECODE loss of the predicted token bag vs clean target obs. Keys: `<name>` for mse
+        decoders (bit-identical to before) or `flow/<name>` (+ `shortcut/<name>`) for flow decoders. The
+        per-key weight is the modality weight (key.split('/')[-1] -> name)."""
+        out, off = {}, 0
+        for name, n in self.layout:
+            mod = self.modalities[name]
+            main, sc = mod.decode_loss(bag[..., off:off + n, :], targets[name])
+            if mod.decode_kind == "flow":
+                out[f"flow/{name}"] = main
+                if sc is not None:
+                    out[f"shortcut/{name}"] = sc
+            else:
+                out[name] = main
+            off += n
+        return out
+
     def _to_input(self, bag: Tensor, act: Tensor) -> Tensor:        # (B,T,n_state,d),(B,T,2)->(B,T,n_input,d)
         return torch.cat([bag, self.act_enc(act).unsqueeze(-2)], dim=-2)
 

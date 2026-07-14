@@ -7,11 +7,15 @@ interpret_run: logs/eval_interpret_2026_07_08_04_07_28_interpret_r3diff_v4   # s
 #      eval coloring + the steering-readiness probe (score latents vs bucket words), never for the training loss. ----
 factors: [color, positioning]   # factors for eval/coloring/probe only (the loss is caption-contrastive)
 factor: color            # fallback if `factors` is unset (single-factor). Must be conf/interpret factors.
-soft_targets: false      # false = vanilla CLIP InfoNCE (own caption = the only positive; same-combo captions are
-#                          false negatives). true = soft targets: the per-batch caption-caption MiniLM similarity
-#                          IS the target distribution, so semantically-equal captions share credit (no false neg).
-caption_tau: 0.1         # soft-target temperature (only used when soft_targets=true): low -> only near-identical
-#                          captions count as soft-positive (~vanilla); high -> broader semantic neighborhoods share.
+soft_targets: false      # KEEP FALSE (vanilla CLIP InfoNCE) — this is the validated default. DO NOT enable soft.
+#   Empirical (2026-07, 5 compound requests x 2 heads, identical data): vanilla mean final distance-to-request
+#   0.567 vs soft 0.935; vanilla won 4/5 and soft FAILED to steer top-red / lower-blue (distance rose, i.e. MPPI
+#   couldn't reduce even its own objective -> soft's credit-spreading flattens the reward landscape). The 7.6%
+#   measured false-negative rate does NOT hurt vanilla enough to matter. See design/models (language steering).
+#   false = own caption is the only positive (same-combo captions are false negatives — harmless here).
+#   true  = per-batch caption-caption MiniLM similarity IS the target (semantically-equal captions share credit).
+caption_tau: 0.1         # soft-target temperature (only used if soft_targets=true, which we don't): low -> only
+#                          near-identical captions count as soft-positive (~vanilla); high -> broader neighborhoods.
 embed_dim: 128           # shared f_z/f_t projection dim
 hidden: 256              # MLP hidden width
 epochs: 300

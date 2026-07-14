@@ -25,22 +25,23 @@ vlm:
 # buckets = the label set (also the legend order); colors = a matplotlib color per bucket for the legend.
 factors:
   color:                       # the surface the agent is standing on
-    source: vlm                # VLM reads the image -> the independent probe; analytic (hue at position) cross-checks it
-    buckets: [cyan, blue, purple, pink, red, orange, yellow, "light green", green]
+    source: vlm                # VLM reads the image -> the independent probe; analytic (environments/torus.color_at) cross-checks it
+    # TRIMMED to the 7 PRODUCIBLE names: the ring is painted with plt.cm.hsv in 16 pure-hue bands, and
+    # "light green" (shares green's hue) + "purple" (falls between blue-violet and magenta) are NEVER the
+    # nearest to a real band — unsteerable/unverifiable, so dropped (see environments/torus.py + smoke/torus_env.py).
+    buckets: [cyan, blue, pink, red, orange, yellow, green]
     colors:
       cyan: "#00ffff"
       blue: "#0000ff"
-      purple: "#800080"
       pink: "#ff69b4"
       red: "#ff0000"
       orange: "#ffa500"
       yellow: "#ffff00"
-      "light green": "#90ee90"
       green: "#228b22"
     analytic:
-      kind: hue_at_position    # hue at the agent's ring angle theta -> nearest color center (light-green/green are close in
-                               # hue; the VLM/image is the source of truth for that pair, so the analytic cross-check is approximate there).
-      hue_centers: {red: 0.0, orange: 0.06, yellow: 0.14, "light green": 0.22, green: 0.30, cyan: 0.5, blue: 0.60, purple: 0.78, pink: 0.90}
+      kind: hue_at_position    # NOTE: the exact ground truth is now environments/torus.color_at (band-accurate);
+                               # this hue_centers map is the legacy per-clip cross-check (interpret.py rewire pending).
+      hue_centers: {red: 0.0, orange: 0.09, yellow: 0.17, green: 0.34, cyan: 0.5, blue: 0.67, pink: 0.87}
   positioning:                 # where the agent is on the torus vertically (ambient height z)
     source: analytic           # exact from the imagined position; z = r*sin(phi) in [-r, +r] (r = tube radius)
     buckets: [top, middle, bottom]
