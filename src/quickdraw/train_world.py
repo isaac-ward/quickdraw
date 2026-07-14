@@ -163,7 +163,10 @@ def main(cfg):
     # enable_progress_bar=False: no tqdm; ProgressPrinter emits plain per-epoch lines instead.
     trainer = L.Trainer(max_epochs=cfg.trainer.max_epochs, precision=cfg.trainer.precision,
                         accelerator="gpu", devices=1, gradient_clip_val=1.0, enable_progress_bar=False,
-                        check_val_every_n_epoch=1, callbacks=callbacks, logger=False,
+                        check_val_every_n_epoch=int(cfg.trainer.get("check_val_every_n_epoch", 1)),  # val is an
+                        #  autoregressive rollout ~as long as the train epoch (~50% of wall time); raise this to
+                        #  validate less often and train faster (e.g. 5). Eval routines have their own cadence.
+                        callbacks=callbacks, logger=False,
                         inference_mode=cfg.trainer.get("inference_mode", False),  # False (val under no_grad,
                         #   not inference_mode) lets the contraction variation build its Jacobian graph on
                         #   val for val/loss/contraction. Measured to have NO speed cost vs inference_mode.
