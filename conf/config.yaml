@@ -44,7 +44,11 @@ checkpoint: null
 #   variations.noise_injection.std=0.05   variations.physical_loss.weight=1.0
 #   variations.contraction.weight=1.0 variations.contraction.target=1.0
 variations:
-  noise_injection: { std: 0.0 }                  # sigma of Gaussian noise on the normalized obs INPUTS
+  noise_injection:                               # two injection sites (design/models/flow_heads.md sec 8):
+    std: 0.0                                      #  observations_raw ("corrupt-and-hide"): additive Gaussian on obs INPUTS
+    observations_encoded_pre_fusion:              #  ("corrupt-and-tell") = DIFFUSION FORCING: noise the pre-fusion context
+      scale: 0.0                                  #    tokens at independent per-timestep levels + a backbone level-embedding.
+      granularity: timestep                       #    FLOW models only (gated). 0 -> off (bit-identical). fraction of full noise.
   physical_loss:   { weight: 0.0, continuity: 0.0, warmup_epochs: 10 }  # weight: on-surface+tangent; continuity:
   #                  kinematic v=dp/dt; warmup_epochs: ramp the physical weight 0->1 over N epochs (schedules/)
   contraction:     { weight: 0.0, target: 1.02, power_iters: 2, n_sample_steps: 4 }  # hinge on sigma_max(one-step J)

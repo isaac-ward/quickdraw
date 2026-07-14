@@ -112,7 +112,13 @@ class MultiModalSequenceModel(nn.Module):
             off += n
         return out
 
-    def _to_input(self, bag: Tensor, act: Tensor) -> Tensor:        # (B,T,n_state,d),(B,T,2)->(B,T,n_input,d)
+    def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
+        """Diffusion-forcing hook: add a per-state-token noise-LEVEL embedding to the bag before fusion.
+        Base = no-op (bit-identical for DSAR/LSAR and for the flow model with DF off)."""
+        return bag
+
+    def _to_input(self, bag: Tensor, act: Tensor, levels=None) -> Tensor:  # (B,T,n_state,d),(B,T,2)->(B,T,n_input,d)
+        bag = self._add_level_emb(bag, levels)                 # DF: condition the backbone on context noise levels
         return torch.cat([bag, self.act_enc(act).unsqueeze(-2)], dim=-2)
 
     def physical_state(self, bag: Tensor):
@@ -328,7 +334,8 @@ class MultiModalFlow(MultiModalSequenceModel):
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = False, time_sampling: str = "uniform", flow_hidden: int = 0,
-                 lambda_flow: float = 1.0, lambda_consistency: float = 1.0):
+                 lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
+                 df_scale: float = 0.0, df_granularity: str = "timestep"):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim)
         assert predict in ("residual", "absolute")
@@ -340,6 +347,30 @@ class MultiModalFlow(MultiModalSequenceModel):
         self.flow = FlowField(d, h_dim=d, hidden=(flow_hidden or d), cond="concat", shortcut=shortcut)
         self.pred_obs_in_loss = True
         self.lambda_pred_obs = 1.0
+        # ---- diffusion forcing (opt-in; df_scale=0 -> everything below is inert / bit-identical) ----
+        # noise the ENCODED context tokens at independent per-timestep levels (train only), and CONDITION the
+        # backbone on those levels via a learned level embedding (added to the state tokens in _to_input). At
+        # inference / rollout, levels default to 0 (clean) -> emb(0). See design/models/flow_heads.md sec 8.
+        import math as _math
+        self.df_scale = float(df_scale)
+        self.df_granularity = str(df_granularity)
+        if self.df_scale > 0.0:
+            if self.df_granularity != "timestep":
+                raise NotImplementedError(f"diffusion_forcing granularity={self.df_granularity!r} not implemented "
+                                          "(only 'timestep' for now; 'modality' is a future option).")
+            nfreq = 16
+            self.register_buffer("_df_freqs", 2.0 * _math.pi * torch.logspace(0.0, 2.0, nfreq), persistent=False)
+            self.df_level_emb = nn.Sequential(nn.Linear(2 * nfreq, d), nn.GELU(), nn.Linear(d, d))
+
+    def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
+        """Add a per-timestep noise-level embedding to the state tokens (DF). levels: (...,1) in [0,1] over the
+        bag's leading (position) dims, or None -> 0 (clean, the inference/rollout default). Inert when df_scale=0."""
+        if self.df_scale <= 0.0:
+            return bag
+        if levels is None:
+            levels = bag.new_zeros(bag.shape[:-2] + (1,))       # level 0 (clean) — matches inference
+        feats = torch.cat([(levels * self._df_freqs).sin(), (levels * self._df_freqs).cos()], dim=-1)
+        return bag + self.df_level_emb(feats).unsqueeze(-2)     # (...,1,d) broadcast over the n_state tokens
 
     def predict_next(self, h_state: Tensor, prev_bag: Tensor) -> Tensor:
         det = (not self.training) and (not self.stochastic_eval)
@@ -352,9 +383,15 @@ class MultiModalFlow(MultiModalSequenceModel):
         z = self.encode_state(obs)                              # (B,L,n_state,d)
         L = z.shape[1]
         s = z[:, :-1]                                           # contexts (B,L-1,n_state,d)
-        h = self.backbone(self._to_input(s, act_seq[:, :L - 1]))
+        levels = None
+        if self.df_scale > 0.0 and self.training:               # diffusion forcing: noise the context + tell the backbone
+            levels = torch.rand(s.shape[:-2] + (1,), device=s.device, dtype=s.dtype) * self.df_scale  # (B,L-1,1)
+            eps = torch.randn_like(s)
+            lv = levels.unsqueeze(-2)                            # (B,L-1,1,1) broadcast over n_state,d
+            s = _ln((1.0 - lv) * s + lv * eps)                  # noised context (renormalized on the sphere)
+        h = self.backbone(self._to_input(s, act_seq[:, :L - 1], levels=levels))
         h_state = h[..., : self.n_state, :]                     # (B,L-1,n_state,d)
-        target = (z[:, 1:] - s).detach() if self.predict_residual else z[:, 1:].detach()
+        target = (z[:, 1:] - z[:, :-1]).detach() if self.predict_residual else z[:, 1:].detach()  # target off CLEAN z
         l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
         raw, w = {"flow/latent": l_flow}, {"flow/latent": self.lambda_flow}   # dynamics flow (was "flow")
         if l_cons is not None:

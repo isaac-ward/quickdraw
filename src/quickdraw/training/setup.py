@@ -39,6 +39,16 @@ def build_model(cfg):
         from ..models.multimodal import MultiModalFlow, MultiModalDSAR, MultiModalLSAR
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
                       mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2))
+        # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
+        # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
+        ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}
+        oe = (ni.get("observations_encoded_pre_fusion", {}) if hasattr(ni, "get") else {}) or {}
+        oeg = (lambda k, v: oe.get(k, v)) if hasattr(oe, "get") else (lambda k, v: getattr(oe, k, v))
+        df_scale = float(oeg("scale", 0.0) or 0.0)
+        df_granularity = str(oeg("granularity", "timestep"))
+        if df_scale > 0.0 and name not in ("mm_flow", "flow"):
+            raise ValueError(f"variations.noise_injection.observations_encoded_pre_fusion (diffusion forcing) "
+                             f"requires a flow model (model.name in mm_flow/flow); got {name!r}.")
         if name in ("mm_dsar", "dsar", "base"):
             return MultiModalDSAR(**common)
         if name in ("mm_lsar", "lsar"):
@@ -65,7 +75,8 @@ def build_model(cfg):
                                        time_sampling=str(dfg("time_sampling", "uniform")),
                                        flow_hidden=int(dfg("flow_hidden", 0)),
                                        lambda_flow=m.get("lambda_flow", 1.0),
-                                       lambda_consistency=m.get("lambda_consistency", 1.0))
+                                       lambda_consistency=m.get("lambda_consistency", 1.0),
+                                       df_scale=df_scale, df_granularity=df_granularity)
         raise ValueError(f"unknown model.name: {name!r}")
 
 
