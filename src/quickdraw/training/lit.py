@@ -84,8 +84,10 @@ class LitWorldModel(L.LightningModule):
             src, fut = recon_src[:, idx], {kk: v[:, idx] for kk, v in future.items()}
         else:
             src, fut = recon_src, future
-        dec = m.to_obs(src)                                   # decoded obs (mse: decode; flow: 1-step sample) — metrics/media
         recon = m.recon_losses(src, fut)                      # per-head decode LOSS: {name} (mse) or {flow/name,shortcut/name}
+        # NOTE: do NOT decode here (to_obs) in train — recon_losses is the decode loss, and for flow decoders
+        # to_obs would SAMPLE the ViT decoder every step (with grad) for nothing -> huge wasted memory (OOM). The
+        # decoded sample is only needed for val metrics; computed there under no_grad.
         raw, w = m.loss_terms(preds, future, obs, p_tf, act)
         loss = sum(w[k] * raw[k] for k in raw) + sum(wts[k.split("/")[-1]] * recon[k] for k in recon)
 
@@ -115,6 +117,7 @@ class LitWorldModel(L.LightningModule):
                 self.log("schedules/physical_loss_ramp", self._physical_ramp())
         if tag == "val":
             with torch.no_grad():
+                dec = m.to_obs(src)                           # decode (mse) / 1-step sample (flow) — val metrics only
                 p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
                 p_true = self.norm.denorm_obs(future["proprio"])
                 self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
