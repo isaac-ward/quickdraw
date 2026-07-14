@@ -68,14 +68,24 @@ class MultiModalSequenceModel(nn.Module):
         rows = []
         for name, ntok in self.layout:
             mod = self.modalities[name]
-            ins = f"(B,T,{mod.ae.cfg.img_size},{mod.ae.cfg.img_size},3)" if hasattr(mod, "ae") else f"(B,T,{mod.dim})"
-            rows.append((f"modality:{name} (trunk+head)", f"{ins} -> (B,T,{ntok},{self.d})", npar(mod)))
+            is_img = hasattr(mod, "ae")
+            ins = f"(B,T,{mod.ae.cfg.img_size},{mod.ae.cfg.img_size},3)" if is_img else f"(B,T,{mod.dim})"
+            dk = getattr(mod, "decode_kind", "mse")
+            dh = getattr(mod, "decode_head", None)
+            # ENCODER (trunk): obs -> tokens. Params = modality minus the flow decode head (mse decoder is inside the AE).
+            rows.append((f"modality:{name} trunk (encoder)", f"{ins} -> (B,T,{ntok},{self.d})", npar(mod) - npar(dh)))
+            # DECODE HEAD: tokens -> obs. mse = deterministic; flow = a TransportHead (ViT for image, MLP for vector).
+            net = ("ImageFlowHead ViT" if is_img else "FlowField MLP") if dk == "flow" else \
+                  ("deterministic ViT" if is_img else "deterministic MLP")
+            rows.append((f"  └ decode head:{name} ({dk}, {net})", f"(B,T,{ntok},{self.d}) -> {ins}",
+                         npar(dh) if dh is not None else 0))
         rows.append(("action_enc", f"(B,T,2) -> (B,T,1,{self.d})", npar(self.act_enc)))
         rows.append(("token_bag (per step)", f"{self.n_state} state tokens ++ 1 action = (B,T,{self.n_input},{self.d})", 0))
         rows.append(("backbone space-time", f"(B,T,{self.n_input},{self.d}) -> same  "
                      f"[spatial: {self.n_input} tokens/step fuse; temporal: T causal]", npar(self.backbone)))
         head = getattr(self, "flow", None) or getattr(self, "predictor", None)
-        label = "flow field (rectified flow)" if hasattr(self, "flow") else "predictor (per-token MLP residual)"
+        label = ("DYNAMICS transport head: FlowField MLP (rectified flow, per-token)" if hasattr(self, "flow")
+                 else "predictor (per-token MLP residual)")
         rows.append((f"predict_next: {label}", f"(B,T,{self.n_state},{self.d}) -> (B,T,{self.n_state},{self.d})", npar(head)))
         if getattr(self, "predictor_q", None) is not None:
             rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
