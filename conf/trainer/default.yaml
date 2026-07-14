@@ -1,3 +1,4 @@
 max_epochs: 50
 precision: bf16-mixed
 save_top_k: 2
+check_val_every_n_epoch: 2   # val is an autoregressive rollout ~as long as a train epoch; validate every 2 epochs
