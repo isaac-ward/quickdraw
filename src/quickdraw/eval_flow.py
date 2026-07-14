@@ -1,4 +1,4 @@
-"""Standalone denoising eval (denoising_multistep + denoising_aggregate). `python -m quickdraw.eval_diffusion checkpoint=...`"""
+"""Standalone denoising eval (denoising_multistep + denoising_aggregate). `python -m quickdraw.eval_flow checkpoint=...`"""
 
 from __future__ import annotations
 

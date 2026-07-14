@@ -318,7 +318,7 @@ class MultiModalDSAR(MultiModalLSAR):
         return {}, {}
 
 
-class MultiModalDiffusion(MultiModalSequenceModel):
+class MultiModalFlow(MultiModalSequenceModel):
     """Latent flow-matching over the token bag. `predict_next` denoises the next-bag RESIDUAL with the
     shared FlowField (rectified flow / shortcut), applied PER TOKEN (the token is a leading dim, and the
     per-token context h already carries cross-token structure from the space-time backbone). Mirrors
@@ -356,7 +356,7 @@ class MultiModalDiffusion(MultiModalSequenceModel):
         h_state = h[..., : self.n_state, :]                     # (B,L-1,n_state,d)
         target = (z[:, 1:] - s).detach() if self.predict_residual else z[:, 1:].detach()
         l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
-        raw, w = {"flow": l_flow}, {"flow": self.lambda_flow}
+        raw, w = {"flow/latent": l_flow}, {"flow/latent": self.lambda_flow}   # dynamics flow (was "flow")
         if l_cons is not None:
-            raw["flow_consistency"], w["flow_consistency"] = l_cons, self.lambda_consistency
+            raw["shortcut/latent"], w["shortcut/latent"] = l_cons, self.lambda_consistency   # was "flow_consistency"
         return raw, w

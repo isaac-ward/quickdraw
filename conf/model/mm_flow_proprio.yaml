@@ -1,6 +1,6 @@
-# Proprio-only MultiModalDiffusion — same general backbone as mm_diffusion, image modality removed
+# Proprio-only MultiModalFlow — same general backbone as mm_flow, image modality removed
 # (ablation baseline for the vision comparison). eval_vision self-skips (no image head).
-name: mm_diffusion
+name: mm_flow
 d: 32
 depth: 4
 heads: 8

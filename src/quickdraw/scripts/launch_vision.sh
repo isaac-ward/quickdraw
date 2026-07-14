@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vision runs: TWO multimodal (proprio + image_fpv) runs, ONE per H100, 50 epochs, eval every 10 (skipping 0).
+# Vision runs: TWO multimodal (proprio + image) runs, ONE per H100, 50 epochs, eval every 10 (skipping 0).
 # GPU 0: LSAR with RECON grounding (plain mm_lsar).  GPU 1: diffusion with shortcut (K=1 self-consistency).
 # Matched for a fair head-to-head: identical spine/tokens/data/hyperparams; only the next-state head differs
 # (MLP-residual latent step vs rectified-flow step). recon = the 06-28 shootout's best collapse strategy;
@@ -57,7 +57,7 @@ launch () {  # $1=gpu  $2=experiment-name  $3=model-config  $4=trying-env-var-na
 # with shortcut (K=1 sampling via self-consistency).  detach_every=16 on both so the BPTT window matches too.
 launch 0 vis_lsar_recon         mm_lsar      RS_TRYING_lsar model.detach_every=16
 sleep 45
-launch 1 vis_diffusion_shortcut mm_diffusion RS_TRYING_diff model.diffusion.shortcut=true
+launch 1 vis_diffusion_shortcut mm_flow RS_TRYING_diff model.diffusion.shortcut=true
 
 echo "[vision] launched 2 vision runs (GPU0: lsar_recon; GPU1: diffusion_shortcut), 50 epochs, eval every 10."
 echo "[vision] wandb group: $GROUP   |   watch: nvidia-smi   |   progress: logs/train_*vis_*/progress.log"

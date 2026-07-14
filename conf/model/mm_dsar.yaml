@@ -16,4 +16,4 @@ detach_every: 8
 # noise_std on each modality (training only). Registry = trunks+heads; drop image for the proprio ablation.
 modalities:
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, noise_std: 0.0}
-  - {name: image_fpv, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, noise_std: 0.0}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, noise_std: 0.0}

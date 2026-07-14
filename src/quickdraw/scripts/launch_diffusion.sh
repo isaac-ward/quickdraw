@@ -2,7 +2,7 @@
 # Diffusion mini-shootout: the latent flow-matching world model in TWO variants — plain flow + shortcut
 # (design/models/diffusion.md). Backbone/data/BPTT match the variation campaign (recon LSAR) so the
 # diffusion class is comparable to the rest of the shoot-out. In-loop eval = the shared OOD + control
-# routines PLUS the diffusion flow-field viz (eval_diffusion/quiver + pointwise_error).
+# routines PLUS the diffusion flow-field viz (eval_flow/quiver + pointwise_error).
 # ============================================================================================
 # !!! DO NOT disable compile / DO NOT set TORCHDYNAMO_DISABLE=1 — FlexAttention REQUIRES torch.compile
 # to build its kernel. The diffusion forward (incl. the flow sampler) compiles fine. See launch_shootout.sh.
@@ -32,7 +32,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 #
 # fixed across both: diffusion model, full backbone, batch 256, v8 data, truncated BPTT (16) — the
 # variation-campaign settings, so diffusion is comparable. denoising viz on (the headline artifacts).
-COMMON=( model=mm_diffusion_proprio data.root="$DATA" data.batch=256 model.detach_every=16
+COMMON=( model=mm_flow_proprio data.root="$DATA" data.batch=256 model.detach_every=16
          eval.during_train.evals.denoising_multistep=true eval.during_train.evals.denoising_aggregate=true )
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED"
      run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )

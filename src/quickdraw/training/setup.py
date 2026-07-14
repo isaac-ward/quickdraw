@@ -36,7 +36,7 @@ def build_model(cfg):
 
     specs = _modality_specs(cfg)
     if specs is not None:
-        from ..models.multimodal import MultiModalDiffusion, MultiModalDSAR, MultiModalLSAR
+        from ..models.multimodal import MultiModalFlow, MultiModalDSAR, MultiModalLSAR
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
                       mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2))
         if name in ("mm_dsar", "dsar", "base"):
@@ -51,7 +51,7 @@ def build_model(cfg):
                 strat = Reconstruction()
             return MultiModalLSAR(**common, lambda_pred_latent=m.get("lambda_pred_latent", 1.0),
                                   collapse=strat, lambda_reg=m.get("lambda_reg", 1.0))
-        if name in ("mm_diffusion", "diffusion"):
+        if name in ("mm_flow", "flow"):
             cv = (cfg.get("variations") or {}).get("contraction", {}) or {}
             cw = float((cv.get("weight", 0.0) if hasattr(cv, "get") else getattr(cv, "weight", 0.0)) or 0.0)
             if cw > 0.0:   # contraction differentiates the one-step map, which for diffusion runs through the ODE sampler
@@ -59,7 +59,7 @@ def build_model(cfg):
                                  "(disable contraction, weight=0, to train diffusion).")
             d = m.get("diffusion", {})
             dfg = (lambda k, v: d.get(k, v)) if hasattr(d, "get") else (lambda k, v: getattr(d, k, v))
-            return MultiModalDiffusion(**common, sampling_steps=int(dfg("sampling_steps", 6)),
+            return MultiModalFlow(**common, sampling_steps=int(dfg("sampling_steps", 6)),
                                        shortcut=bool(dfg("shortcut", False)), predict=str(dfg("predict", "residual")),
                                        stochastic_eval=bool(dfg("stochastic_eval", False)),
                                        time_sampling=str(dfg("time_sampling", "uniform")),

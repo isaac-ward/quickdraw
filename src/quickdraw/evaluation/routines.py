@@ -225,14 +225,14 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     onto the next convergence point along the fixed (static) black future line, one swarm after the next. Shows
     the per-step denoising dynamics / flow field at one location. A seed (default: the epoch step; cfg.eval.
     denoising_seed pins it) picks the trajectory + swarm angle so a bad-looking eval won't recur. Scalars:
-    eval_diffusion/std_of_samples + time/*."""
+    eval_flow/std_of_samples + time/*."""
     import numpy as _np
     import torch.nn.functional as F
 
     from ..data.dataset import load_split_episodes_mm
-    from ..models.multimodal import MultiModalDiffusion
+    from ..models.multimodal import MultiModalFlow
     m = getattr(model, "_orig_mod", model)
-    if not isinstance(m, MultiModalDiffusion):
+    if not isinstance(m, MultiModalFlow):
         return {}
     was = m.training
     m.eval()
@@ -302,8 +302,8 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     ms_frames = viz.diffusion_quiver_sequential_frames(R, r, "rainbow", ms_cur, ms_act, ms_tail, ms_future,
                                                        ms_steps, title="denoising multistep",
                                                        log=lambda mm: _plog(writer, f"[denoising_multistep @ep{step}] render {mm}"))
-    writer.video("eval_diffusion/denoising_multistep", ms_frames, 60, step)
-    writer.scene("eval_diffusion/denoising_multistep", {
+    writer.video("eval_flow/denoising_multistep", ms_frames, 60, step)
+    writer.scene("eval_flow/denoising_multistep", {
         "description": "Sequential swarms at a FIXED agent: each swarm denoises, then its tails collapse onto the "
                        "convergence point along the (fixed) black future line, before the next swarm; agent, history "
                        "and future do not move.",
@@ -311,13 +311,13 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
         "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
         "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,
         "swarm_target_per_step_xyz": [s["true_next"] for s in ms_steps]}, step)
-    writer.scalars({"eval_diffusion/std_of_samples": float(_np.mean(spreads)),      # predicted uncertainty
-                    "eval_diffusion/time/sample_s": float(_np.mean(sample_times)),
-                    "eval_diffusion/time/sample_ms_per_euler_step": float(1000.0 * _np.mean(sample_times) / max(1, K))}, step)
+    writer.scalars({"eval_flow/std_of_samples": float(_np.mean(spreads)),      # predicted uncertainty
+                    "eval_flow/time/sample_s": float(_np.mean(sample_times)),
+                    "eval_flow/time/sample_ms_per_euler_step": float(1000.0 * _np.mean(sample_times) / max(1, K))}, step)
     if was:
         m.train()
     _plog(writer, f"[denoising_multistep @ep{step}] done in {time.perf_counter() - t0:.1f}s std_of_samples={_np.mean(spreads):.4f}")
-    return {"eval_diffusion_std_of_samples": float(_np.mean(spreads))}
+    return {"eval_flow_std_of_samples": float(_np.mean(spreads))}
 
 
 @torch.no_grad()
@@ -329,10 +329,10 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     import numpy as _np
 
     from ..data.dataset import load_split_episodes_mm
-    from ..models.multimodal import MultiModalDiffusion
+    from ..models.multimodal import MultiModalFlow
     from .manifold import manifold_clouds
     m = getattr(model, "_orig_mod", model)
-    if not isinstance(m, MultiModalDiffusion):
+    if not isinstance(m, MultiModalFlow):
         return {}
     was = m.training
     m.eval()
@@ -349,8 +349,8 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     mframes = viz.points_collapse_frames(paths6d[..., :3], lims=((-Lm, Lm), (-Lm, Lm), (-Zm, Zm)), n_frames=480,
                                          point_size=2.0, title=f"denoising aggregate — noise -> manifold\n{sub}",
                                          log=lambda mm: _plog(writer, f"[denoising_aggregate @ep{step}] render {mm}"))   # 480 @ 60fps = 8s (0.5x speed)
-    writer.video("eval_diffusion/denoising_aggregate", mframes, 60, step)
-    writer.scene("eval_diffusion/denoising_aggregate", {
+    writer.video("eval_flow/denoising_aggregate", mframes, 60, step)
+    writer.scene("eval_flow/denoising_aggregate", {
         "description": "Denoising ODE paths pooled over many val contexts: a swarm of predicted next-states "
                        "collapsing from noise onto the recovered torus manifold over the K flow steps.",
         "coordinate_system": "world xyz, same space as the torus",

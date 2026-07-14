@@ -1,4 +1,4 @@
-"""Greenlight smoke for MultiModalDiffusion (models/multimodal.py) — latent flow-matching over the token
+"""Greenlight smoke for MultiModalFlow (models/multimodal.py) — latent flow-matching over the token
 bag on the shared spine. Checks: forward/rollout/imagine_eval shapes, flow loss present+finite and drops,
 DETERMINISTIC (ε=0) committed prediction byte-stable, per-head recon drops, and proprio-only generality.
 Run: uv run python -m quickdraw.smoke.multimodal_diffusion
@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from quickdraw.models.modalities import ModalitySpec
-from quickdraw.models.multimodal import MultiModalDiffusion
+from quickdraw.models.multimodal import MultiModalFlow
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 R = []
@@ -20,7 +20,7 @@ def check(name, cond, extra=""):
 
 def build(specs, d=256, depth=2, shortcut=False):
     torch.manual_seed(0)
-    return MultiModalDiffusion(specs, d=d, depth=depth, heads=4, window=16, mlp_ratio=4.0,
+    return MultiModalFlow(specs, d=d, depth=depth, heads=4, window=16, mlp_ratio=4.0,
                                rope_theta=10000.0, action_dim=2, sampling_steps=4, shortcut=shortcut).to(DEV)
 
 
@@ -37,7 +37,7 @@ def main():
     pf = m(obs, act)
     check("forward bag (B,L,n_state,d)", pf.shape == (B, L, 9, d), str(tuple(pf.shape)))
     raw, w = m.loss_terms(pf.detach(), {k: v[:, P:] for k, v in obs.items()}, obs, 1.0, act)
-    check("flow loss present + finite", "flow" in raw and torch.isfinite(raw["flow"]).all())
+    check("flow loss present + finite", "flow/latent" in raw and torch.isfinite(raw["flow/latent"]).all())
 
     # DETERMINISTIC committed prediction: eval + eps=0 -> byte-identical across two calls
     m.eval()
@@ -69,7 +69,7 @@ def main():
         rl = {k: F.mse_loss(dec[k], future[k]) for k in future}
         raw, w = m.loss_terms(preds, future, obs, 1.0, act)
         (sum(rl.values()) + sum(w[k] * raw[k] for k in raw)).backward(); opt.step()
-        flow_hist.append(float(raw["flow"])); pro_hist.append(float(rl["proprio"])); img_hist.append(float(rl["image"]))
+        flow_hist.append(float(raw["flow/latent"])); pro_hist.append(float(rl["proprio"])); img_hist.append(float(rl["image"]))
     mean = lambda xs: sum(xs) / len(xs)
     f0, f1 = mean(flow_hist[:15]), mean(flow_hist[-15:])
     check("flow loss drops (windowed mean)", f1 < f0, f"{f0:.4f}->{f1:.4f}")

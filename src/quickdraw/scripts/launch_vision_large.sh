@@ -46,7 +46,7 @@ RECONFRAC="${RECONFRAC:-1.0}"         # fraction (0-1) of F frames to supervise 
 : "${RS_PROBLEM:?author + export run_summary fresh, not hardcoded; missing RS_PROBLEM}"
 : "${RS_TRIED:?missing RS_TRIED}"; : "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
 
-# the three codec changes, shared by both models. image_fpv is modalities index 1 (proprio is index 0);
+# the three codec changes, shared by both models. image is modalities index 1 (proprio is index 0);
 # model.d propagates to the AE width (see ImageModality(spec, d) -> VisionAEConfig(d=d)).
 BIG=( model.d="$D" model.depth="$DEPTH" model.modalities.1.num_tokens="$TOKENS" model.modalities.1.patch="$PATCH"
       model.modalities.1.ae_depth="$AEDEPTH" model.detach_every="$DETACH" model.recon_frac="$RECONFRAC" )
@@ -69,10 +69,10 @@ launch () {  # $1=gpu  $2=experiment-name  $3=model-config  $4=trying-env-var-na
 }
 
 # GPU0: LSAR with recon grounding (plain mm_lsar, recon is its default collapse), detach_every=16 to match.
-# GPU1: stock diffusion (mm_diffusion; shortcut=false + sampling_steps=6 are the config defaults = stock K=6).
+# GPU1: stock diffusion (mm_flow; shortcut=false + sampling_steps=6 are the config defaults = stock K=6).
 launch 0 "${GROUP}_lsar_recon" mm_lsar      RS_TRYING_lsar
 sleep 45
-launch 1 "${GROUP}_diffusion"  mm_diffusion RS_TRYING_diff
+launch 1 "${GROUP}_diffusion"  mm_flow RS_TRYING_diff
 
 echo "[vision_large] launched 2 LARGE-AE runs (GPU0 lsar_recon, GPU1 diffusion), 100 epochs, eval every 20."
 echo "[vision_large] group: $GROUP  |  F=$F detach=$DETACH tokens=$TOKENS batch=$BATCH  |  RE-PROBE epoch-1 AR memory  |  progress: logs/train_*${GROUP}_*/progress.log"

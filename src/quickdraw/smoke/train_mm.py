@@ -37,7 +37,7 @@ def main():
     train_eps, hold = eps[:-4], eps[-4]                         # hold out 1 episode for the rollout viz
     loader = MMWindowLoader(train_eps, P, Fh, norm, batch=B, shuffle=True, device=DEV)
     specs = [ModalitySpec("proprio", "vector", dim=6, weight=1.0),
-             ModalitySpec("image_fpv", "image", num_tokens=8, weight=1.0)]
+             ModalitySpec("image", "image", num_tokens=8, weight=1.0)]
     m = MultiModalLSAR(specs, d=d, depth=4, heads=4, window=P + Fh, mlp_ratio=4.0,
                        rope_theta=10000.0, action_dim=2).to(DEV)
     wts = {mm.name: mm.weight for mm in m.modalities.values()}
@@ -49,7 +49,7 @@ def main():
     it = 0
     while it < steps:
         for batch in loader:
-            obs = {"proprio": batch["obs_seq"], "image_fpv": batch["image_fpv"]}
+            obs = {"proprio": batch["obs_seq"], "image": batch["image"]}
             pf = m({k: v[:, :-1] for k, v in obs.items()}, batch["act_seq"][:, :-1])
             preds = pf[:, P - 1:]
             future = {k: v[:, P:] for k, v in obs.items()}
@@ -60,7 +60,7 @@ def main():
             opt.zero_grad(); loss.backward(); opt.step()
             if it % 200 == 0 or it == steps - 1:
                 print(f"[train_mm]   step {it:5d}  proprio {rl['proprio'].item():.4f}  "
-                      f"image {rl['image_fpv'].item():.4f} (psnr {psnr(rl['image_fpv'].item()):.1f})  "
+                      f"image {rl['image'].item():.4f} (psnr {psnr(rl['image'].item()):.1f})  "
                       f"pred_latent {raw['pred_latent'].item():.4f}")
             it += 1
             if it >= steps:
@@ -71,11 +71,11 @@ def main():
     o, a, img = hold
     H = min(Fh, len(o) - P - 1)
     ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[:P])).float()[None].to(DEV),
-           "image_fpv": torch.from_numpy(img[:P]).float().div(255.0)[None].to(DEV)}
+           "image": torch.from_numpy(img[:P]).float().div(255.0)[None].to(DEV)}
     actions = torch.from_numpy(a[:P + H - 1]).float()[None].to(DEV)
     with torch.no_grad():
         out = m.imagine_eval(ctx, actions, H)
-    pred_img = out["image_fpv"][0].clamp(0, 1).cpu().numpy()                     # (H,128,128,3)
+    pred_img = out["image"][0].clamp(0, 1).cpu().numpy()                     # (H,128,128,3)
     true_img = (img[P:P + H].astype(np.float32) / 255.0)                     # (H,128,128,3)
     pred_pro = norm.denorm_obs(out["proprio"][0].cpu()).numpy()              # (H,6)
     true_pro = o[P:P + H]

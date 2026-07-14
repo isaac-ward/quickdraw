@@ -6,7 +6,7 @@ filmstrip/rollout/curve/scene emission, which drifted (`rollout` vs `prediction_
 Everything routes through `product_tag`, so the folder/label convention is defined once and generalizes to
 N image heads for free (callers just loop the heads from `model.layout`):
     <routine>/<name>_<i>            global / proprio product, instance i     (e.g. eval_control/control_video_0)
-    <routine>/<head>/<name>_<i>     per-image-head product, instance i       (e.g. eval_ood_horizon/image_fpv/rollout_0)
+    <routine>/<head>/<name>_<i>     per-image-head product, instance i       (e.g. eval_ood_horizon/image/rollout_0)
     <routine>/<name>_<scale>        averaged curve                           (e.g. .../error_vs_step_avg_log)
 """
 

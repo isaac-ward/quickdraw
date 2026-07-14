@@ -1,4 +1,4 @@
-name: mm_diffusion
+name: mm_flow
 d: 32                     # backbone/token width (all modality tokens live at d)
 depth: 4
 heads: 8                   # head_dim = 4 (d/heads; power of 2 for FlexAttention)
@@ -22,7 +22,8 @@ diffusion:
   time_sampling: uniform
   flow_hidden: 0           # 0 -> mirror d
 modalities:
-  # decode_kind: flow -> generative 1-step (shortcut) decode head per trunk (design/models/flow_heads.md).
-  # mse (default) = deterministic decode, bit-identical to before. Starting BOTH trunks on flow to validate cross-trunk.
-  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow}
-  - {name: image_fpv, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: flow}
+  # decode_kind: flow -> generative decode head per trunk (design/models/flow_heads.md). mse (default) =
+  # deterministic decode, bit-identical to before. decode_shortcut: true -> K=1 sampling (EXPLICIT opt-in, like
+  # the dynamics `diffusion.shortcut`; shortcut is never default-on). Starting BOTH trunks on flow to validate cross-trunk.
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_shortcut: true}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: flow, decode_shortcut: true}

@@ -17,4 +17,4 @@ recon_frac: 1.0            # fraction (0-1) of the F rollout frames to supervise
 detach_every: 8
 modalities:
   - {name: proprio, kind: vector, dim: 6, weight: 1.0}
-  - {name: image_fpv, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0}

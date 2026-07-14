@@ -31,6 +31,7 @@ class VisionAEConfig:
     num_tokens: int = 8     # latent token-list length (NOT the diffusion step count K)
     channels: int = 3
     mlp_ratio: float = 4.0
+    build_decoder: bool = True  # False when a generative flow decode head replaces the mse decoder (no dead weight)
 
 
 def _heads(x, heads):                                    # (B,N,d) -> (B,heads,N,hd)
@@ -99,13 +100,16 @@ class ImageAutoencoder(nn.Module):
         self.latent_q = nn.Parameter(torch.zeros(1, cfg.num_tokens, d))
         self.to_latent = CrossAttn(d, h)
         self.latent_norm = nn.LayerNorm(d)
-        # decoder
-        self.dec_pos = nn.Parameter(torch.zeros(1, self.np, d))   # output-patch query tokens
-        self.from_latent = CrossAttn(d, h)
-        self.dec_blocks = nn.ModuleList([ViTBlock(d, h, cfg.mlp_ratio) for _ in range(cfg.dec_depth)])
-        self.dec_norm = nn.LayerNorm(d)
-        self.unpatch = nn.Linear(d, pdim)
-        for p in (self.enc_pos, self.dec_pos, self.latent_q):
+        # decoder (mse). Skipped entirely when a generative flow decode head replaces it (build_decoder=False)
+        # — otherwise these would be dead, never-called, never-trained params.
+        if cfg.build_decoder:
+            self.dec_pos = nn.Parameter(torch.zeros(1, self.np, d))   # output-patch query tokens
+            self.from_latent = CrossAttn(d, h)
+            self.dec_blocks = nn.ModuleList([ViTBlock(d, h, cfg.mlp_ratio) for _ in range(cfg.dec_depth)])
+            self.dec_norm = nn.LayerNorm(d)
+            self.unpatch = nn.Linear(d, pdim)
+            nn.init.trunc_normal_(self.dec_pos, std=0.02)
+        for p in (self.enc_pos, self.latent_q):
             nn.init.trunc_normal_(p, std=0.02)
 
     # ---- linear (de)patchify, no conv ----

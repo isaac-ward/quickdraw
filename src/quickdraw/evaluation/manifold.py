@@ -120,7 +120,7 @@ def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device)
     """Diffusion-SPECIFIC (token-bag spine): one uniform-hypercube noise per context, denoised through the
     per-token flow to the committed next PROPRIO token, keeping the WHOLE ODE path. Returns (paths6d
     (N, K+1, 6) physical proprio, speed (N,), latents (N, d) = committed proprio token, n_avail). Feeds
-    eval_diffusion's `denoising_aggregate` (the swarm collapsing from noise onto the recovered manifold)."""
+    eval_flow's `denoising_aggregate` (the swarm collapsing from noise onto the recovered manifold)."""
     import torch.nn.functional as F
     _ln = lambda x: F.layer_norm(x, (x.shape[-1],))
     d, K = m.d, m.sampling_steps
