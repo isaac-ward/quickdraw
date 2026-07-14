@@ -34,6 +34,20 @@ class LitWorldModel(L.LightningModule):
         self.physical_warmup = float((pl.get("warmup_epochs", 0) if hasattr(pl, "get")
                                       else getattr(pl, "warmup_epochs", 0)) or 0) if self.has_physical else 0.0
 
+    def on_train_start(self):
+        # TRIP-WIRE: full teacher-forcing (p_tf never drops) means NO in-rollout drift training. This produced
+        # collapsed/drifting models (val rises, rollout predictions -> origin) on the flow model. Warn LOUDLY to
+        # stdout->progress.log so it's caught while monitoring. If intentional (e.g. isolating a decode test),
+        # ignore; otherwise set p_tf_end<1 for in-rollout (use dynamics shortcut=true to keep it affordable).
+        if float(self.p_tf_end) >= 1.0 and float(self.p_tf_start) >= 1.0:
+            msg = ("[WARNING] p_tf is CONSTANT 1.0 (FULL teacher-forcing, NO in-rollout drift training). "
+                   "This previously produced drifting/collapsed rollouts (val rises, preds->origin). "
+                   "Set p_tf_end<1 for in-rollout training (dynamics shortcut=true keeps the cost sane) "
+                   "unless this is deliberate.")
+            print("\n" + "!" * 100 + "\n" + msg + "\n" + "!" * 100, flush=True)
+            import warnings
+            warnings.warn(msg)
+
     def _cur_p_tf(self) -> float:
         # curriculum: ramp from p_tf_start (e.g. 1.0, full teacher forcing) down to p_tf_end over warmup
         return linear_schedule(self.p_tf_start, self.p_tf_end, self.p_tf_warmup, self.current_epoch)
