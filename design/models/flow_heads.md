@@ -1,6 +1,10 @@
 # Flow heads — one flow core for the dynamics AND every decoder (+ diffusion forcing)
 
-Status: **design / implementation plan** (2026-07). Extends `design/models/diffusion.md` (the latent
+Status: **IMPLEMENTED** (2026-07-14, branch `flow-heads`) — P1 TransportHead refactor, P2 flow decode heads,
+P3 diffusion forcing, P4 renames (MultiModalFlow / mm_flow / eval_flow / image), all tested (df-off
+bit-identical; df-on + gate + end-to-end verified). Runs: `flowdec_v1` (DF off) + `flowdec_df_v1` (DF on).
+Deferred: trunk **stable-id** decoupling (future-proofing; rename is safe now since we retrain). Not merged to main.
+Extends `design/models/diffusion.md` (the latent
 dynamics flow) by (a) generalizing the flow into a **reusable generative-head core** shared by the
 dynamics and the modality decoders, (b) adding an opt-in **diffusion-forcing** training regime, and (c)
 recording where we sit vs *Interactive World Simulator* (IWS, arXiv 2603.08546) and canonical CTM.
