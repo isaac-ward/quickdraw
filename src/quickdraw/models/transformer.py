@@ -113,6 +113,35 @@ def _rope(T: int, head_dim: int, theta: float, device, dtype):
     return rc
 
 
+def rope_at(positions: Tensor, head_dim: int, theta: float, device, dtype):
+    """cos/sin at ARBITRARY (not necessarily 0..T-1) positions. The cached rollout ropes each step at its
+    GLOBAL time index, so attention scores depend only on the q-k distance (RoPE's relative property) and
+    reproduce the sliding-window path exactly. positions: (S,) long. Returns cos,sin each (S, head_dim)."""
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
+    freqs = torch.outer(positions.to(torch.float32), inv_freq)   # (S, half)
+    emb = torch.cat((freqs, freqs), dim=-1)                      # (S, head_dim)
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+class KVRing:
+    """One temporal-attention layer's K/V ring buffer for the cached (no-grad) rollout. Holds POST-rope K and
+    V and keeps only the last `window` steps (the sliding-window span). Appended one step at a time."""
+    __slots__ = ("k", "v")
+
+    def __init__(self):
+        self.k = None
+        self.v = None
+
+    def append(self, k: Tensor, v: Tensor, window: int):   # k,v: (M,H,S,Dh) -> full (M,H,L,Dh), L<=window
+        self.k = k if self.k is None else torch.cat((self.k, k), dim=2)
+        self.v = v if self.v is None else torch.cat((self.v, v), dim=2)
+        if self.k.shape[2] > window:
+            self.k = self.k[:, :, -window:].contiguous()
+            self.v = self.v[:, :, -window:].contiguous()
+        return self.k, self.v
+
+
 # ----------------------------- attention -----------------------------
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, heads: int, window: int, rope_theta: float):
@@ -145,6 +174,30 @@ class SelfAttention(nn.Module):
             o = flex_attention(q, k, v, block_mask=block_mask)
         o = o.transpose(1, 2).reshape(B, T, self.heads * self.head_dim)
         return self.out(o)
+
+    _M_CHUNK = 8192   # match _SpatialAttention: SDPA's kernel-launch config overflows past this batch (MPPI)
+
+    def forward_cached(self, x: Tensor, ring: "KVRing", positions: Tensor) -> Tensor:
+        """Incremental temporal attention for the cached rollout. x: (M, 1, d), M=B*N slots, ONE new step;
+        `positions`: (1,) global time index for RoPE; `ring`: this layer's KVRing. Plain SDPA — FlexAttention's
+        block-sparse win vanishes at one query and it would recompile a mask per step. The single new query
+        attends ALL cached keys (the ring holds <= window steps, all at earlier-or-equal positions -> causal
+        by construction), so no mask is needed. Only S=1 is supported (the rollout feeds one step at a time)."""
+        M, S, _ = x.shape
+        assert S == 1, "cached temporal attention feeds one step at a time (S==1)"
+        qkv = self.qkv(x).view(M, S, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]                      # (M,H,S,Dh)
+        cos, sin = rope_at(positions, self.head_dim, self.rope_theta, x.device, torch.float32)
+        q = apply_rope(q.float(), cos, sin).to(v.dtype)
+        k = apply_rope(k.float(), cos, sin).to(v.dtype)
+        K, V = ring.append(k, v, self.window)                # (M,H,L,Dh), L<=window
+        if M <= self._M_CHUNK:
+            o = F.scaled_dot_product_attention(q, K, V)
+        else:
+            o = torch.cat([F.scaled_dot_product_attention(q[i:i + self._M_CHUNK], K[i:i + self._M_CHUNK],
+                                                           V[i:i + self._M_CHUNK])
+                           for i in range(0, M, self._M_CHUNK)], dim=0)
+        return self.out(o.transpose(1, 2).reshape(M, S, self.heads * self.head_dim))
 
 
 class FeedForward(nn.Module):

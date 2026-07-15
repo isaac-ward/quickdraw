@@ -79,6 +79,19 @@ class SpaceTimeBlock(nn.Module):
         # mlp (token-wise)
         return x + self.mlp(self.m_norm(x))
 
+    def forward_cached(self, x: Tensor, ring, pos: int) -> Tensor:
+        """Single-step counterpart of forward with a temporal KV-cache. x: (B, N, d) — the NEW step's bag;
+        `ring`: this block's KVRing; `pos`: the step's GLOBAL time index (RoPE). Spatial (within-step,
+        bidirectional over N) and the MLP are per-step-local so they are recomputed; only temporal attention
+        reads/writes the cache across time. Returns (B, N, d)."""
+        B, N, d = x.shape
+        x = x + self.s_attn(self.s_norm(x))                     # spatial, single step (M=B)
+        y = self.t_norm(x).reshape(B * N, 1, d)                 # temporal per-slot: (B*N, 1, d)
+        positions = torch.full((1,), pos, device=x.device, dtype=torch.long)
+        t = self.t_attn.forward_cached(y, ring, positions)      # (B*N, 1, d)
+        x = x + t.reshape(B, N, d)
+        return x + self.mlp(self.m_norm(x))
+
 
 class SpaceTimeTransformer(nn.Module):
     """Stack of factorized blocks over a token bag (B, T, N, d). `n_slots` = N (fixed per model from the
@@ -98,4 +111,18 @@ class SpaceTimeTransformer(nn.Module):
         x = x + self.slot_emb[:, :, : x.shape[2]]                # per-slot (token-type) embedding
         for blk in self.blocks:
             x = blk(x, temporal_block_mask, attn_eager)
+        return self.norm_out(x)
+
+    def make_cache(self):
+        """Fresh per-block temporal K/V ring buffers for one cached rollout (one KVRing per block)."""
+        from .transformer import KVRing
+        return [KVRing() for _ in self.blocks]
+
+    def forward_cached(self, x: Tensor, cache, pos: int) -> Tensor:
+        """One rollout step through the stack with a temporal KV-cache. x: (B, N, d) — the NEW step's token
+        bag; `cache`: list[KVRing] from make_cache(); `pos`: the step's GLOBAL time index. Returns (B, N, d) —
+        the backbone output at this step, equal (within fp tolerance) to the parallel path's h[:, -1]."""
+        x = x + self.slot_emb[:, 0, : x.shape[1]]                # (1,N,d) per-slot emb, broadcast over B
+        for blk, ring in zip(self.blocks, cache):
+            x = blk.forward_cached(x, ring, pos)
         return self.norm_out(x)

@@ -19,7 +19,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 
 uv run python -m quickdraw.train_world \
   model=mm_flow model.d=128 model.depth=4 model.heads=8 model.window=32 \
-  data.batch=64 model.recon_frac=0.25 model.p_tf_end=1.0 \
+  data.batch=64 model.recon_frac=0.25 model.diffusion.shortcut=true \
   data.root="$DATA" \
   trainer.max_epochs=100 eval.during_train.every_epochs=20 \
   +run_summary.problem="MSE_image_decode_blur_prone_deterministic_readout_cannot_commit_to_sharp_detail" \

@@ -149,6 +149,13 @@ class LitWorldModel(L.LightningModule):
                 if hasattr(m, "collapse_diagnostics"):        # latent-collapse (esp. for EMA); on the encoded bag
                     for k, val in m.collapse_diagnostics(obs).items():
                         self.log(f"collapse/{k}", val)
+                if not getattr(self, "_kv_logged", False) and hasattr(m, "kvcache_report"):
+                    # ONE-TIME temporal KV-cache A/B (kvcache/*): realized wall-clock speedup of the inference
+                    # rollout + the (benign) latent divergence. proprio-only decode -> cheap; runs once per run.
+                    self._kv_logged = True
+                    ctxk = {k: v[:, :P] for k, v in obs.items()}
+                    for k, val in m.kvcache_report(ctxk, act[:, : L - 1], L - P, heads=["proprio"]).items():
+                        self.log(k, val)
         return loss
 
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):

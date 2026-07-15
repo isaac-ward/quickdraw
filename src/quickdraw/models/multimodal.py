@@ -47,6 +47,9 @@ class MultiModalSequenceModel(nn.Module):
     """Token-bag backbone + the ONE autoregressive rollout. Subclasses implement `predict_next` (and may
     add model-specific loss terms via `loss_terms`)."""
 
+    use_kv_cache = True   # temporal KV-cache for inference rollouts (imagine_eval / imagine_shared/MPPI). Never
+    #                       used in training (needs the full backprop graph); toggled off for the parity A/B.
+
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
                  mlp_ratio: float, rope_theta: float, action_dim: int):
         super().__init__()
@@ -201,15 +204,19 @@ class MultiModalSequenceModel(nn.Module):
 
     # ---- shared autoregressive rollout (token-bag analogue of SequenceWorldModel._rollout) ----
     def _rollout(self, ctx_obs: dict[str, Tensor], actions: Tensor, horizon: int, p_tf: float,
-                 true_future: dict[str, Tensor] | None, detach_every: int) -> Tensor:
+                 true_future: dict[str, Tensor] | None, detach_every: int, use_cache: bool = False) -> Tensor:
         bag_buf = list(self.encode_state(ctx_obs).unbind(dim=1))     # P bags of (B,n_state,d)
         tf_future = self.encode_state(true_future) if true_future is not None else None
-        return self._rollout_from(bag_buf, actions, horizon, p_tf, tf_future, detach_every)
+        return self._rollout_from(bag_buf, actions, horizon, p_tf, tf_future, detach_every, use_cache=use_cache)
 
     def _rollout_from(self, bag_buf, actions: Tensor, horizon: int, p_tf: float,
-                      tf_future: Tensor | None, detach_every: int) -> Tensor:
+                      tf_future: Tensor | None, detach_every: int, use_cache: bool = False) -> Tensor:
         """Rollout from a PRE-ENCODED context (list of P bags). Lets callers encode the context once and
-        roll many action variants from it (MPPI: encode the image context once, share across K candidates)."""
+        roll many action variants from it (MPPI: encode the image context once, share across K candidates).
+        use_cache: temporal KV-cache path (inference only) — see `_rollout_cached`."""
+        if use_cache:
+            assert p_tf == 0.0 and tf_future is None, "KV-cache rollout is inference-only (no teacher forcing)"
+            return self._rollout_cached(list(bag_buf), actions, horizon)
         W = self.window
         bag_buf = list(bag_buf)
         B = bag_buf[0].shape[0]
@@ -239,6 +246,31 @@ class MultiModalSequenceModel(nn.Module):
             bag_buf.append(s_feed)
         return torch.stack(preds, dim=1)                            # (B,horizon,n_state,d)
 
+    def _rollout_cached(self, bag_buf, actions: Tensor, horizon: int) -> Tensor:
+        """Autoregressive rollout with a temporal KV-cache (INFERENCE only — no grad, no teacher forcing).
+        Numerically matches `_rollout_from` (p_tf=0) but advances the backbone INCREMENTALLY: the parallel
+        path re-runs the full W-window backbone every step (O(horizon*W)); here each step is one cached
+        forward (O(horizon)). Every step feeds S=1; global-index RoPE + a window-length ring buffer reproduce
+        the sliding-window attention exactly, so the only difference from the parallel path is fp arithmetic
+        (SDPA vs FlexAttention). Not for training: the cache holds no autograd graph across steps."""
+        P = len(bag_buf)
+        cache = self.backbone.make_cache()
+
+        def step(bag, idx):                                          # bag:(B,n_state,d) at global index idx
+            x = self._to_input(bag.unsqueeze(1), actions[:, idx:idx + 1]).squeeze(1)   # (B,n_input,d)
+            return self.backbone.forward_cached(x, cache, idx)                         # (B,n_input,d)
+
+        for i in range(P - 1):                                       # prefill context [0..P-2] (populate cache)
+            step(bag_buf[i], i)
+        preds = []
+        for h in range(horizon):
+            idx = P - 1 + h                                          # read out at the last fed position
+            h_last = step(bag_buf[idx], idx)                         # (B,n_input,d)
+            s_pred = self.readout(h_last, bag_buf[idx])              # (B,n_state,d)
+            preds.append(s_pred)
+            bag_buf.append(self.carry_transform(s_pred))
+        return torch.stack(preds, dim=1)                             # (B,horizon,n_state,d)
+
     def rollout_train(self, ctx_obs, actions, true_future: dict, p_tf: float, detach_every: int = 8) -> Tensor:
         horizon = next(iter(true_future.values())).shape[1]
         return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every)
@@ -254,7 +286,7 @@ class MultiModalSequenceModel(nn.Module):
         with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
             bags = self.encode_state(ctx_obs)                                    # (B,P,n_state,d) — one encode
             buf = [b.repeat_interleave(K, dim=0) for b in bags.unbind(1)]        # each (B*K,n_state,d)
-            bag = self._rollout_from(buf, actions, horizon, 0.0, None, 0)
+            bag = self._rollout_from(buf, actions, horizon, 0.0, None, 0, use_cache=self.use_kv_cache)
             out = self.to_obs(bag, heads=heads)
         out = {k: v.float() for k, v in out.items()}
         if return_bag:
@@ -262,13 +294,40 @@ class MultiModalSequenceModel(nn.Module):
         return out
 
     @torch.no_grad()
-    def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None) -> dict[str, Tensor]:
+    def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None,
+                     use_cache: bool | None = None) -> dict[str, Tensor]:
         """`heads` limits which modalities are decoded (e.g. ['proprio'] for cheap long-horizon rollouts —
-        the full latent bag, including image tokens, still rolls forward; we just skip decoding images)."""
+        the full latent bag, including image tokens, still rolls forward; we just skip decoding images).
+        use_cache: temporal KV-cache (default self.use_kv_cache; pass False for the parity A/B)."""
+        uc = self.use_kv_cache if use_cache is None else use_cache
         with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
-            bag = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0)
+            bag = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=uc)
             out = self.to_obs(bag, heads=heads)
         return {k: v.float() for k, v in out.items()}
+
+    @torch.no_grad()
+    def kvcache_report(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None) -> dict[str, float]:
+        """One-time A/B: run the SAME rollout with and without the KV-cache, CUDA-timed (1 warmup + 1 timed
+        each), to log the realized wall-clock speedup to kvcache/. Cheap — a few extra rollouts, called once
+        per run. Also reports the max abs latent divergence as a correctness sanity signal."""
+        import time
+        dev = actions.device
+        sync = (lambda: torch.cuda.synchronize()) if dev.type == "cuda" else (lambda: None)
+
+        def timed(uc):
+            self.imagine_eval(ctx_obs, actions, horizon, heads=heads, use_cache=uc)     # warmup (compile/alloc)
+            sync(); t0 = time.perf_counter()
+            self.imagine_eval(ctx_obs, actions, horizon, heads=heads, use_cache=uc)
+            sync(); return time.perf_counter() - t0
+
+        t_cached, t_uncached = timed(True), timed(False)
+        with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
+            bc = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=True)
+            bu = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=False)
+        return {"kvcache/speedup": t_uncached / max(t_cached, 1e-9),
+                "kvcache/ms_cached": t_cached * 1e3, "kvcache/ms_uncached": t_uncached * 1e3,
+                "kvcache/horizon": float(horizon),
+                "kvcache/latent_max_abs_diff": float((bc - bu).abs().max())}
 
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
         return {}, {}
