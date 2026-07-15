@@ -269,3 +269,10 @@ Exp 5 latency callout). At F=24 an epoch is ~19 min:
 **Verdict:** F=247 is time-infeasible. Practical path = **F≈48 + checkpointing** (keeps batch 96, ~2.6 days) **paired
 with the contraction penalty** — "sees its own multi-step drift" + "dynamics that pull back" is the actual cure for the
 color→structure drift, at a fraction of the cost of training at the full horizon.
+
+### Measured headroom: mm_flow d=64 in-rollout (2026-07-15)
+The flow-x0 / mse-control pair (d=64, batch 128, in-rollout, dynamics shortcut, flow-x0 decode, recon_frac 0.25,
+detach_every 16) sits at **~63.8 GB / 93 GB** and **~15–20% GPU util** at ~30 min/epoch — latency-bound exactly as the
+callout above predicts. So **batch 256 fits with room to spare for this setup** (memory ~doubles from ~64 GB, still
+< 93 GB; detach_every caps the in-rollout graph). It mainly raises utilization (fills the idle sequential steps) rather
+than cutting wall-clock proportionally — but it's free memory-wise and the right default next time we launch this config.

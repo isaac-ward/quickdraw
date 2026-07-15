@@ -69,37 +69,22 @@ class MultiModalSequenceModel(nn.Module):
         (spatial within-step + temporal across-step), and the per-token prediction head."""
         def npar(mod): return sum(p.numel() for p in mod.parameters()) if mod is not None else 0
 
-        def kids(mod, ind=1, depth=2):
-            """Granular sub-rows: named_children with params>0, recursively up to `depth` levels."""
-            out = []
-            if mod is None or depth <= 0:
-                return out
-            for cn, cm in mod.named_children():
-                p = npar(cm)
-                if p > 0:
-                    out.append(("  " * ind + f"- {cn}", "", p))
-                    out += kids(cm, ind + 1, depth - 1)
-            return out
-
         rows = []
-        # ---- 1) TRUNKS: obs -> tokens (encoders) + the action encoder ----
+        # encoders (obs -> tokens) + the action encoder
         for name, ntok in self.layout:
             mod = self.modalities[name]
             is_img = hasattr(mod, "ae")
             ins = f"(B,T,{mod.ae.cfg.img_size},{mod.ae.cfg.img_size},3)" if is_img else f"(B,T,{mod.dim})"
             enc = mod.ae if is_img else mod.enc     # image AE (encoder-only when decode_kind=flow); proprio enc MLP
-            rows.append((f"TRUNK {name} (encoder)", f"{ins} -> (B,T,{ntok},{self.d})", npar(enc)))
-            rows += kids(enc)
-        rows.append(("TRUNK action_enc", f"(B,T,{self.act_enc[0].in_features}) -> (B,T,1,{self.d})", npar(self.act_enc)))
-        # ---- 2) BACKBONE: fuse the token bag over space (within-step) + time (causal) ----
-        rows.append(("BACKBONE space-time", f"(B,T,{self.n_input},{self.d}) -> same "
+            rows.append((f"{name} encoder", f"{ins} -> (B,T,{ntok},{self.d})", npar(enc)))
+        rows.append(("action_enc", f"(B,T,{self.act_enc[0].in_features}) -> (B,T,1,{self.d})", npar(self.act_enc)))
+        # backbone: fuse the token bag over space (within-step) + time (causal)
+        rows.append(("space-time backbone", f"(B,T,{self.n_input},{self.d}) -> same "
                      f"[spatial {self.n_input} tok/step + temporal causal]", npar(self.backbone)))
-        rows += kids(self.backbone)
-        # ---- 3) OTHER ----
-        rows.append(("OTHER token_bag (per step)", f"{self.n_state} state + 1 action = (B,T,{self.n_input},{self.d})", 0))
+        rows.append(("token_bag (per step)", f"{self.n_state} state + 1 action = (B,T,{self.n_input},{self.d})", 0))
         if getattr(self, "df_scale", 0.0) > 0.0 and getattr(self, "df_level_emb", None) is not None:
-            rows.append(("OTHER diffusion_forcing level_emb", f"level -> (..,{self.d}) added to state tokens", npar(self.df_level_emb)))
-        # ---- 4) HEADS: tokens -> obs (decode) + tokens -> next-state (dynamics) ----
+            rows.append(("diffusion_forcing level_emb", f"level -> (..,{self.d}) added to state tokens", npar(self.df_level_emb)))
+        # decode heads (tokens -> obs) + the dynamics head (tokens -> next-state)
         for name, ntok in self.layout:
             mod = self.modalities[name]
             is_img = hasattr(mod, "ae")
@@ -109,14 +94,12 @@ class MultiModalSequenceModel(nn.Module):
             net = ("ImageFlowHead ViT" if is_img else "FlowField MLP") if dk == "flow" else \
                   ("deterministic ViT" if is_img else "deterministic MLP")
             head_mod = dh if dh is not None else getattr(mod, "dec", None)   # mse proprio uses .dec (image mse decoder lives in the AE)
-            rows.append((f"HEAD {name} decode ({dk}, {net})", f"(B,T,{ntok},{self.d}) -> {ins}", npar(head_mod)))
-            rows += kids(head_mod)
+            rows.append((f"{name} decode ({dk}, {net})", f"(B,T,{ntok},{self.d}) -> {ins}", npar(head_mod)))
         dyn = getattr(self, "flow", None) or getattr(self, "predictor", None)
-        lbl = "DYNAMICS flow (rectified, per-token)" if hasattr(self, "flow") else "predictor (MLP residual)"
-        rows.append((f"HEAD predict_next: {lbl}", f"(B,T,{self.n_state},{self.d}) -> same", npar(dyn)))
-        rows += kids(dyn)
+        lbl = "flow (rectified, per-token)" if hasattr(self, "flow") else "predictor (MLP residual)"
+        rows.append((f"predict_next: {lbl}", f"(B,T,{self.n_state},{self.d}) -> same", npar(dyn)))
         if getattr(self, "predictor_q", None) is not None:
-            rows.append(("HEAD predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
+            rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
         return rows
 
     # ---- modality <-> token bag ----
