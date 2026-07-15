@@ -142,3 +142,43 @@ def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, p
         if log is not None:
             log(f"{mdir} done")
     return transform_ok
+
+
+def animate_joint_space(cloud, traj, t_e, *, method="lda", labels=None, factor_cfg=None,
+                        reward_mode=False, n_frames=200, point_size=6.0, tail=60, title="", log=None):
+    """Animate an agent's control trajectory through the JOINT latent space (design/language_steering.md P2).
+    Fits `method` (lda|umap|pca) on `cloud` (N,D) = f_z(latents), transforms the cloud, the agent `traj`
+    (T,D) = f_z(z_t) over control steps, and the goal direction `t_e` (D,) = f_t(goal) into 2D, then renders
+    the moving agent (tail-fade) over a STATIC backdrop toward the starred goal. Two colorings:
+      reward_mode=False -> by concept (needs `labels` [per cloud point] + `factor_cfg`);
+      reward_mode=True  -> by the reward FIELD cos(normalize(cloud), t_e) (a heatmap; how "flat reward far
+                           from goal" shows up — uniform vs a gradient toward the star).
+    `method` MUST expose .transform() (lda/umap/pca; t-SNE can't project the new trajectory -> excluded).
+    Returns (n_frames, H, W, 3) uint8 (feed to viz.save_mp4)."""
+    cloud = np.asarray(cloud, dtype=np.float32)
+    traj = np.asarray(traj, dtype=np.float32)
+    t_e = np.asarray(t_e, dtype=np.float32).reshape(-1)
+    y = None
+    if method == "lda":                                          # supervised: fit toward the concept labels
+        assert labels is not None and factor_cfg is not None, "method='lda' needs labels + factor_cfg"
+        bmap = {b: k for k, b in enumerate(factor_cfg["buckets"])}
+        y = np.array([bmap[l] for l in labels])
+    e, reducer = reduce_dims(cloud, method, n_components=2, seed=0, return_reducer=True,
+                             **({"y": y} if y is not None else {}))
+    assert hasattr(reducer, "transform"), f"method={method!r} has no .transform() (cannot project the trajectory)"
+    traj2 = reducer.transform(traj)
+    goal2 = reducer.transform(t_e.reshape(1, -1))[0]
+    if reward_mode:                                              # scalar reward field -> colormap + colorbar
+        cn = cloud / (np.linalg.norm(cloud, axis=1, keepdims=True) + 1e-9)
+        color = cn @ (t_e / (np.linalg.norm(t_e) + 1e-9))
+        legend, cbar = None, "reward  cos(f_z(z), f_t(goal))"
+    else:                                                        # categorical concept coloring + legend
+        assert labels is not None and factor_cfg is not None, "reward_mode=False needs labels + factor_cfg"
+        color, legend = point_colors(labels, factor_cfg); cbar = ""
+    lims = pad_lims(np.concatenate([e, traj2, goal2[None]], axis=0))
+    fig = viz.fig_points_2d(e, color=color, lims=lims, point_size=point_size, legend=legend,
+                            cbar_label=cbar, marks=[{"pos": goal2, "text": "G"}], title=title)
+    idx = np.unique(np.linspace(1, len(traj2), min(n_frames, len(traj2))).astype(int))
+    frames = viz.animate_latent(fig, traj2, is3d=False, idx=idx, log=log, tail=tail)
+    plt.close(fig)
+    return frames
