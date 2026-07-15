@@ -120,3 +120,41 @@ latent subspace the planner optimizes.
 
 Deferred: guardrail #2 (off-manifold penalty); the LDA-subspace distance refinement; a `r_settle`/`beta_vel`
 sweep for the cosine-distance scale (default `r_settle=0.5` only brakes at `R>0.5` — likely want ~1.0).
+
+## Viz products — latent-space plots (spec)
+
+Everything is **decode-free** and reuses `evaluation/projection.py` (`project_and_plot`, generalized via
+`plots_name`) + the tail-fade latent-animation renderer. Plot folders are named **by the SPACE shown**:
+
+| Space | Folder | Written by | What |
+|---|---|---|---|
+| WM token-bag latent | `world_model_latent_space_plots/` | eval_interpret | raw world-model latent, per factor |
+| Joint `f_z`/`f_t` | `joint_latent_space_plots/` | train_reward (static) + eval_control (anim) | the shared reward space |
+| Language (MiniLM) | `language_model_latent_space_plots/` | train_reward | raw caption embeddings, per factor |
+| artifacts | `saved_projections/` | interpret + train_reward | `latents.npy`, `*_reducer.pkl` (`.transform()`) |
+
+Structure everywhere: `<plots_name>/<factor>/<proj>/<Nd>d.{png,mp4}`. **Static** plots emit the full reducer
+suite (pca/tsne/umap/lda/umap-sup); **animations** emit only lda/umap/pca (t-SNE has no out-of-sample
+`.transform()`, so a fitted reducer can't project new control-trajectory points — it cannot animate).
+
+**P1 — `language_model_latent_space_plots/` (train_reward, static, 2D).** Project the raw MiniLM caption
+embeddings (`cap_emb`), colored by concept (per-factor supervised LDA + unsupervised pca/umap/tsne). Shows how
+language organizes the concepts *before* `f_t`. Follow-up: annotate a few bucket-word prototypes with leader
+lines + text ("top red", "the upper red area") so you can see where phrasings land.
+
+**P2 — `eval_control/joint_latent_space_plots/<factor>/<proj>/2d_<i>_{concept,reward}.mp4` (animation).** Fit
+per-factor LDA/UMAP/PCA on `f_z(latents)` (∪ `f_t(vocab)` landmarks); animate the agent's `f_z(z_t)` over the
+executed control trajectory (`.transform()` per frame, tail-fade) toward the starred `f_t(goal)`. Two colorings:
+by GT **concept**, and by the **reward field** `cos(f_z(z), f_t(goal))` (heatmap) — the reward coloring is how
+you SEE the "flat reward far from goal" failure (uniform vs a gradient). Read on the **UMAP** view for legal
+paths (the cloud is the reachable manifold; a far goal forces transit through intermediate concepts); read on
+**LDA** for "did it reach the goal cluster." Per rendered episode → `_i`.
+
+**P3 — `eval_control/reward_trace_<goal>_<i>.png` (static, standard in every eval_control run).** Three lines
+over control step: **imagined** `cos(f_z(imagined latent), f_t(goal))` (MPPI's belief), **achieved-head**
+`cos(f_z(encode(real obs)), f_t(goal))`, **achieved-GT** (torus `color_reward`/`position_reward` on the real
+state). Failure decomposition, printed as a footer on the plot: imagined↑ & achieved-head flat ⇒ **WM drift**;
+achieved-head↑ & GT flat ⇒ **alignment/grounding error**; all flat ⇒ **horizon/reward-shape/exploration**.
+
+**Grounding score** = the existing `probe/<factor>_acc` (nearest-`f_t`-word vs GT); surfaced, not re-built.
+Pairwise-factor scatter dropped from defaults (doesn't scale past 2 factors) — on-demand only.

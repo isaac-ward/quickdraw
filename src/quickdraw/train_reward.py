@@ -67,8 +67,9 @@ def _load_interpret(run: str, factors):
     clip_idx = np.load(os.path.join(d, "saved_projections", "clip_index.npy"))    # (N,) -> clip position in `ok`
     recs = json.load(open(os.path.join(d, "labels.json")))                        # per-clip, `ok` order
     labels_by = {f: [recs[int(c)]["label"][f] for c in clip_idx] for f in factors}
+    labels_by_clip = {f: [r["label"][f] for r in recs] for f in factors}          # per-CLIP (for the caption plots)
     caps_by_clip = [list(r.get("captions", [])) for r in recs]
-    return latents.astype(np.float32), clip_idx.astype(int), labels_by, caps_by_clip
+    return latents.astype(np.float32), clip_idx.astype(int), labels_by, labels_by_clip, caps_by_clip
 
 
 def _soft_ce(logits, target_dist):
@@ -111,7 +112,7 @@ def main(cfg):
     bmap = {f: {b: k for k, b in enumerate(buckets_by[f])} for f in factors}
 
     # ---- data: per-point latents + per-factor labels + per-clip captions; split BY CLIP ----
-    latents, clip_idx, labels_by, caps_by_clip = _load_interpret(rc.interpret_run, factors)
+    latents, clip_idx, labels_by, labels_by_clip, caps_by_clip = _load_interpret(rc.interpret_run, factors)
     ncap = len(caps_by_clip[0]) if caps_by_clip else 0
     assert ncap and all(len(c) == ncap for c in caps_by_clip), (
         f"caption-contrastive training needs a fixed #captions per clip; got {ncap} "
@@ -283,6 +284,19 @@ def main(cfg):
                      step=int(rc.epochs), point_size=2.5, methods=("pca", "tsne", "umap"), umap_sup_weights=sup_w,
                      save_dir=rs_dir, plots_name="joint_latent_space_plots",
                      subtitle=f"joint latent space f_z(latent), val split ({int(va.sum()):,} points)", log=plog)
+
+    # ---- language-model latent space: project the RAW MiniLM caption embeddings, colored by concept. This is
+    #      the language space BEFORE f_t (model-independent, frozen MiniLM). Subsample for a legible/fast plot. ----
+    cap_lab = {f: [labels_by_clip[f][c] for c in range(len(caps_by_clip)) for _ in range(ncap)] for f in factors}
+    n_cap = cap_emb.shape[0]
+    keep = np.arange(n_cap)
+    if n_cap > 4000:                                             # cap points: t-SNE/UMAP cost + plot legibility
+        keep = rng.choice(n_cap, 4000, replace=False)
+    project_and_plot(writer, "train_reward", cap_emb[keep].cpu().numpy(),
+                     {f: [cap_lab[f][i] for i in keep] for f in factors}, fac_cfgs,
+                     step=int(rc.epochs), point_size=2.5, methods=("pca", "tsne", "umap"), umap_sup_weights=sup_w,
+                     n_components=(2,), plots_name="language_model_latent_space_plots",
+                     subtitle=f"language space MiniLM(caption), {len(keep):,} captions", log=plog)
 
     writer.finalize()
     plog(f"[train_reward] done -> {run_dir} (reward_head.pt, val probe acc: {probes}, "
