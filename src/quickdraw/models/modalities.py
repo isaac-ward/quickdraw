@@ -33,9 +33,11 @@ class ModalitySpec:
     noise_std: float = 0.0  # per-stream input noise sigma (training only; the variations design's per-stream sigma)
     decode_kind: str = "mse"  # "mse" (deterministic decode, bit-identical to before) | "flow" (generative
     #                           decode head — a TransportHead denoising the obs from the predicted tokens)
-    decode_shortcut: bool = False  # flow decode: opt-in shortcut self-consistency -> K=1 sampling (like the
-    #                                dynamics `diffusion.shortcut`, shortcut is NEVER default-on). Off -> plain flow, decode_steps.
-    decode_steps: int = 6     # flow decode ODE steps when NOT shortcut (shortcut -> always K=1)
+    decode_shortcut: bool = False  # flow decode (param=v): opt-in shortcut self-consistency -> K=1 sampling
+    #                                (like the dynamics `diffusion.shortcut`; never default-on). Off -> plain flow, decode_steps.
+    decode_steps: int = 6     # flow decode sampling steps (K). v: ODE steps (shortcut->1). x0: consistency refine steps (1 = direct)
+    decode_param: str = "v"   # flow decode parameterization: "v" (velocity, integrate ODE — imprecise for images)
+    #                           | "x0" (predict the clean obs directly — precise + in-range; use for image decode). See flow.py.
     # vector
     dim: int = 6
     # image
@@ -80,7 +82,8 @@ class Modality(nn.Module):
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         if self.decode_kind == "flow":
-            steps = 1 if self.decode_head.shortcut else self.decode_steps   # shortcut -> K=1; plain flow -> decode_steps
+            # committed (deterministic) decode: x0 -> 1-step direct prediction; v+shortcut -> K=1; v plain -> decode_steps
+            steps = 1 if (self.decode_head.shortcut or self.decode_head.param == "x0") else self.decode_steps
             obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=True)
         else:
             obs = self._decode(flat)
@@ -110,7 +113,8 @@ class VectorModality(Modality):
         self.dec = _mlp(d, spec.dim, hidden)
         self.decode_steps = int(spec.decode_steps)
         if self.decode_kind == "flow":            # generative decode head: cond = the single token (M,d)
-            self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden, shortcut=spec.decode_shortcut)
+            self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
+                                         param=spec.decode_param, shortcut=spec.decode_shortcut)
 
     def _encode(self, obs):                      # (M, dim) -> (M, 1, d)
         return self.enc(obs).unsqueeze(1)
@@ -137,7 +141,8 @@ class ImageModality(Modality):
             build_decoder=(self.decode_kind == "mse")))   # flow -> the ImageFlowHead IS the decoder; no dead mse decoder
         self.decode_steps = int(spec.decode_steps)
         if self.decode_kind == "flow":            # generative ViT decode head: cond = the latent tokens (M,num_tokens,d)
-            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, shortcut=spec.decode_shortcut)
+            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth,
+                                             param=spec.decode_param, shortcut=spec.decode_shortcut)
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)

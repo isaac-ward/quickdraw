@@ -33,9 +33,21 @@ class TransportHead(nn.Module):
     """Shared rectified-flow algorithm over an injected `velocity(x, temb, cond, demb)` net. Subclass and
     implement `velocity`. The base owns the time (and shortcut step-size) embeddings + loss/sample/consistency."""
 
-    def __init__(self, *, shortcut: bool = False, event_dims: int = 1, n_freq: int = 16, time_dim: int = 32):
+    def __init__(self, *, param: str = "v", shortcut: bool = False, event_dims: int = 1,
+                 n_freq: int = 16, time_dim: int = 32):
         super().__init__()
-        self.shortcut, self.event_dims, self.time_dim = shortcut, event_dims, time_dim
+        # param = what the net predicts / how we sample:
+        #   "v"  (velocity, rectified flow): net predicts the velocity u = eps - x0; sample INTEGRATES the ODE
+        #        noise->data over K Euler steps. Good for low-dim targets (latent tokens, proprio); for
+        #        high-dim images the integration accumulates error + overshoots range -> poor reconstruction.
+        #   "x0" (data / consistency-style): net predicts the CLEAN target x0 DIRECTLY from a noised input.
+        #        sample = predict x0 (1 step from noise) -> precise + in-range; K>1 refines by renoising
+        #        (consistency multi-step). Deterministic (eps=0) x0 = the conditional mean (~MSE); stochastic
+        #        eps + multi-step gives sharp samples. This is the IWS decode approach; use it for image decode.
+        assert param in ("v", "x0")
+        if param == "x0":
+            shortcut = False                          # x0 is a 1-step predictor; shortcut self-consistency is a v-only trick
+        self.param, self.shortcut, self.event_dims, self.time_dim = param, shortcut, event_dims, time_dim
         # fixed log-spaced frequencies (deterministic -> reproducible embeddings / golden-testable)
         self.register_buffer("freqs", 2.0 * math.pi * torch.logspace(0.0, 2.0, n_freq), persistent=False)
         self.tau_mlp = nn.Sequential(nn.Linear(2 * n_freq, time_dim), nn.GELU(), nn.Linear(time_dim, time_dim))
@@ -62,13 +74,16 @@ class TransportHead(nn.Module):
 
     # ---- training ----
     def loss(self, cond: Tensor, target: Tensor, *, time_sampling: str = "uniform") -> tuple[Tensor, Tensor | None]:
-        """Rectified flow-matching loss ||v - (eps - target)||^2 (+ shortcut self-consistency). Returns
-        (L_flow, L_shortcut_or_None)."""
+        """param="v": rectified flow-matching ||net - (eps-target)||^2 (+ shortcut self-consistency).
+        param="x0": ||net(x_tau,tau) - target||^2 — predict the clean target directly. Returns (L_main, L_shortcut|None)."""
         ts = self._tau_shape(target)
         tau = self._sample_time(ts, target.device, target.dtype, time_sampling)
         eps = torch.randn_like(target)
         x_tau = (1.0 - tau) * target + tau * eps      # straight (rectified) path
-        u = eps - target                              # constant velocity along it (regression target)
+        if self.param == "x0":                        # net predicts the CLEAN target directly
+            x0_hat = self.velocity(x_tau, self._temb(tau), cond, None)
+            return F.mse_loss(x0_hat, target), None
+        u = eps - target                              # velocity along the straight path (regression target)
         demb = self._demb(torch.zeros_like(tau)) if self.shortcut else None   # flow-matching = the d->0 field
         v = self.velocity(x_tau, self._temb(tau), cond, demb)
         l_flow = F.mse_loss(v, u)
@@ -102,9 +117,20 @@ class TransportHead(nn.Module):
         x = eps
         path = [x]
         ts = tuple(lead) + (1,) * self.event_dims
+        if self.param == "x0":                        # consistency-style: predict x0, optionally renoise + refine
+            for k in range(steps):
+                tau = cond.new_full(ts, 1.0 - k / steps)
+                x0_hat = self.velocity(x, self._temb(tau), cond, None)      # direct clean-target prediction
+                if record_path:
+                    path.append(x0_hat)
+                if k < steps - 1:                     # renoise to a lower level and refine (0 noise if deterministic)
+                    tn = 1.0 - (k + 1) / steps
+                    noise = torch.zeros_like(x0_hat) if deterministic else torch.randn_like(x0_hat)
+                    x = (1.0 - tn) * x0_hat + tn * noise
+            return (x0_hat, path) if record_path else x0_hat
         d = cond.new_full(ts, 1.0 / steps) if self.shortcut else None       # step-size conditioning
         demb = self._demb(d) if self.shortcut else None
-        for k in range(steps):
+        for k in range(steps):                        # param="v": Euler-integrate dx/dtau = v, tau=1 -> 0
             tau = cond.new_full(ts, 1.0 - k / steps)
             x = x - self.velocity(x, self._temb(tau), cond, demb) * (1.0 / steps)
             if record_path:
@@ -116,13 +142,13 @@ class FlowField(TransportHead):
     """MLP velocity `v([x || emb(tau) || cond (|| emb(d))]) -> dz`. The dynamics head over the token bag
     (cond = backbone context h, dz = d) AND the proprio decoder (cond = the proprio token, dz = 6)."""
 
-    def __init__(self, dz: int, h_dim: int, hidden: int, *, cond: str = "concat",
+    def __init__(self, dz: int, h_dim: int, hidden: int, *, cond: str = "concat", param: str = "v",
                  shortcut: bool = False, n_freq: int = 16, time_dim: int = 32):
         if cond != "concat":
             raise NotImplementedError(f"FlowField cond={cond!r} not implemented; use 'concat' (adaln is a future upgrade).")
-        super().__init__(shortcut=shortcut, event_dims=1, n_freq=n_freq, time_dim=time_dim)
+        super().__init__(param=param, shortcut=shortcut, event_dims=1, n_freq=n_freq, time_dim=time_dim)
         self.dz = dz
-        in_dim = dz + time_dim + h_dim + (time_dim if shortcut else 0)
+        in_dim = dz + time_dim + h_dim + (time_dim if self.shortcut else 0)   # self.shortcut (x0 forces it off)
         self.net = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(),
                                  nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dz))
 
@@ -142,8 +168,8 @@ class ImageFlowHead(TransportHead):
     decoder. v(noised_img (M,H,W,C), tau, latent_tokens (M,num_tokens,d)[, d_step]) -> velocity (M,H,W,C).
     Reuses vision.ViTBlock/CrossAttn + linear (de)patchify (own weights, separate from the AE)."""
 
-    def __init__(self, ae_cfg, *, depth: int = 4, shortcut: bool = False, n_freq: int = 16, time_dim: int = 32):
-        super().__init__(shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim)
+    def __init__(self, ae_cfg, *, depth: int = 4, param: str = "v", shortcut: bool = False, n_freq: int = 16, time_dim: int = 32):
+        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim)
         from .vision import CrossAttn, ViTBlock
         c = ae_cfg
         self.cfg = c
@@ -154,7 +180,7 @@ class ImageFlowHead(TransportHead):
         self.patch_embed = nn.Linear(pdim, d)
         self.pos = nn.Parameter(torch.zeros(1, self.np, d))
         self.t_proj = nn.Linear(time_dim, d)
-        self.d_proj = nn.Linear(time_dim, d) if shortcut else None
+        self.d_proj = nn.Linear(time_dim, d) if self.shortcut else None      # self.shortcut (x0 forces it off)
         self.from_latent = CrossAttn(d, c.heads)                      # patches attend to the conditioning tokens
         self.blocks = nn.ModuleList([ViTBlock(d, c.heads, c.mlp_ratio) for _ in range(depth)])
         self.norm = nn.LayerNorm(d)

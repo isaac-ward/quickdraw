@@ -25,5 +25,5 @@ modalities:
   # decode_kind: flow -> generative decode head per trunk (design/models/flow_heads.md). mse (default) =
   # deterministic decode, bit-identical to before. decode_shortcut: true -> K=1 sampling (EXPLICIT opt-in, like
   # the dynamics `diffusion.shortcut`; shortcut is never default-on). Starting BOTH trunks on flow to validate cross-trunk.
-  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_shortcut: true}
-  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: flow, decode_shortcut: true}
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: flow, decode_param: x0}
