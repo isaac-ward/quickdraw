@@ -78,7 +78,7 @@ pca/lda/umap expose `.transform()` to project NEW points into the SAME embedding
 
 def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, point_size, subtitle="",
                      methods=("pca", "tsne", "umap"), umap_sup_weights=(), n_components=(3, 2),
-                     save_dir=None, log=None, plots_name="plots"):
+                     save_dir=None, log=None, plots_name="plots", annotate=None):
     """Project `pts` (N, D) with each reducer and log the plots under `<tag>/<plots_name>/<categorical>/<method>/<Nd>d`.
     `plots_name` names the plot folder so each caller labels it by the SPACE being shown (e.g.
     `world_model_latent_space_plots` for eval_interpret, `joint_latent_space_plots` for the f_z reward space).
@@ -88,6 +88,14 @@ def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, p
     ({key: reducer-has-.transform}) so the caller can record it (e.g. in its own meta.json)."""
     fig_fn = {nd: (viz.fig_points_9view if nd == 3 else viz.fig_points_2d) for nd in n_components}
     transform_ok = {}
+    ann_labels = list(annotate) if annotate else []                # {label: (D,) embedding} -> leader-line labels (2d only)
+    ann_embs = np.stack([np.asarray(annotate[k], dtype=np.float32) for k in ann_labels]) if ann_labels else None
+
+    def _ann2d(reducer, nd):                                       # transform the annotation embeddings into THIS reducer (2d, transform-capable)
+        if ann_embs is None or nd != 2 or not hasattr(reducer, "transform"):
+            return None
+        xy = reducer.transform(ann_embs)
+        return [{"pos": xy[i], "text": ann_labels[i]} for i in range(len(ann_labels))]
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         np.save(os.path.join(save_dir, "latents.npy"), pts)
@@ -104,17 +112,18 @@ def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, p
         except Exception:
             transform_ok[key] = False
 
-    def _plot(mdir, method_label, e, factor=None):   # factor=None -> uncolored view (grouped under 'none')
+    def _plot(mdir, method_label, e, factor=None, annotations=None):   # factor=None -> uncolored view (grouped under 'none')
         nd = e.shape[1]
+        extra = {"annotations": annotations} if (nd == 2 and annotations) else {}
         if factor is None:                           # <plots_name>/none/<reducer>/<nd>d
             fig = fig_fn[nd](e, lims=pad_lims(e), point_size=point_size,
-                             title=f"{tag} — {method_label} of latent to {nd}D (no coloring)\n{subtitle}")
+                             title=f"{tag} — {method_label} of latent to {nd}D (no coloring)\n{subtitle}", **extra)
             writer.figure(f"{tag}/{plots_name}/none/{mdir}/{nd}d", fig, step); plt.close(fig)
         else:                                        # <plots_name>/<categorical>/<reducer>/<nd>d
             rgb, legend = point_colors(labels_by_factor[factor], factor_cfgs[factor])
             fig = fig_fn[nd](e, color=rgb, lims=pad_lims(e), point_size=point_size, legend=legend,
                              title=f"{tag} — {method_label} of latent to {nd}D, colored by {factor} "
-                                   f"({factor_cfgs[factor].get('source', '?')})\n{subtitle}")
+                                   f"({factor_cfgs[factor].get('source', '?')})\n{subtitle}", **extra)
             writer.figure(f"{tag}/{plots_name}/{factor}/{mdir}/{nd}d", fig, step); plt.close(fig)
 
     # ---- unsupervised: one projection per (method, dim); an uncolored view + one recolor per factor ----
@@ -122,9 +131,10 @@ def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, p
         for nd in n_components:
             e, reducer = reduce_dims(pts, method, n_components=nd, seed=0, return_reducer=True)
             _save(f"{method}_{nd}d", e, reducer)
-            _plot(method, method.upper(), e)
+            ann = _ann2d(reducer, nd)
+            _plot(method, method.upper(), e, annotations=ann)
             for factor in factor_cfgs:
-                _plot(method, method.upper(), e, factor)
+                _plot(method, method.upper(), e, factor, annotations=ann)
         if log is not None:
             log(f"{method} done")
 
@@ -138,7 +148,7 @@ def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, p
                 kw = {"y": yv} if w is None else {"y": yv, "target_weight": w}
                 e, reducer = reduce_dims(pts, meth, n_components=nd, seed=0, return_reducer=True, **kw)
                 _save(f"{mdir}_{factor}_{nd}d", e, reducer)
-                _plot(mdir, mdir, e, factor)
+                _plot(mdir, mdir, e, factor, annotations=_ann2d(reducer, nd))
         if log is not None:
             log(f"{mdir} done")
     return transform_ok
