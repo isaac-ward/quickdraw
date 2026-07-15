@@ -398,10 +398,11 @@ def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", tit
 
 
 def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | None = None, vlines=None,
-                      yscale: str = "log", split_top=None):
+                      yscale: str = "log", split_top=None, caption: str | None = None):
     """Curves vs rollout step. If `split_top` (a set of keys) is given AND there are other keys, those go in
     a TOP panel and the rest in a BOTTOM panel sharing ONE long x-axis (e.g. PSNR in dB on top; ssim/mse/l1
-    in [0,1] below), instead of squashing incompatible scales together. Captions (CAPTIONS) render below."""
+    in [0,1] below), instead of squashing incompatible scales together. Captions (per-curve CAPTIONS, plus a
+    free-form `caption` — e.g. the reward-trace failure-decomposition legend) render below the axes."""
     top = set(split_top or ()) & set(errors)
     top_keys = [k for k in errors if k in top]
     bot_keys = [k for k in errors if k not in top]
@@ -434,6 +435,8 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
     for k in errors:
         if k in CAPTIONS:
             lines += textwrap.wrap(CAPTIONS[k], width=190, subsequent_indent="      ") or [CAPTIONS[k]]
+    for para in (caption.split("\n") if caption else []):        # free-form footer (e.g. failure decomposition)
+        lines += textwrap.wrap(para, width=190, subsequent_indent="      ") or [para]
     fig.subplots_adjust(bottom=min(0.55, 0.10 + 0.028 * len(lines)))
     fig.text(0.02, 0.02, "\n".join(lines), fontsize=7, va="bottom")
     return fig
