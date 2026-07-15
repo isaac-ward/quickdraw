@@ -34,3 +34,31 @@ can we add another thing to the
 
 
   gifs
+
+
+
+  oth paths. ✓
+- Effective receptive field — stack L layers each with a W-window and the reach compounds: layer-2 at position j attends layer-1 at [j−W+1, j], and each of those attended back another W. So a depth-L windowed transformer sees back ≈ L·(W−1), not W. This is standard sliding-window attention (Mistral, Longformer): window per layer, receptive field grows with depth.
+
+The legacy per-step rollout re-feeds only the last W raw bags each step → deep layers physically can't reach past W → receptive field capped at W. That's "sliding window over raw inputs," which is more restrictive than standard windowed attention. The cache (== full-mask forward) keeps each attention at W but lets depth compound → the standard semantics.
+
+The reassuring part — what's actually different between train and eval:
+
+┌─────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+│                    Path                     │                            Window semantics                             │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ Teacher-forced training (forward(), p_tf≥1) │ builds _block_mask(W,T) over the full sequence → true window (== cache) │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ In-rollout training (rollout_train, p_tf<1) │ per-step truncated → capped at W                                        │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+│ Eval (now, cached)                          │ true window (== teacher-forced training)                                │
+└─────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+
+So the cache exactly matches the teacher-forced path. The only mismatch is with in-rollout training, and only for horizon > window (32). Within 32 steps: bit-identical.
+
+Is it an odd thing that causes errors? No — mild, and benign-directional:
+- It's a ~0.02 (≈2%) shift on decoded obs, only past step 32, and only because our A′ schedule ends in-rollout.
+- Direction is safe: eval gives strictly more, correctly-computed context with the same weights — not garbage. And because the p_tf schedule spends its warmup epochs teacher-forced, the model has already seen true-window features, so they aren't foreign at eval.
+- It won't produce qualitative failures (nothing like the 0,0,0 collapse) — it's a quantitative long-horizon nudge.
+
+If you ever want zero mismatch: either train teacher-forced (matches the cache, but we left TF deliberately for drift-robustness), or apply the O(T²) in-rollout fix from before. My call: accept it, note it (done, in config + memory).

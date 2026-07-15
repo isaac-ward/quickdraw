@@ -146,19 +146,21 @@ class LoggingCallback(L.Callback):
         self.norm = normalizer
         self.ecfg = ecfg
         self.every = every_epochs
-        self.at_epochs = set(int(e) for e in at_epochs) if at_epochs else None  # explicit benchmark epochs
+        self.at_epochs = set(int(e) for e in at_epochs) if at_epochs else None  # extra epochs to ALSO eval at (unioned with the every-N cadence)
         self.routines = routines
         self._t_fit = self._t_epoch = self._t_b0 = None
         self._eval_cum = 0.0
         self._compile_s = None
 
     def _eval_due(self, epoch: int) -> bool:
-        # explicit list (e.g. [20, 40]) takes precedence over the every-N cadence
-        if self.at_epochs is not None:
-            return epoch in self.at_epochs
-        # every N (SKIP epoch 0) PLUS one early eval at N/2 -> every=20 gives 10, 20, 40, 60, 80, ...
-        # (two evals inside the first 20 so early training is visible, then the every-N cadence)
-        return self.every > 0 and epoch > 0 and (epoch % self.every == 0 or epoch == self.every // 2)
+        # UNION of the every-N cadence (20, 40, 60, ...) and the explicit at_epochs list (extra one-off
+        # epochs, e.g. an early [10] read). at_epochs ADDS to the cadence (not override), so
+        # `every=20, at_epochs=[10]` -> 10, 20, 40, 60, 80, ...  (SKIP epoch 0). every=0 disables the cadence.
+        if epoch <= 0:
+            return False
+        cadence = self.every > 0 and epoch % self.every == 0
+        extra = self.at_epochs is not None and epoch in self.at_epochs
+        return cadence or extra
 
     def on_fit_start(self, trainer, pl_module):
         self.writer.config(OmegaConf.to_container(self.cfg, resolve=True))
