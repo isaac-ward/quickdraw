@@ -131,7 +131,7 @@ def load_latent_projection(interpret_run, method, factor, dim, *, fc, reward, re
     from .manifold import pad_lims
     base = glob.glob(os.path.join(interpret_run, "logs", "epoch_*", "eval_interpret"))
     assert base, f"no eval_interpret outputs under {interpret_run}/logs/epoch_*/"
-    pdir = os.path.join(base[0], "projections")
+    pdir = os.path.join(base[0], "saved_projections")
     sup = method == "lda" or method.startswith("umap-sup")             # supervised reducers include the factor in the name
     key = f"{method}_{factor}_{dim}d" if sup else f"{method}_{dim}d"
     with open(os.path.join(pdir, f"{key}_reducer.pkl"), "rb") as fh:

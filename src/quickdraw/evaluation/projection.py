@@ -78,8 +78,10 @@ pca/lda/umap expose `.transform()` to project NEW points into the SAME embedding
 
 def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, point_size, subtitle="",
                      methods=("pca", "tsne", "umap"), umap_sup_weights=(), n_components=(3, 2),
-                     save_dir=None, log=None):
-    """Project `pts` (N, D) with each reducer and log the plots under `<tag>/plots/<method>/...`.
+                     save_dir=None, log=None, plots_name="plots"):
+    """Project `pts` (N, D) with each reducer and log the plots under `<tag>/<plots_name>/<categorical>/<method>/<Nd>d`.
+    `plots_name` names the plot folder so each caller labels it by the SPACE being shown (e.g.
+    `world_model_latent_space_plots` for eval_interpret, `joint_latent_space_plots` for the f_z reward space).
     labels_by_factor: {factor: [label per point]} (already broadcast to the N points). factor_cfgs:
     {factor: its interpret config} (buckets/colors/source), for coloring + the supervised label mapping.
     save_dir: if given, persist latents.npy + each fitted embedding/reducer. Returns `transform_ok`
@@ -104,16 +106,16 @@ def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, p
 
     def _plot(mdir, method_label, e, factor=None):   # factor=None -> uncolored view (grouped under 'none')
         nd = e.shape[1]
-        if factor is None:                           # plots/none/<reducer>/<nd>d
+        if factor is None:                           # <plots_name>/none/<reducer>/<nd>d
             fig = fig_fn[nd](e, lims=pad_lims(e), point_size=point_size,
                              title=f"{tag} — {method_label} of latent to {nd}D (no coloring)\n{subtitle}")
-            writer.figure(f"{tag}/plots/none/{mdir}/{nd}d", fig, step); plt.close(fig)
-        else:                                        # plots/<categorical>/<reducer>/<nd>d
+            writer.figure(f"{tag}/{plots_name}/none/{mdir}/{nd}d", fig, step); plt.close(fig)
+        else:                                        # <plots_name>/<categorical>/<reducer>/<nd>d
             rgb, legend = point_colors(labels_by_factor[factor], factor_cfgs[factor])
             fig = fig_fn[nd](e, color=rgb, lims=pad_lims(e), point_size=point_size, legend=legend,
                              title=f"{tag} — {method_label} of latent to {nd}D, colored by {factor} "
                                    f"({factor_cfgs[factor].get('source', '?')})\n{subtitle}")
-            writer.figure(f"{tag}/plots/{factor}/{mdir}/{nd}d", fig, step); plt.close(fig)
+            writer.figure(f"{tag}/{plots_name}/{factor}/{mdir}/{nd}d", fig, step); plt.close(fig)
 
     # ---- unsupervised: one projection per (method, dim); an uncolored view + one recolor per factor ----
     for method in methods:

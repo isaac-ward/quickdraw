@@ -63,8 +63,8 @@ def _load_interpret(run: str, factors):
     base = glob.glob(os.path.join(run, "logs", "epoch_*", "eval_interpret"))
     assert base, f"no eval_interpret outputs under {run}/logs/epoch_*/"
     d = base[0]
-    latents = np.load(os.path.join(d, "projections", "latents.npy"))              # (N, D)
-    clip_idx = np.load(os.path.join(d, "projections", "clip_index.npy"))          # (N,) -> clip position in `ok`
+    latents = np.load(os.path.join(d, "saved_projections", "latents.npy"))        # (N, D)
+    clip_idx = np.load(os.path.join(d, "saved_projections", "clip_index.npy"))    # (N,) -> clip position in `ok`
     recs = json.load(open(os.path.join(d, "labels.json")))                        # per-clip, `ok` order
     labels_by = {f: [recs[int(c)]["label"][f] for c in clip_idx] for f in factors}
     caps_by_clip = [list(r.get("captions", [])) for r in recs]
@@ -277,11 +277,12 @@ def main(cfg):
                                xlabel="reward probe argmax", ylabel="true")
         writer.figure(f"val/confusion/{f}", cf, int(rc.epochs)); plt.close(cf)
     labels_val = {f: [buckets_by[f][i] for i in v["per"][f]["y"].tolist()] for f in factors}
-    rs_dir = os.path.join(writer.dir, f"epoch_{int(rc.epochs):04d}", "train_reward", "projections")
+    rs_dir = os.path.join(writer.dir, f"epoch_{int(rc.epochs):04d}", "train_reward", "saved_projections")
     sup_w = [float(w) for w in cfg.interpret.get("umap_sup_weights", [0.1, 0.3, 0.9])]
     project_and_plot(writer, "train_reward", v["zc"].numpy(), labels_val, fac_cfgs,
                      step=int(rc.epochs), point_size=2.5, methods=("pca", "tsne", "umap"), umap_sup_weights=sup_w,
-                     save_dir=rs_dir, subtitle=f"reward space f_z(latent), val split ({int(va.sum()):,} points)", log=plog)
+                     save_dir=rs_dir, plots_name="joint_latent_space_plots",
+                     subtitle=f"joint latent space f_z(latent), val split ({int(va.sum()):,} points)", log=plog)
 
     writer.finalize()
     plog(f"[train_reward] done -> {run_dir} (reward_head.pt, val probe acc: {probes}, "

@@ -535,14 +535,14 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     # ---- project + plot every reducer via the shared library (evaluation/projection.py); it saves the fitted
     #      reducers too, so a projection is reusable later (reducer.transform(new_latents) — pca/umap/lda only) ----
     from .projection import project_and_plot
-    pdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret", "projections")
+    pdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret", "saved_projections")
     os.makedirs(pdir, exist_ok=True)
     _np.save(os.path.join(pdir, "clip_index.npy"), clip_pos)                  # each point -> its clip's index within `ok`
     labels_pp = {f: [labels_ok[f][c] for c in clip_pos] for f in factors}     # per-POINT labels (broadcast from clips)
     transform_ok = project_and_plot(writer, "eval_interpret", pts, labels_pp, factors, step=step,
                                     point_size=psize, subtitle=sub, methods=("pca", "tsne", "umap"),
                                     umap_sup_weights=[float(w) for w in ic.get("umap_sup_weights", [0.5, 1.0])],
-                                    save_dir=pdir,
+                                    save_dir=pdir, plots_name="world_model_latent_space_plots",
                                     log=lambda m: _plog(writer, f"[eval_interpret @ep{step}] {m} ({time.perf_counter() - t0:.0f}s)"))
     with open(os.path.join(pdir, "meta.json"), "w") as fh:
         json.dump({"mode": mode, "n_points": int(len(pts)), "latent_dim": int(pts.shape[1]),
