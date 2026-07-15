@@ -10,7 +10,7 @@ denoising_max_steps: null  # null -> full 128 sequential swarms (~25min render);
 # enabled routines are cycled through on every eval epoch.
 during_train:
   every_epochs: 20         # regular cadence: eval at 20, 40, 60, ... (SKIP 0); 0 disables the cadence
-  at_epochs: [10]          # extra one-off epochs, UNIONED with the cadence -> {10, 20, 40, 60, 80, ...}
+  at_epochs: [5, 10]       # extra early one-off epochs, UNIONED with the cadence -> {5, 10, 20, 40, 60, 80, ...}
   evals:
     ood_horizon: true      # long-horizon open-loop rollout (OOD vs the short training horizon)
     ood_visual: false      # open-loop on the visual-OOD split (texture shift)

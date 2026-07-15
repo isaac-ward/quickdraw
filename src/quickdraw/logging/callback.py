@@ -179,6 +179,30 @@ class LoggingCallback(L.Callback):
         if self._compile_s is None and self._t_b0 is not None:
             self._compile_s = time.perf_counter() - self._t_b0  # ~ one-time compile
 
+    def on_train_epoch_end(self, trainer, pl_module):
+        # Eval routines fire on the eval CADENCE, decoupled from the validation cadence. They used to live in
+        # on_validation_epoch_end, which only fires on val epochs — so with check_val_every_n_epoch=2 (odd val
+        # epochs) and an even eval cadence (10, 20, 40, ...) they NEVER coincided and no eval ran. Running them
+        # here (every train-epoch end) means the eval cadence is honored regardless of the val cadence. The
+        # model is put in eval mode for the routines, then restored (validation, which follows, sets its own).
+        if trainer.sanity_checking or not (self.routines and self._eval_due(trainer.current_epoch)):
+            return
+        from ..evaluation.routines import REGISTRY
+        epoch = trainer.current_epoch
+        m = pl_module.model
+        was_training = m.training
+        m.eval()
+        t_eval = time.perf_counter()
+        try:
+            for name in self.routines:
+                REGISTRY[name](self.cfg, m, self.norm, self.ecfg, self.writer, pl_module.device, epoch)
+            bench = self._bench(pl_module)
+            if bench:
+                self.writer.scalars(bench, step=epoch)   # inference-speed scalars (empty for multimodal)
+        finally:
+            m.train(was_training)
+        self._eval_cum += time.perf_counter() - t_eval
+
     def _bench(self, pl_module):
         """time/ms/* + time/hz/* from a controlled rollout micro-benchmark (batch B and batch 1)."""
         m, dev = pl_module.model, pl_module.device
@@ -203,17 +227,9 @@ class LoggingCallback(L.Callback):
         # forward every aggregated scalar metric (train/* and val/*) through the one writer
         self.writer.scalars({k: v.item() for k, v in trainer.callback_metrics.items()}, step=epoch)
 
-        metrics = {}
-        if self.routines and self._eval_due(epoch):
-            from ..evaluation.routines import REGISTRY
+        metrics = {}                                  # eval routines now run in on_train_epoch_end (decoupled from val cadence)
 
-            t_eval = time.perf_counter()
-            for name in self.routines:
-                REGISTRY[name](self.cfg, pl_module.model, self.norm, self.ecfg, self.writer, pl_module.device, epoch)
-            self._eval_cum += time.perf_counter() - t_eval
-            metrics.update(self._bench(pl_module))  # inference-speed scalars, only on eval epochs
-
-        # wall-clock + cost, every epoch (computed after the eval routine so epoch time includes it)
+        # wall-clock + cost, every epoch (eval time — run earlier in on_train_epoch_end — is in self._eval_cum)
         now = time.perf_counter()
         total_s = now - self._t_fit
         metrics["time/epoch_seconds"] = now - self._t_epoch
