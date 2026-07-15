@@ -14,6 +14,11 @@ p_tf_warmup_epochs: 4
 recon_frac: 1.0            # fraction (0-1) of the F rollout frames to supervise the decode recon on (train only;
                            #   ALL output modalities, same random subset per step). 1.0=all. <1 saves ViT-AE decode compute.
 detach_every: 16
+# Temporal KV-cache is ON by default for INFERENCE rollouts (imagine_eval / MPPI; MultiModalSequenceModel.
+# use_kv_cache, never used in training). It is the FAITHFUL sliding-window forward (cached == full-sequence
+# masked forward, ~8e-7). NOTE: it also (correctly) un-truncates deep-layer receptive fields that the legacy
+# per-step rollout truncated at the window's left edge -> for horizon > window the cached rollout differs
+# slightly (~0.02 on decoded obs) from the pre-cache path. Within window it is identical. See smoke/kvcache.py.
 diffusion:
   shortcut: false          # true -> K=1 sampling via self-consistency
   sampling_steps: 6
