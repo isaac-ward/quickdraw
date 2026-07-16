@@ -292,11 +292,10 @@ def main(cfg):
     keep = np.arange(n_cap)
     if n_cap > 4000:                                             # cap points: t-SNE/UMAP cost + plot legibility
         keep = rng.choice(n_cap, 4000, replace=False)
-    lang_ann = {b: T[k].cpu().numpy() for k, (f, b) in enumerate(flat)}   # annotate each bucket word where it lands
     project_and_plot(writer, "train_reward", cap_emb[keep].cpu().numpy(),
                      {f: [cap_lab[f][i] for i in keep] for f in factors}, fac_cfgs,
                      step=int(rc.epochs), point_size=2.5, methods=("pca", "tsne", "umap"), umap_sup_weights=sup_w,
-                     n_components=(2,), plots_name="language_model_latent_space_plots", annotate=lang_ann,
+                     n_components=(2,), plots_name="language_model_latent_space_plots",
                      subtitle=f"language space MiniLM(caption), {len(keep):,} captions", log=plog)
 
     writer.finalize()
