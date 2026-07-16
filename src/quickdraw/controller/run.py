@@ -212,25 +212,25 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 fz = reward.f_z(torch.from_numpy(lat).to(reward.device)).cpu().numpy()
                 rfield = reward.score(torch.from_numpy(lat).to(reward.device), t_e).cpu().numpy()
             t_e_np = t_e.cpu().numpy()
-            col_fc = OmegaConf.to_container(cfg.interpret.factors["color"], resolve=True)
-            yb = {b: k for k, b in enumerate(col_fc["buckets"])}
-            e = reduce_dims(fz, "lda", n_components=2, seed=0,
-                            y=np.array([yb[recs[int(c)]["label"]["color"]] for c in clip_idx]))
-            ff = viz.fig_points_2d(e, color=rfield, cbar_label=f"reward  cos(f_z, f_t('{request}'))",
-                                   lims=pad_lims(e), point_size=3.0, title=f"reward field over the joint space — '{request}'")
-            writer.figure(product_tag("eval_control", "reward_field"), ff, step); plt.close(ff)
-            _plog(writer, f"[eval_control @ep{step}] reward_field '{request}' (range {rfield.min():.2f}..{rfield.max():.2f})")
+            _plog(writer, f"[eval_control @ep{step}] reward field '{request}' (range {rfield.min():.2f}..{rfield.max():.2f})")
             for factor in ("color", "positioning"):
                 fc = OmegaConf.to_container(cfg.interpret.factors[factor], resolve=True)
                 labels = [recs[int(c)]["label"][factor] for c in clip_idx]
+                yb = {b: k for k, b in enumerate(fc["buckets"])}
+                e = reduce_dims(fz, "lda", n_components=2, seed=0, y=np.array([yb[l] for l in labels]))
+                # STATIC reward field in THIS factor's LDA layout (readable gradient; the reward_*.mp4 animates the same)
+                ff = viz.fig_points_2d(e, color=rfield, cbar_label=f"reward  cos(f_z, f_t('{request}'))",
+                                       lims=pad_lims(e), point_size=3.0, title=f"reward field '{request}' — {factor} LDA")
+                writer.figure(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", "reward_field"), ff, step)
+                plt.close(ff)
                 for i in range(NP):
                     with torch.no_grad():
                         fzt = reward.f_z(torch.from_numpy(np.asarray(res["agent_latents"][i], np.float32)).to(reward.device)).cpu().numpy()
                     for rmode, tag in ((False, "concept"), (True, "reward")):
                         fr = animate_joint_space(fz, fzt, t_e_np, method="lda", labels=labels, factor_cfg=fc,
                                                  reward_mode=rmode, title=f"'{request}' · {factor} joint ({tag}) #{i}")
-                        writer.video(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", "2d", i=i) + f"_{tag}",
-                                     fr, fps, step)
+                        writer.video(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", f"{tag}_2d", i=i),
+                                     fr, fps, step)   # <coloring>_<nd>d_<i>.mp4, matching the other products
                     _plog(writer, f"[eval_control @ep{step}] joint anim {factor}/lda #{i} (concept+reward)")
 
     # aggregate scalars (over ALL episodes, once)
