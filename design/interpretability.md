@@ -1,4 +1,13 @@
-# Interpretability module — `eval_interpret/` (design, not yet built)
+# Interpretability module — `eval_interpret/` (BUILT; see update)
+
+> **Update (2026-07-16): built, with two drifts from the sketch below.**
+> 1. **Factors are `color` and `speed` only — `direction` was dropped** (unreliable VLM labeling of heading-change
+>    sign on short clips). Wherever the doc lists `{color,speed,direction}`, read `{color,speed}`.
+> 2. **Projection folders are renamed at call-time via a `plots_name` arg**, and fitted reducers are cached +
+>    reused across an eval via `saved_projections`. In `eval_interpret` the products live under
+>    **`world_model_latent_space_plots/`** (was the bare `eval_interpret/{umap,tsne,pca}` tree); `eval_control`
+>    reuses the same projection machinery under **`joint_latent_space_plots/`** on `f_z(z)∪f_t(text)`. The
+>    per-reducer/per-factor `<factor>_{2,3}d.png` naming inside each folder is unchanged.
 
 **Goal:** probe whether the world-model's LATENT space organizes by human-legible semantic factors — **color,
 speed, direction** — by VLM-labeling short imagined clips and recoloring the `eval_manifold` projections by those

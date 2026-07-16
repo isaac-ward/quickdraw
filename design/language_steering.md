@@ -142,19 +142,26 @@ embeddings (`cap_emb`), colored by concept (per-factor supervised LDA + unsuperv
 language organizes the concepts *before* `f_t`. Follow-up: annotate a few bucket-word prototypes with leader
 lines + text ("top red", "the upper red area") so you can see where phrasings land.
 
-**P2 — `eval_control/joint_latent_space_plots/<factor>/<proj>/2d_<i>_{concept,reward}.mp4` (animation).** Fit
-per-factor LDA/UMAP/PCA on `f_z(latents)` (∪ `f_t(vocab)` landmarks); animate the agent's `f_z(z_t)` over the
-executed control trajectory (`.transform()` per frame, tail-fade) toward the starred `f_t(goal)`. Two colorings:
-by GT **concept**, and by the **reward field** `cos(f_z(z), f_t(goal))` (heatmap) — the reward coloring is how
-you SEE the "flat reward far from goal" failure (uniform vs a gradient). Read on the **UMAP** view for legal
-paths (the cloud is the reachable manifold; a far goal forces transit through intermediate concepts); read on
-**LDA** for "did it reach the goal cluster." Per rendered episode → `_i`.
+**P2 — `eval_control/joint_latent_space_plots/<factor>/lda/{concept,reward}_2d_<i>.mp4` (animation) + `reward_field.png` (static).**
+Fit per-factor LDA on `f_z(latents)`; animate the agent's `f_z(z_t)` over the executed control trajectory
+(`.transform()` per frame, tail-fade) toward the `f_t(request)` landmark (a leader line + the request text, not
+a bare marker). Two colorings: by GT **concept**, and by the **reward field** `cos(f_z(z), f_t(request))`
+(the static `reward_field.png` is that same backdrop, for reading the gradient — uniform vs a gradient shows
+the "flat reward far from goal" failure). Capped to 1 episode (render cost). *(`f_t(vocab)` landmarks + per-request
+—not representative-only— joint/field plots are optional future polish.)*
 
-**P3 — `eval_control/reward_trace_<goal>_<i>.png` (static, standard in every eval_control run).** Three lines
-over control step: **imagined** `cos(f_z(imagined latent), f_t(goal))` (MPPI's belief), **achieved-head**
-`cos(f_z(encode(real obs)), f_t(goal))`, **achieved-GT** (torus `color_reward`/`position_reward` on the real
-state). Failure decomposition, printed as a footer on the plot: imagined↑ & achieved-head flat ⇒ **WM drift**;
-achieved-head↑ & GT flat ⇒ **alignment/grounding error**; all flat ⇒ **horizon/reward-shape/exploration**.
+**P3 — `eval_control/reward_trace_<i>.png` + `.npz` (static, standard every run).** **FOUR** lines over control
+step, `{imagined, achieved} × {reward head, ground truth}`: **achieved** = on the REAL executed state, **imagined**
+= the chosen plan's PREDICTED state (world-model belief, rolled with the KV-cache to match MPPI); **reward head**
+= `cos(f_z, f_t(request))` (purple), **ground truth** = torus `color_reward`/`position_reward` on the path
+(green); achieved solid, imagined dashed. **Open circles mark each MPPI replan** on the imagined lines (+ a black
+"replanning step" legend key). Footer decomposition: imagined-vs-achieved ⇒ **WM/imagination accuracy (drift)**;
+reward-head-vs-ground-truth ⇒ **alignment/grounding**. The **`.npz`** dumps the raw curves (re-plot / average /
+post-process for the paper without re-running).
+
+**Multi-query** — `language.requests` (a LIST) runs **one episode per request** in ONE batch (per-episode `t_e`),
+so they share the torus; `control_video_combined.mp4` shows **all agents on one torus** (all black). Single
+`language.request` is the classic one-request run. Other knobs: `reward_field`, `hull_frac`.
 
 **Grounding score** = the existing `probe/<factor>_acc` (nearest-`f_t`-word vs GT); surfaced, not re-built.
 Pairwise-factor scatter dropped from defaults (doesn't scale past 2 factors) — on-demand only.

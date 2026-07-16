@@ -1,5 +1,13 @@
 # Diffusion — latent autoregressive flow-matching world model
 
+> **Renames (branch `flow-heads`, 2026-07-16) — the "as built" names below are superseded:** the flow core is
+> now `TransportHead` (base) + `FlowField`/`ImageFlowHead`/`ImageUNetFlowHead` (was a single `FlowField`); the
+> model class is `MultiModalFlow` (was `MultiModalDiffusion`/`Diffusion`); the eval routine + entrypoint are
+> `eval_flow` (was `eval_diffusion`); the consistency loss key is `shortcut/latent` (was `flow_consistency`).
+> The dynamics-head content here is still accurate; the generative-head **decode** is now unified — see
+> `design/models/flow_heads.md` (the authoritative decode doc: one `TransportHead` per modality, `decode_kind`
+> mse=no_noise vs flow, `decode_arch` mlp|vit|unet).
+
 A fourth model class for the shoot-out, alongside **DSAR** (data-space) and **LSAR** (latent-space,
 deterministic). Where the deterministic models predict a *point estimate* of the next state, the
 diffusion model predicts the **distribution** of the next state by learning a **velocity field** that

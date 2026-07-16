@@ -1,9 +1,15 @@
 # Vision era — multimodal (kinematic + image) world models
 
-> **Status: initial thoughts.** Captures a design discussion, not a committed spec. The diffusion /
-> LSAR / DSAR specs (`diffusion.md`, `latent_space_autoregressor.md`, `data_space_autoregressor.md`)
-> remain the authoritative model docs; this is where the *vision extension* of all of them gets
-> sketched before we commit. Nothing here is implemented yet.
+> **Status: initial thoughts** (vision extension now IMPLEMENTED — see below). The authoritative decode doc is
+> `flow_heads.md`.
+>
+> **Update (2026-07-16): the "100% ViT / No CNNs" framing below is no longer absolute.** The image AE encoder is
+> still all-ViT, but (a) the AE is now **encoder-only** (`build_decoder=False` always — the decode head is the
+> decoder), and (b) the decoder architecture is a config axis **`decode_arch: vit | unet`**: `vit` =
+> `ImageFlowHead` (ViT denoiser); `unet` = `ImageUNetFlowHead` wrapping **`vision.ConditionalUNet`** — a **conv
+> U-Net** (FiLM(time,cond) res-blocks, spatial cond seed at the bottleneck, no patch grid). So there ARE CNNs in
+> the image decode path now. Decode is a `TransportHead` in all cases (`decode_kind` mse=no_noise vs flow); the
+> old deterministic-MSE ViT decoder / transposed-conv sketches below are superseded.
 
 ## The shape: two inputs, two outputs, fused
 

@@ -1,22 +1,41 @@
 # Flow heads — one flow core for the dynamics AND every decoder (+ diffusion forcing)
 
-Status: **IMPLEMENTED** (2026-07-14, branch `flow-heads`) — P1 TransportHead refactor, P2 flow decode heads,
-P3 diffusion forcing, P4 renames (MultiModalFlow / mm_flow / eval_flow / image), all tested (df-off
-bit-identical; df-on + gate + end-to-end verified). Runs: `flowdec_v1` (DF off) + `flowdec_df_v1` (DF on).
-Deferred: trunk **stable-id** decoupling (future-proofing; rename is safe now since we retrain). Not merged to main.
-Extends `design/models/diffusion.md` (the latent
-dynamics flow) by (a) generalizing the flow into a **reusable generative-head core** shared by the
-dynamics and the modality decoders, (b) adding an opt-in **diffusion-forcing** training regime, and (c)
-recording where we sit vs *Interactive World Simulator* (IWS, arXiv 2603.08546) and canonical CTM.
-Default behavior is unchanged: `decode_kind: mse` + `diffusion_forcing: off` is **bit-identical to today**.
+Status: **IMPLEMENTED + UNIFIED** (2026-07-14 base; unification refactor 2026-07-16, branch `flow-heads`).
+TransportHead refactor, flow decode heads, diffusion forcing, renames (MultiModalFlow / mm_flow / eval_flow),
+then the decode UNIFICATION below. Extends `design/models/diffusion.md` (the latent dynamics flow).
+
+## UPDATE — decode unification + `decode_arch` (2026-07-16, SUPERSEDES the plan below)
+
+The original plan (below) treated `mse` as a *separate deterministic decoder*. That's gone — decode is now
+**fully unified**: every modality has exactly ONE `decode_head`, and `decode_kind` only picks how that one
+network is *optimized*.
+- **`decode_head` is always a `TransportHead`** (`FlowField` / `ImageFlowHead` / `ImageUNetFlowHead`).
+  `Modality.decode`/`decode_loss` always route through it — there is no `_decode`, no `VectorModality.dec`,
+  no AE mse decoder (`build_decoder=False` always; the AE is **encoder-only**), no `mse_unet`.
+- **`decode_kind = flow`** → the flow head (noise curriculum + flow-matching / shortcut loss).
+- **`decode_kind = mse`** → the SAME net as a degenerate `TransportHead(no_noise=True)`: predict the clean
+  target from `x=0, τ=1`, L2 loss, one step. "mse = flow with no noise." So the two kinds share weights-shape
+  and code; only the training objective differs.
+- **`decode_arch` is an ORTHOGONAL axis**: `mlp` (proprio `FlowField`) | `vit` (`ImageFlowHead`) |
+  `unet` (`ImageUNetFlowHead` wrapping `vision.ConditionalUNet` — conv + FiLM(time,cond) + spatial cond seed,
+  no patch grid). All 4 image combos (kind × arch) build + reconstruct.
+- **Bit-identicality**: the `flow` path is byte-identical to before (no_noise=False = unchanged branches,
+  verified by decode_recon). The `mse` path intentionally CHANGED net (adopts the flow net), so old mse
+  checkpoints are not reloadable — accepted for true unification.
+- **`TransportHead.forward == velocity`** so `torch.func.functional_call` (physical_state frozen-decoder probe) works.
+
+Empirical (why this matters): the ViT `x0`-flow decode at ep~24 was WORSE than mse (color-biased, patch-blocky)
+— see memory `flow-x0-decode-ep24-finding`. The `unet` arch (no patch grid) is the response; a matched
+`unet_flow` vs `unet_mse` comparison (~4.95M each, teacher-forced) tests whether the flow *objective* earns
+its keep on a conv decoder. `decode_kind: mse` is NOT bit-identical to the pre-flow-heads code anymore.
 
 ---
 
-## 0. TL;DR
+## 0. TL;DR (original plan — see the UPDATE above for what shipped)
 
-- Today: dynamics is generative (rectified flow in latent), decode is **deterministic MSE** → blur.
-- Plan: make **decode a generative flow head too**, reusing the *same* flow core, per trunk
-  (`decode_kind: mse | flow`). One-step via **shortcut** (not CTM — same inference speed, far simpler).
+- Then: dynamics is generative (rectified flow in latent), decode was **deterministic MSE** → blur.
+- Plan (shipped, then unified): make **decode a generative flow head too**, reusing the *same* flow core, per
+  trunk (`decode_kind: mse | flow`). One-step via **shortcut** (not CTM — same inference speed, far simpler).
 - Add **diffusion forcing** as a gated variation: noise the *context*, not just the prediction target,
   at independent levels → the model trains on noisy history → robust long rollouts.
 - **Naming, done right (not grandfathered):** the family is **flow**. Rename `MultiModalDiffusion →
