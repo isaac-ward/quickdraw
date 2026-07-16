@@ -220,7 +220,7 @@ class ImageUNetFlowHead(TransportHead):
     the predicted latent tokens. Same TransportHead contract + `sample()` signature — so it drops in wherever
     ImageFlowHead does. No patch grid -> smooth color fields don't block (see the ep24 ViT-decode blocking)."""
 
-    def __init__(self, ae_cfg, *, base: int = 64, param: str = "v", shortcut: bool = False,
+    def __init__(self, ae_cfg, *, base: int = 32, param: str = "v", shortcut: bool = False,
                  n_freq: int = 16, time_dim: int = 32):
         super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim)
         from .vision import ConditionalUNet

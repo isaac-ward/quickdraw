@@ -171,7 +171,7 @@ class ConditionalUNet(nn.Module):
       - mse:   x = zeros, temb = None                      -> pure tokens->image decoder.
     Decodes from `cond` regardless of `x` (bottleneck injection), so the eps=0 deterministic sample works."""
 
-    def __init__(self, ae_cfg, *, base: int = 64, time_dim: int = 32):
+    def __init__(self, ae_cfg, *, base: int = 32, time_dim: int = 32):
         super().__init__()
         import math
         self.cfg = ae_cfg
@@ -186,7 +186,8 @@ class ConditionalUNet(nn.Module):
         for ch in chs:
             self.downs.append(_FiLMResBlock(prev, ch, d)); prev = ch
         self.bott_hw = ae_cfg.img_size // (2 ** len(chs))     # 128/16 = 8
-        self.cond_to_spatial = nn.Linear(T * d, chs[-1] * self.bott_hw * self.bott_hw)   # tokens -> bottleneck map
+        self.seed_hw = 2                                       # tokens -> a small 2x2 seed, upsampled to the bottleneck
+        self.cond_to_spatial = nn.Linear(T * d, chs[-1] * self.seed_hw * self.seed_hw)   # (was a dense 8x8 map = the 8M term)
         self.mid = _FiLMResBlock(chs[-1], chs[-1], d)
         self.ups, prev = nn.ModuleList(), chs[-1]
         for ch in reversed(chs):
@@ -205,7 +206,8 @@ class ConditionalUNet(nn.Module):
         skips = []
         for down in self.downs:
             h = down(h, g); skips.append(h); h = F.avg_pool2d(h, 2)
-        h = h + self.cond_to_spatial(cond.reshape(M, -1)).reshape(M, -1, self.bott_hw, self.bott_hw)
+        seed = self.cond_to_spatial(cond.reshape(M, -1)).reshape(M, -1, self.seed_hw, self.seed_hw)
+        h = h + F.interpolate(seed, size=(self.bott_hw, self.bott_hw), mode="nearest")
         h = self.mid(h, g)
         for up, skip in zip(self.ups, reversed(skips)):
             h = F.interpolate(h, scale_factor=2, mode="nearest")
