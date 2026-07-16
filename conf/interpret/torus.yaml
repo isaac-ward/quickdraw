@@ -2,7 +2,7 @@
 # select on the CLI with interpret=<env>. eval_interpret imagines short clips, VLM-labels them by semantic
 # factor, and recolors the eval_manifold latent projections by those labels (see design/interpretability.md).
 
-n_clips: 2048         # imagined clips to label + embed (more (latent,label) pairs -> a better-generalizing reward head)
+n_clips: 1024         # imagined clips to label + embed (more (latent,label) pairs -> a better-generalizing reward head)
 n_captions: 16        # detailed free-form VLM captions per clip (0 = off). CLIP-style reward training aligns f_z(latent)
 #                       with f_t(MiniLM(caption)); varied real phrasings -> open-vocab steering. Same VLM call as labeling.
 point: per_step       # per_step = every step's latent, clip label broadcast (dense, ~n_clips*clip_len points, comparable to eval_manifold); mean = one clip-mean latent per clip (sparse, clean)

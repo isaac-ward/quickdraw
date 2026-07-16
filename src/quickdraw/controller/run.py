@@ -138,10 +138,23 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
 
         # per-episode realized-distance curve
         if reward is not None:   # language: realized distance 1 - R(state, request) (lower = redder, 0 = on target)
-            rc = res["pred"]["dist_curves"][i]
+            rc = np.asarray(res["pred"]["dist_curves"][i])
             klab = f"learned: distance to '{request}' (1 - R)"
             curve = viz.fig_error_vs_step({klab: rc}, colors={klab: "dimgray"}, yscale="linear")
             writer.figure(product_tag("eval_control", "distance_to_request", i=i), curve, step); plt.close(curve)
+            # reward TRACE: achieved-head (realized R = 1 - dist) vs achieved-GT (torus reward on the REAL path).
+            from ..environments import torus as T
+            rq, xyz = str(request).lower(), np.asarray(agents[0]["path"])
+            gt = [T.color_reward(xyz, b) for b in cfg.interpret.factors.color.buckets if str(b).lower() in rq] + \
+                 [T.position_reward(xyz, r, b) for b in cfg.interpret.factors.positioning.buckets if str(b).lower() in rq]
+            lines = {"achieved (reward head)": 1.0 - rc}
+            if gt:
+                lines["achieved (GT truth)"] = np.mean(gt, axis=0)
+            tr = viz.fig_error_vs_step(lines, yscale="linear",
+                caption="achieved(reward head) = realized cos(f_z, f_t(req)); achieved(GT) = torus reward on the real "
+                        "path. head rises & GT flat => alignment/grounding error; both rise => steering works; both "
+                        "flat => planning/horizon. (imagined/MPPI-belief line is a TODO — needs an mppi hook.)")
+            writer.figure(product_tag("eval_control", "reward_trace", i=i), tr, step); plt.close(tr)
         else:                    # goal race: distance to current goal, verticals at goal switches
             k_true, k_pred = "true (oracle): dist to current goal", "pred (learned): dist to current goal"
             curve = viz.fig_error_vs_step({k_true: res["true"]["dist_curves"][i], k_pred: res["pred"]["dist_curves"][i]},
@@ -177,6 +190,48 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                     writer.video(product_tag(f"eval_control/interpret/{factor}/{method}", f"{dim}d", i=i), vid, fps, step)
                     _plog(writer, f"[eval_control @ep{step}] interpret/{factor}/{method}/{dim}d_{i} "
                                   f"({len(vid)} frames, {time.perf_counter() - ti:.0f}s)")
+
+    # (language) JOINT-f_z space: reward FIELD (static) + agent animation (concept + reward-field colorings). The
+    # aligned space where f_z(latent) meets f_t(text) — where the reward gradient the planner climbs actually lives.
+    if reward is not None and lang.get("interpret_run") and res.get("agent_latents") is not None:
+        import glob
+
+        import torch
+        from omegaconf import OmegaConf
+
+        from ..evaluation.manifold import pad_lims, reduce_dims
+        from ..evaluation.projection import animate_joint_space
+        base = glob.glob(os.path.join(str(lang.interpret_run), "logs", "epoch_*", "eval_interpret"))
+        if base:
+            sp = os.path.join(base[0], "saved_projections")
+            lat = np.load(os.path.join(sp, "latents.npy")).astype(np.float32)
+            clip_idx = np.load(os.path.join(sp, "clip_index.npy"))
+            recs = json.load(open(os.path.join(base[0], "labels.json")))
+            t_e = reward.text_embedding(request)
+            with torch.no_grad():                                    # f_z: WM latent -> joint space; reward field over the cloud
+                fz = reward.f_z(torch.from_numpy(lat).to(reward.device)).cpu().numpy()
+                rfield = reward.score(torch.from_numpy(lat).to(reward.device), t_e).cpu().numpy()
+            t_e_np = t_e.cpu().numpy()
+            col_fc = OmegaConf.to_container(cfg.interpret.factors["color"], resolve=True)
+            yb = {b: k for k, b in enumerate(col_fc["buckets"])}
+            e = reduce_dims(fz, "lda", n_components=2, seed=0,
+                            y=np.array([yb[recs[int(c)]["label"]["color"]] for c in clip_idx]))
+            ff = viz.fig_points_2d(e, color=rfield, cbar_label=f"reward  cos(f_z, f_t('{request}'))",
+                                   lims=pad_lims(e), point_size=3.0, title=f"reward field over the joint space — '{request}'")
+            writer.figure(product_tag("eval_control", "reward_field"), ff, step); plt.close(ff)
+            _plog(writer, f"[eval_control @ep{step}] reward_field '{request}' (range {rfield.min():.2f}..{rfield.max():.2f})")
+            for factor in ("color", "positioning"):
+                fc = OmegaConf.to_container(cfg.interpret.factors[factor], resolve=True)
+                labels = [recs[int(c)]["label"][factor] for c in clip_idx]
+                for i in range(NP):
+                    with torch.no_grad():
+                        fzt = reward.f_z(torch.from_numpy(np.asarray(res["agent_latents"][i], np.float32)).to(reward.device)).cpu().numpy()
+                    for rmode, tag in ((False, "concept"), (True, "reward")):
+                        fr = animate_joint_space(fz, fzt, t_e_np, method="lda", labels=labels, factor_cfg=fc,
+                                                 reward_mode=rmode, title=f"'{request}' · {factor} joint ({tag}) #{i}")
+                        writer.video(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", "2d", i=i) + f"_{tag}",
+                                     fr, fps, step)
+                    _plog(writer, f"[eval_control @ep{step}] joint anim {factor}/lda #{i} (concept+reward)")
 
     # aggregate scalars (over ALL episodes, once)
     summary = {"n_steps": res["n_steps"], "time/mppi_chunk_s": mppi_chunk_s, "time/mppi_chunk_hz": mppi_chunk_hz}
