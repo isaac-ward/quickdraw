@@ -58,6 +58,10 @@ class LanguageReward:
 
     @torch.no_grad()
     def score(self, latent: torch.Tensor, t_e: torch.Tensor) -> torch.Tensor:
-        """latent (..., latent_dim) -> (...) cosine reward against t_e. Flatten a token bag's (n_state,d) first."""
+        """latent (..., latent_dim) -> (...) cosine reward against t_e. Flatten a token bag's (n_state,d) first.
+        t_e (embed,) -> one target for all (broadcast). t_e (L, embed) -> a PER-leading-index target (multi-query:
+        latent's first dim = episode, each episode scored against its own request)."""
         z = F.normalize(self.f_z(latent.to(self.device)), dim=-1)
-        return z @ t_e
+        if t_e.dim() == 1:
+            return z @ t_e
+        return torch.einsum("l...e,le->l...", z, t_e.to(z.device))

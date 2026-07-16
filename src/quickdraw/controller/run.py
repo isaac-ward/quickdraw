@@ -59,16 +59,22 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     # language steering: request + reward head -> the LEARNED controller maximizes R(latent, request) with the
     # oracle OFF (a single controller, same code spine). Otherwise the default dual goal race (oracle vs learned).
     lang = cfg.get("language")
-    reward, request = None, None
-    if lang is not None and lang.get("request") and lang.get("head"):
+    reward, request, requests = None, None, None
+    if lang is not None and lang.get("head") and (lang.get("requests") or lang.get("request")):
         from ..language.reward import LanguageReward
-        request = str(lang.request)
+        # MULTI-QUERY: language.requests = a LIST of texts -> one episode PER request, all steered in one batch
+        # (so they share the torus). Single language.request -> the classic single-request run (n_episodes inits).
+        requests = [str(x) for x in (lang.get("requests") or [lang.request])]
+        request = requests[0]                     # representative text for the shared joint-space / reward-field plots
         reward = LanguageReward(lang.head, device=device)
-        reward.text_embedding(request)   # validate up front: raises if the request matches no known buckets (compound OK)
-        ov = dict(lang.get("overrides") or {})   # language-mode control knobs (n_episodes/max_steps/...) over `control:`
+        for rq in requests:
+            reward.text_embedding(rq)             # validate each up front (raises on an unknown bucket)
+        ov = dict(lang.get("overrides") or {})    # language-mode control knobs (n_episodes/max_steps/...) over `control:`
+        if len(requests) > 1:                     # one episode per request; render them all
+            ov["n_episodes"] = ov["n_plot"] = len(requests)
         mppi_kwargs.update(ov)
-        _plog(writer, f"[eval_control @ep{step}] LANGUAGE steering -> '{request}' "
-                      f"({os.path.basename(lang.head)}); oracle OFF, single learned controller"
+        _plog(writer, f"[eval_control @ep{step}] LANGUAGE steering -> {requests} "
+                      f"({os.path.basename(lang.head)}); oracle OFF, learned controller"
                       + (f"; overrides {ov}" if ov else ""))
     n_ctrl = 1 if reward is not None else 2
     n_plot = int(mppi_kwargs.pop("n_plot", 1))    # NOT an MPPIConfig field: how many episodes to render products for
@@ -78,7 +84,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     t = time.perf_counter()
     res, _ = run_control(model, normalizer, ecfg, MPPIConfig(**mppi_kwargs), device=device,
                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv,
-                         reward=reward, request=request, oracle=(reward is None), n_plot=n_plot)
+                         reward=reward, request=request, requests=requests, oracle=(reward is None), n_plot=n_plot)
     t_ctrl = time.perf_counter() - t
     # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers the controller(s) + chunk
     # execution over n_chunks replans, so per-chunk wall time = t_ctrl / n_chunks.
@@ -101,20 +107,24 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
 
     # per-episode products (parallel episodes from different inits): control_video_i (+scene), <head>/rollout_i
     # (+filmstrip), and a distance curve_i. goal race: black oracle vs grey learned; language: single grey agent.
-    ctrl_frames = []                       # collected per-episode control videos -> tiled into control_video_combined
+    ep_requests = res.get("requests")          # per-episode request text (multi-query), or None
+    combined_agents = []                        # (language) one pred agent per episode -> ALL on ONE torus (combined)
+    _PALETTE = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628", "#f781bf", "#000000"]
     for i in range(NP):
         ti = time.perf_counter()
         agents = [_agent(res[k], i, colors[k], R, r) for k in kinds]
+        req_i = ep_requests[i] if ep_requests else request
         nf = len(agents[0]["path"])
         _plog(writer, f"[eval_control @ep{step}] rendering control video #{i} ({nf} frames, GPU/EGL)...")
-        vtitle = (f'"{request}"  #{i}' if reward is not None else f"control: true vs pred #{i}")
+        vtitle = (f'"{req_i}"  #{i}' if reward is not None else f"control: true vs pred #{i}")
         frames = viz.control_compare_frames(R, r, "hsv", agents, n_frames=nf, title=vtitle,
                                             fan_seq=res["fan_seqs"][i],  # pred's MPPI candidate fan, colored by score
                                             reuse=bool(cfg.control.get("reuse_render", False)),
                                             show_goals=(reward is None),  # language mode has no target -> no goal ring
                                             log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}"))
         writer.video(product_tag("eval_control", "control_video", i=i), frames, fps, step)
-        ctrl_frames.append(frames)
+        if reward is not None:                  # collect this episode's agent (distinct color) for the ONE-torus combined
+            combined_agents.append(_agent(res["pred"], i, _PALETTE[i % len(_PALETTE)], R, r))
         scene_desc = (f"Language-steered MPPI on the torus (episode {i}): a single GREY learned-model agent "
                       f"steering to maximize the language reward R(latent, '{request}'). The action arrow per step "
                       f"is the applied control."
@@ -143,7 +153,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         if reward is not None:
             rc = np.asarray(res["pred"]["dist_curves"][i])
             from ..environments import torus as T
-            rq, xyz = str(request).lower(), np.asarray(agents[0]["path"])
+            rq, xyz = str(req_i).lower(), np.asarray(agents[0]["path"])
 
             def _gt(path):   # torus ground-truth reward on a path for the buckets named in the request
                 g = [T.color_reward(path, b) for b in cfg.interpret.factors.color.buckets if str(b).lower() in rq] + \
@@ -181,18 +191,16 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
             writer.figure(product_tag("eval_control", "distance_to_goal", i=i), curve, step); plt.close(curve)
         _plog(writer, f"[eval_control @ep{step}] episode #{i} rendered in {time.perf_counter() - ti:.1f}s")
 
-    # combined control video: tile the per-episode control videos into one grid — all inits of the request at once.
-    if len(ctrl_frames) > 1:
-        import math
-        Tm = min(len(f) for f in ctrl_frames)
-        nc = int(math.ceil(math.sqrt(len(ctrl_frames)))); nr = int(math.ceil(len(ctrl_frames) / nc))
-        Hh, Ww = ctrl_frames[0].shape[1:3]
-        comb = np.zeros((Tm, nr * Hh, nc * Ww, 3), dtype=ctrl_frames[0].dtype)
-        for k, f in enumerate(ctrl_frames):
-            rr, cc = divmod(k, nc)
-            comb[:, rr * Hh:(rr + 1) * Hh, cc * Ww:(cc + 1) * Ww] = f[:Tm]
+    # combined control video: ALL agents on ONE torus (one colored dot per request/episode), not a grid.
+    if len(combined_agents) > 1:
+        nf = max(len(a["path"]) for a in combined_agents)
+        ctitle = "  ·  ".join(f'{_PALETTE[k % len(_PALETTE)]}={(ep_requests[k] if ep_requests else f"#{k}")}'
+                              for k in range(len(combined_agents)))
+        comb = viz.control_compare_frames(R, r, "hsv", combined_agents, n_frames=nf, title=ctitle,
+                                          reuse=bool(cfg.control.get("reuse_render", False)), show_goals=False,
+                                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   combined {m}"))
         writer.video(product_tag("eval_control", "control_video_combined"), comb, fps, step)
-        _plog(writer, f"[eval_control @ep{step}] control_video_combined ({len(ctrl_frames)} eps, {nr}x{nc} grid, {Tm} frames)")
+        _plog(writer, f"[eval_control @ep{step}] control_video_combined ({len(combined_agents)} agents on one torus)")
 
     # (language) world-model latent-space animations: agent moving through the eval_interpret projections toward X_c/X_r.
     if reward is not None and lang.get("interpret_run") and res.get("agent_latents") is not None:
@@ -251,8 +259,8 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 goal2d = red.transform(t_e_np[None])[0][:2]     # the request f_t(request) projected -> its spot in this layout
                 # STATIC reward field in THIS factor's LDA layout (readable gradient; the reward_*.mp4 animates the same)
                 ff = viz.fig_points_2d(e, color=rfield, cbar_label=f"reward  cos(f_z, f_t('{request}'))",
-                                       lims=pad_lims(np.concatenate([e, goal2d[None]])), point_size=3.0,
-                                       annotations=[{"pos": goal2d, "text": f"request: {request}"}],
+                                       lims=pad_lims(np.concatenate([e, goal2d[None]])), point_size=6.0,
+                                       annotations=[{"pos": goal2d, "text": request}],
                                        title=f"reward field '{request}' — {factor} LDA")
                 writer.figure(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", "reward_field"), ff, step)
                 plt.close(ff)

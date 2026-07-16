@@ -114,7 +114,7 @@ def _init_controller(cfg, B, device, seed):
 
 @torch.no_grad()
 def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, device="cpu", log=None, fpv=None,
-                reward=None, request=None, oracle=True, n_plot=1):
+                reward=None, request=None, oracle=True, n_plot=1, requests=None):
     """MPPI control on the torus. Default: race the oracle (true dynamics) vs the learned model through
     spatial goals. `oracle=False` -> learned controller only (same code spine). `reward` (a
     language.reward.LanguageReward) + `request` -> the learned controller maximizes R(latent, request)
@@ -141,7 +141,16 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     order = torch.rand(B, len(goals), generator=torch.Generator(device=device).manual_seed(1),
                        device=device).argsort(dim=1)[:, :n_goals]    # (B, n_goals)
     chunk = max(1, min(mppi.chunk, H))
-    t_e = reward.text_embedding(request).to(device) if reward is not None else None
+    # multi-query: `requests` (len == n_episodes) -> a PER-EPISODE target t_e (B, embed), so each episode steers to
+    # its OWN request in ONE batched rollout (they share the torus). Single `request` -> one (embed,) target for all.
+    ep_requests = list(requests) if requests else ([request] * B if request is not None else None)
+    if reward is None:
+        t_e = None
+    elif requests:
+        assert len(requests) == B, f"requests ({len(requests)}) must match n_episodes ({B})"
+        t_e = torch.stack([reward.text_embedding(r) for r in requests]).to(device)   # (B, embed)
+    else:
+        t_e = reward.text_embedding(request).to(device)                              # (embed,)
     # language reward as a DISTANCE: d = 1 - cos(f_z(z), t_e) per step (G,K,H). Fed to _score exactly like
     # the goal distance, so beta_vel/r_settle (near-target braking) + beta_ctrl apply identically -> the agent
     # settles ON red instead of orbiting it, and the "score" reads as a distance (0 = perfectly red).
@@ -202,7 +211,8 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                                         dtype=torch.bfloat16, enabled=("cuda" in str(device))):
                         ibag = core._rollout(ric, a_im, H, 0.0, None, 0)               # (NP,H,n_state,d)
                         iprop = normalizer.denorm_obs(core.to_obs(ibag, heads=["proprio"])["proprio"])  # (NP,H,6)
-                    cur_imag = {"head": reward.score(ibag.reshape(NP, H, -1).float(), t_e).cpu().numpy(),   # (NP,H) imagined R
+                    te = t_e[:NP] if t_e.dim() > 1 else t_e                            # per-episode target (multi-query)
+                    cur_imag = {"head": reward.score(ibag.reshape(NP, H, -1).float(), te).cpu().numpy(),   # (NP,H) imagined R
                                 "xyz": iprop[..., :3].float().cpu().numpy()}           # (NP,H,3) imagined path
         for j in range(chunk):  # execute `chunk` actions of each plan open-loop, then replan
             if step >= mppi.max_steps:
@@ -286,6 +296,8 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     if reward is not None and imag_head_logs[0]:   # per episode: the chosen plan's IMAGINED belief per executed step
         out["imag_head_curves"] = [np.array(imag_head_logs[e]) for e in range(NP)]   # (T,) imagined reward-head reward
         out["imag_paths"] = [np.stack(imag_xyz_logs[e]) for e in range(NP)]          # (T,3) imagined xyz -> imagined GT
+    if ep_requests is not None:
+        out["requests"] = ep_requests[:NP]         # per-episode request (multi-query: each episode's own text)
     for kind, c in ctrls.items():
         done = c["done_step"]
         completed = done >= 0
