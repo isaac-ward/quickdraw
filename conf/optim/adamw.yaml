@@ -1,2 +1,4 @@
 lr: 1.0e-3
 weight_decay: 1.0e-4
+lr_warmup_steps: 300   # linear LR warmup over N optimizer steps (0 -> no warmup). Stabilizes the flow decode's
+#                        high-variance early gradients so an oversized first update can't overflow into inf/NaN.

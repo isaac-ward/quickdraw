@@ -14,7 +14,7 @@ class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
                  lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0,
-                 recon_frac: float = 1.0):
+                 recon_frac: float = 1.0, lr_warmup_steps: int = 0):
         super().__init__()
         self.model = model
         self.norm = normalizer
@@ -23,6 +23,7 @@ class LitWorldModel(L.LightningModule):
         self.recon_frac = float(recon_frac)   # <1 -> supervise the decode recon on a random subset of F frames (ALL heads)
         self.p_tf_start, self.p_tf_end, self.p_tf_warmup = p_tf_start, p_tf_end, p_tf_warmup
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
+        self.lr_warmup_steps = int(lr_warmup_steps)
         # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
         self.variations = make_variation_suite(variations)
         # physical-loss warmup: ramp its weight 0 -> 1 over warmup_epochs (same linear schedule as p_tf;
@@ -161,14 +162,32 @@ class LitWorldModel(L.LightningModule):
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
         # clip (Trainer sets val=1.0) AND log the total grad norm pre- and post-clip, generically for
         # every model, so BPTT blow-ups (DSAR diverged ~ep30 even with clipping) are diagnosable.
+        grads = [p.grad.detach() for p in self.parameters() if p.grad is not None]
         def _total_norm():
-            gs = [p.grad.detach().norm() for p in self.parameters() if p.grad is not None]
+            gs = [g.norm() for g in grads]
             return torch.norm(torch.stack(gs)) if gs else torch.zeros((), device=self.device)
+        # pre-clip non-finite fractions: localize a blow-up (which/how much of the grad is bad) BEFORE clipping
+        # mangles it — norm-clipping turns a single inf into an all-NaN grad, so the fractions must be read here.
+        total = sum(g.numel() for g in grads) or 1
+        n_nan = sum(torch.isnan(g).sum() for g in grads) if grads else 0
+        n_inf = sum(torch.isinf(g).sum() for g in grads) if grads else 0
         pre = _total_norm()
-        self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val,
-                            gradient_clip_algorithm=gradient_clip_algorithm)
+        # non-finite guard: a single inf/nan grad makes norm-clipping compute a NaN total-norm and scale EVERY
+        # grad to NaN, which then poisons AdamW's state permanently (unet_flow died this way ~ep2). Skip the
+        # step instead — zero the grads so optimizer.step() is a harmless no-op — and count skips so a
+        # SYSTEMATIC problem (vs a rare transient batch) is visible in grad/nonfinite_skipped.
+        skipped = not bool(torch.isfinite(pre))
+        if skipped:
+            for g in grads:
+                g.zero_()
+        else:
+            self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val,
+                                gradient_clip_algorithm=gradient_clip_algorithm)
         self.log("grad/norm_preclip", pre)
         self.log("grad/norm_postclip", _total_norm())
+        self.log("grad/fraction_nans", n_nan / total)
+        self.log("grad/fraction_infs", n_inf / total)
+        self.log("grad/nonfinite_skipped", float(skipped))
 
     def training_step(self, batch, _):
         return self._step(batch, "train")
@@ -182,4 +201,12 @@ class LitWorldModel(L.LightningModule):
     def configure_optimizers(self):
         # not fused: Lightning's gradient_clip_val is incompatible with a fused optimizer, and at this
         # model size the fused speedup is negligible while grad clipping aids autoregressive stability.
-        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        if self.lr_warmup_steps > 0:
+            # linear LR warmup 0->1 over N OPTIMIZER STEPS. The flow decode regresses a clean target from a
+            # near-pure-noise input -> high-variance early gradients; full LR from step 0 let one oversized
+            # early update blow activations up into a bf16 overflow. Warmup lets them settle. interval="step"
+            # counts batches (not epochs) so warmup finishes early in epoch 0.
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / self.lr_warmup_steps))
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+        return opt

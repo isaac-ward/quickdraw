@@ -153,6 +153,9 @@ class _FiLMResBlock(nn.Module):
         self.norm2 = nn.GroupNorm(min(8, cout), cout)
         self.conv2 = nn.Conv2d(cout, cout, 3, padding=1)
         self.film = nn.Linear(gdim, 2 * cout)
+        nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)   # zero-init -> s=0,b=0 at init, so the
+        #   block starts as an exact identity modulation (ADM/DiT standard). Prevents FiLM's multiplicative
+        #   (1+s) term from amplifying activations early, which is how the flow-decode U-Net overflowed to inf.
         self.skip = nn.Conv2d(cin, cout, 1) if cin != cout else nn.Identity()
 
     def forward(self, x, g):

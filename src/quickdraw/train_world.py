@@ -139,7 +139,8 @@ def main(cfg):
                         cfg.model.p_tf_start, cfg.model.p_tf_end, cfg.model.p_tf_warmup_epochs,
                         cfg.optim.lr, cfg.optim.weight_decay, cfg.model.detach_every,
                         variations=cfg.get("variations"), dt=e.dt,
-                        recon_frac=float(cfg.model.get("recon_frac", 1.0)))
+                        recon_frac=float(cfg.model.get("recon_frac", 1.0)),
+                        lr_warmup_steps=int(cfg.optim.get("lr_warmup_steps", 0)))
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py). Lightning's own
     # logger is OFF; all logging flows through the writer via LoggingCallback.
