@@ -149,11 +149,14 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                  [T.position_reward(xyz, r, b) for b in cfg.interpret.factors.positioning.buckets if str(b).lower() in rq]
             lines = {"achieved (reward head)": 1.0 - rc}
             if gt:
-                lines["achieved (GT truth)"] = np.mean(gt, axis=0)
+                lines["achieved (ground truth)"] = np.mean(gt, axis=0)
             tr = viz.fig_error_vs_step(lines, yscale="linear",
-                caption="achieved(reward head) = realized cos(f_z, f_t(req)); achieved(GT) = torus reward on the real "
-                        "path. head rises & GT flat => alignment/grounding error; both rise => steering works; both "
-                        "flat => planning/horizon. (imagined/MPPI-belief line is a TODO — needs an mppi hook.)")
+                caption="achieved (reward head) = realized cos(f_z, f_t(request)) on the real state.\n"
+                        "achieved (ground truth) = torus reward on the real executed path.\n"
+                        "reward-head rises but ground-truth flat  =>  alignment / grounding error.\n"
+                        "both rise  =>  steering works.\n"
+                        "both flat  =>  planning / horizon failure.\n"
+                        "(imagined / MPPI-belief lines pending an mppi hook — see the 4-line trace TODO.)")
             writer.figure(product_tag("eval_control", "reward_trace", i=i), tr, step); plt.close(tr)
         else:                    # goal race: distance to current goal, verticals at goal switches
             k_true, k_pred = "true (oracle): dist to current goal", "pred (learned): dist to current goal"
@@ -165,7 +168,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
             writer.figure(product_tag("eval_control", "distance_to_goal", i=i), curve, step); plt.close(curve)
         _plog(writer, f"[eval_control @ep{step}] episode #{i} rendered in {time.perf_counter() - ti:.1f}s")
 
-    # (language) latent-space animations: agent moving through the eval_interpret projections toward X_c/X_r.
+    # (language) world-model latent-space animations: agent moving through the eval_interpret projections toward X_c/X_r.
     if reward is not None and lang.get("interpret_run") and res.get("agent_latents") is not None:
         from omegaconf import OmegaConf
 
@@ -186,9 +189,10 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                                               title=f'"{request}"  ·  {factor} ({method} {dim}d)  #{i}',
                                               log=lambda m, i=i, method=method, dim=dim:
                                                   _plog(writer, f"[eval_control @ep{step}]   anim {factor}/{method}/{dim}d #{i} {m}"))
-                    # eval_control/interpret/<categorical>/<reducer>/<nd>d_<i> (mirrors the plots/<cat>/<reducer> layout)
-                    writer.video(product_tag(f"eval_control/interpret/{factor}/{method}", f"{dim}d", i=i), vid, fps, step)
-                    _plog(writer, f"[eval_control @ep{step}] interpret/{factor}/{method}/{dim}d_{i} "
+                    # eval_control/world_model_latent_space_plots/<categorical>/<reducer>/<nd>d_<i>
+                    writer.video(product_tag(f"eval_control/world_model_latent_space_plots/{factor}/{method}", f"{dim}d", i=i),
+                                 vid, fps, step)
+                    _plog(writer, f"[eval_control @ep{step}] world_model_latent_space_plots/{factor}/{method}/{dim}d_{i} "
                                   f"({len(vid)} frames, {time.perf_counter() - ti:.0f}s)")
 
     # (language) JOINT-f_z space: reward FIELD (static) + agent animation (concept + reward-field colorings). The
@@ -217,10 +221,13 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 fc = OmegaConf.to_container(cfg.interpret.factors[factor], resolve=True)
                 labels = [recs[int(c)]["label"][factor] for c in clip_idx]
                 yb = {b: k for k, b in enumerate(fc["buckets"])}
-                e = reduce_dims(fz, "lda", n_components=2, seed=0, y=np.array([yb[l] for l in labels]))
+                e, red = reduce_dims(fz, "lda", n_components=2, seed=0, return_reducer=True, y=np.array([yb[l] for l in labels]))
+                goal2d = red.transform(t_e_np[None])[0][:2]     # the request f_t(request) projected -> its spot in this layout
                 # STATIC reward field in THIS factor's LDA layout (readable gradient; the reward_*.mp4 animates the same)
                 ff = viz.fig_points_2d(e, color=rfield, cbar_label=f"reward  cos(f_z, f_t('{request}'))",
-                                       lims=pad_lims(e), point_size=3.0, title=f"reward field '{request}' — {factor} LDA")
+                                       lims=pad_lims(np.concatenate([e, goal2d[None]])), point_size=3.0,
+                                       annotations=[{"pos": goal2d, "text": f"request: {request}"}],
+                                       title=f"reward field '{request}' — {factor} LDA")
                 writer.figure(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", "reward_field"), ff, step)
                 plt.close(ff)
                 for i in range(NP):
@@ -228,9 +235,9 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                         fzt = reward.f_z(torch.from_numpy(np.asarray(res["agent_latents"][i], np.float32)).to(reward.device)).cpu().numpy()
                     for rmode, tag in ((False, "concept"), (True, "reward")):
                         fr = animate_joint_space(fz, fzt, t_e_np, method="lda", labels=labels, factor_cfg=fc,
-                                                 reward_mode=rmode, title=f"'{request}' · {factor} joint ({tag}) #{i}")
+                                                 reward_mode=rmode, goal_label=request, title=f"'{request}' · {factor} joint ({tag}) #{i}")
                         writer.video(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", f"{tag}_2d", i=i),
-                                     fr, fps, step)   # <coloring>_<nd>d_<i>.mp4, matching the other products
+                                     fr, fps, step)   # <type>_<nd>d_<i>.mp4 (type = concept|reward), matching the other products
                     _plog(writer, f"[eval_control @ep{step}] joint anim {factor}/lda #{i} (concept+reward)")
 
     # aggregate scalars (over ALL episodes, once)

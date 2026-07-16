@@ -155,7 +155,7 @@ def project_and_plot(writer, tag, pts, labels_by_factor, factor_cfgs, *, step, p
 
 
 def animate_joint_space(cloud, traj, t_e, *, method="lda", labels=None, factor_cfg=None,
-                        reward_mode=False, n_frames=200, point_size=6.0, tail=60, title="", log=None):
+                        reward_mode=False, goal_label="goal", n_frames=200, point_size=6.0, tail=60, title="", log=None):
     """Animate an agent's control trajectory through the JOINT latent space (design/language_steering.md P2).
     Fits `method` (lda|umap|pca) on `cloud` (N,D) = f_z(latents), transforms the cloud, the agent `traj`
     (T,D) = f_z(z_t) over control steps, and the goal direction `t_e` (D,) = f_t(goal) into 2D, then renders
@@ -187,7 +187,7 @@ def animate_joint_space(cloud, traj, t_e, *, method="lda", labels=None, factor_c
         color, legend = point_colors(labels, factor_cfg); cbar = ""
     lims = pad_lims(np.concatenate([e, traj2, goal2[None]], axis=0))
     fig = viz.fig_points_2d(e, color=color, lims=lims, point_size=point_size, legend=legend,
-                            cbar_label=cbar, marks=[{"pos": goal2, "text": "G"}], title=title)
+                            cbar_label=cbar, annotations=[{"pos": goal2, "text": goal_label}], title=title)
     idx = np.unique(np.linspace(1, len(traj2), min(n_frames, len(traj2))).astype(int))
     frames = viz.animate_latent(fig, traj2, is3d=False, idx=idx, log=log, tail=tail)
     plt.close(fig)
