@@ -166,7 +166,9 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     fpv_actual_logs = [[] for _ in range(NP)] # (MM) per episode: per-step actual rendered FPV
     latent_logs = [[] for _ in range(NP)]     # (reward mode) per episode: per-step agent latent (the rolled bag, the
     #                                           same space eval_interpret fit its reducers on) -> latent-space animation
-    cur_plan_fpv = None
+    imag_head_logs = [[] for _ in range(NP)]  # (reward mode) imagined reward-head reward of the CHOSEN plan, per executed step
+    imag_xyz_logs = [[] for _ in range(NP)]   # (reward mode) imagined xyz of the chosen plan -> imagined GROUND-TRUTH reward
+    cur_plan_fpv = cur_imag = None
     while step < mppi.max_steps:
         n_chunks += 1
         for kind, c in ctrls.items():  # plan once per chunk (re-grounded on the latest true state)
@@ -191,6 +193,17 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                     ctxN = {"proprio": normalizer.norm_obs(ctx[:NP]), img_head: ctx_fpv[:NP]}
                     actN = normalizer.norm_act(torch.cat([pa[:NP], c["plan"][:NP]], dim=1))  # (NP, p-1+H, 2)
                     cur_plan_fpv = model.imagine_eval(ctxN, actN, H, heads=[img_head])[img_head].clamp(0, 1)  # (NP,H,s,s,3)
+                if reward is not None:  # imagined rollout of the CHOSEN plan -> per-step imagined reward-head + xyz (trace)
+                    a_im = normalizer.norm_act(torch.cat([pa[:NP], c["plan"][:NP]], dim=1))
+                    ric = {"proprio": normalizer.norm_obs(ctx[:NP])}
+                    if use_fpv:
+                        ric[img_head] = ctx_fpv[:NP]
+                    with torch.autocast(device_type=("cuda" if "cuda" in str(device) else "cpu"),
+                                        dtype=torch.bfloat16, enabled=("cuda" in str(device))):
+                        ibag = core._rollout(ric, a_im, H, 0.0, None, 0)               # (NP,H,n_state,d)
+                        iprop = normalizer.denorm_obs(core.to_obs(ibag, heads=["proprio"])["proprio"])  # (NP,H,6)
+                    cur_imag = {"head": reward.score(ibag.reshape(NP, H, -1).float(), t_e).cpu().numpy(),   # (NP,H) imagined R
+                                "xyz": iprop[..., :3].float().cpu().numpy()}           # (NP,H,3) imagined path
         for j in range(chunk):  # execute `chunk` actions of each plan open-loop, then replan
             if step >= mppi.max_steps:
                 break
@@ -226,6 +239,9 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                     c["dist_log"].append((1.0 - reward.score(bf, t_e)).cpu().numpy())  # (B,) realized dist 1-R
                     for e in range(NP):
                         latent_logs[e].append(bf[e].cpu().numpy())              # per-episode agent latent -> LDA animation
+                        if cur_imag is not None:                                # the chosen plan's imagined belief for this step
+                            imag_head_logs[e].append(float(cur_imag["head"][e, min(j, H - 1)]))
+                            imag_xyz_logs[e].append(cur_imag["xyz"][e, min(j, H - 1)])
                     c["goal_log"].append(new_obs[:, :3].cpu().numpy())          # no target -> mark the agent itself
                 else:                    # goal-reaching control: distance to current goal + advance on settle
                     c["goal_log"].append(cur.cpu().numpy())
@@ -267,6 +283,9 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
             out["pred_fpv_videos"].append({"pred": pred[:n], "actual": actual[:n]})
     if reward is not None and latent_logs[0]:   # per episode: (T, n_state*d) agent latent trajectory (reward space)
         out["agent_latents"] = [np.stack(latent_logs[e]) for e in range(NP)]
+    if reward is not None and imag_head_logs[0]:   # per episode: the chosen plan's IMAGINED belief per executed step
+        out["imag_head_curves"] = [np.array(imag_head_logs[e]) for e in range(NP)]   # (T,) imagined reward-head reward
+        out["imag_paths"] = [np.stack(imag_xyz_logs[e]) for e in range(NP)]          # (T,3) imagined xyz -> imagined GT
     for kind, c in ctrls.items():
         done = c["done_step"]
         completed = done >= 0

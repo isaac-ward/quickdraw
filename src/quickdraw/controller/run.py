@@ -101,6 +101,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
 
     # per-episode products (parallel episodes from different inits): control_video_i (+scene), <head>/rollout_i
     # (+filmstrip), and a distance curve_i. goal race: black oracle vs grey learned; language: single grey agent.
+    ctrl_frames = []                       # collected per-episode control videos -> tiled into control_video_combined
     for i in range(NP):
         ti = time.perf_counter()
         agents = [_agent(res[k], i, colors[k], R, r) for k in kinds]
@@ -113,6 +114,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                                             show_goals=(reward is None),  # language mode has no target -> no goal ring
                                             log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}"))
         writer.video(product_tag("eval_control", "control_video", i=i), frames, fps, step)
+        ctrl_frames.append(frames)
         scene_desc = (f"Language-steered MPPI on the torus (episode {i}): a single GREY learned-model agent "
                       f"steering to maximize the language reward R(latent, '{request}'). The action arrow per step "
                       f"is the applied control."
@@ -142,21 +144,29 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
             klab = f"learned: distance to '{request}' (1 - R)"
             curve = viz.fig_error_vs_step({klab: rc}, colors={klab: "dimgray"}, yscale="linear")
             writer.figure(product_tag("eval_control", "distance_to_request", i=i), curve, step); plt.close(curve)
-            # reward TRACE: achieved-head (realized R = 1 - dist) vs achieved-GT (torus reward on the REAL path).
+            # reward TRACE (4 lines): {imagined, achieved} x {reward head, ground truth}.
             from ..environments import torus as T
             rq, xyz = str(request).lower(), np.asarray(agents[0]["path"])
-            gt = [T.color_reward(xyz, b) for b in cfg.interpret.factors.color.buckets if str(b).lower() in rq] + \
-                 [T.position_reward(xyz, r, b) for b in cfg.interpret.factors.positioning.buckets if str(b).lower() in rq]
-            lines = {"achieved (reward head)": 1.0 - rc}
-            if gt:
-                lines["achieved (ground truth)"] = np.mean(gt, axis=0)
-            tr = viz.fig_error_vs_step(lines, yscale="linear",
-                caption="achieved (reward head) = realized cos(f_z, f_t(request)) on the real state.\n"
-                        "achieved (ground truth) = torus reward on the real executed path.\n"
-                        "reward-head rises but ground-truth flat  =>  alignment / grounding error.\n"
-                        "both rise  =>  steering works.\n"
-                        "both flat  =>  planning / horizon failure.\n"
-                        "(imagined / MPPI-belief lines pending an mppi hook — see the 4-line trace TODO.)")
+
+            def _gt(path):   # torus ground-truth reward on a path for the buckets named in the request
+                g = [T.color_reward(path, b) for b in cfg.interpret.factors.color.buckets if str(b).lower() in rq] + \
+                    [T.position_reward(path, r, b) for b in cfg.interpret.factors.positioning.buckets if str(b).lower() in rq]
+                return np.mean(g, axis=0) if g else None
+            lines, cols = {"achieved (reward head)": 1.0 - rc}, {"achieved (reward head)": "tab:blue"}
+            gta = _gt(xyz)
+            if gta is not None:
+                lines["achieved (ground truth)"] = gta; cols["achieved (ground truth)"] = "tab:green"
+            if res.get("imag_head_curves") is not None:   # the chosen plan's IMAGINED belief (world-model prediction)
+                lines["imagined (reward head)"] = res["imag_head_curves"][i]; cols["imagined (reward head)"] = "tab:cyan"
+                igt = _gt(np.asarray(res["imag_paths"][i]))
+                if igt is not None:
+                    lines["imagined (ground truth)"] = igt; cols["imagined (ground truth)"] = "tab:olive"
+            tr = viz.fig_error_vs_step(lines, colors=cols, yscale="linear",
+                caption="achieved = on the REAL executed state; imagined = the chosen plan's PREDICTED state (world-model belief).\n"
+                        "reward head = cos(f_z, f_t(request)); ground truth = torus reward on the path.\n"
+                        "imagined vs achieved  =>  world-model / imagination accuracy (drift).\n"
+                        "reward-head vs ground-truth  =>  alignment / grounding accuracy.\n"
+                        "all four high and together  =>  the model imagines right, steers there, and the head agrees with truth.")
             writer.figure(product_tag("eval_control", "reward_trace", i=i), tr, step); plt.close(tr)
         else:                    # goal race: distance to current goal, verticals at goal switches
             k_true, k_pred = "true (oracle): dist to current goal", "pred (learned): dist to current goal"
@@ -167,6 +177,19 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                                           yscale="linear")  # distance to goal is bounded -> linear reads better
             writer.figure(product_tag("eval_control", "distance_to_goal", i=i), curve, step); plt.close(curve)
         _plog(writer, f"[eval_control @ep{step}] episode #{i} rendered in {time.perf_counter() - ti:.1f}s")
+
+    # combined control video: tile the per-episode control videos into one grid — all inits of the request at once.
+    if len(ctrl_frames) > 1:
+        import math
+        Tm = min(len(f) for f in ctrl_frames)
+        nc = int(math.ceil(math.sqrt(len(ctrl_frames)))); nr = int(math.ceil(len(ctrl_frames) / nc))
+        Hh, Ww = ctrl_frames[0].shape[1:3]
+        comb = np.zeros((Tm, nr * Hh, nc * Ww, 3), dtype=ctrl_frames[0].dtype)
+        for k, f in enumerate(ctrl_frames):
+            rr, cc = divmod(k, nc)
+            comb[:, rr * Hh:(rr + 1) * Hh, cc * Ww:(cc + 1) * Ww] = f[:Tm]
+        writer.video(product_tag("eval_control", "control_video_combined"), comb, fps, step)
+        _plog(writer, f"[eval_control @ep{step}] control_video_combined ({len(ctrl_frames)} eps, {nr}x{nc} grid, {Tm} frames)")
 
     # (language) world-model latent-space animations: agent moving through the eval_interpret projections toward X_c/X_r.
     if reward is not None and lang.get("interpret_run") and res.get("agent_latents") is not None:
@@ -183,7 +206,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 if proj is None:
                     _plog(writer, f"[eval_control @ep{step}] latent anim: {method} {dim}d has no out-of-sample map (skip)")
                     continue
-                for i in range(NP):
+                for i in range(min(NP, 1)):   # latent animations are per-mechanism; 1 episode suffices (render cost)
                     ti = time.perf_counter()
                     vid = render_latent_video(proj, res["agent_latents"][i],
                                               title=f'"{request}"  ·  {factor} ({method} {dim}d)  #{i}',
@@ -230,7 +253,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                                        title=f"reward field '{request}' — {factor} LDA")
                 writer.figure(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", "reward_field"), ff, step)
                 plt.close(ff)
-                for i in range(NP):
+                for i in range(min(NP, 1)):   # 1 episode's joint animation suffices; combined control video shows all inits
                     with torch.no_grad():
                         fzt = reward.f_z(torch.from_numpy(np.asarray(res["agent_latents"][i], np.float32)).to(reward.device)).cpu().numpy()
                     for rmode, tag in ((False, "concept"), (True, "reward")):
