@@ -83,6 +83,13 @@ Two axes: **(1) base process** — diffusion (curved, learn score, needs a sched
 - Rectified flow: **"Flow Straight and Fast" / Rectified Flow** (Liu et al. 2023); used in **SD3** (Esser
   et al. 2024). ← quickdraw.
 - Shortcut: **One-Step Diffusion via Shortcut Models** (Frans et al. 2024). ← quickdraw's K→1 path.
+- Diffusion forcing: **Diffusion Forcing** (Chen et al. 2024) + **DFoT** (Diffusion Forcing Transformer) —
+  train-time independent per-frame noise levels on the *context*. ← §8's DF (IWS only *cites* these).
+- World model we take generative-decode from: **IWS — "Interactive World Simulator for Robot Policy Training
+  and Evaluation"** ([arXiv 2603.08546](https://arxiv.org/abs/2603.08546), 2026). Consistency-model decoder +
+  latent-space dynamics sharing one **data-grounded** loss; 2D latent; CNN encoder. Trains on clean context
+  (fully-noises only the predicted frame) + an inference-time small-noise robustness hack — **it does not use
+  diffusion forcing** (see §7 correction).
 
 **Correct names for our code:** the high-level umbrella that contains *both* branches is **continuous
 transport** (a.k.a. continuous-time generative transport). Our branch is **flow**. The reusable class is
@@ -240,16 +247,27 @@ cosmetic, decide later.
 | What's learned | jump map `G(x,t,s)` | jump map `G(x,t,s)`, **same loss for decoder & dynamics** | velocity `v(x,τ,d)` |
 | Regression target | self-bootstrap (two-hop) + EMA teacher, often **+ DSM + GAN** | **ground-truth noised samples** `x_s, x₀` — no teacher, no GAN | flow velocity + shortcut self-consistency (teacher-free) |
 | Geometry | EDM/diffusion (curved) | discretized diffusion timesteps | **rectified flow (straight)** |
-| Context/history | diffusion forcing (indep per-frame levels) | **diffusion forcing** (`prev_frame_noise_scale`, `uniform`) | clean today; **DF opt-in** (§8) |
+| Context/history | (n/a — image gen) | **clean context in training** (only the predicted frame fully noised); small *unquantified* noise at **inference** for rollout robustness — NOT diffusion forcing | clean today; **train-time DF opt-in** (§8) |
 | Few-step | anytime 1..N | 1..N via stop-level `s` | K→1 via shortcut `d` |
 | Staging | (method) | **3 stages** (enc+dec → dyn → dec-finetune) | **1 stage** (joint enc+dec+dyn) |
 | Extra losses | DSM + adversarial common | just weighted MSE (`loss_s + loss_u`) | flow + shortcut MSE |
 
 Takeaway: IWS's edge over canonical CTM is the **data-grounded, teacher/GAN-free** consistency target
-reused across decoder & dynamics; its stability lever is **diffusion forcing**. We already have the reuse
-(one flow core) and one-stage; the two things we borrow are **generative decode** (§4) and **diffusion
-forcing** (§8). We stay in **flow** geometry (straight + shortcut), not diffusion+CTM — same 1-step speed,
-simpler training.
+reused across decoder & dynamics.
+
+> **Correction (2026-07-16, verified against the paper — IWS = "Interactive World Simulator for Robot Policy
+> Training and Evaluation", [arXiv 2603.08546](https://arxiv.org/abs/2603.08546)):** IWS does **NOT** use
+> diffusion forcing. In dynamics training it keeps **history/context clean** and fully-noises **only the
+> predicted frame** (*"we only apply full noise to the last frame …"*); for long rollouts it injects
+> **inference-time** *"small noise to observation contexts"* — an unquantified robustness hack (no scale/σ
+> given). The **diffusion forcing** we adopt in §8 (train-time per-frame context noise) comes from the
+> **Diffusion Forcing** line (Chen et al. 2024; **DFoT**, Diffusion Forcing Transformer), which IWS only
+> *cites* in related work. So `prev_frame_noise_scale`/`uniform` below is a DF/DFoT concept, not IWS's.
+
+We borrow the loss reuse (one flow core) + one-stage we already have; the two things we take are **generative
+decode** (§4, the IWS idea) and **train-time diffusion forcing** (§8, from Chen/DFoT — a train-time
+alternative to IWS's inference-time hack). We stay in **flow** geometry (straight + shortcut), not
+diffusion+CTM — same 1-step speed, simpler training.
 
 ---
 
@@ -360,10 +378,11 @@ variations:
     enabled: false             # off = today (clean context), bit-identical
     observed_token_noise_scale: 0.25   # noise on the PRE-FUSION tokens of INGESTED TRUE observations only
     #                            (never on carried/imagined latents during AR). Fraction of the full noise range;
-    #                            0 = clean; 1 = as noisy as the target. (= IWS `prev_frame_noise_scale`.)
+    #                            0 = clean; 1 = as noisy as the target. (Diffusion Forcing / DFoT per-frame
+    #                            noise level — NOT from IWS; see the §7 correction.)
     granularity: timestep      # timestep | modality  (token NOT supported — see below). timestep = default.
 ```
-- **`observed_token_noise_scale`** (← IWS `prev_frame_noise_scale`): the name encodes both properties you
+- **`observed_token_noise_scale`** (a Diffusion Forcing / DFoT per-frame noise level — NOT IWS; see §7): the name encodes both properties you
   wanted — **`observed`** = applied only to ingested *true observations* (never to carried/imagined latents
   during autoregression), **`token`** = on the *pre-fusion* per-modality tokens (after encode, before the
   transformer). Caps how corrupted the ingested context gets in training; bigger = more drift practiced =
