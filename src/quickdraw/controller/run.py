@@ -115,7 +115,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         req_i = ep_requests[i] if ep_requests else request
         nf = len(agents[0]["path"])
         _plog(writer, f"[eval_control @ep{step}] rendering control video #{i} ({nf} frames, GPU/EGL)...")
-        vtitle = (f'"{req_i}"  #{i}' if reward is not None else f"control: true vs pred #{i}")
+        vtitle = (f'"{req_i}"' if reward is not None else f"control: true vs pred #{i}")
         frames = viz.control_compare_frames(R, r, "hsv", agents, n_frames=nf, title=vtitle,
                                             fan_seq=res["fan_seqs"][i],  # pred's MPPI candidate fan, colored by score
                                             reuse=bool(cfg.control.get("reuse_render", False)),
