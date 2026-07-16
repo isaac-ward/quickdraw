@@ -25,6 +25,10 @@ language:
     - {method: lda, factor: color, dims: [2, 3]}         # color LDA, 2d + 3d
     - {method: lda, factor: positioning, dims: [2, 3]}   # positioning LDA, 2d + 3d
   hull_frac: 0.8        # request-region hull: keep the inner this-fraction of cluster points (drop outliers) before hulling
+  per_request_joint_plots: false   # joint-space reward_field + concept/reward animations: false -> only the
+  #                                  representative request (#0); true -> one set PER request (expensive: an LDA
+  #                                  reward field + 2 animations per request per factor). Multi-query control
+  #                                  video always shows all agents regardless — this only gates the joint plots.
   overrides:
     n_episodes: 4     # steered episodes from different inits (all rendered)
     n_plot: 4         # how many episodes to render products for (control_video_i / rollout_i / distance_i / interpret)
