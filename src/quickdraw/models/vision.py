@@ -141,3 +141,73 @@ class ImageAutoencoder(nn.Module):
     def forward(self, img):
         z = self.encode(img)
         return self.decode(z), z
+
+
+class _FiLMResBlock(nn.Module):
+    """Conv residual block with FiLM (per-channel scale+shift) from a global conditioning vector `g`."""
+
+    def __init__(self, cin: int, cout: int, gdim: int):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(8, cin), cin)
+        self.conv1 = nn.Conv2d(cin, cout, 3, padding=1)
+        self.norm2 = nn.GroupNorm(min(8, cout), cout)
+        self.conv2 = nn.Conv2d(cout, cout, 3, padding=1)
+        self.film = nn.Linear(gdim, 2 * cout)
+        self.skip = nn.Conv2d(cin, cout, 1) if cin != cout else nn.Identity()
+
+    def forward(self, x, g):
+        h = self.conv1(F.silu(self.norm1(x)))
+        s, b = self.film(g).chunk(2, dim=-1)
+        h = self.norm2(h) * (1 + s[..., None, None]) + b[..., None, None]
+        h = self.conv2(F.silu(h))
+        return h + self.skip(x)
+
+
+class ConditionalUNet(nn.Module):
+    """Conv U-Net over an image, conditioned on the latent tokens (spatial injection at the bottleneck) + an
+    optional time/step embedding. The convolutional alternative to the all-ViT image head — no patch grid, so
+    smooth fields don't block. ONE module serves both decode kinds via `velocity(x, temb, cond, demb)`:
+      - flow:  x = the noised image, temb = tau embedding  -> denoiser (velocity or x0).
+      - mse:   x = zeros, temb = None                      -> pure tokens->image decoder.
+    Decodes from `cond` regardless of `x` (bottleneck injection), so the eps=0 deterministic sample works."""
+
+    def __init__(self, ae_cfg, *, base: int = 64, time_dim: int = 32):
+        super().__init__()
+        import math
+        self.cfg = ae_cfg
+        C, d, T = ae_cfg.channels, ae_cfg.d, ae_cfg.num_tokens
+        n_levels = max(1, int(math.log2(max(8, ae_cfg.img_size) // 8)))   # keep the bottleneck ~8px (128->4, 64->3, 32->2)
+        chs = [base * min(4, 2 ** i) for i in range(n_levels)]            # e.g. 128px -> [base,2b,4b,4b]
+        self.gdim = d
+        self.t_proj = nn.Linear(time_dim, d)                  # time (flow); unused for mse (temb=None)
+        self.d_proj = nn.Linear(time_dim, d)                  # step-size (shortcut); unused unless demb given
+        self.in_conv = nn.Conv2d(C, chs[0], 3, padding=1)
+        prev, self.downs = chs[0], nn.ModuleList()
+        for ch in chs:
+            self.downs.append(_FiLMResBlock(prev, ch, d)); prev = ch
+        self.bott_hw = ae_cfg.img_size // (2 ** len(chs))     # 128/16 = 8
+        self.cond_to_spatial = nn.Linear(T * d, chs[-1] * self.bott_hw * self.bott_hw)   # tokens -> bottleneck map
+        self.mid = _FiLMResBlock(chs[-1], chs[-1], d)
+        self.ups, prev = nn.ModuleList(), chs[-1]
+        for ch in reversed(chs):
+            self.ups.append(_FiLMResBlock(prev + ch, ch, d)); prev = ch  # concat skip
+        self.out_norm = nn.GroupNorm(min(8, chs[0]), chs[0])
+        self.out_conv = nn.Conv2d(chs[0], C, 3, padding=1)
+
+    def velocity(self, x, temb=None, cond=None, demb=None):   # x:(M,H,W,C) cond:(M,T,d) -> (M,H,W,C)
+        M = cond.shape[0]
+        g = cond.mean(1)                                      # (M,d) global conditioning
+        if temb is not None:
+            g = g + self.t_proj(temb.reshape(M, -1))
+        if demb is not None:
+            g = g + self.d_proj(demb.reshape(M, -1))
+        h = self.in_conv(x.permute(0, 3, 1, 2))               # (M,C,H,W)
+        skips = []
+        for down in self.downs:
+            h = down(h, g); skips.append(h); h = F.avg_pool2d(h, 2)
+        h = h + self.cond_to_spatial(cond.reshape(M, -1)).reshape(M, -1, self.bott_hw, self.bott_hw)
+        h = self.mid(h, g)
+        for up, skip in zip(self.ups, reversed(skips)):
+            h = F.interpolate(h, scale_factor=2, mode="nearest")
+            h = up(torch.cat([h, skip], dim=1), g)
+        return self.out_conv(F.silu(self.out_norm(h))).permute(0, 2, 3, 1)   # (M,H,W,C)

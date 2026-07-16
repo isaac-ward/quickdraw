@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ..models.flow import FlowField, ImageFlowHead
+from ..models.flow import FlowField, ImageFlowHead, ImageUNetFlowHead
 from ..models.vision import VisionAEConfig
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -39,8 +39,14 @@ def main():
     ci, ti = torch.randn(4, 8, 128, device=DEV), torch.rand(4, 32, 32, 3, device=DEV)
     r_x0 = _overfit(ImageFlowHead(cfg, depth=4, param="x0").to(DEV), ci, ti)
     mse_x0 = float(F.mse_loss(r_x0, ti)); rng = (float(r_x0.min()), float(r_x0.max()))
-    check("image x0 overfit reconstructs", mse_x0 < 0.02, f"mse {mse_x0:.4f}")
-    check("image x0 stays ~in-range [0,1]", -0.2 < rng[0] and rng[1] < 1.2, f"range [{rng[0]:.2f},{rng[1]:.2f}]")
+    check("image x0 (ViT) overfit reconstructs", mse_x0 < 0.02, f"mse {mse_x0:.4f}")
+    check("image x0 (ViT) stays ~in-range [0,1]", -0.2 < rng[0] and rng[1] < 1.2, f"range [{rng[0]:.2f},{rng[1]:.2f}]")
+
+    # IMAGE (U-Net flow head): the conv alternative must ALSO reconstruct (x0, 1-step deterministic).
+    r_u = _overfit(ImageUNetFlowHead(cfg, param="x0").to(DEV), ci, ti)
+    mse_u = float(F.mse_loss(r_u, ti)); rngu = (float(r_u.min()), float(r_u.max()))
+    check("image x0 (U-Net) overfit reconstructs", mse_u < 0.02, f"mse {mse_u:.4f}")
+    check("image x0 (U-Net) stays ~in-range [0,1]", -0.2 < rngu[0] and rngu[1] < 1.2, f"range [{rngu[0]:.2f},{rngu[1]:.2f}]")
 
     # PROPRIO: both should reconstruct (low-dim); x0 near-exact.
     cp, tp = torch.randn(8, 128, device=DEV), torch.randn(8, 6, device=DEV)

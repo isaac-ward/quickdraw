@@ -213,3 +213,25 @@ class ImageFlowHead(TransportHead):
         c = self.cfg
         return self._sample(cond, event_shape=(c.img_size, c.img_size, c.channels), lead=cond.shape[:-2],
                             steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
+
+
+class ImageUNetFlowHead(TransportHead):
+    """CNN U-Net velocity denoiser over an image (the conv alternative to ImageFlowHead's ViT), conditioned on
+    the predicted latent tokens. Same TransportHead contract + `sample()` signature — so it drops in wherever
+    ImageFlowHead does. No patch grid -> smooth color fields don't block (see the ep24 ViT-decode blocking)."""
+
+    def __init__(self, ae_cfg, *, base: int = 64, param: str = "v", shortcut: bool = False,
+                 n_freq: int = 16, time_dim: int = 32):
+        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim)
+        from .vision import ConditionalUNet
+        self.cfg = ae_cfg
+        self.unet = ConditionalUNet(ae_cfg, base=base, time_dim=time_dim)
+
+    def velocity(self, x: Tensor, temb: Tensor, cond: Tensor, demb: Tensor | None = None) -> Tensor:
+        return self.unet.velocity(x, temb, cond, demb)
+
+    def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
+               record_path: bool = False):
+        c = self.cfg
+        return self._sample(cond, event_shape=(c.img_size, c.img_size, c.channels), lead=cond.shape[:-2],
+                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)

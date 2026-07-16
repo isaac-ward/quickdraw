@@ -17,8 +17,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .flow import FlowField, ImageFlowHead
-from .vision import ImageAutoencoder, VisionAEConfig
+from .flow import FlowField, ImageFlowHead, ImageUNetFlowHead
+from .vision import ConditionalUNet, ImageAutoencoder, VisionAEConfig
 
 
 def _mlp(i: int, o: int, h: int) -> nn.Sequential:
@@ -38,6 +38,9 @@ class ModalitySpec:
     decode_steps: int = 6     # flow decode sampling steps (K). v: ODE steps (shortcut->1). x0: consistency refine steps (1 = direct)
     decode_param: str = "v"   # flow decode parameterization: "v" (velocity, integrate ODE — imprecise for images)
     #                           | "x0" (predict the clean obs directly — precise + in-range; use for image decode). See flow.py.
+    decode_arch: str = "vit"  # IMAGE decoder architecture, ORTHOGONAL to decode_kind: "vit" (all-attention, patch
+    #                           grid) | "unet" (conv U-Net, no patch grid -> smoother fields). Composes with both
+    #                           mse and flow (4 combos). Ignored by vector modalities. See vision.ConditionalUNet.
     # vector
     dim: int = 6
     # image
@@ -135,19 +138,30 @@ class ImageModality(Modality):
         self.name, self.n_tokens, self.weight = spec.name, spec.num_tokens, spec.weight
         self.noise_std = float(spec.noise_std)
         self.decode_kind = spec.decode_kind
+        self.decode_arch = getattr(spec, "decode_arch", "vit")
+        mse_vit = self.decode_kind == "mse" and self.decode_arch == "vit"   # the ONLY case needing the AE's ViT decoder
         self.ae = ImageAutoencoder(VisionAEConfig(
             img_size=spec.img_size, patch=spec.patch, d=d, enc_depth=spec.ae_depth,
             dec_depth=spec.ae_depth, num_tokens=spec.num_tokens, channels=spec.channels,
-            build_decoder=(self.decode_kind == "mse")))   # flow -> the ImageFlowHead IS the decoder; no dead mse decoder
+            build_decoder=mse_vit))                # otherwise the flow head / U-Net IS the decoder; no dead ViT decoder
         self.decode_steps = int(spec.decode_steps)
-        if self.decode_kind == "flow":            # generative ViT decode head: cond = the latent tokens (M,num_tokens,d)
-            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth,
-                                             param=spec.decode_param, shortcut=spec.decode_shortcut)
+        if self.decode_kind == "flow":             # generative decode head: cond = the latent tokens (M,num_tokens,d)
+            if self.decode_arch == "unet":
+                self.decode_head = ImageUNetFlowHead(self.ae.cfg, param=spec.decode_param, shortcut=spec.decode_shortcut)
+            else:
+                self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth,
+                                                 param=spec.decode_param, shortcut=spec.decode_shortcut)
+        elif self.decode_arch == "unet":           # mse + U-Net: deterministic conv decoder (tokens -> image, no time)
+            self.mse_unet = ConditionalUNet(self.ae.cfg)
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)
 
     def _decode(self, tok):                        # (M, num_tokens, d) -> (M, H, W, C)
+        if self.decode_kind == "mse" and self.decode_arch == "unet":
+            c = self.ae.cfg                        # decode from cond alone: x = zeros, no time embedding
+            x0 = tok.new_zeros(tok.shape[0], c.img_size, c.img_size, c.channels)
+            return self.mse_unet.velocity(x0, None, tok, None)
         return self.ae.decode(tok)
 
     def _decode_cond(self, flat_tok):             # (M, num_tokens, d) -> (M, num_tokens, d) (the latent tokens)
