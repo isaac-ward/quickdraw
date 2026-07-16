@@ -166,9 +166,9 @@ class LitWorldModel(L.LightningModule):
         def _total_norm():
             gs = [g.norm() for g in grads]
             return torch.norm(torch.stack(gs)) if gs else torch.zeros((), device=self.device)
-        # pre-clip non-finite fractions: localize a blow-up (which/how much of the grad is bad) BEFORE clipping
-        # mangles it — norm-clipping turns a single inf into an all-NaN grad, so the fractions must be read here.
-        total = sum(g.numel() for g in grads) or 1
+        # pre-clip inf/nan COUNTS: localize a blow-up (kind + extent) BEFORE clipping mangles it — norm-clipping
+        # turns a single inf into an all-NaN grad, so these must be read here. Counts, not fractions: one inf is
+        # fatal but ~2e-7 as a fraction of ~5M elements, so it would round away; a count shows it as "1".
         n_nan = sum(torch.isnan(g).sum() for g in grads) if grads else 0
         n_inf = sum(torch.isinf(g).sum() for g in grads) if grads else 0
         pre = _total_norm()
@@ -185,9 +185,11 @@ class LitWorldModel(L.LightningModule):
                                 gradient_clip_algorithm=gradient_clip_algorithm)
         self.log("grad/norm_preclip", pre)
         self.log("grad/norm_postclip", _total_norm())
-        self.log("grad/fraction_nans", n_nan / total)
-        self.log("grad/fraction_infs", n_inf / total)
-        self.log("grad/nonfinite_skipped", float(skipped))
+        # reduce_fx=max -> the epoch value is the WORST step (mean would dilute one spike across 1000s of clean
+        # steps into ~0); nonfinite_skipped uses sum -> total # of skipped steps this epoch.
+        self.log("grad/num_nans", float(n_nan), reduce_fx="max")
+        self.log("grad/num_infs", float(n_inf), reduce_fx="max")
+        self.log("grad/nonfinite_skipped", float(skipped), reduce_fx="sum")
 
     def training_step(self, batch, _):
         return self._step(batch, "train")
