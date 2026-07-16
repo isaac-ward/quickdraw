@@ -138,13 +138,10 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
             log_image_head(writer, "eval_control", img_head, i, pv["actual"], pv["pred"], step, fps,
                            context_len=0, title=f"{img_head} #{i} pred(top)/actual(bottom)")
 
-        # per-episode realized-distance curve
-        if reward is not None:   # language: realized distance 1 - R(state, request) (lower = redder, 0 = on target)
+        # per-episode reward TRACE (4 lines: {imagined, achieved} x {reward head, ground truth}). Replaces the old
+        # distance_to_request curve — that was just 1 - achieved(reward head), already a line here.
+        if reward is not None:
             rc = np.asarray(res["pred"]["dist_curves"][i])
-            klab = f"learned: distance to '{request}' (1 - R)"
-            curve = viz.fig_error_vs_step({klab: rc}, colors={klab: "dimgray"}, yscale="linear")
-            writer.figure(product_tag("eval_control", "distance_to_request", i=i), curve, step); plt.close(curve)
-            # reward TRACE (4 lines): {imagined, achieved} x {reward head, ground truth}.
             from ..environments import torus as T
             rq, xyz = str(request).lower(), np.asarray(agents[0]["path"])
 
@@ -152,22 +149,28 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 g = [T.color_reward(path, b) for b in cfg.interpret.factors.color.buckets if str(b).lower() in rq] + \
                     [T.position_reward(path, r, b) for b in cfg.interpret.factors.positioning.buckets if str(b).lower() in rq]
                 return np.mean(g, axis=0) if g else None
-            lines, cols = {"achieved (reward head)": 1.0 - rc}, {"achieved (reward head)": "tab:blue"}
+            # purple = reward head, green = ground truth; solid = achieved (real), dashed = imagined (predicted)
+            lines = {"achieved (reward head)": 1.0 - rc}
+            cols = {"achieved (reward head)": "purple"}
+            styl = {"achieved (reward head)": "-"}
             gta = _gt(xyz)
             if gta is not None:
-                lines["achieved (ground truth)"] = gta; cols["achieved (ground truth)"] = "tab:green"
+                lines["achieved (ground truth)"] = gta; cols["achieved (ground truth)"] = "green"; styl["achieved (ground truth)"] = "-"
             if res.get("imag_head_curves") is not None:   # the chosen plan's IMAGINED belief (world-model prediction)
-                lines["imagined (reward head)"] = res["imag_head_curves"][i]; cols["imagined (reward head)"] = "tab:cyan"
+                lines["imagined (reward head)"] = res["imag_head_curves"][i]; cols["imagined (reward head)"] = "purple"; styl["imagined (reward head)"] = "--"
                 igt = _gt(np.asarray(res["imag_paths"][i]))
                 if igt is not None:
-                    lines["imagined (ground truth)"] = igt; cols["imagined (ground truth)"] = "tab:olive"
-            tr = viz.fig_error_vs_step(lines, colors=cols, yscale="linear",
-                caption="achieved = on the REAL executed state; imagined = the chosen plan's PREDICTED state (world-model belief).\n"
-                        "reward head = cos(f_z, f_t(request)); ground truth = torus reward on the path.\n"
+                    lines["imagined (ground truth)"] = igt; cols["imagined (ground truth)"] = "green"; styl["imagined (ground truth)"] = "--"
+            tr = viz.fig_error_vs_step(lines, colors=cols, linestyles=styl, yscale="linear",
+                caption="solid = achieved (REAL executed state);  dashed = imagined (chosen plan's PREDICTED state).\n"
+                        "purple = reward head cos(f_z, f_t(request));  green = ground truth (torus reward on the path).\n"
                         "imagined vs achieved  =>  world-model / imagination accuracy (drift).\n"
                         "reward-head vs ground-truth  =>  alignment / grounding accuracy.\n"
                         "all four high and together  =>  the model imagines right, steers there, and the head agrees with truth.")
             writer.figure(product_tag("eval_control", "reward_trace", i=i), tr, step); plt.close(tr)
+            # raw curve data (npz) next to the figure -> re-plot / average / post-process for the paper without a re-run
+            writer.array(product_tag("eval_control", "reward_trace", i=i), step,
+                         **{k.replace(" (", "_").replace(")", "").replace(" ", "_"): np.asarray(v) for k, v in lines.items()})
         else:                    # goal race: distance to current goal, verticals at goal switches
             k_true, k_pred = "true (oracle): dist to current goal", "pred (learned): dist to current goal"
             curve = viz.fig_error_vs_step({k_true: res["true"]["dist_curves"][i], k_pred: res["pred"]["dist_curves"][i]},

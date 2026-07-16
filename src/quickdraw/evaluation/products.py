@@ -60,9 +60,9 @@ def log_image_head(writer, routine, head, i, true_full, pred, step, fps, *,
                                      title=title or f"{head} #{i} pred(top)/GT(bottom)")
         writer.figure(product_tag(routine, "filmstrip", head=head, i=i), ff, step)
         plt.close(ff)
-        # raw frames behind the filmstrip -> logs/epoch_<step>/<routine>/<head>/raw_frames_<i>.npz (pred + GT,
-        # float32 [0,1]). Keeps native pixels so sharpness can be judged later (PSNR can't; a figure is downscaled).
-        writer.array(product_tag(routine, "raw_frames", head=head, i=i), step,
+        # raw FILMSTRIP frames -> logs/epoch_<step>/<routine>/<head>/raw_filmstrip_frames_<i>.npz (pred + GT, the
+        # filmstrip's images at native res, float32 [0,1]) — so sharpness is judgeable later (PSNR/a figure can't).
+        writer.array(product_tag(routine, "raw_filmstrip_frames", head=head, i=i), step,
                      pred=np.asarray(pred, np.float32), gt=np.asarray(true_full[context_len:], np.float32))
 
 

@@ -398,7 +398,7 @@ def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", tit
 
 
 def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | None = None, vlines=None,
-                      yscale: str = "log", split_top=None, caption: str | None = None):
+                      yscale: str = "log", split_top=None, caption: str | None = None, linestyles=None):
     """Curves vs rollout step. If `split_top` (a set of keys) is given AND there are other keys, those go in
     a TOP panel and the rest in a BOTTOM panel sharing ONE long x-axis (e.g. PSNR in dB on top; ssim/mse/l1
     in [0,1] below), instead of squashing incompatible scales together. Captions (per-curve CAPTIONS, plus a
@@ -414,7 +414,8 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
         panels = [(ax, list(errors))]
     for ax_, keys in panels:
         for name in keys:
-            ax_.plot(errors[name], label=name, color=(colors or {}).get(name))
+            ax_.plot(errors[name], label=name, color=(colors or {}).get(name),
+                     linestyle=(linestyles or {}).get(name, "-"))
         ax_.set_yscale(yscale)  # log spreads small early + late blow-up; linear for bounded curves (control dist)
         ax_.grid(True, which="both", alpha=0.3)
         ax_.set_ylabel(f"({yscale} scale)" if yscale == "log" else "value")
