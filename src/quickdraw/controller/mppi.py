@@ -209,9 +209,11 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                     ric = {"proprio": normalizer.norm_obs(ctx[:NP])}
                     if use_fpv:
                         ric[img_head] = ctx_fpv[:NP]
-                    with torch.autocast(device_type=("cuda" if "cuda" in str(device) else "cpu"),
-                                        dtype=torch.bfloat16, enabled=("cuda" in str(device))):
-                        ibag = core._rollout(ric, a_im, H, 0.0, None, 0)               # (NP,H,n_state,d)
+                    # KV-cache: inference/no-grad rollout -> cache applies (faster) AND it's the faithful sliding-
+                    # window computation MPPI's planner uses (imagine_shared), so the imagined line matches the belief.
+                    with torch.no_grad(), torch.autocast(device_type=("cuda" if "cuda" in str(device) else "cpu"),
+                                                         dtype=torch.bfloat16, enabled=("cuda" in str(device))):
+                        ibag = core._rollout(ric, a_im, H, 0.0, None, 0, use_cache=True)   # (NP,H,n_state,d)
                         iprop = normalizer.denorm_obs(core.to_obs(ibag, heads=["proprio"])["proprio"])  # (NP,H,6)
                     te = t_e[:NP] if t_e.dim() > 1 else t_e                            # per-episode target (multi-query)
                     cur_imag = {"head": reward.score(ibag.reshape(NP, H, -1).float(), te).cpu().numpy(),   # (NP,H) imagined R
