@@ -178,8 +178,10 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     imag_head_logs = [[] for _ in range(NP)]  # (reward mode) imagined reward-head reward of the CHOSEN plan, per executed step
     imag_xyz_logs = [[] for _ in range(NP)]   # (reward mode) imagined xyz of the chosen plan -> imagined GROUND-TRUTH reward
     cur_plan_fpv = cur_imag = None
+    replan_steps = []          # executed-step index at each MPPI replan (where the imagined belief is refreshed)
     while step < mppi.max_steps:
         n_chunks += 1
+        replan_steps.append(step)          # this executed step begins a fresh plan (imagined belief refreshed)
         for kind, c in ctrls.items():  # plan once per chunk (re-grounded on the latest true state)
             cur = tgt[order[arange, c["gidx"].clamp(max=n_goals - 1)]]
             if kind == "pred":
@@ -298,6 +300,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
         out["imag_paths"] = [np.stack(imag_xyz_logs[e]) for e in range(NP)]          # (T,3) imagined xyz -> imagined GT
     if ep_requests is not None:
         out["requests"] = ep_requests[:NP]         # per-episode request (multi-query: each episode's own text)
+    out["replan_steps"] = [s for s in replan_steps if s < step]   # replan boundaries (for the reward-trace markers)
     for kind, c in ctrls.items():
         done = c["done_step"]
         completed = done >= 0

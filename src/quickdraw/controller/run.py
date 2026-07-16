@@ -170,7 +170,9 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 igt = _gt(np.asarray(res["imag_paths"][i]))
                 if igt is not None:
                     lines["imagined (ground truth)"] = igt; cols["imagined (ground truth)"] = "green"; styl["imagined (ground truth)"] = "--"
-            tr = viz.fig_error_vs_step(lines, colors=cols, linestyles=styl, yscale="linear",
+            rsteps = res.get("replan_steps", [])          # circle the imagined lines at each MPPI replan
+            mk = {k: rsteps for k in lines if k.startswith("imagined")}
+            tr = viz.fig_error_vs_step(lines, colors=cols, linestyles=styl, markers=mk, yscale="linear",
                 caption="solid = achieved (REAL executed state);  dashed = imagined (chosen plan's PREDICTED state).\n"
                         "purple = reward head cos(f_z, f_t(request));  green = ground truth (torus reward on the path).\n"
                         "imagined vs achieved  =>  world-model / imagination accuracy (drift).\n"
