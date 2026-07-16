@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .flow import FlowField, ImageFlowHead, ImageUNetFlowHead
-from .vision import ConditionalUNet, ImageAutoencoder, VisionAEConfig
+from .vision import ImageAutoencoder, VisionAEConfig
 
 
 def _mlp(i: int, o: int, h: int) -> nn.Sequential:
@@ -53,23 +53,18 @@ class ModalitySpec:
 
 class Modality(nn.Module):
     """Base: holds a name, the per-step token count, and the recon weight. encode/decode flatten leading dims.
-    `decode_kind` picks the decoder: "mse" (deterministic `_decode`) or "flow" (a TransportHead `decode_head`
-    denoising the obs from the predicted tokens — generative, 1-step-sampled via shortcut)."""
+    UNIFIED decode: every modality has ONE `decode_head` (a TransportHead over the chosen net — MLP/ViT/UNet).
+    `decode_kind` is just how that net is trained/used: "flow" = the noise-curriculum flow head; "mse" = the
+    DEGENERATE no-noise head (deterministic x0 from x=0, L2 loss) — same net, optimized differently."""
     name: str
     n_tokens: int
     weight: float
     decode_kind: str = "mse"
-    # NOTE: decode_head (a TransportHead) is set on the instance ONLY when decode_kind == "flow"; do NOT add
-    # a `decode_head = None` class attribute — it would shadow the registered submodule (class attrs win over
-    # nn.Module.__getattr__). The mse path never touches decode_head (guarded by decode_kind).
 
     def _encode(self, obs: Tensor) -> Tensor:    # (M, ...) -> (M, n_tokens, d)
         raise NotImplementedError
 
-    def _decode(self, tok: Tensor) -> Tensor:    # (M, n_tokens, d) -> (M, ...)  (mse decoder)
-        raise NotImplementedError
-
-    def _decode_cond(self, flat_tok: Tensor) -> Tensor:   # (M, n_tokens, d) -> conditioning for the flow head
+    def _decode_cond(self, flat_tok: Tensor) -> Tensor:   # (M, n_tokens, d) -> conditioning for the decode head
         raise NotImplementedError
 
     def encode(self, obs: Tensor) -> Tensor:
@@ -80,26 +75,20 @@ class Modality(nn.Module):
         return tok.reshape(*lead, self.n_tokens, tok.shape[-1])
 
     def decode(self, tok: Tensor) -> Tensor:
-        """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape). Deterministic decode for "mse"; a 1-step
-        (shortcut) generative sample for "flow" — so downstream metrics/media are unchanged in shape."""
+        """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape), a committed (deterministic) decode. mse/x0 ->
+        1 step; v+shortcut -> K=1; v plain -> decode_steps. Same output shape for every kind/arch."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
-        if self.decode_kind == "flow":
-            # committed (deterministic) decode: x0 -> 1-step direct prediction; v+shortcut -> K=1; v plain -> decode_steps
-            steps = 1 if (self.decode_head.shortcut or self.decode_head.param == "x0") else self.decode_steps
-            obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=True)
-        else:
-            obs = self._decode(flat)
+        steps = 1 if (self.decode_head.shortcut or self.decode_head.param == "x0") else self.decode_steps
+        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=True)
         return obs.reshape(*lead, *obs.shape[1:])
 
     def decode_loss(self, tok: Tensor, target: Tensor):
-        """Per-head decode loss. "mse" -> (MSE(decode, target), None); "flow" -> (flow-matching, shortcut)."""
+        """Per-head decode loss via the unified head: mse (no_noise) -> (L2, None); flow -> (flow-matching, shortcut)."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         tgt = target.reshape(-1, *target.shape[len(lead):])
-        if self.decode_kind == "flow":
-            return self.decode_head.loss(self._decode_cond(flat), tgt)
-        return F.mse_loss(self._decode(flat), tgt), None
+        return self.decode_head.loss(self._decode_cond(flat), tgt)
 
 
 class VectorModality(Modality):
@@ -113,17 +102,14 @@ class VectorModality(Modality):
         self.decode_kind = spec.decode_kind
         self.dim = spec.dim
         self.enc = _mlp(spec.dim, d, hidden)
-        self.dec = _mlp(d, spec.dim, hidden)
         self.decode_steps = int(spec.decode_steps)
-        if self.decode_kind == "flow":            # generative decode head: cond = the single token (M,d)
-            self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
-                                         param=spec.decode_param, shortcut=spec.decode_shortcut)
+        no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
+        self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
+                                     param=("x0" if no_noise else spec.decode_param),
+                                     shortcut=(spec.decode_shortcut and not no_noise), no_noise=no_noise)
 
     def _encode(self, obs):                      # (M, dim) -> (M, 1, d)
         return self.enc(obs).unsqueeze(1)
-
-    def _decode(self, tok):                       # (M, 1, d) -> (M, dim)
-        return self.dec(tok[:, 0])
 
     def _decode_cond(self, flat_tok):             # (M, 1, d) -> (M, d)
         return flat_tok[:, 0]
@@ -139,30 +125,20 @@ class ImageModality(Modality):
         self.noise_std = float(spec.noise_std)
         self.decode_kind = spec.decode_kind
         self.decode_arch = getattr(spec, "decode_arch", "vit")
-        mse_vit = self.decode_kind == "mse" and self.decode_arch == "vit"   # the ONLY case needing the AE's ViT decoder
         self.ae = ImageAutoencoder(VisionAEConfig(
             img_size=spec.img_size, patch=spec.patch, d=d, enc_depth=spec.ae_depth,
             dec_depth=spec.ae_depth, num_tokens=spec.num_tokens, channels=spec.channels,
-            build_decoder=mse_vit))                # otherwise the flow head / U-Net IS the decoder; no dead ViT decoder
+            build_decoder=False))                  # encoder-only AE; the unified decode_head IS the decoder
         self.decode_steps = int(spec.decode_steps)
-        if self.decode_kind == "flow":             # generative decode head: cond = the latent tokens (M,num_tokens,d)
-            if self.decode_arch == "unet":
-                self.decode_head = ImageUNetFlowHead(self.ae.cfg, param=spec.decode_param, shortcut=spec.decode_shortcut)
-            else:
-                self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth,
-                                                 param=spec.decode_param, shortcut=spec.decode_shortcut)
-        elif self.decode_arch == "unet":           # mse + U-Net: deterministic conv decoder (tokens -> image, no time)
-            self.mse_unet = ConditionalUNet(self.ae.cfg)
+        no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
+        param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
+        if self.decode_arch == "unet":
+            self.decode_head = ImageUNetFlowHead(self.ae.cfg, param=param, shortcut=sc, no_noise=no_noise)
+        else:
+            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc, no_noise=no_noise)
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)
-
-    def _decode(self, tok):                        # (M, num_tokens, d) -> (M, H, W, C)
-        if self.decode_kind == "mse" and self.decode_arch == "unet":
-            c = self.ae.cfg                        # decode from cond alone: x = zeros, no time embedding
-            x0 = tok.new_zeros(tok.shape[0], c.img_size, c.img_size, c.channels)
-            return self.mse_unet.velocity(x0, None, tok, None)
-        return self.ae.decode(tok)
 
     def _decode_cond(self, flat_tok):             # (M, num_tokens, d) -> (M, num_tokens, d) (the latent tokens)
         return flat_tok

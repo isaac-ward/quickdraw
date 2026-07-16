@@ -91,10 +91,9 @@ class MultiModalSequenceModel(nn.Module):
             dk = getattr(mod, "decode_kind", "mse")
             dh = getattr(mod, "decode_head", None)
             ins = f"(B,T,{mod.ae.cfg.img_size},{mod.ae.cfg.img_size},3)" if is_img else f"(B,T,{mod.dim})"
-            net = ("ImageFlowHead ViT" if is_img else "FlowField MLP") if dk == "flow" else \
-                  ("deterministic ViT" if is_img else "deterministic MLP")
-            head_mod = dh if dh is not None else getattr(mod, "dec", None)   # mse proprio uses .dec (image mse decoder lives in the AE)
-            rows.append((f"{name} decode ({dk}, {net})", f"(B,T,{ntok},{self.d}) -> {ins}", npar(head_mod)))
+            arch = getattr(mod, "decode_arch", "mlp")   # image: vit|unet; vector: mlp. UNIFIED net; kind = flow|mse(no-noise)
+            net = f"{arch} {'flow' if dk == 'flow' else 'mse/no-noise'}"
+            rows.append((f"{name} decode ({net})", f"(B,T,{ntok},{self.d}) -> {ins}", npar(dh)))
         dyn = getattr(self, "flow", None) or getattr(self, "predictor", None)
         lbl = "flow (rectified, per-token)" if hasattr(self, "flow") else "predictor (MLP residual)"
         rows.append((f"predict_next: {lbl}", f"(B,T,{self.n_state},{self.d}) -> same", npar(dyn)))
@@ -149,10 +148,14 @@ class MultiModalSequenceModel(nn.Module):
         off = 0
         for name, n in self.layout:
             if name == "proprio":
-                dec = self.modalities["proprio"].dec
-                pb = {k: v.detach() for k, v in dec.named_parameters()}
-                pb.update({k: b.detach() for k, b in dec.named_buffers()})
-                return functional_call(dec, pb, (bag[..., off:off + n, :][..., 0, :],))   # (...,6)
+                mod = self.modalities["proprio"]
+                head = mod.decode_head                                  # unified head; decode = velocity(x=0, tau=1, cond)
+                cond = bag[..., off:off + n, :][..., 0, :]              # the proprio token (...,d)
+                x0 = cond.new_zeros(cond.shape[:-1] + (mod.dim,))
+                temb = head._temb(cond.new_ones(cond.shape[:-1] + (1,)))
+                pb = {k: v.detach() for k, v in head.named_parameters()}   # FROZEN decoder (grad -> latent only)
+                pb.update({k: b.detach() for k, b in head.named_buffers()})
+                return functional_call(head, pb, (x0, temb, cond, None))   # head.forward == velocity -> (...,6)
             off += n
         return None
 

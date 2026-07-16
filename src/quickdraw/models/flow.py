@@ -34,8 +34,14 @@ class TransportHead(nn.Module):
     implement `velocity`. The base owns the time (and shortcut step-size) embeddings + loss/sample/consistency."""
 
     def __init__(self, *, param: str = "v", shortcut: bool = False, event_dims: int = 1,
-                 n_freq: int = 16, time_dim: int = 32):
+                 n_freq: int = 16, time_dim: int = 32, no_noise: bool = False):
         super().__init__()
+        # no_noise: the DEGENERATE case = a deterministic decoder (decode_kind="mse"). SAME network as the flow
+        # head, trained/used WITHOUT the noise curriculum: predict the clean target from x=0 (tau=1), L2 loss, one
+        # step. This unifies mse + flow onto one net per arch — mse is just "flow with no noise". Forces param="x0".
+        self.no_noise = no_noise
+        if no_noise:
+            param, shortcut = "x0", False
         # param = what the net predicts / how we sample:
         #   "v"  (velocity, rectified flow): net predicts the velocity u = eps - x0; sample INTEGRATES the ODE
         #        noise->data over K Euler steps. Good for low-dim targets (latent tokens, proprio); for
@@ -63,6 +69,9 @@ class TransportHead(nn.Module):
     def velocity(self, x: Tensor, temb: Tensor, cond: Tensor, demb: Tensor | None = None) -> Tensor:
         raise NotImplementedError
 
+    def forward(self, x: Tensor, temb: Tensor, cond: Tensor, demb: Tensor | None = None) -> Tensor:
+        return self.velocity(x, temb, cond, demb)   # so torch.func.functional_call (frozen-decoder probes) works
+
     # ---- shapes: leading dims get independent taus; trailing `event_dims` share one ----
     def _tau_shape(self, target: Tensor) -> tuple[int, ...]:
         return target.shape[: target.ndim - self.event_dims] + (1,) * self.event_dims
@@ -77,6 +86,9 @@ class TransportHead(nn.Module):
         """param="v": rectified flow-matching ||net - (eps-target)||^2 (+ shortcut self-consistency).
         param="x0": ||net(x_tau,tau) - target||^2 — predict the clean target directly. Returns (L_main, L_shortcut|None)."""
         ts = self._tau_shape(target)
+        if self.no_noise:                             # mse decode: deterministic cond->target, no noise curriculum
+            x0 = torch.zeros_like(target)
+            return F.mse_loss(self.velocity(x0, self._temb(target.new_ones(ts)), cond, None), target), None
         tau = self._sample_time(ts, target.device, target.dtype, time_sampling)
         eps = torch.randn_like(target)
         x_tau = (1.0 - tau) * target + tau * eps      # straight (rectified) path
@@ -111,12 +123,15 @@ class TransportHead(nn.Module):
                 eps: Tensor | None = None, record_path: bool = False):
         """Euler-integrate dx/dtau = v from tau=1 (x=eps) -> tau=0. eps=0 (deterministic) -> reproducible
         committed prediction. `event_shape`/`lead` let heads with different target shapes reuse this."""
+        ts = tuple(lead) + (1,) * self.event_dims
+        if self.no_noise:                             # mse decode: one deterministic cond->target prediction (x=0, tau=1)
+            out = self.velocity(cond.new_zeros(tuple(lead) + tuple(event_shape)), self._temb(cond.new_ones(ts)), cond, None)
+            return (out, [out]) if record_path else out
         if eps is None:
             shp = tuple(lead) + tuple(event_shape)
             eps = cond.new_zeros(shp) if deterministic else torch.randn(shp, device=cond.device, dtype=cond.dtype)
         x = eps
         path = [x]
-        ts = tuple(lead) + (1,) * self.event_dims
         if self.param == "x0":                        # consistency-style: predict x0, optionally renoise + refine
             for k in range(steps):
                 tau = cond.new_full(ts, 1.0 - k / steps)
@@ -143,10 +158,10 @@ class FlowField(TransportHead):
     (cond = backbone context h, dz = d) AND the proprio decoder (cond = the proprio token, dz = 6)."""
 
     def __init__(self, dz: int, h_dim: int, hidden: int, *, cond: str = "concat", param: str = "v",
-                 shortcut: bool = False, n_freq: int = 16, time_dim: int = 32):
+                 shortcut: bool = False, n_freq: int = 16, time_dim: int = 32, no_noise: bool = False):
         if cond != "concat":
             raise NotImplementedError(f"FlowField cond={cond!r} not implemented; use 'concat' (adaln is a future upgrade).")
-        super().__init__(param=param, shortcut=shortcut, event_dims=1, n_freq=n_freq, time_dim=time_dim)
+        super().__init__(param=param, shortcut=shortcut, event_dims=1, n_freq=n_freq, time_dim=time_dim, no_noise=no_noise)
         self.dz = dz
         in_dim = dz + time_dim + h_dim + (time_dim if self.shortcut else 0)   # self.shortcut (x0 forces it off)
         self.net = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(),
@@ -168,8 +183,9 @@ class ImageFlowHead(TransportHead):
     decoder. v(noised_img (M,H,W,C), tau, latent_tokens (M,num_tokens,d)[, d_step]) -> velocity (M,H,W,C).
     Reuses vision.ViTBlock/CrossAttn + linear (de)patchify (own weights, separate from the AE)."""
 
-    def __init__(self, ae_cfg, *, depth: int = 4, param: str = "v", shortcut: bool = False, n_freq: int = 16, time_dim: int = 32):
-        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim)
+    def __init__(self, ae_cfg, *, depth: int = 4, param: str = "v", shortcut: bool = False, n_freq: int = 16,
+                 time_dim: int = 32, no_noise: bool = False):
+        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim, no_noise=no_noise)
         from .vision import CrossAttn, ViTBlock
         c = ae_cfg
         self.cfg = c
@@ -221,8 +237,8 @@ class ImageUNetFlowHead(TransportHead):
     ImageFlowHead does. No patch grid -> smooth color fields don't block (see the ep24 ViT-decode blocking)."""
 
     def __init__(self, ae_cfg, *, base: int = 32, param: str = "v", shortcut: bool = False,
-                 n_freq: int = 16, time_dim: int = 32):
-        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim)
+                 n_freq: int = 16, time_dim: int = 32, no_noise: bool = False):
+        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim, no_noise=no_noise)
         from .vision import ConditionalUNet
         self.cfg = ae_cfg
         self.unet = ConditionalUNet(ae_cfg, base=base, time_dim=time_dim)
