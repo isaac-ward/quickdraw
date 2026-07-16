@@ -148,6 +148,15 @@ class RunWriter:
         for b in self.backends:
             b.scene(tag, scene, step)
 
+    def array(self, tag, step, **arrays):
+        """Save raw numpy arrays next to the media at logs/epoch_<step>/<tag>.npz (LOCAL only — not sent to
+        wandb). For keeping the exact pixels behind a rendered product (e.g. filmstrip pred/GT frames) so
+        sharpness/quality can be judged later at native resolution instead of from a downscaled figure."""
+        import numpy as np
+        p = os.path.join(self.dir, f"epoch_{step:04d}", tag) + ".npz"
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        np.savez_compressed(p, **arrays)
+
     def config(self, cfg: dict):
         for b in self.backends:
             b.config(cfg)
