@@ -1024,9 +1024,9 @@ def fig_points_2d(pts, color=None, title="", lims=None, point_size=4.0, cmap="pl
             n = float(np.hypot(dx, dy)) or 1.0
             ux, uy = (dx / n, dy / n) if n > 1e-6 else (np.cos(2 * np.pi * j / len(anns)), np.sin(2 * np.pi * j / len(anns)))
             tx, ty = x + 0.16 * span * ux, y + 0.16 * span * uy
-            ax.scatter([x], [y], s=point_size * 24, c="black", marker="*", zorder=21, linewidths=0)
+            ax.scatter([x], [y], s=point_size * 48, c="black", marker="*", zorder=21, linewidths=0)
             ax.annotate(str(a["text"]), xy=(x, y), xycoords="data", xytext=(tx, ty), textcoords="data",
-                        fontsize=9, fontweight="bold", zorder=22, ha="center", va="center",
+                        fontsize=18, fontweight="bold", zorder=22, ha="center", va="center",
                         bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="black", lw=0.6, alpha=0.92),
                         arrowprops=dict(arrowstyle="-", color="black", lw=0.7, alpha=0.8))
     if lims is not None:

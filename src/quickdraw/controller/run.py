@@ -109,7 +109,6 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     # (+filmstrip), and a distance curve_i. goal race: black oracle vs grey learned; language: single grey agent.
     ep_requests = res.get("requests")          # per-episode request text (multi-query), or None
     combined_agents = []                        # (language) one pred agent per episode -> ALL on ONE torus (combined)
-    _PALETTE = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628", "#f781bf", "#000000"]
     for i in range(NP):
         ti = time.perf_counter()
         agents = [_agent(res[k], i, colors[k], R, r) for k in kinds]
@@ -123,8 +122,8 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                                             show_goals=(reward is None),  # language mode has no target -> no goal ring
                                             log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}"))
         writer.video(product_tag("eval_control", "control_video", i=i), frames, fps, step)
-        if reward is not None:                  # collect this episode's agent (distinct color) for the ONE-torus combined
-            combined_agents.append(_agent(res["pred"], i, _PALETTE[i % len(_PALETTE)], R, r))
+        if reward is not None:                  # collect this episode's agent for the ONE-torus combined (all BLACK)
+            combined_agents.append(_agent(res["pred"], i, "black", R, r))
         scene_desc = (f"Language-steered MPPI on the torus (episode {i}): a single GREY learned-model agent "
                       f"steering to maximize the language reward R(latent, '{request}'). The action arrow per step "
                       f"is the applied control."
@@ -194,8 +193,8 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     # combined control video: ALL agents on ONE torus (one colored dot per request/episode), not a grid.
     if len(combined_agents) > 1:
         nf = max(len(a["path"]) for a in combined_agents)
-        ctitle = "  ·  ".join(f'{_PALETTE[k % len(_PALETTE)]}={(ep_requests[k] if ep_requests else f"#{k}")}'
-                              for k in range(len(combined_agents)))
+        ctitle = ("  ·  ".join(dict.fromkeys(ep_requests)) if ep_requests else
+                  f"{len(combined_agents)} agents")   # all agents BLACK on one torus
         comb = viz.control_compare_frames(R, r, "hsv", combined_agents, n_frames=nf, title=ctitle,
                                           reuse=bool(cfg.control.get("reuse_render", False)), show_goals=False,
                                           log=lambda m: _plog(writer, f"[eval_control @ep{step}]   combined {m}"))
