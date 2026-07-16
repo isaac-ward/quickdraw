@@ -125,7 +125,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         if reward is not None:                  # collect this episode's agent for the ONE-torus combined (all BLACK)
             combined_agents.append(_agent(res["pred"], i, "black", R, r))
         scene_desc = (f"Language-steered MPPI on the torus (episode {i}): a single GREY learned-model agent "
-                      f"steering to maximize the language reward R(latent, '{request}'). The action arrow per step "
+                      f"steering to maximize the language reward R(latent, '{req_i}'). The action arrow per step "
                       f"is the applied control."
                       if reward is not None else
                       f"Dual MPPI control on the torus (episode {i}): a BLACK oracle agent (true dynamics) and a "
