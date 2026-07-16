@@ -171,6 +171,23 @@ class LitWorldModel(L.LightningModule):
         # fatal but ~2e-7 as a fraction of ~5M elements, so it would round away; a count shows it as "1".
         n_nan = sum(torch.isnan(g).sum() for g in grads) if grads else 0
         n_inf = sum(torch.isinf(g).sum() for g in grads) if grads else 0
+        # per-module grad norms (pre-clip): the "WHERE" axis — localize which subnetwork blows up first. Grouped
+        # so the decode head (differs between mse/flow runs) is separable from the shared trunk: encode_<mod>,
+        # decode_<mod>, backbone (dynamics context), flow (latent-dynamics head).
+        module_sq = {}
+        for name, p in self.named_parameters():
+            if p.grad is None:
+                continue
+            parts = name.split(".")
+            if "decode_head" in parts and "modalities" in parts:
+                key = "decode_" + parts[parts.index("modalities") + 1]
+            elif "modalities" in parts:
+                key = "encode_" + parts[parts.index("modalities") + 1]
+            elif len(parts) > 1 and parts[0] == "model":
+                key = parts[1]
+            else:
+                key = parts[0]
+            module_sq[key] = module_sq.get(key, 0.0) + p.grad.detach().float().pow(2).sum()
         pre = _total_norm()
         # non-finite guard: a single inf/nan grad makes norm-clipping compute a NaN total-norm and scale EVERY
         # grad to NaN, which then poisons AdamW's state permanently (unet_flow died this way ~ep2). Skip the
@@ -190,6 +207,8 @@ class LitWorldModel(L.LightningModule):
         self.log("grad/num_nans", float(n_nan), reduce_fx="max")
         self.log("grad/num_infs", float(n_inf), reduce_fx="max")
         self.log("grad/nonfinite_skipped", float(skipped), reduce_fx="sum")
+        for key, sq in module_sq.items():
+            self.log(f"grad/norm/{key}", sq.sqrt(), reduce_fx="max")   # worst-step per-module norm
 
     def training_step(self, batch, _):
         return self._step(batch, "train")
