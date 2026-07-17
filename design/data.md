@@ -10,12 +10,13 @@ What the model sees is an observation, not state:
 
 | Key | Shape | lerobot feature |
 |---|---|---|
-| `observation_vector` | `(6,)` float32 | `observation.vector` |
-| `observation_image` | `(3, 72, 128)` uint8 | `observation.image` (video) |
+| `observation_vector` | `(6,)` float32 | `observation_vector` |
+| `observation.images.fpv` | `(256, 256, 3)` uint8 (video) | `observation.images.fpv` |
 | `action` | `(2,)` float32 | `action` |
 
-`observation_image` is absent until the image stage; the schema and loader do not change when it
-arrives. Per-frame meta: `timestamp`, `frame_index`, `episode_index` (lerobot provides these).
+The **FPV image** (egocentric RGB, rendered per trajectory and stored as MP4 / torchcodec-decoded) is
+the image modality and is now generated on **every** run, aligned 1:1 with the vector frames. Per-frame
+meta: `timestamp`, `frame_index`, `episode_index` (lerobot provides these).
 
 ## Dataset taxonomy
 
@@ -24,35 +25,43 @@ in-distribution and three OOD axes.
 
 | Split | Distribution | # traj | steps/traj | Purpose |
 |---|---|---|---|---|
-| `train` | A | 1000 | 256 | fit models (sliced into windows) |
-| `val` | A, new seeds | 128 | 256 | model selection |
-| `eval_ood_horizon` | A, new seeds | 32 | 2048 | long-horizon, no shift |
-| `eval_ood_visual` | A + recolor | 32 | 2048 | image generalization |
-| `eval_ood_geometric` | new `(R,r)` | 32 | 2048 | manifold-shape generalization |
-| `eval_ood_dynamics` | new `γ,a_max` | 32 | 2048 | dynamics generalization |
+| `train` | A | 256 | 256 | fit models (sliced into windows) |
+| `val` | A, new seeds | 64 | 256 | model selection |
+| `eval_ood_horizon` | A, new seeds | 64 | 1024 | long-horizon, no shift |
+| `eval_ood_visual` | A + recolor | 64 | 256 | image generalization |
+| `eval_ood_geometric` | new `(R,r)` | 64 | 256 | manifold-shape generalization |
+| `eval_ood_dynamics` | new `γ, mass` | 64 | 256 | dynamics generalization |
 
-Train trajectories are short and many (broad coverage, ~193 windows each). Eval trajectories are
-long (2048 steps ≈ 68 s @ 30 Hz) because long-horizon drift is the measured thing.
+Values above are the current `conf/data/torus.yaml`. `eval_ood_horizon` is the long-horizon split
+(1024 steps) because long-horizon drift is the measured thing; the other eval splits are 256 steps and
+each isolate ONE OOD axis (visual = recolor only, geometric = `(R,r)` only, dynamics = `γ, mass` only).
 
 ## Generation
 
-1. `TorusEnv` steps `B` envs at once on GPU; actions from an OU process; per-episode seed
-   `fold_in(base_seed, episode_id)` stored in meta.
-2. Write each episode with `LeRobotDataset.add_frame` / `save_episode`.
-3. Image stage: batched render → encode to MP4 per episode (lerobot's video writer).
-4. Each split is this pipeline with its own params block.
+1. `TorusEnv` steps all of a split's trajectories at once; **actions come from `data.action_sampler`** —
+   `ou` (Ornstein–Uhlenbeck, unimodal, default) or `bimodal` (`BimodalActionSampler`: a two-basin
+   action-**magnitude** process, temporally smoothed, leaning to the low-thrust basin). An 8-tile
+   **`media/action_distribution.png`** preview of the action distribution over time is rendered every run.
+2. **FPV render (the heavy step, decoupled for parallelism):** each trajectory's 256×256 egocentric
+   clip is rendered offscreen (OSMesa) at full worker parallelism, then ingested as `observation.images.fpv`.
+3. Write each split's `LeRobotDataset` (`add_frame` / `save_episode`), then meta + `summary.json`, then
+   stitch per-split composite grids.
+4. Each split is this pipeline with its own trajectory count / steps / seed / env overrides.
 
-Datasets are immutable and versioned (`datasets/torus/v1/`, lerobot on-disk format), generated once,
-reused by every model — separate from training runs.
+Each generated dataset is a `logs/data_generation_<timestamp>_<experiment>/` run folder (lerobot on-disk
+format, one sub-dataset per split + `media/` + `summary.json`), reused by every model via `data.root=`.
+The canonical copy is published to the HF Hub (`isaac-ronald-ward/quickdraw-torus`) via
+`quickdraw.push_to_hub`, which clears-and-reuploads the whole folder on every push.
 
 ## Loading
 
-- **Train / val (windowed):** `LeRobotDataset` with `delta_timestamps` covering past `P=32` and
-  future `F=32` relative frames → one window per item. Batch keys `past_*` / `future_*`. torchcodec
-  decodes the image window on demand (image stage). DataLoader: `num_workers>0`, `pin_memory=True`,
-  `persistent_workers=True`, `prefetch_factor=4`.
+- **Train / val (windowed):** windows cover past `P=8` and future `F=64` frames → one window per item
+  (`conf/data/torus.yaml`). The default loader is **GPU-resident** (`data.fast_gpu`): all windows held
+  on-device and batched by index (no per-item torchcodec workers) for throughput; the lerobot
+  `delta_timestamps` path is the CPU alternative. Each batch carries the past context + the `F`-step target.
 - **Eval (full trajectory):** iterate whole episodes; feed the model the first `P` frames + the true
-  `action` sequence; roll out 2048 steps; score with the `environment.md` errors.
+  `action` sequence; roll out the split's horizon (1024 for `eval_ood_horizon`); score with the
+  `environment.md` errors.
 - **Normalization:** compute mean/std on `train` only; apply those stats to every split (including
   OOD), so OOD shift stays real. Override lerobot's per-dataset stats with the train stats.
 
