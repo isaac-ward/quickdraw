@@ -19,26 +19,33 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
-from ..environments.torus import OUActionSampler, TorusConfig, TorusEnv
+from ..environments.torus import BimodalActionSampler, OUActionSampler, TorusConfig, TorusEnv
 
 
-def generate_episodes(env_cfg: TorusConfig, n_traj: int, steps: int, seed: int, device="cpu"):
+def generate_episodes(env_cfg: TorusConfig, n_traj: int, steps: int, seed: int, device="cpu",
+                      action_sampler: str = "ou"):
     """Return obs (n_traj, steps, 6) and act (n_traj, steps, 2) as float32 numpy arrays.
 
     All n_traj episodes are simulated in parallel as one batched env. action[:, t] is the action
     applied at step t (producing obs[:, t+1]); the final action is recorded but unused downstream.
+    `action_sampler`: "ou" (unimodal OU, default) or "bimodal" (two-basin action-magnitude process).
     """
     g = torch.Generator(device=device).manual_seed(seed)
     env = TorusEnv(env_cfg, batch=n_traj, device=device)
-    ou = OUActionSampler(n_traj, env_cfg.a_max, device=device)
+    if action_sampler == "bimodal":
+        sampler = BimodalActionSampler(n_traj, env_cfg.a_max, device=device)
+    elif action_sampler == "ou":
+        sampler = OUActionSampler(n_traj, env_cfg.a_max, device=device)
+    else:
+        raise ValueError(f"unknown action_sampler {action_sampler!r} (expected 'ou' or 'bimodal')")
     env.reset(g)
-    ou.reset(g)
+    sampler.reset(g)
     obs_list, act_list = [env.observe()], []
     for _ in range(steps - 1):
-        a = ou.sample(g)
+        a = sampler.sample(g)
         act_list.append(a)
         obs_list.append(env.step(a))
-    act_list.append(ou.sample(g))  # pad last action so shapes match (unused)
+    act_list.append(sampler.sample(g))  # pad last action so shapes match (unused)
     obs = torch.stack(obs_list, dim=1).cpu().numpy().astype(np.float32)
     act = torch.stack(act_list, dim=1).cpu().numpy().astype(np.float32)
     return obs, act

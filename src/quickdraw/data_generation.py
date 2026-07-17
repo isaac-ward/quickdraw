@@ -95,7 +95,8 @@ def main(cfg):
     data = {}
     for name, s in cfg.data.splits.items():
         scfg = replace(ecfg, **dict(s.get("env", {}) or {}))
-        obs, act = generate_episodes(scfg, int(s["n_traj"]), int(s["steps"]), int(s["seed"]))
+        obs, act = generate_episodes(scfg, int(s["n_traj"]), int(s["steps"]), int(s["seed"]),
+                                     action_sampler=cfg.data.get("action_sampler", "ou"))
         data[name] = (scfg, obs, act, s.get("coloring", "hsv"))
         os.makedirs(os.path.join(fpv_root, name), exist_ok=True)
     log(f"[gen] simulated {len(data)} splits, {sum(o.shape[0] for _, o, _, _ in data.values())} trajectories")

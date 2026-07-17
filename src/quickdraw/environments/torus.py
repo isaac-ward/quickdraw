@@ -207,6 +207,50 @@ class OUActionSampler:
         return (self.state * self.a_max).clamp(-self.a_max, self.a_max)
 
 
+class BimodalActionSampler:
+    """Play-data action process with a BIMODAL action-MAGNITUDE distribution and temporal smoothing.
+
+    A black box (the world model never sees its internals) used only for data generation. Each trajectory:
+      - carries a binary latent `mode` (low- vs high-thrust) that flips with small per-step prob `p_switch`
+        -> occasional smooth HOPS between the two basins (not a scripted schedule);
+      - relaxes its magnitude toward the current mode's target via an OU step (temporal smoothing), so a
+        single sequence is smooth and DWELLS in a basin;
+      - walks the thrust DIRECTION smoothly (OU/random walk on the angle).
+    The magnitude starts at 0 and relaxes into its basin, so across many trajectories the magnitude
+    distribution is unimodal-near-0 early and separates into TWO peaks later -> the time-variation EMERGES
+    from the dynamics rather than being hardcoded. Draw many trajectories and histogram |a| at any timestep
+    to see the (evolving) bimodal shape. Action = magnitude * (cos ang, sin ang), clamped to a_max.
+    """
+
+    def __init__(self, batch: int, a_max: float, *, mu_lo: float = 0.6, mu_hi: float = 1.6,
+                 theta_mag: float = 0.12, sigma_mag: float = 0.06, p_switch: float = 0.004,
+                 sigma_ang: float = 0.25, device="cpu"):
+        self.batch, self.a_max = batch, a_max
+        self.mu = torch.tensor([mu_lo, mu_hi], device=device)
+        self.theta_mag, self.sigma_mag, self.p_switch, self.sigma_ang = theta_mag, sigma_mag, p_switch, sigma_ang
+        self.device = torch.device(device)
+        self.mode = torch.zeros(batch, dtype=torch.long, device=self.device)
+        self.mag = torch.zeros(batch, device=self.device)
+        self.ang = torch.zeros(batch, device=self.device)
+
+    def reset(self, generator: torch.Generator | None = None):
+        r = lambda *s: torch.rand(*s, device=self.device, generator=generator)
+        self.mode = (r(self.batch) < 0.5).long()                 # 50/50 low vs high basin
+        self.mag = torch.zeros(self.batch, device=self.device)    # start at 0 -> bimodality EMERGES as it relaxes
+        self.ang = r(self.batch) * TWO_PI
+
+    def sample(self, generator: torch.Generator | None = None) -> Tensor:
+        r = lambda: torch.rand(self.batch, device=self.device, generator=generator)
+        n = lambda: torch.randn(self.batch, device=self.device, generator=generator)
+        self.mode = torch.where(r() < self.p_switch, 1 - self.mode, self.mode)   # occasional basin hop
+        target = self.mu[self.mode]
+        self.mag = self.mag + self.theta_mag * (target - self.mag) + self.sigma_mag * n()   # OU toward basin
+        self.ang = self.ang + self.sigma_ang * n()                                          # smooth direction walk
+        mag = self.mag.clamp(0.0, self.a_max)
+        a = torch.stack([mag * torch.cos(self.ang), mag * torch.sin(self.ang)], dim=-1)
+        return a.clamp(-self.a_max, self.a_max)
+
+
 # --------------------------------------------------------------------------------------
 # Surface COLOR + vertical POSITION — the analytic ground truth (single source of truth),
 # matching the RENDERER exactly (logging/viz.py `_texture_array`): the ring is painted with
