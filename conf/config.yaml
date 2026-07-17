@@ -53,6 +53,11 @@ variations:
     observations_encoded_pre_fusion:              #  ("corrupt-and-tell") = DIFFUSION FORCING: noise the pre-fusion context
       scale: 0.0                                  #    tokens at independent per-timestep levels + a backbone level-embedding.
       granularity: timestep                       #    FLOW models only (gated). 0 -> off (bit-identical). fraction of full noise.
+      # EMPIRICAL (2026-07-17, bimodal data): scale controls ENCODER-latent collapse. IWS uses 0.1
+      # (their prev_frame_noise_scale). At 0.1 the encoder stayed stable (encode_image grad ~0.001, no spike)
+      # and the HARD collapse that 0.25/1.0 caused (encode_image grad spiked to 4.34 ~ep13, latent val 4-8)
+      # did NOT happen. NOTE: 0.1 still leaves a slower dynamics-side rollout drift under full TF (p_tf=1);
+      # that residual wants in-rollout (p_tf<1) or SNR/log-normal loss shaping, NOT more DF.
   physical_loss:   { weight: 0.0, continuity: 0.0, warmup_epochs: 10 }  # weight: on-surface+tangent; continuity:
   #                  kinematic v=dp/dt; warmup_epochs: ramp the physical weight 0->1 over N epochs (schedules/)
   contraction:     { weight: 0.0, target: 1.02, power_iters: 2, n_sample_steps: 4 }  # hinge on sigma_max(one-step J)
