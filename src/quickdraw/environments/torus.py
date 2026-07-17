@@ -267,6 +267,20 @@ class BimodalActionSampler:
         a = torch.stack([mag * torch.cos(self.ang), mag * torch.sin(self.ang)], dim=-1)
         return a.clamp(-self.a_max, self.a_max)
 
+    def sample_at_state(self, x: float, n: int, generator: torch.Generator | None = None) -> Tensor:
+        """`n` independent draws from the action distribution CONDITIONED on ambient x — the stationary basin
+        mixture at that state (mode ~ weight_hi, magnitude ~ the OU stationary spread around the x-scaled basin,
+        angle uniform). The 'true' reference at a single state for eval_action_distribution's per-trajectory
+        animation (the temporal process gives only one action per step, so this is its per-state conditional)."""
+        dev = self.device
+        scale = self.slow_frac + (1.0 - self.slow_frac) * torch.sigmoid(torch.tensor(float(x), device=dev) / self.x_width)
+        mode = (torch.rand(n, device=dev, generator=generator) < self.weight_hi).long()
+        stat_std = self.sigma_mag / (1.0 - (1.0 - self.theta_mag) ** 2) ** 0.5   # OU stationary std around the basin
+        mag = (self.mu[mode] * scale + stat_std * scale
+               * torch.randn(n, device=dev, generator=generator)).clamp(0.0, self.a_max)
+        ang = torch.rand(n, device=dev, generator=generator) * TWO_PI
+        return torch.stack([mag * torch.cos(ang), mag * torch.sin(ang)], dim=-1).clamp(-self.a_max, self.a_max)
+
 
 # --------------------------------------------------------------------------------------
 # Surface COLOR + vertical POSITION — the analytic ground truth (single source of truth),

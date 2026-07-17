@@ -503,6 +503,15 @@ class MultiModalFlow(MultiModalSequenceModel):
                 raw["shortcut/action"], w["shortcut/action"] = l_acons, self.action_head_weight
         return raw, w
 
+    def action_context(self, obs, act_seq) -> Tensor:
+        """Per-step pooled backbone context for the action prior. Returns (B, L-1, d): entry k is h[k], the
+        leak-free context (state[<=k] + a[<k]) from which the NEXT action a[k+1] is predicted. Mirrors the
+        h computation in loss_terms (clean context; DF noise is train-only). For eval_action_distribution / MPPI."""
+        z = self.encode_state(obs)                               # (B, L, n_state, d)
+        L = z.shape[1]
+        h = self.backbone(self._to_input(z[:, :-1], act_seq[:, :L - 1]))   # (B, L-1, n_input, d)
+        return h.mean(dim=-2)                                    # (B, L-1, d) pooled per step
+
     def sample_action(self, h_ctx: Tensor, *, deterministic: bool = False, eps: Tensor | None = None) -> Tensor:
         """Sample from the learned action PRIOR given a per-step context vector `h_ctx` (..., d) — the pooled
         backbone context h[t-1]. Returns NORMALIZED actions (..., action_dim); the caller denorms. For the
