@@ -23,6 +23,12 @@ def _make_card(root: str, name: str) -> str:
     s = json.load(open(os.path.join(root, "summary.json")))
     counts, split_env, coloring = s["counts"], s["split_env"], s["coloring"]
     splits = list(counts)
+    action_sampler = s.get("action_sampler", "ou")
+    action_desc = {
+        "ou": "an **Ornstein–Uhlenbeck** action process (temporally-correlated, unimodal, zero-mean)",
+        "bimodal": "a **two-basin** action process with a **bimodal action-magnitude** distribution "
+                   "(low- vs high-thrust rings) and temporal smoothing — occasional smooth hops between basins",
+    }.get(action_sampler, f"a `{action_sampler}` action process")
 
     cfgs = "\n".join(f"  - config_name: {sp}\n    data_files: {sp}/data/**/*.parquet" for sp in splits)
     rows = "\n".join(
@@ -45,13 +51,21 @@ configs:
 
 # {name}
 
-A toy world-model benchmark: a damped particle driven by an Ornstein–Uhlenbeck action around a
+A toy world-model benchmark: a damped particle driven by {action_desc} around a
 **torus** manifold. The benchmark measures long-horizon consistency as *staying on the data
 manifold*. Generated with [quickdraw](https://github.com/isaac-ward/quickdraw).
 
 ## Observation / action
 - **observation_vector** (6): `[position (x,y,z); velocity (ẋ,ẏ,ż)]`
+- **observation.images.fpv** (256×256×3, video): the egocentric / first-person-view RGB frame, stored
+  as MP4 (torchcodec-decoded), aligned 1:1 with the vector frames — the image modality for vision models
 - **action** (2): `(a_θ, a_φ)` — angular pushes in the two torus coordinates
+
+## Action distribution
+The action process is `{action_sampler}`. Its per-timestep action-magnitude distribution (8 timesteps,
+regenerated with every dataset build) — read the two peaks for the bimodal sampler:
+
+![action distribution](media/action_distribution.png)
 
 ## Splits
 | split | episodes | steps/ep | transitions | environment | coloring |
@@ -87,8 +101,10 @@ def main(cfg):
     with open(os.path.join(root, "README.md"), "w") as f:  # dataset card -> uploaded with the folder
         f.write(_make_card(root, name))
     api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
-    api.upload_folder(repo_id=repo_id, repo_type="dataset", folder_path=root)
-    print(f"[push_to_hub] {root} -> https://huggingface.co/datasets/{repo_id} (private={private})")
+    # delete_patterns="*" -> a CLEAN reupload: every remote file not in this upload is removed in the same
+    # commit, so a regenerated dataset fully replaces the old one (no stale splits/media left behind).
+    api.upload_folder(repo_id=repo_id, repo_type="dataset", folder_path=root, delete_patterns="*")
+    print(f"[push_to_hub] {root} -> https://huggingface.co/datasets/{repo_id} (private={private}, cleared+reuploaded)")
 
 
 if __name__ == "__main__":

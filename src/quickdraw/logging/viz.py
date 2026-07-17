@@ -1150,3 +1150,25 @@ def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, 
         plt.close(fig)
     return np.stack(frames)
 
+
+
+def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
+    """8 magnitude-histogram tiles of the data's ACTION distribution at 8 timesteps (2x4 grid).
+
+    act: (n_traj, steps, action_dim) float. Shows |a| pooled over trajectories at each timestep, so the
+    (possibly time-varying) shape — e.g. the two-basin bimodal magnitude — is directly visible. Regenerated
+    on every data_generation run and referenced by the HF dataset card.
+    """
+    act = np.asarray(act)
+    mag = np.linalg.norm(act, axis=-1)            # (n_traj, steps)
+    steps = mag.shape[1]
+    if timesteps is None:                          # 8 timesteps spanning the episode (near-start ... end)
+        timesteps = [int(round(f * (steps - 1))) for f in (0.02, 0.06, 0.12, 0.25, 0.4, 0.6, 0.8, 1.0)]
+    fig, axes = plt.subplots(2, 4, figsize=(16, 7))
+    for ax, t in zip(axes.ravel(), timesteps):
+        ax.hist(mag[:, t], bins=60, range=(0, float(a_max)), color="steelblue")
+        ax.set_title(f"|a| @ t={t}", fontsize=11); ax.set_xlabel("|a|")
+    ttl = "action-magnitude distribution over time" + (f"  ·  sampler={sampler_name}" if sampler_name else "")
+    fig.suptitle(ttl, fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return fig

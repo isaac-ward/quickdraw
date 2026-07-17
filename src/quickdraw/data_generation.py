@@ -101,6 +101,14 @@ def main(cfg):
         os.makedirs(os.path.join(fpv_root, name), exist_ok=True)
     log(f"[gen] simulated {len(data)} splits, {sum(o.shape[0] for _, o, _, _ in data.values())} trajectories")
 
+    # action-distribution preview (regenerated EVERY run): 8 magnitude-histogram tiles over time, so the
+    # data's action distribution (e.g. the two-basin bimodal magnitude) is eyeballable + referenced by the card.
+    asamp = cfg.data.get("action_sampler", "ou")
+    adfig = viz.fig_action_distribution(data["train"][2], ecfg.a_max, sampler_name=asamp)
+    adfig.savefig(os.path.join(media, "action_distribution.png"), dpi=viz.DPI)
+    plt.close(adfig)
+    log(f"[action-dist] media/action_distribution.png (sampler={asamp})")
+
     workers = int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4))   # cap to leave CPU for concurrent training
 
     # 2. SUMMARY atlas plot + video per split FIRST, so the new physics can be eyeballed before the long
@@ -159,6 +167,7 @@ def main(cfg):
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump({"dataset_root": run_dir, "counts": counts, "splits": card["splits"],
                    "split_env": card["split_env"], "coloring": card["coloring"],
+                   "action_sampler": cfg.data.get("action_sampler", "ou"),
                    "normalization_stats": norm}, f, indent=2)
 
     # 4. composites: stitch every split's clips into one grid (reusing the rendered clips)
