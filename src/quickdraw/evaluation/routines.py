@@ -590,11 +590,74 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     return {f"eval_interpret_agreement_{f}": v for f, v in agree.items()}
 
 
+@torch.no_grad()
+def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
+    """The learned action PRIOR (action-flow head) vs the TRUE data action distribution. Self-skips unless
+    the model has an action head. All under eval_action_distribution/:
+      - by_state_{true,pred}: |a| split by sign of ambient x (slow x<0 / fast x>=0) x uniform timesteps.
+      - animation_0 (bimodal sampler only): one val trajectory, true(green)|pred(red)|both — peaks move as x oscillates.
+      - action_true_pred_w1: 1D-Wasserstein between pooled true and pred |a| (scalar, lower=better).
+    The head predicts a[k+1] from the leak-free context h[k]; we sample it and compare to the recorded a[k+1]."""
+    m = getattr(model, "_orig_mod", model)
+    if not getattr(m, "action_head_enabled", False):
+        return {}                                                # no action head -> skip
+    from ..data.dataset import load_split_episodes_mm
+    from ..environments.torus import BimodalActionSampler
+    was = m.training; m.eval()
+    t0 = time.perf_counter()
+    def prog(p, w): _plog(writer, f"[eval_action_distribution @ep{step}] {p:3d}% — {w}")
+
+    img_heads = [n for n, _ in m.layout if n != "proprio"]
+    img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+    n_ep = min(8 if img_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(eps))
+    eps = eps[:n_ep]
+    L = min(len(o) for o, _, _ in eps)
+    prog(0, f"start: {n_ep} val episodes, L={L}")
+
+    ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(o[:L])) for o, _, _ in eps]).float().to(device)}
+    for h in img_heads:
+        ctx[h] = torch.stack([torch.from_numpy(im[:L]) for _, _, im in eps]).float().div(255.0).to(device)
+    act = torch.stack([norm.norm_act(torch.from_numpy(a[:L])) for _, a, _ in eps]).float().to(device)  # (E,L,2) normalized
+
+    h_ctx = m.action_context(ctx, act)                           # (E,L-1,d): h[k] predicts a[k+1] (leak-free)
+    prog(30, "context + head sampling")
+    pred = norm.denorm_act(m.sample_action(h_ctx).cpu()).numpy()  # (E,L-1,2) raw
+    true = norm.denorm_act(act[:, 1:].cpu()).numpy()             # a[1..L-1] raw, aligned with h_ctx
+    x = np.stack([o[1:L, 0] for o, _, _ in eps]).astype(np.float32)   # ambient x at each action's state (E,L-1)
+
+    for name, arr in (("true", true), ("pred", pred)):           # by-x 2-row static, true vs pred
+        fig = viz.fig_action_by_state(arr, x, ecfg.a_max, sampler_name=f"{cfg.data.get('action_sampler','?')} · {name}")
+        writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
+
+    tm, pm = np.linalg.norm(true, -1).reshape(-1), np.linalg.norm(pred, -1).reshape(-1)
+    q = np.linspace(0.0, 1.0, 512)
+    w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a|
+    writer.scalar("eval_action_distribution/true_pred_w1", w1, step)
+    prog(60, f"by-x static + distance (w1={w1:.3f})")
+
+    if cfg.data.get("action_sampler") == "bimodal":              # per-trajectory animation (moving peaks)
+        N, e = viz.ACTION_DIST_N_SAMPLES, 0
+        sampler = BimodalActionSampler(1, ecfg.a_max, device=device)
+        xe = x[e]                                                # (L-1,) ambient x along episode e
+        true_a = np.stack([norm.denorm_act(sampler.sample_at_state(float(xe[k]), N).cpu()).numpy()
+                           for k in range(L - 1)], axis=1)       # (N,L-1,2) true conditional at each state
+        pred_a = norm.denorm_act(m.sample_action(h_ctx[e:e + 1].expand(N, -1, -1)).cpu()).numpy()  # (N,L-1,2)
+        frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max, max_frames=200)
+        writer.video(f"eval_action_distribution/animation_{e}", frames, round(1.0 / ecfg.dt), step)
+        prog(90, "animation")
+
+    if was:
+        m.train()
+    prog(100, f"done in {time.perf_counter() - t0:.1f}s -> eval_action_distribution/")
+    return {"action_true_pred_w1": w1}
+
+
 REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
             "control": eval_control, "denoising_multistep": eval_denoising_multistep,
             "denoising_aggregate": eval_denoising_aggregate, "manifold": eval_manifold,
-            "interpret": eval_interpret}
+            "interpret": eval_interpret, "action_distribution": eval_action_distribution}
 
 
 def _quiver_round_data(swarm, grow=10, collapse=5):
