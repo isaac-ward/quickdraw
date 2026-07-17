@@ -201,8 +201,8 @@ class OUActionSampler:
     def reset(self, generator: torch.Generator | None = None):
         self.state = torch.zeros_like(self.state)
 
-    def sample(self, generator: torch.Generator | None = None) -> Tensor:
-        noise = torch.randn(self.state.shape, device=self.device, generator=generator)
+    def sample(self, generator: torch.Generator | None = None, state: Tensor | None = None) -> Tensor:
+        noise = torch.randn(self.state.shape, device=self.device, generator=generator)   # `state` ignored (state-independent)
         self.state = self.state + self.theta_ou * (-self.state) + self.sigma * noise
         return (self.state * self.a_max).clamp(-self.a_max, self.a_max)
 
@@ -220,15 +220,23 @@ class BimodalActionSampler:
     distribution is unimodal-near-0 early and separates into TWO peaks later -> the time-variation EMERGES
     from the dynamics rather than being hardcoded. Draw many trajectories and histogram |a| at any timestep
     to see the (evolving) bimodal shape. Action = magnitude * (cos ang, sin ang), clamped to a_max.
+
+    STATE-DEPENDENT: when `sample(state=...)` is given the current observation, the basin magnitudes (and
+    spread) are scaled by a SMOOTH function of the particle's ambient x — ~`slow_frac` speed on the
+    negative-x half of the ring, full speed on the positive-x half. So as the particle circles the ring the
+    peaks MOVE/breathe emergently (driven by its own motion, not a scripted schedule) — a stand-in for the
+    state-dependent, multimodal action distributions of teleoperated play data.
     """
 
     def __init__(self, batch: int, a_max: float, *, mu_lo: float = 1.0, mu_hi: float = 2.8,
                  weight_hi: float = 1.0 / 3.0, theta_mag: float = 0.12, sigma_mag: float = 0.12,
-                 p_switch: float = 0.004, sigma_ang: float = 0.25, device="cpu"):
+                 p_switch: float = 0.004, sigma_ang: float = 0.25, slow_frac: float = 0.4,
+                 x_width: float = 0.3, device="cpu"):
         self.batch, self.a_max = batch, a_max
         self.mu = torch.tensor([mu_lo, mu_hi], device=device)     # index 0 = low basin, 1 = high basin
         self.weight_hi = float(weight_hi)                         # stationary fraction of mass in the HIGH basin
         self.theta_mag, self.sigma_mag, self.p_switch, self.sigma_ang = theta_mag, sigma_mag, p_switch, sigma_ang
+        self.slow_frac, self.x_width = float(slow_frac), float(x_width)   # neg-x-half speed fraction + transition width
         self.device = torch.device(device)
         self.mode = torch.zeros(batch, dtype=torch.long, device=self.device)
         self.mag = torch.zeros(batch, device=self.device)
@@ -240,7 +248,7 @@ class BimodalActionSampler:
         self.mag = torch.zeros(self.batch, device=self.device)    # start at 0 -> bimodality EMERGES as it relaxes
         self.ang = r(self.batch) * TWO_PI
 
-    def sample(self, generator: torch.Generator | None = None) -> Tensor:
+    def sample(self, generator: torch.Generator | None = None, state: Tensor | None = None) -> Tensor:
         r = lambda: torch.rand(self.batch, device=self.device, generator=generator)
         n = lambda: torch.randn(self.batch, device=self.device, generator=generator)
         # ASYMMETRIC hop rates so the STATIONARY split is weight_hi:(1-weight_hi) (detailed balance): leaving
@@ -248,8 +256,12 @@ class BimodalActionSampler:
         leave = torch.where(self.mode == 0, self.p_switch * self.weight_hi,
                             self.p_switch * (1.0 - self.weight_hi))
         self.mode = torch.where(r() < leave, 1 - self.mode, self.mode)   # smooth basin hop (target flips; mag ramps)
-        target = self.mu[self.mode]
-        self.mag = self.mag + self.theta_mag * (target - self.mag) + self.sigma_mag * n()   # OU toward basin
+        scale = torch.ones(self.batch, device=self.device)
+        if state is not None:                        # STATE-DEPENDENT: ~slow_frac speed on the negative-x half of
+            x = state[..., 0]                        # the ring, full speed on the positive-x half (smooth in x)
+            scale = self.slow_frac + (1.0 - self.slow_frac) * torch.sigmoid(x / self.x_width)
+        target = self.mu[self.mode] * scale
+        self.mag = self.mag + self.theta_mag * (target - self.mag) + self.sigma_mag * scale * n()  # OU toward basin
         self.ang = self.ang + self.sigma_ang * n()                                          # smooth direction walk
         mag = self.mag.clamp(0.0, self.a_max)
         a = torch.stack([mag * torch.cos(self.ang), mag * torch.sin(self.ang)], dim=-1)

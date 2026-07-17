@@ -31,16 +31,6 @@ def _build_sampler(kind: str, n_traj: int, a_max: float, device):
     raise ValueError(f"unknown action_sampler {kind!r} (expected 'ou' or 'bimodal')")
 
 
-def sample_action_sequences(a_max: float, n_traj: int, steps: int, seed: int,
-                            action_sampler: str = "ou", device="cpu"):
-    """Roll ONLY the action process (no env) -> (n_traj, steps, 2) float32. Used for the action-distribution
-    preview plot (drawn at higher N than the dataset for clean patterns); the eval samples the head likewise."""
-    g = torch.Generator(device=device).manual_seed(seed)
-    sampler = _build_sampler(action_sampler, n_traj, a_max, device)
-    sampler.reset(g)
-    return torch.stack([sampler.sample(g) for _ in range(steps)], dim=1).cpu().numpy().astype(np.float32)
-
-
 def generate_episodes(env_cfg: TorusConfig, n_traj: int, steps: int, seed: int, device="cpu",
                       action_sampler: str = "ou"):
     """Return obs (n_traj, steps, 6) and act (n_traj, steps, 2) as float32 numpy arrays.
@@ -56,10 +46,10 @@ def generate_episodes(env_cfg: TorusConfig, n_traj: int, steps: int, seed: int, 
     sampler.reset(g)
     obs_list, act_list = [env.observe()], []
     for _ in range(steps - 1):
-        a = sampler.sample(g)
+        a = sampler.sample(g, state=obs_list[-1])   # state = current obs -> state-dependent samplers (bimodal)
         act_list.append(a)
         obs_list.append(env.step(a))
-    act_list.append(sampler.sample(g))  # pad last action so shapes match (unused)
+    act_list.append(sampler.sample(g, state=obs_list[-1]))  # pad last action so shapes match (unused)
     obs = torch.stack(obs_list, dim=1).cpu().numpy().astype(np.float32)
     act = torch.stack(act_list, dim=1).cpu().numpy().astype(np.float32)
     return obs, act

@@ -21,8 +21,7 @@ from dataclasses import asdict, replace
 import hydra
 import matplotlib.pyplot as plt
 
-from .data.generate import (compute_norm_stats, generate_episodes, sample_action_sequences,
-                            write_lerobot_split, write_meta)
+from .data.generate import compute_norm_stats, generate_episodes, write_lerobot_split, write_meta
 from .environments.torus import TorusConfig
 from .logging import viz
 from .training.setup import env_cfg
@@ -107,8 +106,8 @@ def main(cfg):
     # Drawn at ACTION_DIST_N_SAMPLES (> dataset size) for clean patterns; the eval samples the head at the same N.
     asamp = cfg.data.get("action_sampler", "ou")
     ad_steps = int(cfg.data.splits["train"]["steps"])
-    ad_acts = sample_action_sequences(ecfg.a_max, viz.ACTION_DIST_N_SAMPLES, ad_steps,
-                                      seed=int(cfg.data.splits["train"]["seed"]), action_sampler=asamp)
+    _, ad_acts = generate_episodes(ecfg, viz.ACTION_DIST_N_SAMPLES, ad_steps,     # roll the env -> reflects the
+                                   seed=int(cfg.data.splits["train"]["seed"]), action_sampler=asamp)  # STATE-dependent dist
     adfig = viz.fig_action_distribution(ad_acts, ecfg.a_max, sampler_name=asamp)
     adfig.savefig(os.path.join(media, "action_distribution.png"), dpi=viz.DPI)
     plt.close(adfig)
