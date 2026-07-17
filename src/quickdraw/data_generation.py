@@ -106,12 +106,13 @@ def main(cfg):
     # Drawn at ACTION_DIST_N_SAMPLES (> dataset size) for clean patterns; the eval samples the head at the same N.
     asamp = cfg.data.get("action_sampler", "ou")
     ad_steps = int(cfg.data.splits["train"]["steps"])
-    _, ad_acts = generate_episodes(ecfg, viz.ACTION_DIST_N_SAMPLES, ad_steps,     # roll the env -> reflects the
-                                   seed=int(cfg.data.splits["train"]["seed"]), action_sampler=asamp)  # STATE-dependent dist
-    adfig = viz.fig_action_distribution(ad_acts, ecfg.a_max, sampler_name=asamp)
+    ad_obs, ad_acts = generate_episodes(ecfg, viz.ACTION_DIST_N_SAMPLES, ad_steps,   # roll the env -> reflects the
+                                        seed=int(cfg.data.splits["train"]["seed"]), action_sampler=asamp)
+    # conditioned on ambient x (obs[...,0]) so a STATE-dependent sampler shows its dependence: slow on -x, fast on +x.
+    adfig = viz.fig_action_by_state(ad_acts, ad_obs[..., 0], ecfg.a_max, sampler_name=asamp)
     adfig.savefig(os.path.join(media, "action_distribution.png"), dpi=viz.DPI)
     plt.close(adfig)
-    log(f"[action-dist] media/action_distribution.png ({viz.ACTION_DIST_N_SAMPLES} samples, sampler={asamp})")
+    log(f"[action-dist] media/action_distribution.png ({viz.ACTION_DIST_N_SAMPLES} traj, by-x, sampler={asamp})")
 
     workers = int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4))   # cap to leave CPU for concurrent training
 

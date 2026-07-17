@@ -1165,6 +1165,7 @@ def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
     on every data_generation run and referenced by the HF dataset card.
     """
     act = np.asarray(act)
+    act = np.asarray(act); n_traj = act.shape[0]
     mag = np.linalg.norm(act, axis=-1)            # (n_traj, steps)
     steps = mag.shape[1]
     if timesteps is None:                          # 8 timesteps spanning the episode (near-start ... end)
@@ -1174,7 +1175,8 @@ def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
     for ax, t in zip(axes.ravel(), timesteps):
         ax.hist(mag[:, t], bins=60, range=(0, hi), color="steelblue")
         ax.set_title(f"|a| @ t={t}", fontsize=11); ax.set_xlabel("|a|")
-    ttl = "action-magnitude distribution over time" + (f"  ·  sampler={sampler_name}" if sampler_name else "")
+    ttl = (f"action-magnitude distribution over time  ·  each tile pooled over {n_traj} trajectories"
+           + (f"  ·  sampler={sampler_name}" if sampler_name else ""))
     fig.suptitle(ttl, fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     return fig
@@ -1216,3 +1218,30 @@ def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=20
         fig.tight_layout(rect=(0, 0, 1, 0.93)); fig.set_dpi(dpi)
         frames.append(_fig_rgb(fig)); plt.close(fig)
     return np.stack(frames)
+
+
+def fig_action_by_state(act, x, a_max, sampler_name="", n_cols=4):
+    """Action-magnitude distribution split by the sign of ambient x (the state-dependence division): TOP row =
+    x<0 (slow half), BOTTOM row = x>=0 (fast half); columns are uniformly-spaced timesteps. Same column across
+    rows -> same timestep, so slow-vs-fast is directly comparable. Histograms are densities (comparable across
+    tiles despite differing counts). `act` (n_traj, steps, 2), `x` (n_traj, steps) ambient x."""
+    a = np.asarray(act); n_traj = a.shape[0]
+    mag = np.linalg.norm(a, axis=-1)                 # (n_traj, steps)
+    x = np.asarray(x)                                # (n_traj, steps)
+    steps = mag.shape[1]
+    cols = [int(round(f * (steps - 1))) for f in np.linspace(0.05, 1.0, n_cols)]   # uniform timesteps
+    hi = min(float(a_max), float(mag.max()) * 1.15)
+    fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 7), sharex=True, sharey=True)
+    for r, (lbl, keep) in enumerate((("x < 0 (slow)", x < 0.0), ("x ≥ 0 (fast)", x >= 0.0))):
+        for c, t in enumerate(cols):
+            m = mag[:, t][keep[:, t]]
+            ax = axes[r, c]
+            ax.hist(m, bins=55, range=(0, hi), density=True, color="steelblue")
+            ax.set_title(f"{lbl},  t={t}  (n={m.size})", fontsize=10)
+            if r == 1:
+                ax.set_xlabel("|a|")
+    ttl = (f"action-magnitude distribution — top: x<0 (slow)  |  bottom: x≥0 (fast)  ·  "
+           f"pooled over {n_traj} trajectories" + (f"  ·  sampler={sampler_name}" if sampler_name else ""))
+    fig.suptitle(ttl, fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return fig
