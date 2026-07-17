@@ -1152,6 +1152,11 @@ def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, 
 
 
 
+# samples per timestep for the action-distribution preview + eval (4x the 256 train trajectories, so the
+# shape/peaks/weights read clearly above Monte-Carlo noise). The eval samples the LEARNED head this many too.
+ACTION_DIST_N_SAMPLES = 1024
+
+
 def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
     """8 magnitude-histogram tiles of the data's ACTION distribution at 8 timesteps (2x4 grid).
 
@@ -1164,11 +1169,50 @@ def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
     steps = mag.shape[1]
     if timesteps is None:                          # 8 timesteps spanning the episode (near-start ... end)
         timesteps = [int(round(f * (steps - 1))) for f in (0.02, 0.06, 0.12, 0.25, 0.4, 0.6, 0.8, 1.0)]
+    hi = min(float(a_max), float(np.nanmax(mag)) * 1.2)   # fit the data (a_max can be >> used range), 20% headroom
     fig, axes = plt.subplots(2, 4, figsize=(16, 7))
     for ax, t in zip(axes.ravel(), timesteps):
-        ax.hist(mag[:, t], bins=60, range=(0, float(a_max)), color="steelblue")
+        ax.hist(mag[:, t], bins=60, range=(0, hi), color="steelblue")
         ax.set_title(f"|a| @ t={t}", fontsize=11); ax.set_xlabel("|a|")
     ttl = "action-magnitude distribution over time" + (f"  ·  sampler={sampler_name}" if sampler_name else "")
     fig.suptitle(ttl, fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     return fig
+
+
+def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=200, dpi=90):
+    """Animated 3-panel action-magnitude histogram over time (one frame per timestep) for eval_action_distribution:
+    LEFT = true (green), MIDDLE = pred (red), RIGHT = the two overlaid — true green, pred red, both at 50% opacity
+    so the panels look consistent and the third is directly comparable. Axes (x=|a| range, y=count) are LOCKED
+    across every frame AND identical on all three panels, computed up front over ALL data so nothing clips.
+    `true_acts`/`pred_acts`: (N, steps, action_dim); pass the SAME N so the counts are directly comparable.
+    """
+    tm = np.linalg.norm(np.asarray(true_acts), axis=-1)     # (N, steps)
+    pm = np.linalg.norm(np.asarray(pred_acts), axis=-1)
+    assert tm.shape[0] == pm.shape[0], f"true/pred need the same sample count ({tm.shape[0]} vs {pm.shape[0]})"
+    steps = tm.shape[1]
+    hi = min(float(a_max), max(float(tm.max()), float(pm.max())) * 1.05)   # x-lim over ALL data
+    edges = np.linspace(0.0, hi, bins + 1)
+    ymax = 0                                                                # y-lim = worst-case count over ALL frames
+    for t in range(steps):
+        ymax = max(ymax, int(np.histogram(tm[:, t], bins=edges)[0].max()),
+                   int(np.histogram(pm[:, t], bins=edges)[0].max()))
+    ymax = ymax * 1.08 or 1.0
+    ts = (range(steps) if steps <= max_frames
+          else np.linspace(0, steps - 1, max_frames).round().astype(int))
+    green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
+    frames = []
+    for t in ts:
+        t = int(t)
+        fig, ax = plt.subplots(1, 3, figsize=(15, 4.4))
+        for a in ax:
+            a.set_xlim(0, hi); a.set_ylim(0, ymax); a.set_xlabel("|a|")
+        ax[0].hist(tm[:, t], bins=edges, color=green, alpha=0.5); ax[0].set_title("true")
+        ax[1].hist(pm[:, t], bins=edges, color=red, alpha=0.5); ax[1].set_title("pred")
+        ax[2].hist(tm[:, t], bins=edges, color=green, alpha=0.5, label="true")
+        ax[2].hist(pm[:, t], bins=edges, color=red, alpha=0.5, label="pred")
+        ax[2].set_title("true (green) vs pred (red) — overlaid"); ax[2].legend(loc="upper right", fontsize=9)
+        fig.suptitle(f"action-magnitude distribution  ·  t={t}/{steps - 1}", fontsize=13)
+        fig.tight_layout(rect=(0, 0, 1, 0.93)); fig.set_dpi(dpi)
+        frames.append(_fig_rgb(fig)); plt.close(fig)
+    return np.stack(frames)

@@ -21,7 +21,8 @@ from dataclasses import asdict, replace
 import hydra
 import matplotlib.pyplot as plt
 
-from .data.generate import compute_norm_stats, generate_episodes, write_lerobot_split, write_meta
+from .data.generate import (compute_norm_stats, generate_episodes, sample_action_sequences,
+                            write_lerobot_split, write_meta)
 from .environments.torus import TorusConfig
 from .logging import viz
 from .training.setup import env_cfg
@@ -103,11 +104,15 @@ def main(cfg):
 
     # action-distribution preview (regenerated EVERY run): 8 magnitude-histogram tiles over time, so the
     # data's action distribution (e.g. the two-basin bimodal magnitude) is eyeballable + referenced by the card.
+    # Drawn at ACTION_DIST_N_SAMPLES (> dataset size) for clean patterns; the eval samples the head at the same N.
     asamp = cfg.data.get("action_sampler", "ou")
-    adfig = viz.fig_action_distribution(data["train"][2], ecfg.a_max, sampler_name=asamp)
+    ad_steps = int(cfg.data.splits["train"]["steps"])
+    ad_acts = sample_action_sequences(ecfg.a_max, viz.ACTION_DIST_N_SAMPLES, ad_steps,
+                                      seed=int(cfg.data.splits["train"]["seed"]), action_sampler=asamp)
+    adfig = viz.fig_action_distribution(ad_acts, ecfg.a_max, sampler_name=asamp)
     adfig.savefig(os.path.join(media, "action_distribution.png"), dpi=viz.DPI)
     plt.close(adfig)
-    log(f"[action-dist] media/action_distribution.png (sampler={asamp})")
+    log(f"[action-dist] media/action_distribution.png ({viz.ACTION_DIST_N_SAMPLES} samples, sampler={asamp})")
 
     workers = int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4))   # cap to leave CPU for concurrent training
 

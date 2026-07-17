@@ -222,11 +222,12 @@ class BimodalActionSampler:
     to see the (evolving) bimodal shape. Action = magnitude * (cos ang, sin ang), clamped to a_max.
     """
 
-    def __init__(self, batch: int, a_max: float, *, mu_lo: float = 0.6, mu_hi: float = 1.6,
-                 theta_mag: float = 0.12, sigma_mag: float = 0.06, p_switch: float = 0.004,
-                 sigma_ang: float = 0.25, device="cpu"):
+    def __init__(self, batch: int, a_max: float, *, mu_lo: float = 1.0, mu_hi: float = 2.8,
+                 weight_hi: float = 1.0 / 3.0, theta_mag: float = 0.12, sigma_mag: float = 0.12,
+                 p_switch: float = 0.004, sigma_ang: float = 0.25, device="cpu"):
         self.batch, self.a_max = batch, a_max
-        self.mu = torch.tensor([mu_lo, mu_hi], device=device)
+        self.mu = torch.tensor([mu_lo, mu_hi], device=device)     # index 0 = low basin, 1 = high basin
+        self.weight_hi = float(weight_hi)                         # stationary fraction of mass in the HIGH basin
         self.theta_mag, self.sigma_mag, self.p_switch, self.sigma_ang = theta_mag, sigma_mag, p_switch, sigma_ang
         self.device = torch.device(device)
         self.mode = torch.zeros(batch, dtype=torch.long, device=self.device)
@@ -235,14 +236,18 @@ class BimodalActionSampler:
 
     def reset(self, generator: torch.Generator | None = None):
         r = lambda *s: torch.rand(*s, device=self.device, generator=generator)
-        self.mode = (r(self.batch) < 0.5).long()                 # 50/50 low vs high basin
+        self.mode = (r(self.batch) < self.weight_hi).long()       # P(high) = weight_hi (default 1/3 -> lean slow)
         self.mag = torch.zeros(self.batch, device=self.device)    # start at 0 -> bimodality EMERGES as it relaxes
         self.ang = r(self.batch) * TWO_PI
 
     def sample(self, generator: torch.Generator | None = None) -> Tensor:
         r = lambda: torch.rand(self.batch, device=self.device, generator=generator)
         n = lambda: torch.randn(self.batch, device=self.device, generator=generator)
-        self.mode = torch.where(r() < self.p_switch, 1 - self.mode, self.mode)   # occasional basin hop
+        # ASYMMETRIC hop rates so the STATIONARY split is weight_hi:(1-weight_hi) (detailed balance): leaving
+        # high is (1-weight_hi)/weight_hi x as likely as leaving low, so symmetric drift can't pull it to 50/50.
+        leave = torch.where(self.mode == 0, self.p_switch * self.weight_hi,
+                            self.p_switch * (1.0 - self.weight_hi))
+        self.mode = torch.where(r() < leave, 1 - self.mode, self.mode)   # smooth basin hop (target flips; mag ramps)
         target = self.mu[self.mode]
         self.mag = self.mag + self.theta_mag * (target - self.mag) + self.sigma_mag * n()   # OU toward basin
         self.ang = self.ang + self.sigma_ang * n()                                          # smooth direction walk
