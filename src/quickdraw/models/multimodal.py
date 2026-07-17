@@ -417,7 +417,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
-                 action_head_shortcut: bool = True, action_head_shape_trunk: bool = True):
+                 action_head_shortcut: bool = True, action_head_detach_gradient: bool = False):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim)
         assert predict in ("residual", "absolute")
@@ -445,11 +445,11 @@ class MultiModalFlow(MultiModalSequenceModel):
             self.df_level_emb = nn.Sequential(nn.Linear(2 * nfreq, d), nn.GELU(), nn.Linear(d, d))
         # ---- action-distribution head (opt-in; a learned behavior/play PRIOR for MPPI, never fed back into
         # the WM). Same FlowField class as the dynamics head: predicts the NEXT action a[t] (dz=action_dim)
-        # from the PREVIOUS-step pooled backbone context h[t-1] (leak-free — it never sees a[t]). shape_trunk
+        # from the PREVIOUS-step pooled backbone context h[t-1] (leak-free — it never sees a[t]). detach_gradient
         # controls whether its gradient reshapes the WM trunk. See design/models/flow_heads.md.
         self.action_head_enabled = bool(action_head_enabled)
         self.action_head_weight = float(action_head_weight)
-        self.action_head_shape_trunk = bool(action_head_shape_trunk)
+        self.action_head_detach_gradient = bool(action_head_detach_gradient)
         if self.action_head_enabled:
             self.action_flow = FlowField(action_dim, h_dim=d, hidden=(flow_hidden or d), cond="concat",
                                          shortcut=action_head_shortcut)
@@ -491,10 +491,10 @@ class MultiModalFlow(MultiModalSequenceModel):
         if self.action_head_enabled and L >= 3:
             # action-flow PRIOR: predict a[t] from the PREVIOUS-step pooled context h[t-1] (leak-free — h[t-1]
             # never attended to a[t]). Pool the backbone context over the bag's tokens -> one vector per step.
-            # shape_trunk=False -> detach so the action task does NOT reshape the WM trunk.
+            # detach_gradient=True -> detach so the action task does NOT reshape the WM trunk.
             h_ctx = h.mean(dim=-2)                              # (B, L-1, d): per-step context (all input tokens)
             cond = h_ctx[:, :-1]                                # h[t-1], aligned to predict a[t] for t=1..L-2
-            if not self.action_head_shape_trunk:
+            if self.action_head_detach_gradient:
                 cond = cond.detach()
             a_target = act_seq[:, 1:L - 1].detach()             # normalized a[1..L-2] (never the a[t] in cond)
             l_aflow, l_acons = self.action_flow.loss(cond, a_target, time_sampling=self.time_sampling)
