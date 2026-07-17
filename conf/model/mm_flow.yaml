@@ -26,6 +26,17 @@ diffusion:
   stochastic_eval: false   # false -> eps=0 committed prediction at eval
   time_sampling: uniform
   flow_hidden: 0           # 0 -> mirror d
+# action-distribution head (design/models/flow_heads.md — the action-flow prior). A FlowField that predicts
+# the NEXT action's distribution from the PREVIOUS-step backbone context h[t-1] (leak-free: it never sees the
+# action a[t] it predicts, only history). Trained JOINTLY as an extra flow loss; it is a learned behavior/play
+# prior used LATER as the MPPI proposal — its samples are NEVER fed back into the world model. Eyeballed via the
+# eval_action_distribution routine (true-vs-pred histograms + animation). enabled: false -> no head, bit-identical.
+action_head:
+  enabled: false            # true -> add the action-flow head + loss/flow/action (+ loss/shortcut/action)
+  weight: 1.0               # weight of the action-flow loss in the total training loss
+  shortcut: true            # K=1 sampling (fast MPPI proposal); like the dynamics diffusion.shortcut
+  shape_trunk: true         # true = action-head gradients flow into (reshape) the WM trunk during joint training;
+  #                           false = context detached, so the action head is a non-interfering probe on the trunk
 modalities:
   # decode_kind: flow -> generative decode head per trunk (design/models/flow_heads.md). mse (default) =
   # deterministic decode, bit-identical to before. decode_shortcut: true -> K=1 sampling (EXPLICIT opt-in, like

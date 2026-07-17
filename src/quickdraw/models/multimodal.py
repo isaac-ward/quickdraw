@@ -415,7 +415,9 @@ class MultiModalFlow(MultiModalSequenceModel):
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = False, time_sampling: str = "uniform", flow_hidden: int = 0,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
-                 df_scale: float = 0.0, df_granularity: str = "timestep"):
+                 df_scale: float = 0.0, df_granularity: str = "timestep",
+                 action_head_enabled: bool = False, action_head_weight: float = 1.0,
+                 action_head_shortcut: bool = True, action_head_shape_trunk: bool = True):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim)
         assert predict in ("residual", "absolute")
@@ -441,6 +443,16 @@ class MultiModalFlow(MultiModalSequenceModel):
             nfreq = 16
             self.register_buffer("_df_freqs", 2.0 * _math.pi * torch.logspace(0.0, 2.0, nfreq), persistent=False)
             self.df_level_emb = nn.Sequential(nn.Linear(2 * nfreq, d), nn.GELU(), nn.Linear(d, d))
+        # ---- action-distribution head (opt-in; a learned behavior/play PRIOR for MPPI, never fed back into
+        # the WM). Same FlowField class as the dynamics head: predicts the NEXT action a[t] (dz=action_dim)
+        # from the PREVIOUS-step pooled backbone context h[t-1] (leak-free — it never sees a[t]). shape_trunk
+        # controls whether its gradient reshapes the WM trunk. See design/models/flow_heads.md.
+        self.action_head_enabled = bool(action_head_enabled)
+        self.action_head_weight = float(action_head_weight)
+        self.action_head_shape_trunk = bool(action_head_shape_trunk)
+        if self.action_head_enabled:
+            self.action_flow = FlowField(action_dim, h_dim=d, hidden=(flow_hidden or d), cond="concat",
+                                         shortcut=action_head_shortcut)
 
     def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
         """Add a per-timestep noise-level embedding to the state tokens (DF). levels: (...,1) in [0,1] over the
@@ -476,4 +488,23 @@ class MultiModalFlow(MultiModalSequenceModel):
         raw, w = {"flow/latent": l_flow}, {"flow/latent": self.lambda_flow}   # dynamics flow (was "flow")
         if l_cons is not None:
             raw["shortcut/latent"], w["shortcut/latent"] = l_cons, self.lambda_consistency   # was "flow_consistency"
+        if self.action_head_enabled and L >= 3:
+            # action-flow PRIOR: predict a[t] from the PREVIOUS-step pooled context h[t-1] (leak-free — h[t-1]
+            # never attended to a[t]). Pool the backbone context over the bag's tokens -> one vector per step.
+            # shape_trunk=False -> detach so the action task does NOT reshape the WM trunk.
+            h_ctx = h.mean(dim=-2)                              # (B, L-1, d): per-step context (all input tokens)
+            cond = h_ctx[:, :-1]                                # h[t-1], aligned to predict a[t] for t=1..L-2
+            if not self.action_head_shape_trunk:
+                cond = cond.detach()
+            a_target = act_seq[:, 1:L - 1].detach()             # normalized a[1..L-2] (never the a[t] in cond)
+            l_aflow, l_acons = self.action_flow.loss(cond, a_target, time_sampling=self.time_sampling)
+            raw["flow/action"], w["flow/action"] = l_aflow, self.action_head_weight
+            if l_acons is not None:
+                raw["shortcut/action"], w["shortcut/action"] = l_acons, self.action_head_weight
         return raw, w
+
+    def sample_action(self, h_ctx: Tensor, *, deterministic: bool = False, eps: Tensor | None = None) -> Tensor:
+        """Sample from the learned action PRIOR given a per-step context vector `h_ctx` (..., d) — the pooled
+        backbone context h[t-1]. Returns NORMALIZED actions (..., action_dim); the caller denorms. For the
+        eval_action_distribution routine + the MPPI proposal. Requires action_head_enabled."""
+        return self.action_flow.sample(h_ctx, steps=self.sampling_steps, deterministic=deterministic, eps=eps)

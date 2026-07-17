@@ -69,6 +69,8 @@ def build_model(cfg):
                                  "(disable contraction, weight=0, to train diffusion).")
             d = m.get("diffusion", {})
             dfg = (lambda k, v: d.get(k, v)) if hasattr(d, "get") else (lambda k, v: getattr(d, k, v))
+            ah = m.get("action_head", {}) or {}                # action-distribution prior (opt-in)
+            ahg = (lambda k, v: ah.get(k, v)) if hasattr(ah, "get") else (lambda k, v: getattr(ah, k, v))
             return MultiModalFlow(**common, sampling_steps=int(dfg("sampling_steps", 6)),
                                        shortcut=bool(dfg("shortcut", False)), predict=str(dfg("predict", "residual")),
                                        stochastic_eval=bool(dfg("stochastic_eval", False)),
@@ -76,7 +78,11 @@ def build_model(cfg):
                                        flow_hidden=int(dfg("flow_hidden", 0)),
                                        lambda_flow=m.get("lambda_flow", 1.0),
                                        lambda_consistency=m.get("lambda_consistency", 1.0),
-                                       df_scale=df_scale, df_granularity=df_granularity)
+                                       df_scale=df_scale, df_granularity=df_granularity,
+                                       action_head_enabled=bool(ahg("enabled", False)),
+                                       action_head_weight=float(ahg("weight", 1.0)),
+                                       action_head_shortcut=bool(ahg("shortcut", True)),
+                                       action_head_shape_trunk=bool(ahg("shape_trunk", True)))
         raise ValueError(f"unknown model.name: {name!r}")
 
 
