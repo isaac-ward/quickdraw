@@ -8,9 +8,22 @@ rope_theta: 10000.0
 action_dim: 2
 lambda_flow: 1.0
 lambda_consistency: 1.0
+# TEACHER-FORCING SCHEDULE — p_tf ramps p_tf_start -> p_tf_end over p_tf_warmup_epochs.
+# EMPIRICAL FINDING (2026-07, bimodal data) — DO NOT REGRESS THIS DEFAULT:
+#   p_tf_end=0.0 (IN-ROLLOUT: dynamics trains on its OWN predictions) is the WORKING default. It prevents the
+#   autoregressive MEAN-COLLAPSE (proprio->origin, images->one frozen frame) that full teacher-forcing causes:
+#   under p_tf_end=1.0 the dynamics NEVER sees its own errors, so at rollout it drifts to the unconditional-mean
+#   attractor (val flow/latent 4-8, encode_image grad spikes ~4.34). In-rollout: val 0.81->0.32, pointwise 0.61.
+#   Diffusion Forcing (variations.noise_injection.observations_encoded_pre_fusion.scale) is NOT a substitute —
+#   at scale 0.25/1.0 it made collapse WORSE (train-noised/val-clean 1-step mismatch) and DF-alone eventually
+#   NaNs under full TF; IWS's 0.1 stayed stable but still needs in-rollout for the residual drift. So: keep
+#   p_tf_end=0.0 (in-rollout), keep DF scale=0.0 (off). The anti-collapse lever is in-rollout, not DF.
 p_tf_start: 1.0
 p_tf_end: 0.0
 p_tf_warmup_epochs: 4
+dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding the DYNAMICS (flow/latent) loss:
+#                           the dynamics gradient can't reshape the encoder (trained then only by decode/recon).
+#                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.
 recon_frac: 1.0            # fraction (0-1) of the F rollout frames to supervise the decode recon on (train only;
                            #   ALL output modalities, same random subset per step). 1.0=all. <1 saves ViT-AE decode compute.
 detach_every: 16

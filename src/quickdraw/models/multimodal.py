@@ -417,7 +417,8 @@ class MultiModalFlow(MultiModalSequenceModel):
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
-                 action_head_shortcut: bool = True, action_head_detach_gradient: bool = False):
+                 action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
+                 dynamics_detach_encoder: bool = False):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim)
         assert predict in ("residual", "absolute")
@@ -450,6 +451,10 @@ class MultiModalFlow(MultiModalSequenceModel):
         self.action_head_enabled = bool(action_head_enabled)
         self.action_head_weight = float(action_head_weight)
         self.action_head_detach_gradient = bool(action_head_detach_gradient)
+        # dynamics_detach_encoder: stop-grad the ENCODED context feeding the DYNAMICS (flow/latent) loss, so the
+        # dynamics gradient cannot reshape the encoder. The encoder is then trained ONLY by the decode/recon loss
+        # (which has no collapse shortcut) — the joint-training equivalent of IWS's frozen AE. See loss_terms.
+        self.dynamics_detach_encoder = bool(dynamics_detach_encoder)
         if self.action_head_enabled:
             self.action_flow = FlowField(action_dim, h_dim=d, hidden=(flow_hidden or d), cond="concat",
                                          shortcut=action_head_shortcut)
@@ -475,6 +480,8 @@ class MultiModalFlow(MultiModalSequenceModel):
         z = self.encode_state(obs)                              # (B,L,n_state,d)
         L = z.shape[1]
         s = z[:, :-1]                                           # contexts (B,L-1,n_state,d)
+        if self.dynamics_detach_encoder:                        # stop-grad: dynamics loss won't reshape the encoder
+            s = s.detach()                                      #   (encoder trained only by decode/recon; anti-collapse)
         levels = None
         if self.df_scale > 0.0 and self.training:               # diffusion forcing: noise the context + tell the backbone
             levels = torch.rand(s.shape[:-2] + (1,), device=s.device, dtype=s.dtype) * self.df_scale  # (B,L-1,1)

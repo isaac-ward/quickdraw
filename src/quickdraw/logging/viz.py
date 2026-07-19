@@ -1182,73 +1182,79 @@ def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
     return fig
 
 
-def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=None, dpi=90):
+def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=None, dpi=90, window=0):
     """Animated 3-panel action-magnitude histogram over time for eval_action_distribution: LEFT = true (green),
     MIDDLE = pred (red), RIGHT = the two overlaid at 50% opacity. Axes (x=|a| range, y=density) are LOCKED across
     every frame AND identical on all three panels, computed up front over ALL data. Densities (not counts), so
     true/pred are comparable even with different sample counts. `true_acts`/`pred_acts`: (N, steps, action_dim).
-    max_frames=None -> one frame per timestep (no cap)."""
+    max_frames=None -> one frame per timestep (no cap). window>0 -> each frame pools timesteps [t-w, t+w] (the
+    dist changes slowly -> ~(2w+1)x more samples/frame at negligible bias; the way to densify past #episodes)."""
     tm = np.linalg.norm(np.asarray(true_acts), axis=-1)     # (N, steps)
     pm = np.linalg.norm(np.asarray(pred_acts), axis=-1)
     steps = tm.shape[1]
+    def win(a, t):                                          # samples pooled over [t-w, t+w]
+        return a[:, max(0, t - window): t + window + 1].reshape(-1)
     hi = min(float(a_max), max(float(tm.max()), float(pm.max())) * 1.05)   # x-lim over ALL data
     edges = np.linspace(0.0, hi, bins + 1)
     ymax = 0.0                                                              # y-lim = worst-case density over ALL frames
     for t in range(steps):
-        ymax = max(ymax, float(np.histogram(tm[:, t], bins=edges, density=True)[0].max()),
-                   float(np.histogram(pm[:, t], bins=edges, density=True)[0].max()))
+        ymax = max(ymax, float(np.histogram(win(tm, t), bins=edges, density=True)[0].max()),
+                   float(np.histogram(win(pm, t), bins=edges, density=True)[0].max()))
     ymax = ymax * 1.08 or 1.0
     ts = (range(steps) if (max_frames is None or steps <= max_frames)
           else np.linspace(0, steps - 1, max_frames).round().astype(int))
     green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
     frames = []
     for t in ts:
-        t = int(t)
+        t = int(t); tw, pw = win(tm, t), win(pm, t)
         fig, ax = plt.subplots(1, 3, figsize=(15, 4.4))
         for a in ax:
             a.set_xlim(0, hi); a.set_ylim(0, ymax); a.set_xlabel("|a|")
-        ax[0].hist(tm[:, t], bins=edges, density=True, color=green, alpha=0.5); ax[0].set_title(f"true ({tm.shape[0]} samples)")
-        ax[1].hist(pm[:, t], bins=edges, density=True, color=red, alpha=0.5); ax[1].set_title(f"pred ({pm.shape[0]} samples)")
-        ax[2].hist(tm[:, t], bins=edges, density=True, color=green, alpha=0.5, label="true")
-        ax[2].hist(pm[:, t], bins=edges, density=True, color=red, alpha=0.5, label="pred")
+        ax[0].hist(tw, bins=edges, density=True, color=green, alpha=0.5); ax[0].set_title(f"true ({tw.size} samples)")
+        ax[1].hist(pw, bins=edges, density=True, color=red, alpha=0.5); ax[1].set_title(f"pred ({pw.size} samples)")
+        ax[2].hist(tw, bins=edges, density=True, color=green, alpha=0.5, label="true")
+        ax[2].hist(pw, bins=edges, density=True, color=red, alpha=0.5, label="pred")
         ax[2].set_title("both"); ax[2].legend(loc="upper right", fontsize=9)
-        fig.suptitle(f"action-magnitude distribution  ·  t={t}/{steps - 1}", fontsize=13)
+        fig.suptitle(f"action-magnitude distribution  ·  t={t}/{steps - 1}"
+                     + (f"  (±{window} pooled)" if window else ""), fontsize=13)
         fig.tight_layout(rect=(0, 0, 1, 0.93)); fig.set_dpi(dpi)
         frames.append(_fig_rgb(fig)); plt.close(fig)
     return np.stack(frames)
 
 
-def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=None, dpi=90):
+def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=None, dpi=90, window=0):
     """Animated BY-X action-magnitude histograms over time: 2 rows (TOP x<0 slow, BOTTOM x>=0 fast) x 3 cols
     (true green | pred red | both). Splitting by the sign of ambient x keeps each basin's mode crisp — pooling
     over all x smears the state-dependent scale together. Densities (comparable despite differing per-frame
-    counts); x-range and y-range are locked across every frame and panel. true/pred: (N, steps, 2); x: (N, steps)."""
+    counts); x-range and y-range are locked across every frame and panel. true/pred: (N, steps, 2); x: (N, steps).
+    window>0 -> each frame pools timesteps [t-w, t+w] (~(2w+1)x more samples/frame, the way to densify past #episodes)."""
     tm = np.linalg.norm(np.asarray(true_acts), axis=-1)      # (N, steps)
     pm = np.linalg.norm(np.asarray(pred_acts), axis=-1)
     x = np.asarray(x)
     steps = tm.shape[1]
+    def wsel(a, t, neg):                                      # samples in [t-w,t+w] on the requested x-half
+        lo, hiw = max(0, t - window), t + window + 1
+        aw, xw = a[:, lo:hiw], x[:, lo:hiw]
+        return aw[(xw < 0.0) if neg else (xw >= 0.0)]
     hi = min(float(a_max), max(float(tm.max()), float(pm.max())) * 1.05)
     edges = np.linspace(0.0, hi, bins + 1)
-    masks = (x < 0.0, x >= 0.0)
     ymax = 0.0                                                # locked y (density) over all frames/rows/panels
     for t in range(steps):
-        for keep in masks:
-            k = keep[:, t]
-            for m in (tm[:, t][k], pm[:, t][k]):
+        for neg in (True, False):
+            for m in (wsel(tm, t, neg), wsel(pm, t, neg)):
                 if m.size:
                     ymax = max(ymax, float(np.histogram(m, bins=edges, density=True)[0].max()))
     ymax = ymax * 1.08 or 1.0
     ts = (range(steps) if (max_frames is None or steps <= max_frames)
           else np.linspace(0, steps - 1, max_frames).round().astype(int))
     green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
-    rows = (("x < 0 (slow)", 0), ("x ≥ 0 (fast)", 1))
+    rows = (("x < 0 (slow)", 0, True), ("x ≥ 0 (fast)", 1, False))
     frames = []
     for t in ts:
         t = int(t)
         fig, ax = plt.subplots(2, 3, figsize=(15, 8), sharex=True, sharey=True)
-        for (lbl, r), keep in zip(rows, masks):
-            k = keep[:, t]
-            tt, pp = tm[:, t][k], pm[:, t][k]
+        for lbl, r, neg in rows:
+            tt, pp = wsel(tm, t, neg), wsel(pm, t, neg)
             for c in range(3):
                 ax[r, c].set_xlim(0, hi); ax[r, c].set_ylim(0, ymax)
             if tt.size: ax[r, 0].hist(tt, bins=edges, density=True, color=green, alpha=0.6)
@@ -1260,27 +1266,33 @@ def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=Non
             ax[r, 2].set_title(f"{lbl} · both", fontsize=10); ax[r, 2].legend(loc="upper right", fontsize=8)
         for c in range(3):
             ax[1, c].set_xlabel("|a|")
-        fig.suptitle(f"action-magnitude by x-sign  ·  t={t}/{steps - 1}", fontsize=13)
+        fig.suptitle(f"action-magnitude by x-sign  ·  t={t}/{steps - 1}"
+                     + (f"  (±{window} pooled)" if window else ""), fontsize=13)
         fig.tight_layout(rect=(0, 0, 1, 0.94)); fig.set_dpi(dpi)
         frames.append(_fig_rgb(fig)); plt.close(fig)
     return np.stack(frames)
 
 
-def fig_action_by_state(act, x, a_max, sampler_name="", n_cols=4):
+def fig_action_by_state(act, x, a_max, sampler_name="", n_cols=4, window=0):
     """Action-magnitude distribution split by the sign of ambient x (the state-dependence division): TOP row =
     x<0 (slow half), BOTTOM row = x>=0 (fast half); columns are uniformly-spaced timesteps. Same column across
     rows -> same timestep, so slow-vs-fast is directly comparable. Histograms are densities (comparable across
-    tiles despite differing counts). `act` (n_traj, steps, 2), `x` (n_traj, steps) ambient x."""
+    tiles despite differing counts). `act` (n_traj, steps, 2), `x` (n_traj, steps) ambient x. window>0 -> each
+    column pools timesteps [t-w, t+w] (~(2w+1)x more samples/tile)."""
     a = np.asarray(act); n_traj = a.shape[0]
     mag = np.linalg.norm(a, axis=-1)                 # (n_traj, steps)
     x = np.asarray(x)                                # (n_traj, steps)
     steps = mag.shape[1]
     cols = [int(round(f * (steps - 1))) for f in np.linspace(0.05, 1.0, n_cols)]   # uniform timesteps
     hi = min(float(a_max), float(mag.max()) * 1.15)
+    def wsel(t, neg):                                # samples in [t-w,t+w] on the requested x-half
+        lo, hiw = max(0, t - window), t + window + 1
+        mw, xw = mag[:, lo:hiw], x[:, lo:hiw]
+        return mw[(xw < 0.0) if neg else (xw >= 0.0)]
     fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 7), sharex=True, sharey=True)
-    for r, (lbl, keep) in enumerate((("x < 0 (slow)", x < 0.0), ("x ≥ 0 (fast)", x >= 0.0))):
+    for r, (lbl, neg) in enumerate((("x < 0 (slow)", True), ("x ≥ 0 (fast)", False))):
         for c, t in enumerate(cols):
-            m = mag[:, t][keep[:, t]]
+            m = wsel(t, neg)
             ax = axes[r, c]
             ax.hist(m, bins=55, range=(0, hi), density=True, color="steelblue")
             ax.set_title(f"{lbl},  t={t}  (n={m.size})", fontsize=10)

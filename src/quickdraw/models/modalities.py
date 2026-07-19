@@ -44,6 +44,8 @@ class ModalitySpec:
     encode_arch: str = "vit"  # IMAGE encoder architecture: "vit" (ViT/Perceiver, ImageAutoencoder.encode) | "conv"
     #                           (ConvImageEncoder, mirrors the U-Net down-path). Pair conv<->unet for a symmetric
     #                           conv enc/dec. Both emit num_tokens tokens (same interface). Ignored by vectors.
+    decode_base: int = 32     # decode_arch=unet ONLY: U-Net base channel width (chs = [base, 2b, 4b, ...]). Bigger
+    #                           -> a stronger denoiser for flow decode (sharper images). Ignored by vit/mlp.
     # vector
     dim: int = 6
     # image
@@ -139,7 +141,8 @@ class ImageModality(Modality):
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         if self.decode_arch == "unet":
-            self.decode_head = ImageUNetFlowHead(self.ae.cfg, param=param, shortcut=sc, no_noise=no_noise)
+            self.decode_head = ImageUNetFlowHead(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
+                                                 param=param, shortcut=sc, no_noise=no_noise)
         else:
             self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc, no_noise=no_noise)
 

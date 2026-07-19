@@ -82,7 +82,8 @@ def build_model(cfg):
                                        action_head_enabled=bool(ahg("enabled", False)),
                                        action_head_weight=float(ahg("weight", 1.0)),
                                        action_head_shortcut=bool(ahg("shortcut", True)),
-                                       action_head_detach_gradient=bool(ahg("detach_gradient", False)))
+                                       action_head_detach_gradient=bool(ahg("detach_gradient", False)),
+                                       dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)))
         raise ValueError(f"unknown model.name: {name!r}")
 
 

@@ -641,8 +641,11 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     pred_a = norm.denorm_act(m.sample_action(h_ctx).cpu()).numpy()   # (E,L-1,2) head, 1/context
     prog(50, "head sampling")
 
+    # window: pool +/-w timesteps per frame/tile -> ~(2w+1)x more samples (the dist changes slowly, so bias is
+    # tiny). This is the way to densify PAST the #episodes ceiling. w=4 -> ~9x for both true and pred.
+    win = int(cfg.eval.get("action_dist_window", 4) or 0)
     for name, arr in (("true", true_a), ("pred", pred_a)):       # by-x 2-row static: recorded vs head
-        fig = viz.fig_action_by_state(arr, x, ecfg.a_max, sampler_name=f"{asamp} · {name}")
+        fig = viz.fig_action_by_state(arr, x, ecfg.a_max, sampler_name=f"{asamp} · {name}", window=win)
         writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
 
     tm, pm = np.linalg.norm(true_a, axis=-1).reshape(-1), np.linalg.norm(pred_a, axis=-1).reshape(-1)
@@ -652,12 +655,12 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     prog(70, f"by-x static + distance (w1={w1:.3f})")
 
     fps = round(1.0 / ecfg.dt)
-    # POOLED over all episodes per frame (recorded green vs head red), ALL timesteps (no frame cap).
-    frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max)
+    # POOLED over all episodes per frame (recorded green vs head red), ALL timesteps (no frame cap), +/-win pooled.
+    frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max, window=win)
     writer.video("eval_action_distribution/animation_pooled", frames, fps, step)
     prog(85, "animation (pooled)")
     # BY-X: split into x<0 / x>=0 rows so each basin's mode stays crisp (pooling over all x smears them).
-    frames_bx = viz.anim_action_by_state(true_a, pred_a, x, ecfg.a_max)
+    frames_bx = viz.anim_action_by_state(true_a, pred_a, x, ecfg.a_max, window=win)
     writer.video("eval_action_distribution/animation_byx", frames_bx, fps, step)
     prog(95, "animation (by-x)")
 
