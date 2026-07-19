@@ -1182,25 +1182,23 @@ def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
     return fig
 
 
-def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=200, dpi=90):
-    """Animated 3-panel action-magnitude histogram over time (one frame per timestep) for eval_action_distribution:
-    LEFT = true (green), MIDDLE = pred (red), RIGHT = the two overlaid — true green, pred red, both at 50% opacity
-    so the panels look consistent and the third is directly comparable. Axes (x=|a| range, y=count) are LOCKED
-    across every frame AND identical on all three panels, computed up front over ALL data so nothing clips.
-    `true_acts`/`pred_acts`: (N, steps, action_dim); pass the SAME N so the counts are directly comparable.
-    """
+def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=None, dpi=90):
+    """Animated 3-panel action-magnitude histogram over time for eval_action_distribution: LEFT = true (green),
+    MIDDLE = pred (red), RIGHT = the two overlaid at 50% opacity. Axes (x=|a| range, y=density) are LOCKED across
+    every frame AND identical on all three panels, computed up front over ALL data. Densities (not counts), so
+    true/pred are comparable even with different sample counts. `true_acts`/`pred_acts`: (N, steps, action_dim).
+    max_frames=None -> one frame per timestep (no cap)."""
     tm = np.linalg.norm(np.asarray(true_acts), axis=-1)     # (N, steps)
     pm = np.linalg.norm(np.asarray(pred_acts), axis=-1)
-    assert tm.shape[0] == pm.shape[0], f"true/pred need the same sample count ({tm.shape[0]} vs {pm.shape[0]})"
     steps = tm.shape[1]
     hi = min(float(a_max), max(float(tm.max()), float(pm.max())) * 1.05)   # x-lim over ALL data
     edges = np.linspace(0.0, hi, bins + 1)
-    ymax = 0                                                                # y-lim = worst-case count over ALL frames
+    ymax = 0.0                                                              # y-lim = worst-case density over ALL frames
     for t in range(steps):
-        ymax = max(ymax, int(np.histogram(tm[:, t], bins=edges)[0].max()),
-                   int(np.histogram(pm[:, t], bins=edges)[0].max()))
+        ymax = max(ymax, float(np.histogram(tm[:, t], bins=edges, density=True)[0].max()),
+                   float(np.histogram(pm[:, t], bins=edges, density=True)[0].max()))
     ymax = ymax * 1.08 or 1.0
-    ts = (range(steps) if steps <= max_frames
+    ts = (range(steps) if (max_frames is None or steps <= max_frames)
           else np.linspace(0, steps - 1, max_frames).round().astype(int))
     green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
     frames = []
@@ -1209,10 +1207,10 @@ def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=20
         fig, ax = plt.subplots(1, 3, figsize=(15, 4.4))
         for a in ax:
             a.set_xlim(0, hi); a.set_ylim(0, ymax); a.set_xlabel("|a|")
-        ax[0].hist(tm[:, t], bins=edges, color=green, alpha=0.5); ax[0].set_title(f"true ({tm.shape[0]} samples)")
-        ax[1].hist(pm[:, t], bins=edges, color=red, alpha=0.5); ax[1].set_title(f"pred ({pm.shape[0]} samples)")
-        ax[2].hist(tm[:, t], bins=edges, color=green, alpha=0.5, label="true")
-        ax[2].hist(pm[:, t], bins=edges, color=red, alpha=0.5, label="pred")
+        ax[0].hist(tm[:, t], bins=edges, density=True, color=green, alpha=0.5); ax[0].set_title(f"true ({tm.shape[0]} samples)")
+        ax[1].hist(pm[:, t], bins=edges, density=True, color=red, alpha=0.5); ax[1].set_title(f"pred ({pm.shape[0]} samples)")
+        ax[2].hist(tm[:, t], bins=edges, density=True, color=green, alpha=0.5, label="true")
+        ax[2].hist(pm[:, t], bins=edges, density=True, color=red, alpha=0.5, label="pred")
         ax[2].set_title("both"); ax[2].legend(loc="upper right", fontsize=9)
         fig.suptitle(f"action-magnitude distribution  ·  t={t}/{steps - 1}", fontsize=13)
         fig.tight_layout(rect=(0, 0, 1, 0.93)); fig.set_dpi(dpi)
@@ -1220,7 +1218,7 @@ def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=20
     return np.stack(frames)
 
 
-def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=200, dpi=90):
+def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=None, dpi=90):
     """Animated BY-X action-magnitude histograms over time: 2 rows (TOP x<0 slow, BOTTOM x>=0 fast) x 3 cols
     (true green | pred red | both). Splitting by the sign of ambient x keeps each basin's mode crisp — pooling
     over all x smears the state-dependent scale together. Densities (comparable despite differing per-frame
@@ -1240,7 +1238,7 @@ def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=200
                 if m.size:
                     ymax = max(ymax, float(np.histogram(m, bins=edges, density=True)[0].max()))
     ymax = ymax * 1.08 or 1.0
-    ts = (range(steps) if steps <= max_frames
+    ts = (range(steps) if (max_frames is None or steps <= max_frames)
           else np.linspace(0, steps - 1, max_frames).round().astype(int))
     green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
     rows = (("x < 0 (slow)", 0), ("x ≥ 0 (fast)", 1))

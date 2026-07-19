@@ -594,16 +594,16 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
 def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     """The learned action PRIOR (action-flow head) vs the TRUE data action distribution. Self-skips unless
     the model has an action head. All under eval_action_distribution/:
-      - by_state_{true,pred}: |a| split by sign of ambient x (slow x<0 / fast x>=0) x uniform timesteps (K/context).
-      - animation_pooled (bimodal only): true(green)|pred(red)|both, POOLED over all episodes/frame (both basins -> bimodal).
-      - animation_byx (bimodal only): same, split into x<0 / x>=0 rows so each basin's mode stays crisp.
+      - by_state_{true,pred}: |a| split by sign of ambient x (slow x<0 / fast x>=0) x uniform timesteps.
+      - animation_pooled: true(green)|pred(red)|both, POOLED over all episodes/frame, ALL timesteps (no cap).
+      - animation_byx: same, split into x<0 / x>=0 rows so each basin's mode stays crisp.
       - action_true_pred_w1: 1D-Wasserstein between pooled true and pred |a| (scalar, lower=better).
-    The head predicts a[k+1] from the leak-free context h[k]; true = the sampler's per-state conditional (dense)."""
+    TRUE = the RECORDED actions (actual history-conditioned data); PRED = one head draw/context (h[k] -> a[k+1],
+    leak-free) — the fair comparison for a history-conditioned head. Smoothness scales with #episodes, not samples."""
     m = getattr(model, "_orig_mod", model)
     if not getattr(m, "action_head_enabled", False):
         return {}                                                # no action head -> skip
     from ..data.dataset import load_split_episodes_mm
-    from ..environments.torus import BimodalActionSampler
     was = m.training; m.eval()
     t0 = time.perf_counter()
     def prog(p, w): _plog(writer, f"[eval_action_distribution @ep{step}] {p:3d}% — {w}")
@@ -618,7 +618,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     except Exception:
         pass
     eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
-    n_ep = min(int(cfg.eval.get("action_dist_episodes", 32) or 32), len(eps))   # default 32 (>>8) so bins fill
+    n_ep = min(int(cfg.eval.get("action_dist_episodes", 64) or 64), len(eps))   # default 64 = full val split (max distinct contexts)
     eps = eps[:n_ep]
     L = min(len(o) for o, _, _ in eps)
     prog(0, f"start: {n_ep} val episodes, L={L}, sampler={asamp}")
@@ -630,46 +630,36 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
 
     h_ctx = m.action_context(ctx, act)                           # (E,L-1,d): h[k] predicts a[k+1] (leak-free)
     x = np.stack([o[1:L, 0] for o, _, _ in eps]).astype(np.float32)   # ambient x at each action's state (E,L-1)
-    prog(20, "context")
+    prog(30, "context")
 
-    # DENSIFY: draw K samples per context so the by-x tiles and the animations are smooth. One sample/context
-    # gives n~4-12/tile (unreadable). pred = K head draws/context; true = K draws from the sampler's per-state
-    # stationary conditional (the faithful data-generating dist). Non-bimodal data has no analytic conditional
-    # -> fall back to the recorded actions (one/context) and skip the animations.
-    K = max(1, viz.ACTION_DIST_N_SAMPLES // n_ep)
-    if asamp == "bimodal":
-        sampler = BimodalActionSampler(1, ecfg.a_max, device=device)
-        true_a = np.stack([np.concatenate([norm.denorm_act(sampler.sample_at_state(float(x[e, k]), K).cpu()).numpy()
-                                           for e in range(n_ep)], axis=0) for k in range(L - 1)], axis=1)  # (E*K,L-1,2)
-        pred_a = norm.denorm_act(m.sample_action(h_ctx.repeat_interleave(K, dim=0)).cpu()).numpy()          # (E*K,L-1,2)
-        x_plot = np.repeat(x, K, axis=0)                          # (E*K,L-1), aligned (row i -> episode i//K)
-    else:
-        true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()        # (E,L-1,2) recorded
-        pred_a = norm.denorm_act(m.sample_action(h_ctx).cpu()).numpy()   # (E,L-1,2)
-        x_plot = x
-    prog(45, f"dense sampling (K={K}/context)")
+    # TRUE = the RECORDED actions (the actual history-conditioned data distribution) — the fair reference for a
+    # history-conditioned head. PRED = ONE head draw per context (matching the data's 1-action/context), so both
+    # marginals are estimated the same way and are directly comparable. Smoothness comes from #EPISODES (more
+    # distinct contexts), NOT more samples/context: the head is sharp per context, so extra draws per context just
+    # stack onto the same few spikes. n_ep is capped by the val split (here 64).
+    true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()           # (E,L-1,2) recorded a[1..L-1]
+    pred_a = norm.denorm_act(m.sample_action(h_ctx).cpu()).numpy()   # (E,L-1,2) head, 1/context
+    prog(50, "head sampling")
 
-    for name, arr in (("true", true_a), ("pred", pred_a)):        # by-x 2-row static (pooled over episodes x K)
-        fig = viz.fig_action_by_state(arr, x_plot, ecfg.a_max, sampler_name=f"{asamp} · {name}")
+    for name, arr in (("true", true_a), ("pred", pred_a)):       # by-x 2-row static: recorded vs head
+        fig = viz.fig_action_by_state(arr, x, ecfg.a_max, sampler_name=f"{asamp} · {name}")
         writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
 
     tm, pm = np.linalg.norm(true_a, axis=-1).reshape(-1), np.linalg.norm(pred_a, axis=-1).reshape(-1)
     q = np.linspace(0.0, 1.0, 512)
-    w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a|
+    w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a| (vs recorded)
     writer.scalar("eval_action_distribution/true_pred_w1", w1, step)
-    prog(65, f"by-x static + distance (w1={w1:.3f})")
+    prog(70, f"by-x static + distance (w1={w1:.3f})")
 
-    if asamp == "bimodal":
-        fps = round(1.0 / ecfg.dt)
-        # POOLED over all episodes per frame: both basins present -> true AND pred are bimodal & evolve. (A single
-        # trajectory sits in ONE basin, so the head correctly sharpens to it and looks unimodal — misleading.)
-        frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max, max_frames=200)
-        writer.video("eval_action_distribution/animation_pooled", frames, fps, step)
-        prog(80, "animation (pooled)")
-        # BY-X: same data split into x<0 / x>=0 rows so each basin's mode stays crisp (pooling over all x smears them).
-        frames_bx = viz.anim_action_by_state(true_a, pred_a, x_plot, ecfg.a_max, max_frames=200)
-        writer.video("eval_action_distribution/animation_byx", frames_bx, fps, step)
-        prog(90, "animation (by-x)")
+    fps = round(1.0 / ecfg.dt)
+    # POOLED over all episodes per frame (recorded green vs head red), ALL timesteps (no frame cap).
+    frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max)
+    writer.video("eval_action_distribution/animation_pooled", frames, fps, step)
+    prog(85, "animation (pooled)")
+    # BY-X: split into x<0 / x>=0 rows so each basin's mode stays crisp (pooling over all x smears them).
+    frames_bx = viz.anim_action_by_state(true_a, pred_a, x, ecfg.a_max)
+    writer.video("eval_action_distribution/animation_byx", frames_bx, fps, step)
+    prog(95, "animation (by-x)")
 
     if was:
         m.train()
