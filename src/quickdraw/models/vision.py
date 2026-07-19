@@ -166,6 +166,60 @@ class _FiLMResBlock(nn.Module):
         return h + self.skip(x)
 
 
+class _ConvResBlock(nn.Module):
+    """Plain (unconditioned) conv residual block — the encoder counterpart of _FiLMResBlock (no FiLM: the encoder
+    has nothing to condition on)."""
+
+    def __init__(self, cin: int, cout: int):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(8, cin), cin)
+        self.conv1 = nn.Conv2d(cin, cout, 3, padding=1)
+        self.norm2 = nn.GroupNorm(min(8, cout), cout)
+        self.conv2 = nn.Conv2d(cout, cout, 3, padding=1)
+        self.skip = nn.Conv2d(cin, cout, 1) if cin != cout else nn.Identity()
+
+    def forward(self, x):
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.skip(x)
+
+
+class ConvImageEncoder(nn.Module):
+    """Convolutional image encoder that MIRRORS ConditionalUNet's down-path, so a conv encoder can pair with the
+    conv (unet) decoder — symmetric inductive bias, no patch grid. Same output contract as ImageAutoencoder.encode:
+    (M,H,W,3)[0,1] -> (M, num_tokens, d). Conv pyramid -> a small bottleneck feature map -> num_tokens learned
+    queries cross-attend it (Perceiver bottleneck, same as the ViT encoder) so the token count/interface is
+    identical and the projection stays cheap (no dense flatten)."""
+
+    def __init__(self, cfg: VisionAEConfig, *, base: int = 32):
+        super().__init__()
+        import math
+        self.cfg = cfg
+        C, d, T = cfg.channels, cfg.d, cfg.num_tokens
+        n_levels = max(1, int(math.log2(max(8, cfg.img_size) // 8)))   # keep the bottleneck ~8px (mirrors the U-Net)
+        chs = [base * min(4, 2 ** i) for i in range(n_levels)]
+        self.in_conv = nn.Conv2d(C, chs[0], 3, padding=1)
+        prev, self.downs = chs[0], nn.ModuleList()
+        for ch in chs:
+            self.downs.append(_ConvResBlock(prev, ch)); prev = ch
+        self.bott_hw = cfg.img_size // (2 ** len(chs))                 # 8 at 128px
+        self.to_d = nn.Conv2d(chs[-1], d, 1)                          # channels -> model dim
+        self.pos = nn.Parameter(torch.zeros(1, self.bott_hw * self.bott_hw, d))
+        self.latent_q = nn.Parameter(torch.zeros(1, T, d))
+        self.to_latent = CrossAttn(d, cfg.heads)
+        self.latent_norm = nn.LayerNorm(d)
+        for p in (self.pos, self.latent_q):
+            nn.init.trunc_normal_(p, std=0.02)
+
+    def encode(self, img):                                            # (M,H,W,C)[0,1] -> (M,T,d)
+        h = self.in_conv(img.permute(0, 3, 1, 2))
+        for down in self.downs:
+            h = down(h); h = F.avg_pool2d(h, 2)
+        x = self.to_d(h).flatten(2).transpose(1, 2) + self.pos        # (M, bott_hw^2, d)
+        z = self.to_latent(self.latent_q.expand(x.shape[0], -1, -1), x)
+        return self.latent_norm(z)
+
+
 class ConditionalUNet(nn.Module):
     """Conv U-Net over an image, conditioned on the latent tokens (spatial injection at the bottleneck) + an
     optional time/step embedding. The convolutional alternative to the all-ViT image head — no patch grid, so

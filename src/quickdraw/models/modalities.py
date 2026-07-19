@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .flow import FlowField, ImageFlowHead, ImageUNetFlowHead
-from .vision import ImageAutoencoder, VisionAEConfig
+from .vision import ConvImageEncoder, ImageAutoencoder, VisionAEConfig
 
 
 def _mlp(i: int, o: int, h: int) -> nn.Sequential:
@@ -41,6 +41,9 @@ class ModalitySpec:
     decode_arch: str = "vit"  # IMAGE decoder architecture, ORTHOGONAL to decode_kind: "vit" (all-attention, patch
     #                           grid) | "unet" (conv U-Net, no patch grid -> smoother fields). Composes with both
     #                           mse and flow (4 combos). Ignored by vector modalities. See vision.ConditionalUNet.
+    encode_arch: str = "vit"  # IMAGE encoder architecture: "vit" (ViT/Perceiver, ImageAutoencoder.encode) | "conv"
+    #                           (ConvImageEncoder, mirrors the U-Net down-path). Pair conv<->unet for a symmetric
+    #                           conv enc/dec. Both emit num_tokens tokens (same interface). Ignored by vectors.
     # vector
     dim: int = 6
     # image
@@ -125,10 +128,13 @@ class ImageModality(Modality):
         self.noise_std = float(spec.noise_std)
         self.decode_kind = spec.decode_kind
         self.decode_arch = getattr(spec, "decode_arch", "vit")
-        self.ae = ImageAutoencoder(VisionAEConfig(
+        self.encode_arch = getattr(spec, "encode_arch", "vit")
+        ae_cfg = VisionAEConfig(
             img_size=spec.img_size, patch=spec.patch, d=d, enc_depth=spec.ae_depth,
             dec_depth=spec.ae_depth, num_tokens=spec.num_tokens, channels=spec.channels,
-            build_decoder=False))                  # encoder-only AE; the unified decode_head IS the decoder
+            build_decoder=False)                   # encoder-only; the unified decode_head IS the decoder
+        # `self.ae` is the encoder AND the cfg-holder the decode head reads (both variants expose .cfg + .encode()).
+        self.ae = ConvImageEncoder(ae_cfg) if self.encode_arch == "conv" else ImageAutoencoder(ae_cfg)
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)

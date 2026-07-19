@@ -44,4 +44,4 @@ modalities:
   # deterministic decode, bit-identical to before. decode_shortcut: true -> K=1 sampling (EXPLICIT opt-in, like
   # the dynamics `diffusion.shortcut`; shortcut is never default-on). Starting BOTH trunks on flow to validate cross-trunk.
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
-  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: vit}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: flow, decode_param: x0, encode_arch: vit, decode_arch: vit}
