@@ -628,7 +628,9 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
         ctx[h] = torch.stack([torch.from_numpy(im[:L]) for _, _, im in eps]).float().div(255.0).to(device)
     act = torch.stack([norm.norm_act(torch.from_numpy(a[:L])) for _, a, _ in eps]).float().to(device)  # (E,L,2) normalized
 
-    h_ctx = m.action_context(ctx, act)                           # (E,L-1,d): h[k] predicts a[k+1] (leak-free)
+    with torch.no_grad():                                        # no grad: this eval also runs on the TRAINING GPU
+        h_ctx = m.action_context(ctx, act)                       # (E,L-1,d): h[k] predicts a[k+1] (leak-free)
+        pred_norm = m.sample_action(h_ctx).cpu()                 # (E,L-1,2) head, 1/context
     x = np.stack([o[1:L, 0] for o, _, _ in eps]).astype(np.float32)   # ambient x at each action's state (E,L-1)
     prog(30, "context")
 
@@ -638,7 +640,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     # distinct contexts), NOT more samples/context: the head is sharp per context, so extra draws per context just
     # stack onto the same few spikes. n_ep is capped by the val split (here 64).
     true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()           # (E,L-1,2) recorded a[1..L-1]
-    pred_a = norm.denorm_act(m.sample_action(h_ctx).cpu()).numpy()   # (E,L-1,2) head, 1/context
+    pred_a = norm.denorm_act(pred_norm).numpy()                  # (E,L-1,2) head, 1/context (sampled under no_grad)
     prog(50, "head sampling")
 
     # window: pool +/-w timesteps per frame/tile -> ~(2w+1)x more samples (the dist changes slowly, so bias is
