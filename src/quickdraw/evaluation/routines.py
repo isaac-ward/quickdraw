@@ -609,11 +609,18 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
 
     img_heads = [n for n, _ in m.layout if n != "proprio"]
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+    # the action process is a property of the DATASET (recorded in its summary.json), not the cfg default — read
+    # it so we always produce the FULL set of products (never a partial run gated on a stale cfg.data.action_sampler).
+    asamp = "ou"
+    try:
+        asamp = json.load(open(os.path.join(cfg.data.root, "summary.json"))).get("action_sampler", "ou")
+    except Exception:
+        pass
     eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
-    n_ep = min(8 if img_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(eps))
+    n_ep = min(int(cfg.eval.get("action_dist_episodes", 32) or 32), len(eps))   # default 32 (>>8) so bins fill
     eps = eps[:n_ep]
     L = min(len(o) for o, _, _ in eps)
-    prog(0, f"start: {n_ep} val episodes, L={L}")
+    prog(0, f"start: {n_ep} val episodes, L={L}, sampler={asamp}")
 
     ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(o[:L])) for o, _, _ in eps]).float().to(device)}
     for h in img_heads:
@@ -626,26 +633,28 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     true = norm.denorm_act(act[:, 1:].cpu()).numpy()             # a[1..L-1] raw, aligned with h_ctx
     x = np.stack([o[1:L, 0] for o, _, _ in eps]).astype(np.float32)   # ambient x at each action's state (E,L-1)
 
-    for name, arr in (("true", true), ("pred", pred)):           # by-x 2-row static, true vs pred
-        fig = viz.fig_action_by_state(arr, x, ecfg.a_max, sampler_name=f"{cfg.data.get('action_sampler','?')} · {name}")
+    for name, arr in (("true", true), ("pred", pred)):           # by-x 2-row static, true vs pred (pooled over episodes)
+        fig = viz.fig_action_by_state(arr, x, ecfg.a_max, sampler_name=f"{asamp} · {name}")
         writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
 
-    tm, pm = np.linalg.norm(true, -1).reshape(-1), np.linalg.norm(pred, -1).reshape(-1)
+    tm, pm = np.linalg.norm(true, axis=-1).reshape(-1), np.linalg.norm(pred, axis=-1).reshape(-1)
     q = np.linspace(0.0, 1.0, 512)
     w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a|
     writer.scalar("eval_action_distribution/true_pred_w1", w1, step)
     prog(60, f"by-x static + distance (w1={w1:.3f})")
 
-    if cfg.data.get("action_sampler") == "bimodal":              # per-trajectory animation (moving peaks)
-        N, e = viz.ACTION_DIST_N_SAMPLES, 0
+    if asamp == "bimodal":         # animation: POOLED over episodes per timestep, so BOTH basins appear -> the true
+        #   AND pred distributions are bimodal and evolve. (A single trajectory sits in ONE basin -> the head
+        #   correctly sharpens to it and the frame looks unimodal — misleading. Pooling is the right validation view.)
+        #   Dense via K samples per episode: true = the sampler's per-state conditional; pred = the head.
+        K = max(1, viz.ACTION_DIST_N_SAMPLES // n_ep)
         sampler = BimodalActionSampler(1, ecfg.a_max, device=device)
-        xe = x[e]                                                # (L-1,) ambient x along episode e
-        true_a = np.stack([norm.denorm_act(sampler.sample_at_state(float(xe[k]), N).cpu()).numpy()
-                           for k in range(L - 1)], axis=1)       # (N,L-1,2) true conditional at each state
-        pred_a = norm.denorm_act(m.sample_action(h_ctx[e:e + 1].expand(N, -1, -1)).cpu()).numpy()  # (N,L-1,2)
+        true_a = np.stack([np.concatenate([norm.denorm_act(sampler.sample_at_state(float(x[e, k]), K).cpu()).numpy()
+                                           for e in range(n_ep)], axis=0) for k in range(L - 1)], axis=1)  # (n_ep*K,L-1,2)
+        pred_a = norm.denorm_act(m.sample_action(h_ctx.repeat_interleave(K, dim=0)).cpu()).numpy()          # (n_ep*K,L-1,2)
         frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max, max_frames=200)
-        writer.video(f"eval_action_distribution/animation_{e}", frames, round(1.0 / ecfg.dt), step)
-        prog(90, "animation")
+        writer.video("eval_action_distribution/animation_pooled", frames, round(1.0 / ecfg.dt), step)
+        prog(90, "animation (pooled over episodes)")
 
     if was:
         m.train()

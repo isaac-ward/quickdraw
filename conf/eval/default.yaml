@@ -21,5 +21,5 @@ during_train:
     denoising_aggregate: true  # diffusion ONLY: pooled next-states collapsing from noise onto the manifold (self-skips)
     manifold: true         # ANY method: recovered-manifold UMAPs (data + latent space, 2D + 3D)
     interpret: false       # vision ONLY, POST-HOC (VLM-labeled latent manifolds); needs OPENAI_API_KEY -> run standalone (python -m quickdraw.eval_interpret), keep OFF in the train loop
-    action_distribution: false  # ACTION-HEAD ONLY (self-skips without one): learned action prior vs true data action dist (by-x hists + per-trajectory animation + true_pred_w1)
+    action_distribution: true   # runs whenever the model HAS an action head (self-skips otherwise, like the diffusion evals): learned action prior vs true data action dist (by-x hists + animation + true_pred_w1)
     # (image FPV rollout/filmstrip/metrics are now part of ood_horizon — under eval_ood_horizon/<head>/)
