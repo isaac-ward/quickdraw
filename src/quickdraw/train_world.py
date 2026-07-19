@@ -164,6 +164,9 @@ def main(cfg):
     # enable_progress_bar=False: no tqdm; ProgressPrinter emits plain per-epoch lines instead.
     trainer = L.Trainer(max_epochs=cfg.trainer.max_epochs, precision=cfg.trainer.precision,
                         accelerator="gpu", devices=1, gradient_clip_val=1.0, enable_progress_bar=False,
+                        accumulate_grad_batches=int(cfg.trainer.get("accumulate_grad_batches", 1)),  # effective
+                        #  batch = data.batch x this; use it to keep a large effective batch when the per-step
+                        #  micro-batch is memory-bound (no batchnorm here, so it's gradient-equivalent).
                         check_val_every_n_epoch=int(cfg.trainer.get("check_val_every_n_epoch", 1)),  # val is an
                         #  autoregressive rollout ~as long as the train epoch (~50% of wall time); raise this to
                         #  validate less often and train faster (e.g. 5). Eval routines have their own cadence.
