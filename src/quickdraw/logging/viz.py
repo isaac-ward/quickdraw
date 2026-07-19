@@ -1154,7 +1154,7 @@ def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, 
 
 # samples per timestep for the action-distribution preview + eval (4x the 256 train trajectories, so the
 # shape/peaks/weights read clearly above Monte-Carlo noise). The eval samples the LEARNED head this many too.
-ACTION_DIST_N_SAMPLES = 1024
+ACTION_DIST_N_SAMPLES = 4096   # total pooled samples for the action-dist eval; K=this//n_ep drawn per context
 
 
 def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
@@ -1216,6 +1216,54 @@ def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=20
         ax[2].set_title("both"); ax[2].legend(loc="upper right", fontsize=9)
         fig.suptitle(f"action-magnitude distribution  ·  t={t}/{steps - 1}", fontsize=13)
         fig.tight_layout(rect=(0, 0, 1, 0.93)); fig.set_dpi(dpi)
+        frames.append(_fig_rgb(fig)); plt.close(fig)
+    return np.stack(frames)
+
+
+def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=200, dpi=90):
+    """Animated BY-X action-magnitude histograms over time: 2 rows (TOP x<0 slow, BOTTOM x>=0 fast) x 3 cols
+    (true green | pred red | both). Splitting by the sign of ambient x keeps each basin's mode crisp — pooling
+    over all x smears the state-dependent scale together. Densities (comparable despite differing per-frame
+    counts); x-range and y-range are locked across every frame and panel. true/pred: (N, steps, 2); x: (N, steps)."""
+    tm = np.linalg.norm(np.asarray(true_acts), axis=-1)      # (N, steps)
+    pm = np.linalg.norm(np.asarray(pred_acts), axis=-1)
+    x = np.asarray(x)
+    steps = tm.shape[1]
+    hi = min(float(a_max), max(float(tm.max()), float(pm.max())) * 1.05)
+    edges = np.linspace(0.0, hi, bins + 1)
+    masks = (x < 0.0, x >= 0.0)
+    ymax = 0.0                                                # locked y (density) over all frames/rows/panels
+    for t in range(steps):
+        for keep in masks:
+            k = keep[:, t]
+            for m in (tm[:, t][k], pm[:, t][k]):
+                if m.size:
+                    ymax = max(ymax, float(np.histogram(m, bins=edges, density=True)[0].max()))
+    ymax = ymax * 1.08 or 1.0
+    ts = (range(steps) if steps <= max_frames
+          else np.linspace(0, steps - 1, max_frames).round().astype(int))
+    green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
+    rows = (("x < 0 (slow)", 0), ("x ≥ 0 (fast)", 1))
+    frames = []
+    for t in ts:
+        t = int(t)
+        fig, ax = plt.subplots(2, 3, figsize=(15, 8), sharex=True, sharey=True)
+        for (lbl, r), keep in zip(rows, masks):
+            k = keep[:, t]
+            tt, pp = tm[:, t][k], pm[:, t][k]
+            for c in range(3):
+                ax[r, c].set_xlim(0, hi); ax[r, c].set_ylim(0, ymax)
+            if tt.size: ax[r, 0].hist(tt, bins=edges, density=True, color=green, alpha=0.6)
+            if pp.size: ax[r, 1].hist(pp, bins=edges, density=True, color=red, alpha=0.6)
+            if tt.size: ax[r, 2].hist(tt, bins=edges, density=True, color=green, alpha=0.5, label="true")
+            if pp.size: ax[r, 2].hist(pp, bins=edges, density=True, color=red, alpha=0.5, label="pred")
+            ax[r, 0].set_title(f"{lbl} · true (n={tt.size})", fontsize=10)
+            ax[r, 1].set_title(f"{lbl} · pred (n={pp.size})", fontsize=10)
+            ax[r, 2].set_title(f"{lbl} · both", fontsize=10); ax[r, 2].legend(loc="upper right", fontsize=8)
+        for c in range(3):
+            ax[1, c].set_xlabel("|a|")
+        fig.suptitle(f"action-magnitude by x-sign  ·  t={t}/{steps - 1}", fontsize=13)
+        fig.tight_layout(rect=(0, 0, 1, 0.94)); fig.set_dpi(dpi)
         frames.append(_fig_rgb(fig)); plt.close(fig)
     return np.stack(frames)
 

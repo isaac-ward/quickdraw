@@ -594,10 +594,11 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
 def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     """The learned action PRIOR (action-flow head) vs the TRUE data action distribution. Self-skips unless
     the model has an action head. All under eval_action_distribution/:
-      - by_state_{true,pred}: |a| split by sign of ambient x (slow x<0 / fast x>=0) x uniform timesteps.
-      - animation_0 (bimodal sampler only): one val trajectory, true(green)|pred(red)|both — peaks move as x oscillates.
+      - by_state_{true,pred}: |a| split by sign of ambient x (slow x<0 / fast x>=0) x uniform timesteps (K/context).
+      - animation_pooled (bimodal only): true(green)|pred(red)|both, POOLED over all episodes/frame (both basins -> bimodal).
+      - animation_byx (bimodal only): same, split into x<0 / x>=0 rows so each basin's mode stays crisp.
       - action_true_pred_w1: 1D-Wasserstein between pooled true and pred |a| (scalar, lower=better).
-    The head predicts a[k+1] from the leak-free context h[k]; we sample it and compare to the recorded a[k+1]."""
+    The head predicts a[k+1] from the leak-free context h[k]; true = the sampler's per-state conditional (dense)."""
     m = getattr(model, "_orig_mod", model)
     if not getattr(m, "action_head_enabled", False):
         return {}                                                # no action head -> skip
@@ -628,33 +629,47 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     act = torch.stack([norm.norm_act(torch.from_numpy(a[:L])) for _, a, _ in eps]).float().to(device)  # (E,L,2) normalized
 
     h_ctx = m.action_context(ctx, act)                           # (E,L-1,d): h[k] predicts a[k+1] (leak-free)
-    prog(30, "context + head sampling")
-    pred = norm.denorm_act(m.sample_action(h_ctx).cpu()).numpy()  # (E,L-1,2) raw
-    true = norm.denorm_act(act[:, 1:].cpu()).numpy()             # a[1..L-1] raw, aligned with h_ctx
     x = np.stack([o[1:L, 0] for o, _, _ in eps]).astype(np.float32)   # ambient x at each action's state (E,L-1)
+    prog(20, "context")
 
-    for name, arr in (("true", true), ("pred", pred)):           # by-x 2-row static, true vs pred (pooled over episodes)
-        fig = viz.fig_action_by_state(arr, x, ecfg.a_max, sampler_name=f"{asamp} · {name}")
+    # DENSIFY: draw K samples per context so the by-x tiles and the animations are smooth. One sample/context
+    # gives n~4-12/tile (unreadable). pred = K head draws/context; true = K draws from the sampler's per-state
+    # stationary conditional (the faithful data-generating dist). Non-bimodal data has no analytic conditional
+    # -> fall back to the recorded actions (one/context) and skip the animations.
+    K = max(1, viz.ACTION_DIST_N_SAMPLES // n_ep)
+    if asamp == "bimodal":
+        sampler = BimodalActionSampler(1, ecfg.a_max, device=device)
+        true_a = np.stack([np.concatenate([norm.denorm_act(sampler.sample_at_state(float(x[e, k]), K).cpu()).numpy()
+                                           for e in range(n_ep)], axis=0) for k in range(L - 1)], axis=1)  # (E*K,L-1,2)
+        pred_a = norm.denorm_act(m.sample_action(h_ctx.repeat_interleave(K, dim=0)).cpu()).numpy()          # (E*K,L-1,2)
+        x_plot = np.repeat(x, K, axis=0)                          # (E*K,L-1), aligned (row i -> episode i//K)
+    else:
+        true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()        # (E,L-1,2) recorded
+        pred_a = norm.denorm_act(m.sample_action(h_ctx).cpu()).numpy()   # (E,L-1,2)
+        x_plot = x
+    prog(45, f"dense sampling (K={K}/context)")
+
+    for name, arr in (("true", true_a), ("pred", pred_a)):        # by-x 2-row static (pooled over episodes x K)
+        fig = viz.fig_action_by_state(arr, x_plot, ecfg.a_max, sampler_name=f"{asamp} · {name}")
         writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
 
-    tm, pm = np.linalg.norm(true, axis=-1).reshape(-1), np.linalg.norm(pred, axis=-1).reshape(-1)
+    tm, pm = np.linalg.norm(true_a, axis=-1).reshape(-1), np.linalg.norm(pred_a, axis=-1).reshape(-1)
     q = np.linspace(0.0, 1.0, 512)
     w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a|
     writer.scalar("eval_action_distribution/true_pred_w1", w1, step)
-    prog(60, f"by-x static + distance (w1={w1:.3f})")
+    prog(65, f"by-x static + distance (w1={w1:.3f})")
 
-    if asamp == "bimodal":         # animation: POOLED over episodes per timestep, so BOTH basins appear -> the true
-        #   AND pred distributions are bimodal and evolve. (A single trajectory sits in ONE basin -> the head
-        #   correctly sharpens to it and the frame looks unimodal — misleading. Pooling is the right validation view.)
-        #   Dense via K samples per episode: true = the sampler's per-state conditional; pred = the head.
-        K = max(1, viz.ACTION_DIST_N_SAMPLES // n_ep)
-        sampler = BimodalActionSampler(1, ecfg.a_max, device=device)
-        true_a = np.stack([np.concatenate([norm.denorm_act(sampler.sample_at_state(float(x[e, k]), K).cpu()).numpy()
-                                           for e in range(n_ep)], axis=0) for k in range(L - 1)], axis=1)  # (n_ep*K,L-1,2)
-        pred_a = norm.denorm_act(m.sample_action(h_ctx.repeat_interleave(K, dim=0)).cpu()).numpy()          # (n_ep*K,L-1,2)
+    if asamp == "bimodal":
+        fps = round(1.0 / ecfg.dt)
+        # POOLED over all episodes per frame: both basins present -> true AND pred are bimodal & evolve. (A single
+        # trajectory sits in ONE basin, so the head correctly sharpens to it and looks unimodal — misleading.)
         frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max, max_frames=200)
-        writer.video("eval_action_distribution/animation_pooled", frames, round(1.0 / ecfg.dt), step)
-        prog(90, "animation (pooled over episodes)")
+        writer.video("eval_action_distribution/animation_pooled", frames, fps, step)
+        prog(80, "animation (pooled)")
+        # BY-X: same data split into x<0 / x>=0 rows so each basin's mode stays crisp (pooling over all x smears them).
+        frames_bx = viz.anim_action_by_state(true_a, pred_a, x_plot, ecfg.a_max, max_frames=200)
+        writer.video("eval_action_distribution/animation_byx", frames_bx, fps, step)
+        prog(90, "animation (by-x)")
 
     if was:
         m.train()
