@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -51,8 +52,9 @@ class MultiModalSequenceModel(nn.Module):
     #                       used in training (needs the full backprop graph); toggled off for the parity A/B.
 
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
-                 mlp_ratio: float, rope_theta: float, action_dim: int):
+                 mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False):
         super().__init__()
+        self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         self.modalities = build_modalities(specs, d)
         self.layout = [(m.name, m.n_tokens) for m in self.modalities.values()]  # bag order + slices
         self.n_state = sum(n for _, n in self.layout)
@@ -218,7 +220,15 @@ class MultiModalSequenceModel(nn.Module):
                 a_win = F.pad(a_win, (0, 0, pad, 0))
             x = self._to_input(s_win, a_win)                        # (B,W,n_input,d)
             bm = pad_block_mask(W, pad, x.device)                   # temporal causal + drop padded steps
-            h_last = self.backbone(x, temporal_block_mask=bm)[:, -1]  # (B,n_input,d)
+            if self.grad_checkpoint and self.training:
+                # recompute this step's backbone forward during backward instead of storing its activations
+                # -> AR memory ∝ detach_every, not F (design/accelerations.md Exp 6). bm (a BlockMask, not a
+                # tensor) is bound as a default arg so the backward-time recompute uses THIS step's mask.
+                h_last = torch.utils.checkpoint.checkpoint(
+                    lambda x_, _bm=bm: self.backbone(x_, temporal_block_mask=_bm)[:, -1],
+                    x, use_reentrant=False)                         # (B,n_input,d)
+            else:
+                h_last = self.backbone(x, temporal_block_mask=bm)[:, -1]  # (B,n_input,d)
             s_pred = self.readout(h_last, bag_buf[-1])              # (B,n_state,d)
             preds.append(s_pred)                                   # raw prediction -> loss/decode
             carried = self.carry_transform(s_pred)                 # data-space re-encode for DSAR; identity else
@@ -327,10 +337,11 @@ class MultiModalLSAR(MultiModalSequenceModel):
     pred_latent = MSE to the encoded true-next bag (Reconstruction collapse: obs heads ground the encoder)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
+                 grad_checkpoint: bool = False,
                  pred_hidden: int = 0, lambda_pred_latent: float = 1.0,
                  collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
-                         rope_theta=rope_theta, action_dim=action_dim)
+                         rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
@@ -412,6 +423,7 @@ class MultiModalFlow(MultiModalSequenceModel):
     (deterministic ε=0 at eval unless stochastic_eval — the committed prediction)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
+                 grad_checkpoint: bool = False,
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = False, time_sampling: str = "uniform", flow_hidden: int = 0,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
@@ -420,7 +432,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
                  dynamics_detach_encoder: bool = False):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
-                         rope_theta=rope_theta, action_dim=action_dim)
+                         rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint)
         assert predict in ("residual", "absolute")
         self.predict_residual = predict == "residual"
         self.sampling_steps = int(sampling_steps)

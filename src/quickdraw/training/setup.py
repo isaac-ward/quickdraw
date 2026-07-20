@@ -38,7 +38,8 @@ def build_model(cfg):
     if specs is not None:
         from ..models.multimodal import MultiModalFlow, MultiModalDSAR, MultiModalLSAR
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
-                      mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2))
+                      mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2),
+                      grad_checkpoint=bool(m.get("grad_checkpoint", False)))
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}
