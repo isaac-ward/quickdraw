@@ -5,7 +5,7 @@ F: 64          # future horizon rolled out during training (sets the BPTT length
 window_stride: 1   # TRAIN windows: 1 = every start (dense, redundant — adjacent windows overlap L-1 steps);
                    # >1 strides the starts (e.g. 4 = 4x fewer batches/epoch, ~no coverage loss over many epochs). val stays 1.
 batch: 1024    # fast baseline: 515K model + F=64 full BPTT fits ~51 GB at this batch
-workers: 4
+workers: 16    # image mp4-decode is CPU-heavy; too few workers starves the GPU (low util). 80 cores here.
 fast_gpu: true   # vector stage: hold all windows resident on GPU, batch by on-device index (no workers/copies)
 n_plot_trajectories: 4     # how many sample trajectories to draw per split plot
 fpv_fov: 100            # egocentric camera field of view (deg); VTK default is 30

@@ -196,13 +196,15 @@ class ConvImageEncoder(nn.Module):
         import math
         self.cfg = cfg
         C, d, T = cfg.channels, cfg.d, cfg.num_tokens
-        n_levels = max(1, int(math.log2(max(8, cfg.img_size) // 8)))   # keep the bottleneck ~8px (mirrors the U-Net)
+        stem = 2                                                       # stride-2 stem: the full-res activation is
+        hw0 = cfg.img_size // stem                                     #   1/4 the memory (standard conv-encoder stem)
+        n_levels = max(1, int(math.log2(max(8, hw0) // 8)))           # then pool to a ~8px bottleneck
         chs = [base * min(4, 2 ** i) for i in range(n_levels)]
-        self.in_conv = nn.Conv2d(C, chs[0], 3, padding=1)
+        self.in_conv = nn.Conv2d(C, chs[0], 3, stride=stem, padding=1)
         prev, self.downs = chs[0], nn.ModuleList()
         for ch in chs:
             self.downs.append(_ConvResBlock(prev, ch)); prev = ch
-        self.bott_hw = cfg.img_size // (2 ** len(chs))                 # 8 at 128px
+        self.bott_hw = hw0 // (2 ** len(chs))                          # 8 at 128px (stem/2 then n_levels pools)
         self.to_d = nn.Conv2d(chs[-1], d, 1)                          # channels -> model dim
         self.pos = nn.Parameter(torch.zeros(1, self.bott_hw * self.bott_hw, d))
         self.latent_q = nn.Parameter(torch.zeros(1, T, d))
