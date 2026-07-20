@@ -78,7 +78,8 @@ class MultiModalSequenceModel(nn.Module):
             is_img = hasattr(mod, "ae")
             ins = f"(B,T,{mod.ae.cfg.img_size},{mod.ae.cfg.img_size},3)" if is_img else f"(B,T,{mod.dim})"
             enc = mod.ae if is_img else mod.enc     # image AE (encoder-only when decode_kind=flow); proprio enc MLP
-            rows.append((f"{name} encoder", f"{ins} -> (B,T,{ntok},{self.d})", npar(enc)))
+            earch = getattr(mod, "encode_arch", "vit") if is_img else "mlp"   # vit|conv for image; mlp for vector
+            rows.append((f"{name} encoder ({earch})", f"{ins} -> (B,T,{ntok},{self.d})", npar(enc)))
         rows.append(("action_enc", f"(B,T,{self.act_enc[0].in_features}) -> (B,T,1,{self.d})", npar(self.act_enc)))
         # backbone: fuse the token bag over space (within-step) + time (causal)
         rows.append(("space-time backbone", f"(B,T,{self.n_input},{self.d}) -> same "
@@ -86,7 +87,13 @@ class MultiModalSequenceModel(nn.Module):
         rows.append(("token_bag (per step)", f"{self.n_state} state + 1 action = (B,T,{self.n_input},{self.d})", 0))
         if getattr(self, "df_scale", 0.0) > 0.0 and getattr(self, "df_level_emb", None) is not None:
             rows.append(("diffusion_forcing level_emb", f"level -> (..,{self.d}) added to state tokens", npar(self.df_level_emb)))
-        # decode heads (tokens -> obs) + the dynamics head (tokens -> next-state)
+        # dynamics head (state tokens -> NEXT state) — in the dataflow this runs BEFORE decode, so list it here
+        dyn = getattr(self, "flow", None) or getattr(self, "predictor", None)
+        lbl = "flow (rectified, per-token)" if hasattr(self, "flow") else "predictor (MLP residual)"
+        rows.append((f"predict_next: {lbl}", f"(B,T,{self.n_state},{self.d}) -> same", npar(dyn)))
+        if getattr(self, "predictor_q", None) is not None:
+            rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
+        # decode heads (predicted tokens -> obs)
         for name, ntok in self.layout:
             mod = self.modalities[name]
             is_img = hasattr(mod, "ae")
@@ -96,11 +103,6 @@ class MultiModalSequenceModel(nn.Module):
             arch = getattr(mod, "decode_arch", "mlp")   # image: vit|unet; vector: mlp. UNIFIED net; kind = flow|mse(no-noise)
             net = f"{arch} {'flow' if dk == 'flow' else 'mse/no-noise'}"
             rows.append((f"{name} decode ({net})", f"(B,T,{ntok},{self.d}) -> {ins}", npar(dh)))
-        dyn = getattr(self, "flow", None) or getattr(self, "predictor", None)
-        lbl = "flow (rectified, per-token)" if hasattr(self, "flow") else "predictor (MLP residual)"
-        rows.append((f"predict_next: {lbl}", f"(B,T,{self.n_state},{self.d}) -> same", npar(dyn)))
-        if getattr(self, "predictor_q", None) is not None:
-            rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
         return rows
 
     # ---- modality <-> token bag ----
