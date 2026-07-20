@@ -270,6 +270,24 @@ Exp 5 latency callout). At F=24 an epoch is ~19 min:
 with the contraction penalty** — "sees its own multi-step drift" + "dynamics that pull back" is the actual cure for the
 color→structure drift, at a fraction of the cost of training at the full horizon.
 
+## Experiment 7 — `expandable_segments` allocator mode (2026-07-20)
+
+**Keep `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` ON for all runs.** It is a PyTorch CUDA caching-allocator
+mode (NOT a numerical change — zero effect on results), that lets memory segments grow/shrink so freed blocks of
+differing sizes are reusable instead of leaving fragmentation gaps ("reserved but unallocated" memory that OOMs
+even with free VRAM). Measured on mm_flow d=128, conv encoder, num_tokens=16, in-rollout, batch 16:
+
+| allocator | peak (GB) |
+|---|--:|
+| default | 86.0 |
+| expandable_segments:True | **62.2** |
+
+~28% less peak from fragmentation alone — it raised the real-batch ceiling from ~16 to ~20 at this config. Set it
+in the launch env (`docker exec -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`). Legit acceleration, always on.
+
+> Note (2026-07-20): conv/deconv `base` channel width is a **weak** batch lever — halving base 32→16 only moved the
+> ceiling batch 20→~30 (and hurts decode). Memory is dominated by the ∝`batch·F` rollout (Exp 6), not conv channels.
+
 ### Measured headroom: mm_flow d=64 in-rollout (2026-07-15)
 The flow-x0 / mse-control pair (d=64, batch 128, in-rollout, dynamics shortcut, flow-x0 decode, recon_frac 0.25,
 detach_every 16) sits at **~63.8 GB / 93 GB** and **~15–20% GPU util** at ~30 min/epoch — latency-bound exactly as the
