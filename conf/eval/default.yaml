@@ -9,6 +9,8 @@ denoising_max_steps: null  # null -> full 128 sequential swarms (~25min render);
 # evals that run *during training* (train/val happen normally regardless). flip any to true; the
 # enabled routines are cycled through on every eval epoch.
 during_train:
+  # DECIDED (user, 2026-07-20): eval cadence is {5, 10, 20, 40, 60, ...}. DO NOT CHANGE these two lines without
+  # asking — do NOT add early epochs like [1,3] (that made eval effectively "every 2" and clogged training).
   every_epochs: 20         # regular cadence: eval at 20, 40, 60, ... (SKIP 0); 0 disables the cadence
   at_epochs: [5, 10]       # extra early one-off epochs, UNIONED with the cadence -> {5, 10, 20, 40, 60, 80, ...}
   evals:

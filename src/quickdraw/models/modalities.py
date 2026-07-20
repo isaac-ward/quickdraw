@@ -46,6 +46,8 @@ class ModalitySpec:
     #                           conv enc/dec. Both emit num_tokens tokens (same interface). Ignored by vectors.
     decode_base: int = 32     # decode_arch=unet ONLY: U-Net base channel width (chs = [base, 2b, 4b, ...]). Bigger
     #                           -> a stronger denoiser for flow decode (sharper images). Ignored by vit/mlp.
+    encode_base: int = 32     # encode_arch=conv ONLY: conv-encoder base channel width. Smaller -> less activation
+    #                           memory (bigger batch), at some capacity cost. Ignored by vit.
     # vector
     dim: int = 6
     # image
@@ -136,7 +138,8 @@ class ImageModality(Modality):
             dec_depth=spec.ae_depth, num_tokens=spec.num_tokens, channels=spec.channels,
             build_decoder=False)                   # encoder-only; the unified decode_head IS the decoder
         # `self.ae` is the encoder AND the cfg-holder the decode head reads (both variants expose .cfg + .encode()).
-        self.ae = ConvImageEncoder(ae_cfg) if self.encode_arch == "conv" else ImageAutoencoder(ae_cfg)
+        self.ae = (ConvImageEncoder(ae_cfg, base=int(getattr(spec, "encode_base", 32)))
+                   if self.encode_arch == "conv" else ImageAutoencoder(ae_cfg))
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)

@@ -1,7 +1,9 @@
 max_epochs: 50
 precision: bf16-mixed
 save_top_k: 2
-check_val_every_n_epoch: 1   # validate EVERY epoch (default). Val is an autoregressive rollout ~as long as a train
-#                              epoch, so this ~doubles wall-clock — raise it (e.g. 3) to trade val density for speed.
-accumulate_grad_batches: 1   # keep 1: grad-accum sums micro-batch grads (~Nx effective LR vs the clip) and
-#                              destabilizes in-rollout training — use a real batch that fits, never micro+accum.
+check_val_every_n_epoch: 4   # DECIDED (user, 2026-07-20): validate every 4 epochs. DO NOT CHANGE without asking.
+#                              Val is an autoregressive rollout ~as long as a train epoch, so more-frequent val
+#                              wastes wall-clock; every-4 is the agreed cadence.
+accumulate_grad_batches: 1   # LOCKED at 1. NEVER use gradient accumulation (micro-batch + accum): Lightning SUMS
+#                              micro-batch grads -> ~Nx effective LR against the clip -> destabilized in-rollout
+#                              training into mean-collapse (2026-07-20). Always use a real batch that fits. DO NOT CHANGE.
