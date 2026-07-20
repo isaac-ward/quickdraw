@@ -119,6 +119,13 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
                                     "mse": _np.array(mse_s), "l1": _np.array(l1_s)},
                         "full_true": _np.stack([eps[i][2][:P + H].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                         "ipred": ipred[:n_plot].cpu().numpy()}
+        # per-step future-accuracy scalars: each stat read out at quarter-horizon steps into the future (+ the
+        # full horizon), one scalar apiece, so the accuracy DECAY vs rollout depth is trackable in wandb without
+        # the curve. Tag `eval_ood_horizon/<head>/<stat>/@+<x>` (x = steps ahead). q = floor(0.25*H) increments.
+        q = max(1, int(0.25 * H))
+        for x in sorted({q, 2 * q, 3 * q, H}):
+            for stat, arr in images[head]["icurves"].items():
+                writer.scalar(f"eval_ood_horizon/{head}/{stat}/@+{x}", float(arr[min(x, H) - 1]), step)
     prog(45, f"averaged curves (proprio + {len(img_heads)} image head(s))")
 
     # ---- everything (curves + per-episode trajectory/image visuals) via the shared open-loop emitter ----
