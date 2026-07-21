@@ -49,10 +49,10 @@ action_head:
   enabled: false            # true -> add the action-flow head + loss/flow/action (+ loss/shortcut/action)
   weight: 1.0               # weight of the action-flow loss in the total training loss
   shortcut: true            # K=1 sampling (fast MPPI proposal); like the dynamics diffusion.shortcut
-  detach_gradient: false    # false (default) = the action-head gradient flows into the rest of the model, so the
-  #                           action task co-shapes the WM trunk during joint training; true = the gradient is
-  #                           DETACHED from the trunk, so the action head learns off a frozen context and cannot
-  #                           reshape the shared representation (a non-interfering probe)
+  detach_gradient: false    # LOCKED false (user, 2026-07-21): NEVER set true. detach_gradient=true DESTABILIZED
+  #                           the action flow — it exploded to ~1e22 (vit-mse run) and even when finite HURT OOD
+  #                           (unetflow pointwise 1.13 vs 0.36 baseline). false = gradient flows into the trunk
+  #                           (co-shapes it), the STABLE setting (matches the working 07-17 action-head run). DO NOT CHANGE.
 modalities:
   # decode_kind: flow -> generative decode head per trunk (design/models/flow_heads.md). mse (default) =
   # deterministic decode, bit-identical to before. decode_shortcut: true -> K=1 sampling (EXPLICIT opt-in, like
