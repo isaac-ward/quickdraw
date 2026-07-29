@@ -2,8 +2,7 @@
 
 Every step is a Hydra entrypoint (override any field on the CLI) and writes its own run folder
 `logs/<step>_<timestamp>_<experiment>/` — dataset or checkpoints, plots, videos, and a local mirror of
-everything sent to wandb (see [docs/interpret.md](interpret.md) for how to read the outputs). Run the steps
-in order; `RUN` is your experiment name. Training entrypoints require a **unique** 5-point `run_summary`
+everything sent to wandb. Run the steps in order; `RUN` is your experiment name. Training entrypoints require a **unique** 5-point `run_summary`
 (`+run_summary.problem=... +run_summary.tried=... +run_summary.trying=... +run_summary.trying_detail=...
 +run_summary.rationale=...`) — train fails fast if it is missing or copies a previous run's note.
 
@@ -69,20 +68,24 @@ features computed under `no_grad`. It is post-hoc because joint training destabi
 full-model checkpoints (frozen WM + trained head) that load like any other checkpoint, and runs the
 action-distribution eval itself (learned prior vs the true data action distribution).
 
-## 5. Interpret
-
-How to read everything the runs above produce — the eval metrics, the eval-viz videos, and the
-action-distribution plots — is its own doc: **[docs/interpret.md](interpret.md)**.
-
-The VLM-labeled latent interpretability eval (needed by step 6) runs standalone:
+## 5. Interpret — VLM labeling
 
 ```bash
-uv run python -m quickdraw.eval_interpret checkpoint=$CKPT data.root=$DATA   # needs OPENAI_API_KEY; vision models
+uv run python -m quickdraw.eval_interpret checkpoint=$CKPT data.root=$DATA   # needs OPENAI_API_KEY; image world models only
 ```
 
-It decodes imagined clips, has a VLM caption + label them against the configured factors
-(`conf/interpret/torus.yaml`), and projects the latent space per factor. Produces
-`logs/eval_interpret_<ts>_$RUN/` — set `INTERP=` that path.
+This is the step that attaches human-meaningful labels to the world model's latent space with a
+vision-language model. It imagines `n_clips` short clips from the frozen WM, decodes them to frames, and
+for each clip a VLM (`gpt-4o`) both (a) **labels** it by the semantic factors in `conf/interpret/<env>.yaml`
+(torus: the `color` the agent stands on, read from the image; its vertical `positioning`, analytic) and
+(b) writes `n_captions` diverse free-form **captions** of the clip. Every step's latent is paired with its
+clip's label + captions, and the latent manifold is projected (PCA/UMAP/t-SNE) recolored per factor.
+Produces `logs/eval_interpret_<ts>_$RUN/` (per-point latents + per-factor labels + per-clip captions) — set
+`INTERP=` that path.
+
+The captions are the text side of the reward model's contrastive distillation (step 6), so this labeling
+step is what **grounds language control**: a richer/broader interpret run → a better-generalizing, more
+steerable reward head. Point `interpret=<env>` at a `conf/interpret/<env>.yaml` to label a different env.
 
 ## 6. Train the reward model
 

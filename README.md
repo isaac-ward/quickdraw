@@ -80,7 +80,6 @@ where they predict, how each step is produced, how latent collapse is prevented,
 
 - [docs/workflow.md](docs/workflow.md) — the end-to-end pipeline, in order, with commands
 - [docs/byo_environment.md](docs/byo_environment.md) — bring your own environment (gym adapter or the full `WorldEnv` protocol)
-- [docs/interpret.md](docs/interpret.md) — reading the outputs: metrics, eval-viz videos, and where everything lands
 
 ## Links
 

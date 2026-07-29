@@ -1,11 +1,19 @@
 # Bring your own environment
 
-The pipeline is written against one interface — the `WorldEnv` protocol
+The pipeline is written against **one** interface — the `WorldEnv` protocol
 (`src/quickdraw/environments/base.py`) — and builds environments purely by config through
 `environments/registry.make_env`. There are no env-specific branches downstream, so plugging in a new
-environment means satisfying that protocol one of two ways.
+environment just means giving the pipeline a `WorldEnv`.
 
-## Path A (quickest): any registered `gymnasium.Env`
+There is only that one interface; you have two ways to provide it, differing only in effort:
+
+- **use the built-in gym adapter** (zero code) — for any `gymnasium.Env`, or
+- **implement the protocol yourself** (full control) — for a batched, first-class env like the torus.
+
+The adapter is simply a pre-written `WorldEnv` implementation, so everything downstream is identical either
+way.
+
+## Quickest: any registered `gymnasium.Env` (the built-in adapter)
 
 ```bash
 uv run python -m quickdraw.data_generation 'environments.name=gym:Pendulum-v1' \
@@ -28,7 +36,7 @@ For free you get the `random` behavior policy, the env's own reward for control 
 `render_obs` pred-vs-true filmstrip as eval-viz (`render_diagnostics` is absent → `wants_diagnostics` is
 False → graceful fallback). From here the rest of [docs/workflow.md](workflow.md) applies unchanged.
 
-## Path B (full): implement the `WorldEnv` protocol
+## Full control: implement the `WorldEnv` protocol yourself
 
 For a batched, first-class env like the torus reference (`environments/torus.py`), implement the protocol
 directly — batched-torch `reset`/`step` is a big speed win for data-gen and internal rollouts:
@@ -100,17 +108,30 @@ pixel-identical to the pre-interface videos.
 
 ## Worked example: a stock gym env end-to-end
 
+Each step is its own `uv run` line, exactly as in [docs/workflow.md](workflow.md) — the only difference is
+the `environments.name=gym:Pendulum-v1` override threaded through:
+
 ```bash
 # 1. mine play data with the env-agnostic random policy
-uv run python -m quickdraw.data_generation 'environments.name=gym:Pendulum-v1' \
-    data.action_sampler=random experiment=pendulum
-#    -> DATA=logs/data_generation_<ts>_pendulum
+uv run python -m quickdraw.data_generation 'environments.name=gym:Pendulum-v1' data.action_sampler=random experiment=pendulum
+#    -> set DATA=logs/data_generation_<ts>_pendulum
 
-# 2. onward exactly as docs/workflow.md: push_to_hub -> train_world_model -> evals
-uv run python -m quickdraw.train_world_model experiment=pendulum data.root=$DATA \
-    'environments.name=gym:Pendulum-v1' +run_summary.problem=... # (all 5 fields)
+# 2. push the dataset to the Hub (its own step)
+uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=pendulum
+
+# 3. train the world model
+uv run python -m quickdraw.train_world_model experiment=pendulum data.root=$DATA 'environments.name=gym:Pendulum-v1' +run_summary.problem=... # (all 5 fields)
+#    -> set CKPT=logs/train_world_<ts>_pendulum
+
+# 4. train the action model (post-hoc, on the frozen WM)
+uv run python -m quickdraw.train_action_model checkpoint=$CKPT data.root=$DATA experiment=pendulum 'environments.name=gym:Pendulum-v1' +run_summary.problem=...
+
+# 5. control eval — MPPI scored by the env's own reward
+uv run python -m quickdraw.eval_control checkpoint=$CKPT data.root=$DATA 'environments.name=gym:Pendulum-v1'
 ```
 
 Control eval scores plans with the env's own `reward`; eval-viz uses the `render_obs` filmstrip until you
-implement `render_diagnostics`. To go beyond `random` play data or single-view eval videos, graduate to
-Path B.
+implement `render_diagnostics`. The interpret / reward / language-control steps (5–7 of
+[docs/workflow.md](workflow.md)) need per-env semantic factors (`conf/interpret/<env>.yaml`) and a VLM, so
+they're env-specific — add them when you want language steering. To go beyond `random` play data or
+single-view eval videos, implement the protocol yourself (above).
