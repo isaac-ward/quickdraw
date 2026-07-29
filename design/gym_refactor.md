@@ -198,10 +198,10 @@ See the checkbox tracker below.
 - [ ] 3.3 PARITY: local-root load == hf_repo load for the same dataset (array-exact).
 
 ### Phase 2 — policy-driven, env-agnostic data generation
-- [ ] 2.1 `environments/policies.py`: `RandomPolicy` (samples action_space) + wrap OU/Bimodal samplers as policies.
-- [ ] 2.2 `generate_episodes(env: WorldEnv, policy, ...)`; collect (obs, action, reward, render_obs frames).
-- [ ] 2.3 `data_generation.py`: build env+policy from config; FPV step -> `env.render_obs`. Torus path byte-identical.
-- [ ] 2.4 PARITY: torus dataset regen (fixed seed) == pre-refactor dataset (arrays + frames + norm stats).
+- [x] 2.1 `environments/policies.py`: `RandomPolicy` (samples action_space) + wrap OU/Bimodal samplers as policies.
+- [x] 2.2 `generate_episodes(env: WorldEnv, policy, ...)`; collect (obs, action, reward, render_obs frames).
+- [x] 2.3 `data_generation.py`: build env+policy from config; FPV step -> `env.render_obs`. Torus path byte-identical.
+- [x] 2.4 PARITY: torus dataset regen (fixed seed) == pre-refactor dataset (arrays + frames + norm stats).
 
 ### Phase 4 — control eval via env.reward
 - [ ] 4.1 `MPPI(rollout_fn, reward_fn, action_dim)`: oracle `rollout_fn=env.step`, learned `rollout_fn=WM.rollout`; reward=`env.reward`.

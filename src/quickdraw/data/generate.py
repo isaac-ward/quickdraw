@@ -1,4 +1,4 @@
-"""Dataset generation: roll out TorusEnv -> LeRobotDataset splits (design/data.md).
+"""Dataset generation: roll out a WorldEnv -> LeRobotDataset splits (design/data.md, design/gym_refactor.md).
 
 Splits: train, val, eval_ood_horizon, eval_ood_visual, eval_ood_geometric, eval_ood_dynamics.
 Each split stores `observation_vector`, `action`, and `observation.images.fpv` (the egocentric video,
@@ -19,37 +19,39 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
-from ..environments.torus import BimodalActionSampler, OUActionSampler, TorusConfig, TorusEnv
+from ..environments.policies import make_policy
+from ..environments.torus import TorusConfig, TorusEnv
 
 
-def _build_sampler(kind: str, n_traj: int, a_max: float, device):
-    """Action process for data gen: 'ou' (unimodal OU) or 'bimodal' (two-basin action-magnitude)."""
-    if kind == "bimodal":
-        return BimodalActionSampler(n_traj, a_max, device=device)
-    if kind == "ou":
-        return OUActionSampler(n_traj, a_max, device=device)
-    raise ValueError(f"unknown action_sampler {kind!r} (expected 'ou' or 'bimodal')")
+def generate_episodes(env, n_traj: int, steps: int, seed: int, device="cpu",
+                      action_sampler: str = "ou", policy=None):
+    """Return obs (n_traj, steps, obs_dim) and act (n_traj, steps, action_dim) as float32 numpy arrays.
 
-
-def generate_episodes(env_cfg: TorusConfig, n_traj: int, steps: int, seed: int, device="cpu",
-                      action_sampler: str = "ou"):
-    """Return obs (n_traj, steps, 6) and act (n_traj, steps, 2) as float32 numpy arrays.
+    Env-agnostic: `env` is any batched WorldEnv (batch == n_traj, on `device`) rolled with a behavior
+    `policy` (environments/policies.py; default built by name from `action_sampler`). Legacy signature —
+    `env` may be a TorusConfig, in which case the TorusEnv is built here. Both paths are byte-identical
+    to the pre-refactor torus loop (proven by smoke/refactor_parity_datagen).
 
     All n_traj episodes are simulated in parallel as one batched env. action[:, t] is the action
     applied at step t (producing obs[:, t+1]); the final action is recorded but unused downstream.
-    `action_sampler`: "ou" (unimodal OU, default) or "bimodal" (two-basin action-magnitude process).
+
+    RNG CONTRACT — the data is a pure function of `seed` via ONE generator consumed in EXACTLY this
+    order: env.reset(g), policy.reset(g), then per step policy.sample(obs, g) -> env.step(a). Adding,
+    removing or reordering ANY draw changes every generated dataset.
     """
+    if isinstance(env, TorusConfig):
+        env = TorusEnv(env, batch=n_traj, device=device)
+    if policy is None:
+        policy = make_policy(action_sampler, env, device=device)
     g = torch.Generator(device=device).manual_seed(seed)
-    env = TorusEnv(env_cfg, batch=n_traj, device=device)
-    sampler = _build_sampler(action_sampler, n_traj, env_cfg.a_max, device)
-    env.reset(g)
-    sampler.reset(g)
-    obs_list, act_list = [env.observe()], []
+    obs0 = env.reset(g)
+    policy.reset(g)
+    obs_list, act_list = [obs0], []
     for _ in range(steps - 1):
-        a = sampler.sample(g, state=obs_list[-1])   # state = current obs -> state-dependent samplers (bimodal)
+        a = policy.sample(obs_list[-1], g)   # current obs -> state-dependent policies (bimodal)
         act_list.append(a)
         obs_list.append(env.step(a))
-    act_list.append(sampler.sample(g, state=obs_list[-1]))  # pad last action so shapes match (unused)
+    act_list.append(policy.sample(obs_list[-1], g))  # pad last action so shapes match (unused)
     obs = torch.stack(obs_list, dim=1).cpu().numpy().astype(np.float32)
     act = torch.stack(act_list, dim=1).cpu().numpy().astype(np.float32)
     return obs, act

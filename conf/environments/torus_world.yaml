@@ -1,5 +1,6 @@
 # TorusWorld-v0 / `make_env("torus_world", ...)` — same physics as torus.yaml (kept in place for now;
 # this is the env-registry name introduced by design/gym_refactor.md Phase 1).
+name: torus_world   # env-registry name (environments/registry.make_env)
 R: 0.75           # ~1-unit torus (extent R+r = 1.0 in x/y)
 r: 0.25
 dt: 0.0166667     # 60 Hz — smaller integration step

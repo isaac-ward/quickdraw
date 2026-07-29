@@ -22,6 +22,8 @@ import hydra
 import matplotlib.pyplot as plt
 
 from .data.generate import compute_norm_stats, generate_episodes, write_lerobot_split, write_meta
+from .environments.policies import make_policy
+from .environments.registry import make_env
 from .environments.torus import TorusConfig
 from .logging import viz
 from .training.setup import env_cfg
@@ -91,12 +93,16 @@ def main(cfg):
         os.makedirs(d, exist_ok=True)
     t0 = time.time()
 
-    # 1. simulate every split (cheap, vector only)
+    # 1. simulate every split (cheap, vector only) — env by name from the registry (design/gym_refactor.md
+    # Phase 2), rolled with the configured behavior policy. Torus: byte-identical to the pre-refactor loop.
+    env_name = cfg.environments.get("name", "torus_world")
+    asamp = cfg.data.get("action_sampler", "ou")
     data = {}
     for name, s in cfg.data.splits.items():
         scfg = replace(ecfg, **dict(s.get("env", {}) or {}))
-        obs, act = generate_episodes(scfg, int(s["n_traj"]), int(s["steps"]), int(s["seed"]),
-                                     action_sampler=cfg.data.get("action_sampler", "ou"))
+        env = make_env(env_name, scfg, batch=int(s["n_traj"]))
+        obs, act = generate_episodes(env, int(s["n_traj"]), int(s["steps"]), int(s["seed"]),
+                                     policy=make_policy(asamp, env))
         data[name] = (scfg, obs, act, s.get("coloring", "hsv"))
         os.makedirs(os.path.join(fpv_root, name), exist_ok=True)
     log(f"[gen] simulated {len(data)} splits, {sum(o.shape[0] for _, o, _, _ in data.values())} trajectories")
@@ -104,10 +110,11 @@ def main(cfg):
     # action-distribution preview (regenerated EVERY run): 8 magnitude-histogram tiles over time, so the
     # data's action distribution (e.g. the two-basin bimodal magnitude) is eyeballable + referenced by the card.
     # Drawn at ACTION_DIST_N_SAMPLES (> dataset size) for clean patterns; the eval samples the head at the same N.
-    asamp = cfg.data.get("action_sampler", "ou")
     ad_steps = int(cfg.data.splits["train"]["steps"])
-    ad_obs, ad_acts = generate_episodes(ecfg, viz.ACTION_DIST_N_SAMPLES, ad_steps,   # roll the env -> reflects the
-                                        seed=int(cfg.data.splits["train"]["seed"]), action_sampler=asamp)
+    ad_env = make_env(env_name, ecfg, batch=viz.ACTION_DIST_N_SAMPLES)
+    ad_obs, ad_acts = generate_episodes(ad_env, viz.ACTION_DIST_N_SAMPLES, ad_steps,   # roll the env -> reflects the
+                                        seed=int(cfg.data.splits["train"]["seed"]),
+                                        policy=make_policy(asamp, ad_env))
     # conditioned on ambient x (obs[...,0]) so a STATE-dependent sampler shows its dependence: slow on -x, fast on +x.
     adfig = viz.fig_action_by_state(ad_acts, ad_obs[..., 0], ecfg.a_max, sampler_name=asamp)
     adfig.savefig(os.path.join(media, "action_distribution.png"), dpi=viz.DPI)
