@@ -47,7 +47,9 @@ def make_policy(name: str, env, device="cpu"):
     without a registry only gets 'random'."""
     n = str(name).lower()
     if n == "random":
-        return RandomPolicy(env.action_dim, float(env.cfg.a_max), device=device)
+        # action range: env-level `a_max` (GymBatchAdapter, from the action_space) else cfg (torus)
+        a_max = getattr(env, "a_max", None)
+        return RandomPolicy(env.action_dim, float(env.cfg.a_max if a_max is None else a_max), device=device)
     env_policies = getattr(env, "POLICIES", {})
     if n in env_policies:
         return env_policies[n](env, device)

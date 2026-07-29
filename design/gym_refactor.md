@@ -213,8 +213,8 @@ See the checkbox tracker below.
 - [ ] 5.2 PARITY: torus ood_horizon + control videos pixel-identical.
 
 ### Phase 6 — GymBatchAdapter (bring your own env)
-- [ ] 6.1 `environments/gym_adapter.py`: wrap any `gymnasium.Env` (vectorize B), map spaces, step->reward+obs, render(rgb_array)->render_obs, render_diagnostics->{}.
-- [ ] 6.2 Smoke: a stock gym env (e.g. `Pendulum-v1`) end-to-end: gen -> (push) -> train 1 epoch -> control eval, core diagnostics present.
+- [x] 6.1 `environments/gym_adapter.py`: wrap any `gymnasium.Env` (vectorize B), map spaces, step->reward+obs, render(rgb_array)->render_obs, render_diagnostics->{}.
+- [x] 6.2 Smoke: a stock gym env (e.g. `Pendulum-v1`) end-to-end: gen -> (push) -> train 1 epoch -> control eval, core diagnostics present.
 
 ### Phase 7 — docs + naming
 - [ ] 7.1 `docs/workflow.md` (order: datagen -> pushhub -> wm[+val/eval subpoints] -> am -> interpret -> rm -> language-control).
