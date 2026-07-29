@@ -39,31 +39,35 @@ class MPPIConfig:
     n_goals: int = 5           # goals visited per episode (random subset of the 8 NESW in/out goals)
 
 
-def _score(p_xyz, v_xyz, cand, goal, mppi, dist=None):
-    """MPPI return for each candidate: -distance, a near-target velocity penalty so it settles, and an
-    optional control (action-magnitude) cost. p_xyz/v_xyz: (G,K,H,3); cand: (G,K,H,2); goal: (G,3) -> (G,K).
-    dist (G,K,H) optional: use this precomputed per-step distance INSTEAD of the goal distance (language
-    steering passes 1 - reward, so 'closer' == 'redder') — the velocity-settling + control shaping below is
+def _score(p_xyz, v_xyz, cand, goal, mppi, dist=None, reward_fn=None):
+    """MPPI return for each candidate: the env's per-step reward summed over the horizon, plus an optional
+    control (action-magnitude) cost. p_xyz/v_xyz: (G,K,H,3); cand: (G,K,H,2); goal: (G,3) -> (G,K).
+    reward_fn(obs, goal) is the env-agnostic scorer (WorldEnv.reward; torus == the old inline
+    -distance - gated velocity penalty, so torus numbers are unchanged — gym_refactor.md Phase 4).
+    dist (G,K,H) optional: use this precomputed per-step distance INSTEAD of the env reward (language
+    steering passes 1 - reward, so 'closer' == 'redder') — the velocity-settling + control shaping is
     then applied identically, which is what makes language control structurally the same as goal control."""
-    d = dist if dist is not None else (p_xyz - goal[:, None, None]).norm(dim=-1)   # (G,K,H)
-    gate = (d < mppi.r_settle).float()
-    ret = (-d - mppi.beta_vel * gate * v_xyz.norm(dim=-1)).sum(dim=-1)
+    if dist is not None:                                       # language fast path: distance precomputed on the bag
+        gate = (dist < mppi.r_settle).float()
+        ret = (-dist - mppi.beta_vel * gate * v_xyz.norm(dim=-1)).sum(dim=-1)
+    else:                                                      # env reward per step; goal broadcast over (G,K,H)
+        ret = reward_fn(torch.cat([p_xyz, v_xyz], dim=-1), goal[:, None, None]).sum(dim=-1)
     if mppi.beta_ctrl > 0.0:                                   # cheaper thrust preferred (energy/jitter)
         ret = ret - mppi.beta_ctrl * cand.pow(2).sum(dim=-1).sum(dim=-1)   # sum_h ||a_h||^2  (G,K)
     return ret
 
 
-def _mppi_step(rollout_fn, mean, goal, mppi, a_max, g):
+def _mppi_step(rollout_fn, mean, goal, mppi, a_max, g, reward_fn=None):
     """One MPPI update: sample candidates, score via rollout_fn, return the new weighted mean (G,H,2)
     and the first action (G,2). rollout_fn(cand) -> (p_xyz, v_xyz, dist): dist is a per-step distance
-    override (G,K,H) for the language reward, or None -> use the goal distance. _score applies the same
-    velocity/control shaping either way."""
+    override (G,K,H) for the language reward, or None -> score with reward_fn (the env's reward). _score
+    applies the same velocity/control shaping either way."""
     G, H = mean.shape[0], mppi.horizon
     K = mppi.num_samples
     noise = torch.randn(G, K, H, 2, device=mean.device, generator=g) * mppi.noise_sigma
     cand = (mean[:, None] + noise).clamp(-a_max, a_max)        # (G,K,H,2)
     p_xyz, v_xyz, dist = rollout_fn(cand)                     # dist: per-step (G,K,H) override, or None
-    ret = _score(p_xyz, v_xyz, cand, goal, mppi, dist=dist)   # (G,K) higher = better (lower cost)
+    ret = _score(p_xyz, v_xyz, cand, goal, mppi, dist=dist, reward_fn=reward_fn)   # (G,K) higher = better
     w = torch.softmax(ret / max(mppi.lambda_, 1e-6), dim=1)   # (G,K)
     new_mean = (w[..., None, None] * cand).sum(dim=1)         # (G,H,2)
     return new_mean, new_mean[:, 0], p_xyz, ret               # p_xyz/ret expose the candidate fan
@@ -114,14 +118,16 @@ def _init_controller(cfg, B, device, seed):
 
 @torch.no_grad()
 def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, device="cpu", log=None, fpv=None,
-                reward=None, request=None, oracle=True, n_plot=1, requests=None):
+                reward=None, request=None, oracle=True, n_plot=1, requests=None, reward_fn=None):
     """MPPI control on the torus. Default: race the oracle (true dynamics) vs the learned model through
     spatial goals. `oracle=False` -> learned controller only (same code spine). `reward` (a
     language.reward.LanguageReward) + `request` -> the learned controller maximizes R(latent, request)
     instead of reaching goals: goal advancement is OFF and each controller's `dist_curve` holds the realized
     reward per step (this is the language-steered eval_control). `fpv` renders FPV context in the loop.
     n_plot: render per-episode products (paths/fan/FPV) for the first n_plot of the n_episodes parallel
-    episodes (all run in ONE batched rollout; n_plot only controls how many we keep for visuals)."""
+    episodes (all run in ONE batched rollout; n_plot only controls how many we keep for visuals).
+    reward_fn(obs, goal) -> per-step (…,) reward: the env-agnostic MPPI scorer (WorldEnv.reward), used by
+    BOTH controllers; None -> the true env's reward with the config's beta_vel/r_settle (torus default)."""
     core = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
     use_fpv = img_head is not None and fpv is not None                     # render FPV in the loop ONLY with a real image head
@@ -157,6 +163,9 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     dist_bag = (lambda bag: 1.0 - reward.score(bag, t_e)) if reward is not None else None   # (G,K,H,D)->(G,K,H)
     kinds = ["true", "pred"] if oracle else ["pred"]          # oracle=False -> learned controller only (same spine)
     ctrls = {k: _init_controller(env_cfg, B, device, 2) for k in kinds}
+    if reward_fn is None:   # default scorer: the TRUE env's reward with the config's shaping knobs
+        reward_fn = lambda o, gl: ctrls[kinds[0]]["env"].reward(o, gl, beta_vel=mppi.beta_vel,
+                                                                r_settle=mppi.r_settle)
     arange = torch.arange(B, device=device)
     for c in ctrls.values():
         c["mean"] = torch.zeros(B, H, 2, device=device)
@@ -192,7 +201,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                                                dist_bag=dist_bag)   # reward mode -> per-step distance 1-R on the rolled bag
             else:
                 rollout = _true_rollout_fn(c["env"], env_cfg, device)
-            c["plan"], _, p_xyz, ret = _mppi_step(rollout, c["mean"], cur, mppi, a_max, g)
+            c["plan"], _, p_xyz, ret = _mppi_step(rollout, c["mean"], cur, mppi, a_max, g, reward_fn)
             if kind == "pred":  # per-episode candidate fan, ANCHORED at the current known position: prepend
                 # the dot (last true obs) so the first segment joins where-we-are -> first prediction.
                 anchor = c["obs"][-1][:NP, :3].cpu().numpy()                    # (NP,3) current positions

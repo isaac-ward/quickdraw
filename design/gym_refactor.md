@@ -204,9 +204,16 @@ See the checkbox tracker below.
 - [x] 2.4 PARITY: torus dataset regen (fixed seed) == pre-refactor dataset (arrays + frames + norm stats).
 
 ### Phase 4 — control eval via env.reward
-- [ ] 4.1 `MPPI(rollout_fn, reward_fn, action_dim)`: oracle `rollout_fn=env.step`, learned `rollout_fn=WM.rollout`; reward=`env.reward`.
+- [x] 4.1 `MPPI(rollout_fn, reward_fn, action_dim)`: oracle `rollout_fn=env.step`, learned `rollout_fn=WM.rollout`; reward=`env.reward`.
+        `_score` now sums a per-step `reward_fn(obs, goal)` (default `env.reward` via `make_env` in
+        run_and_log_control; config beta_vel/r_settle bound when the env's reward exposes them). The
+        language `dist` fast path (1 - reward on the rolled bag) is kept inline.
 - [ ] 4.2 `eval_control` builds the SceneOverlay (agents={true,pred}, markers={goal}) for render_diagnostics.
-- [ ] 4.3 PARITY: torus control scalars + videos unchanged vs pre-refactor (fixed ckpt).
+        DEFERRED to Phase 5 with 1.5 (render_diagnostics itself).
+- [x] 4.3 PARITY: torus control scalars + videos unchanged vs pre-refactor (fixed ckpt).
+        Verified on repro_ptf0_mse last.ckpt (4 eps, 400 steps, GPU): all eval_control scalars AND the
+        sha256 of the full per-step dist_curves/paths of both controllers are bit-identical old vs new
+        (and across an old-repeat determinism control). Video/render code untouched by this phase.
 
 ### Phase 5 — eval-viz uses render_diagnostics with graceful fallback
 - [ ] 5.1 `emit_openloop`/filmstrips/rollout videos call `render_diagnostics(overlay, views)`; fall back to `render_obs` filmstrip if `{}`.
@@ -217,8 +224,8 @@ See the checkbox tracker below.
 - [x] 6.2 Smoke: a stock gym env (e.g. `Pendulum-v1`) end-to-end: gen -> (push) -> train 1 epoch -> control eval, core diagnostics present.
 
 ### Phase 7 — docs + naming
-- [ ] 7.1 `docs/workflow.md` (order: datagen -> pushhub -> wm[+val/eval subpoints] -> am -> interpret -> rm -> language-control).
-- [ ] 7.2 `docs/interpret.md` (defining concepts/factors + VLM prompts).
-- [ ] 7.3 `docs/byo_environment.md` (+ the "Diagnostic renders (optional)" section: exact contract + what-you-lose table).
-- [ ] 7.4 `README.md` links to the three docs + this plan + accelerations.md.
+- [x] 7.1 `docs/workflow.md` (order: datagen -> pushhub -> wm[+val/eval subpoints] -> am -> interpret -> rm -> language-control).
+- [x] 7.2 `docs/interpret.md` (defining concepts/factors + VLM prompts).
+- [x] 7.3 `docs/byo_environment.md` (+ the "Diagnostic renders (optional)" section: exact contract + what-you-lose table).
+- [x] 7.4 `README.md` links to the three docs + this plan + accelerations.md.
 - [ ] 7.5 Public rename: HF dataset `quickdraw-torus` -> `torus-world`; gym id `TorusWorld-v0`. Internal `torus/<split>` unchanged.

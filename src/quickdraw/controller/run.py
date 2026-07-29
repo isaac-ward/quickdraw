@@ -7,6 +7,8 @@ standalone `eval_control` entrypoint.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import os
 import time
@@ -14,6 +16,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 
+from ..environments.registry import make_env
 from ..logging import viz
 from .mppi import MPPIConfig, run_control
 
@@ -81,10 +84,19 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     _plog(writer, f"[eval_control @ep{step}] start: MPPI {mppi_kwargs['n_episodes']} eps x {n_ctrl} controller(s), "
                   f"{mppi_kwargs['num_samples']} samples, H={mppi_kwargs['horizon']}, max_steps={mppi_kwargs['max_steps']}, "
                   f"render {n_plot} episode(s)")
+    # env-agnostic MPPI scoring (design/gym_refactor.md Phase 4): both controllers score candidates with the
+    # TRUE env's reward. Torus: TorusEnv.reward == the old inline goal cost, so torus numbers are unchanged;
+    # a generic env brings its own reward. Shaping knobs bound only when the env's reward exposes them.
+    mppi_cfg = MPPIConfig(**mppi_kwargs)
+    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, mppi_cfg.n_episodes, device)
+    knobs = {k: getattr(mppi_cfg, k) for k in ("beta_vel", "r_settle")
+             if k in inspect.signature(env.reward).parameters}
+    reward_fn = functools.partial(env.reward, **knobs)
     t = time.perf_counter()
-    res, _ = run_control(model, normalizer, ecfg, MPPIConfig(**mppi_kwargs), device=device,
+    res, _ = run_control(model, normalizer, ecfg, mppi_cfg, device=device,
                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv,
-                         reward=reward, request=request, requests=requests, oracle=(reward is None), n_plot=n_plot)
+                         reward=reward, request=request, requests=requests, oracle=(reward is None), n_plot=n_plot,
+                         reward_fn=reward_fn)
     t_ctrl = time.perf_counter() - t
     # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers the controller(s) + chunk
     # execution over n_chunks replans, so per-chunk wall time = t_ctrl / n_chunks.
