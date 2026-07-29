@@ -14,8 +14,9 @@ n_plot_trajectories: 4     # how many sample trajectories to draw per split plot
 fpv_fov: 100            # egocentric camera field of view (deg); VTK default is 30
 composite_grid: 4         # NxN grid of per-episode FPV videos stitched per eval case
 action_smooth_window: 18  # boxcar window (steps) for smoothing the action arrow in videos (less whippy)
-action_sampler: ou        # ou (Ornstein-Uhlenbeck, unimodal, default) | bimodal (two-basin action-magnitude
-#                           process for the action-distribution experiment — see BimodalActionSampler)
+action_sampler: ornstein_uhlenbeck   # ornstein_uhlenbeck (unimodal, default; deprecated alias: ou) | bimodal
+#                           (two-basin action-magnitude process for the action-distribution experiment — see
+#                           BimodalActionSampler) | random — torus-registered policies (environments/torus.py)
 
 # All splits + every OOD change live here (env overrides applied on top of `environments/torus.yaml`).
 # Each OOD axis changes exactly ONE thing:

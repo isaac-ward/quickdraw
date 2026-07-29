@@ -18,6 +18,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from .policies import SamplerPolicy
+
 TWO_PI = 2.0 * math.pi
 
 
@@ -158,6 +160,16 @@ class TorusEnv:
 
     action_dim = 2   # (a_theta, a_phi)
     obs_dim = 6      # [p; p_dot]
+
+    # Env-shipped behavior policies (design/gym_refactor.md): name -> factory(env, device) -> Policy.
+    # `make_policy` (environments/policies.py) resolves the generic 'random' itself and delegates these
+    # here — pull Torus World and you get its policies. Wraps the samplers below unchanged (same math/RNG).
+    POLICIES = {
+        "ornstein_uhlenbeck": lambda env, device="cpu": SamplerPolicy(
+            OUActionSampler(getattr(env, "batch", 1), float(env.cfg.a_max), device=device)),
+        "bimodal": lambda env, device="cpu": SamplerPolicy(
+            BimodalActionSampler(getattr(env, "batch", 1), float(env.cfg.a_max), device=device)),
+    }
 
     def __init__(self, cfg: TorusConfig, batch: int, device="cpu"):
         self.cfg = cfg

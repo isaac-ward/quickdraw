@@ -24,7 +24,7 @@ from ..environments.torus import TorusConfig, TorusEnv
 
 
 def generate_episodes(env, n_traj: int, steps: int, seed: int, device="cpu",
-                      action_sampler: str = "ou", policy=None):
+                      action_sampler: str = "ornstein_uhlenbeck", policy=None):
     """Return obs (n_traj, steps, obs_dim) and act (n_traj, steps, action_dim) as float32 numpy arrays.
 
     Env-agnostic: `env` is any batched WorldEnv (batch == n_traj, on `device`) rolled with a behavior

@@ -23,9 +23,9 @@ def _make_card(root: str, name: str) -> str:
     s = json.load(open(os.path.join(root, "summary.json")))
     counts, split_env, coloring = s["counts"], s["split_env"], s["coloring"]
     splits = list(counts)
-    action_sampler = s.get("action_sampler", "ou")
+    action_sampler = s.get("action_sampler", "ornstein_uhlenbeck")
     action_desc = {
-        "ou": "an **Ornstein–Uhlenbeck** action process (temporally-correlated, unimodal, zero-mean)",
+        "ornstein_uhlenbeck": "an **Ornstein–Uhlenbeck** action process (temporally-correlated, unimodal, zero-mean)",
         "bimodal": "a **two-basin** action process with a **bimodal action-magnitude** distribution "
                    "(low- vs high-thrust rings) and temporal smoothing — occasional smooth hops between basins",
     }.get(action_sampler, f"a `{action_sampler}` action process")

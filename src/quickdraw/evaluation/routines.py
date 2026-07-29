@@ -619,9 +619,9 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     # the action process is a property of the DATASET (recorded in its summary.json), not the cfg default — read
     # it so we always produce the FULL set of products (never a partial run gated on a stale cfg.data.action_sampler).
-    asamp = "ou"
+    asamp = "ornstein_uhlenbeck"
     try:
-        asamp = json.load(open(os.path.join(cfg.data.root, "summary.json"))).get("action_sampler", "ou")
+        asamp = json.load(open(os.path.join(cfg.data.root, "summary.json"))).get("action_sampler", asamp)
     except Exception:
         pass
     eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)

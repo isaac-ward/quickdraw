@@ -23,6 +23,8 @@ class TorusWorldEnv(gym.Env):
     modality (rgb_array)."""
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 60}
+    # same env-shipped behavior policies as the batched env (factories fall back to batch=1 here)
+    POLICIES = TorusEnv.POLICIES
 
     def __init__(self, cfg: TorusConfig | None = None, render_mode: str = "rgb_array"):
         self.cfg = cfg if cfg is not None else TorusConfig()

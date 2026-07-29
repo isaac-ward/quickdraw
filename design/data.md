@@ -39,7 +39,7 @@ each isolate ONE OOD axis (visual = recolor only, geometric = `(R,r)` only, dyna
 ## Generation
 
 1. `TorusEnv` steps all of a split's trajectories at once; **actions come from `data.action_sampler`** —
-   `ou` (Ornstein–Uhlenbeck, unimodal, default) or `bimodal` (`BimodalActionSampler`: a two-basin
+   `ornstein_uhlenbeck` (unimodal, default; deprecated alias `ou`) or `bimodal` (`BimodalActionSampler`: a two-basin
    action-**magnitude** process, temporally smoothed, leaning to the low-thrust basin). An 8-tile
    **`media/action_distribution.png`** preview of the action distribution over time is rendered every run.
 2. **FPV render (the heavy step, decoupled for parallelism):** each trajectory's 256×256 egocentric

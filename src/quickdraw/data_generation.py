@@ -96,7 +96,7 @@ def main(cfg):
     # 1. simulate every split (cheap, vector only) — env by name from the registry (design/gym_refactor.md
     # Phase 2), rolled with the configured behavior policy. Torus: byte-identical to the pre-refactor loop.
     env_name = cfg.environments.get("name", "torus_world")
-    asamp = cfg.data.get("action_sampler", "ou")
+    asamp = str(cfg.data.get("action_sampler", "ornstein_uhlenbeck")).lower()
     data = {}
     for name, s in cfg.data.splits.items():
         scfg = replace(ecfg, **dict(s.get("env", {}) or {}))
@@ -179,7 +179,7 @@ def main(cfg):
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump({"dataset_root": run_dir, "counts": counts, "splits": card["splits"],
                    "split_env": card["split_env"], "coloring": card["coloring"],
-                   "action_sampler": cfg.data.get("action_sampler", "ou"),
+                   "action_sampler": asamp,
                    "normalization_stats": norm}, f, indent=2)
 
     # 4. composites: stitch every split's clips into one grid (reusing the rendered clips)

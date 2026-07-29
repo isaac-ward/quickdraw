@@ -2,16 +2,15 @@
 -> action (B, action_dim)`, used to mine play data from ANY batched WorldEnv.
 
 `random` is the only env-agnostic policy (uniform over the env's action range) — the default for a BYO env.
-`ou`/`bimodal` wrap the EXISTING torus action samplers (environments/torus.py) unchanged — same math, same
-RNG draw order (`sample(obs, g)` forwards as the legacy `sampler.sample(g, state=obs)` call), so torus
-datasets stay byte-identical (proven by smoke/refactor_parity_datagen)."""
+Env-specific policies ship WITH their env via a `POLICIES` class registry (name -> factory(env, device));
+torus registers `ornstein_uhlenbeck`/`bimodal` (environments/torus.py) wrapping its EXISTING action samplers
+unchanged — same math, same RNG draw order (`sample(obs, g)` forwards as the legacy `sampler.sample(g,
+state=obs)` call), so torus datasets stay byte-identical (proven by smoke/refactor_parity_datagen)."""
 
 from __future__ import annotations
 
 import torch
 from torch import Tensor
-
-from .torus import BimodalActionSampler, OUActionSampler
 
 
 class RandomPolicy:
@@ -43,14 +42,14 @@ class SamplerPolicy:
 
 
 def make_policy(name: str, env, device="cpu"):
-    """Behavior policy by name: 'random' (env-agnostic) | 'ou' | 'bimodal' (torus samplers as policies).
-    Batch and action range come from the env (a batched WorldEnv exposing `batch` + `cfg.a_max`, e.g. TorusEnv)."""
+    """Behavior policy by name: 'random' (env-agnostic) or any name the env registers in its `POLICIES`
+    class attr (name -> factory(env, device); torus ships 'ornstein_uhlenbeck' + 'bimodal'). A BYO env
+    without a registry only gets 'random'."""
     n = str(name).lower()
-    a_max = float(env.cfg.a_max)
     if n == "random":
-        return RandomPolicy(env.action_dim, a_max, device=device)
-    if n == "ou":
-        return SamplerPolicy(OUActionSampler(env.batch, a_max, device=device))
-    if n == "bimodal":
-        return SamplerPolicy(BimodalActionSampler(env.batch, a_max, device=device))
-    raise ValueError(f"unknown policy {name!r} (expected 'random', 'ou' or 'bimodal')")
+        return RandomPolicy(env.action_dim, float(env.cfg.a_max), device=device)
+    env_policies = getattr(env, "POLICIES", {})
+    if n in env_policies:
+        return env_policies[n](env, device)
+    raise ValueError(f"unknown policy {name!r} (generic: 'random'; "
+                     f"{type(env).__name__} registers: {sorted(env_policies)})")
