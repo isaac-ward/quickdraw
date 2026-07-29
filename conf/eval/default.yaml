@@ -26,5 +26,7 @@ during_train:
     denoising_aggregate: true  # diffusion ONLY: pooled next-states collapsing from noise onto the manifold (self-skips)
     manifold: true         # ANY method: recovered-manifold UMAPs (data + latent space, 2D + 3D)
     interpret: false       # vision ONLY, POST-HOC (VLM-labeled latent manifolds); needs OPENAI_API_KEY -> run standalone (python -m quickdraw.eval_interpret), keep OFF in the train loop
-    action_distribution: true   # runs whenever the model HAS an action head (self-skips otherwise, like the diffusion evals): learned action prior vs true data action dist (by-x hists + animation + true_pred_w1)
+    action_distribution: false  # DECIDED (2026-07-29): the action head is NO LONGER trained during world-model
+    #                             training (it destabilized the WM). It is now a POST-HOC model trained on a FROZEN
+    #                             WM via `python -m quickdraw.train_action_model`, which runs this eval itself.
     # (image FPV rollout/filmstrip/metrics are now part of ood_horizon — under eval_ood_horizon/<head>/)

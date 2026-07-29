@@ -1,4 +1,4 @@
-"""Load a trained language reward head (train_reward.py -> reward_head.pt) and score latents against a
+"""Load a trained language reward head (train_reward_model.py -> reward_head.pt) and score latents against a
 text request, decode-free, for MPPI: `R(latent, text) = cos(f_z(latent), f_t(text))`.
 
 Known-vocabulary requests reuse the precomputed text prototypes (no text encoder needed at plan time).
@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 
-def _mlp(d_in, d_hidden, d_out, dropout=0.0):            # must match train_reward.py's head (incl. dropout structure)
+def _mlp(d_in, d_hidden, d_out, dropout=0.0):            # must match train_reward_model.py's head (incl. dropout structure)
     layers = [torch.nn.Linear(d_in, d_hidden), torch.nn.GELU()]
     if dropout > 0:
         layers.append(torch.nn.Dropout(dropout))
@@ -37,7 +37,7 @@ class LanguageReward:
 
     def _embed(self, text: str) -> torch.Tensor:
         """MiniLM sentence embedding (mean-pooled, L2-normalized), lazy-loaded. This is the SAME frozen encoder
-        train_reward used, so its pretraining carries: free-form phrasings ('upper red', 'the red area at the
+        train_reward_model used, so its pretraining carries: free-form phrasings ('upper red', 'the red area at the
         top') land near the bucket paraphrases f_t was trained on."""
         if self._tok is None:
             from transformers import AutoModel, AutoTokenizer

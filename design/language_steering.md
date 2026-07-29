@@ -6,8 +6,8 @@ rollouts **in latent space** with a learned reward `R(latent, text)`, **distille
 variant because a learned reward needs no target points, no `k`, no centroids. It is **not** a separate eval:
 it is `eval_control` with the oracle turned off and a reward objective swapped in (see MPPI integration).
 
-Naming: the world-model trainer is `train_world.py` (was `train.py`); the reward trainer is `train_reward.py`
-(new), reusing `train_world.py`'s logging path (`make_writer` → local mirror + wandb, identical keys).
+Naming: the world-model trainer is `train_world_model.py` (was `train.py`); the reward trainer is `train_reward_model.py`
+(new), reusing `train_world_model.py`'s logging path (`make_writer` → local mirror + wandb, identical keys).
 
 ## Reward head
 
@@ -88,13 +88,13 @@ Needs a tiny text encoder — `sentence-transformers/paraphrase-MiniLM-L3-v2` (~
   ```yaml
   language:
     request: red     # a bucket in the reward head's vocab
-    head: null       # path to a train_reward run's reward_head.pt; null -> normal goal-race eval_control
+    head: null       # path to a train_reward_model run's reward_head.pt; null -> normal goal-race eval_control
   ```
 
 ## Blast radius / build order — as shipped
 
 The steering path **reuses `run_control`'s spine** via an `oracle` toggle rather than a parallel controller.
-New: `train_reward.py` (trains `f_z/f_t`, saves the head + `f_t` prototypes), `language/reward.py`
+New: `train_reward_model.py` (trains `f_z/f_t`, saves the head + `f_t` prototypes), `language/reward.py`
 (`LanguageReward`: loads the head, `request→t_e`, `score(latent, t_e)`). Modified, surgically:
 1. `controller/mppi.py` — `run_control(reward=None, request=None, oracle=True)`. `oracle=True` builds the
    `true`+`pred` controllers (unchanged dual race); `oracle=False` builds only the learned `pred` controller.
@@ -129,15 +129,15 @@ Everything is **decode-free** and reuses `evaluation/projection.py` (`project_an
 | Space | Folder | Written by | What |
 |---|---|---|---|
 | WM token-bag latent | `world_model_latent_space_plots/` | eval_interpret | raw world-model latent, per factor |
-| Joint `f_z`/`f_t` | `joint_latent_space_plots/` | train_reward (static) + eval_control (anim) | the shared reward space |
-| Language (MiniLM) | `language_model_latent_space_plots/` | train_reward | raw caption embeddings, per factor |
-| artifacts | `saved_projections/` | interpret + train_reward | `latents.npy`, `*_reducer.pkl` (`.transform()`) |
+| Joint `f_z`/`f_t` | `joint_latent_space_plots/` | train_reward_model (static) + eval_control (anim) | the shared reward space |
+| Language (MiniLM) | `language_model_latent_space_plots/` | train_reward_model | raw caption embeddings, per factor |
+| artifacts | `saved_projections/` | interpret + train_reward_model | `latents.npy`, `*_reducer.pkl` (`.transform()`) |
 
 Structure everywhere: `<plots_name>/<factor>/<proj>/<Nd>d.{png,mp4}`. **Static** plots emit the full reducer
 suite (pca/tsne/umap/lda/umap-sup); **animations** emit only lda/umap/pca (t-SNE has no out-of-sample
 `.transform()`, so a fitted reducer can't project new control-trajectory points — it cannot animate).
 
-**P1 — `language_model_latent_space_plots/` (train_reward, static, 2D).** Project the raw MiniLM caption
+**P1 — `language_model_latent_space_plots/` (train_reward_model, static, 2D).** Project the raw MiniLM caption
 embeddings (`cap_emb`), colored by concept (per-factor supervised LDA + unsupervised pca/umap/tsne). Shows how
 language organizes the concepts *before* `f_t`. Follow-up: annotate a few bucket-word prototypes with leader
 lines + text ("top red", "the upper red area") so you can see where phrasings land.

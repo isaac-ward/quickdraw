@@ -1,4 +1,4 @@
-"""General latent-space projection + plotting, shared by eval_interpret and train_reward (and, later, the
+"""General latent-space projection + plotting, shared by eval_interpret and train_reward_model (and, later, the
 reward-space animation). Given ANY labeled point cloud — world-model bags, f_z(bags), or any feature — it
 fits the standard reducers and plots each projection colored by each factor. It's a plain library: every
 workflow calls it independently (no cross-workflow artifact dependency).
@@ -24,7 +24,7 @@ PROJECTIONS_GUIDE = r"""# Projection plots guide
 
 Each plot reduces a labeled LATENT point cloud to 2D/3D and colors it by a factor's label. The points are
 whatever the producer projected — the world-model token bag (eval_interpret) or f_z(bag) = the reward space
-(train_reward). Files: `plots/<method>/<factor>_<nd>d.png` (+ an uncolored `none_<nd>d` for unsupervised
+(train_reward_model). Files: `plots/<method>/<factor>_<nd>d.png` (+ an uncolored `none_<nd>d` for unsupervised
 methods). The fitted reducers + embeddings are in `projections/` (`<key>_{reducer.pkl,embedding.npy}`);
 pca/lda/umap expose `.transform()` to project NEW points into the SAME embedding (t-SNE has no out-of-sample map).
 

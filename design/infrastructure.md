@@ -54,7 +54,7 @@ services:
       - ./datasets:/app/datasets     # generated once, reused
       - ./logs:/app/logs             # run folders, checkpoints, media
       - caches:/caches               # persist torch.compile + HF caches across runs
-    command: uv run python -m quickdraw.train_world
+    command: uv run python -m quickdraw.train_world_model
 volumes:
   caches:
 ```
@@ -72,11 +72,11 @@ docker compose up --build     # builds image, generates data, trains + evals on 
 
 ```bash
 uv run python -m quickdraw.data_generation experiment=$RUN
-uv run python -m quickdraw.train_world          experiment=$RUN              # val + in-dist open-loop
+uv run python -m quickdraw.train_world_model          experiment=$RUN              # val + in-dist open-loop
 uv run python -m quickdraw.eval_ood       experiment=$RUN checkpoint=logs/train_<ts>_$RUN
 uv run python -m quickdraw.eval_control   experiment=$RUN checkpoint=logs/train_<ts>_$RUN
 ```
-Config overrides pass straight through, e.g. `... quickdraw.train_world model.depth=6 trainer.max_epochs=200`.
+Config overrides pass straight through, e.g. `... quickdraw.train_world_model model.depth=6 trainer.max_epochs=200`.
 Runs land in `logs/<step>_<timestamp>_<experiment>/`; the evals resolve the train dir's `best.ckpt`.
 
 ## Speed & reproducibility notes

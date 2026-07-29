@@ -1,5 +1,5 @@
 """Train the language reward head R(latent, text) = cos(f_z(latent), f_t(text)), distilled from an
-eval_interpret run via CLIP-style caption contrastive learning. `python -m quickdraw.train_reward reward.interpret_run=<run>`
+eval_interpret run via CLIP-style caption contrastive learning. `python -m quickdraw.train_reward_model reward.interpret_run=<run>`
 
 Each imagined clip carries N free-form VLM captions. We align f_z(latent) with f_t(MiniLM(caption)) by an
 in-batch contrastive loss over (latent, caption) pairs — NO per-factor prototypes in the loss. Two modes,
@@ -77,7 +77,7 @@ def _soft_ce(logits, target_dist):
     return -(target_dist * F.log_softmax(logits, dim=1)).sum(1).mean()
 
 
-_GUIDE = """# train_reward metrics guide
+_GUIDE = """# train_reward_model metrics guide
 
 Reward head: `R(z, text) = cos(f_z(z), f_t(text))`. `f_z` (latent->d) and `f_t` (MiniLM 384->d) are trained;
 MiniLM + the world model are frozen. **Objective: CLIP-style caption contrastive** over each clip's N VLM
@@ -135,8 +135,8 @@ def main(cfg):
     protos = [" / ".join(str(t).format(c=b) for t in rc.paraphrases) for (f, b) in flat]
     T = _embed_texts(protos, rc.text_model, dev).to(dev)                                    # (K_total, 384)
 
-    run_dir = make_run_dir("train_reward", cfg.experiment)
-    writer = make_writer(run_dir, cfg, job_type="train_reward")
+    run_dir = make_run_dir("train_reward_model", cfg.experiment)
+    writer = make_writer(run_dir, cfg, job_type="train_reward_model")
     writer.config(OmegaConf.to_container(cfg, resolve=True))
     open(os.path.join(writer.dir, "guide.md"), "w").write(_GUIDE)
 
@@ -148,7 +148,7 @@ def main(cfg):
 
     soft = bool(rc.get("soft_targets", False))
     ctau = float(rc.get("caption_tau", 0.1))
-    plog(f"[train_reward] caption-contrastive ({'SOFT targets' if soft else 'vanilla CLIP'}): {len(X)} points "
+    plog(f"[train_reward_model] caption-contrastive ({'SOFT targets' if soft else 'vanilla CLIP'}): {len(X)} points "
          f"({int(tr.sum())} train / {int(va.sum())} val by clip), {ncap} captions/clip, latent dim {X.shape[1]}, "
          f"{int(rc.epochs)} epochs")
 
@@ -159,7 +159,7 @@ def main(cfg):
     k = tuple_key[samp]
     same = (k[:, None] == k[None, :])
     same_combo_frac = float((same.sum() - len(samp)) / max(1, len(samp) * (len(samp) - 1)))
-    plog(f"[train_reward] measured same-combo pair fraction in a batch of {len(samp)}: {100 * same_combo_frac:.1f}% "
+    plog(f"[train_reward_model] measured same-combo pair fraction in a batch of {len(samp)}: {100 * same_combo_frac:.1f}% "
          f"(these are the vanilla-CLIP false negatives; soft_targets down-weights them)")
 
     drop = float(rc.get("dropout", 0.0))
@@ -249,13 +249,13 @@ def main(cfg):
             plog(f"[ep {ep:3d}/{int(rc.epochs)}] probe {probes} | val closs {vl:.3f} "
                  f"(best {best['loss']:.3f}@ep{best['ep']}, bad {bad}/{patience or '-'})")
             if patience and bad >= patience:
-                plog(f"[train_reward] early stop @ep{ep}: val loss hasn't improved for {patience} reports "
+                plog(f"[train_reward_model] early stop @ep{ep}: val loss hasn't improved for {patience} reports "
                      f"(best @ep{best['ep']}, val loss {best['loss']:.3f})")
                 break
 
     if best["fz"] is not None:                                   # deploy the best-val checkpoint, not the (overfit) last
         f_z.load_state_dict(best["fz"]); f_t.load_state_dict(best["ft"])
-        plog(f"[train_reward] restored best-val checkpoint (ep {best['ep']}, val loss {best['loss']:.3f})")
+        plog(f"[train_reward_model] restored best-val checkpoint (ep {best['ep']}, val loss {best['loss']:.3f})")
 
     # ---- save the trained head FIRST (before the slow/failable projections, so a reducer crash never loses it) ----
     v = evaluate(va)
@@ -266,7 +266,7 @@ def main(cfg):
                 "soft_targets": soft},                                    # provenance: which objective made this head
                os.path.join(run_dir, "reward_head.pt"))
     probes = ", ".join(f"{f} {v['per'][f]['acc']:.2f}" for f in factors)
-    plog(f"[train_reward] saved reward_head.pt (val probe acc: {probes}, {'SOFT' if soft else 'vanilla'} targets)")
+    plog(f"[train_reward_model] saved reward_head.pt (val probe acc: {probes}, {'SOFT' if soft else 'vanilla'} targets)")
 
     # ---- final val figures: per-factor probe confusion + reward-space (f_z) projection colored by factor ----
     from .evaluation import interpret as I
@@ -278,9 +278,9 @@ def main(cfg):
                                xlabel="reward probe argmax", ylabel="true")
         writer.figure(f"val/confusion/{f}", cf, int(rc.epochs)); plt.close(cf)
     labels_val = {f: [buckets_by[f][i] for i in v["per"][f]["y"].tolist()] for f in factors}
-    rs_dir = os.path.join(writer.dir, f"epoch_{int(rc.epochs):04d}", "train_reward", "saved_projections")
+    rs_dir = os.path.join(writer.dir, f"epoch_{int(rc.epochs):04d}", "train_reward_model", "saved_projections")
     sup_w = [float(w) for w in cfg.interpret.get("umap_sup_weights", [0.1, 0.3, 0.9])]
-    project_and_plot(writer, "train_reward", v["zc"].numpy(), labels_val, fac_cfgs,
+    project_and_plot(writer, "train_reward_model", v["zc"].numpy(), labels_val, fac_cfgs,
                      step=int(rc.epochs), point_size=2.5, methods=("pca", "tsne", "umap"), umap_sup_weights=sup_w,
                      save_dir=rs_dir, plots_name="joint_latent_space_plots",
                      subtitle=f"joint latent space f_z(latent), val split ({int(va.sum()):,} points)", log=plog)
@@ -292,14 +292,14 @@ def main(cfg):
     keep = np.arange(n_cap)
     if n_cap > 4000:                                             # cap points: t-SNE/UMAP cost + plot legibility
         keep = rng.choice(n_cap, 4000, replace=False)
-    project_and_plot(writer, "train_reward", cap_emb[keep].cpu().numpy(),
+    project_and_plot(writer, "train_reward_model", cap_emb[keep].cpu().numpy(),
                      {f: [cap_lab[f][i] for i in keep] for f in factors}, fac_cfgs,
                      step=int(rc.epochs), point_size=2.5, methods=("pca", "tsne", "umap"), umap_sup_weights=sup_w,
                      n_components=(2,), plots_name="language_model_latent_space_plots",
                      subtitle=f"language space MiniLM(caption), {len(keep):,} captions", log=plog)
 
     writer.finalize()
-    plog(f"[train_reward] done -> {run_dir} (reward_head.pt, val probe acc: {probes}, "
+    plog(f"[train_reward_model] done -> {run_dir} (reward_head.pt, val probe acc: {probes}, "
          f"{'SOFT' if soft else 'vanilla'} targets)")
 
 

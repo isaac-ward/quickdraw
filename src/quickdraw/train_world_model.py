@@ -1,4 +1,4 @@
-"""Entrypoint: train the base world model. `python -m quickdraw.train_world`"""
+"""Entrypoint: train the base world model. `python -m quickdraw.train_world_model`"""
 
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ def main(cfg):
             f"dir as data.root=logs/data_generation_<ts>_<exp> (got data.root={cfg.data.root!r})."
         )
 
-    run_dir = make_run_dir("train_world", cfg.experiment)   # logs/train_world_<ts>_<exp> (prefix names the entrypoint)
+    run_dir = make_run_dir("train_world_model", cfg.experiment)   # logs/train_world_<ts>_<exp> (prefix names the entrypoint)
     os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
     OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))
 

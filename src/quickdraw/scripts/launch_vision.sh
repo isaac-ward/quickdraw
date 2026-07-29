@@ -49,7 +49,7 @@ launch () {  # $1=gpu  $2=experiment-name  $3=model-config  $4=trying-env-var-na
   echo "[vision] launching $name (model=$model) on GPU $gpu  ${*:+[+ $*]}"
   docker compose exec -T -d -e CUDA_VISIBLE_DEVICES="$gpu" -e TORCHINDUCTOR_COMPILE_THREADS=1 \
     -e TORCHINDUCTOR_CACHE_DIR="/tmp/inductor_$name" -e TRITON_CACHE_DIR="/tmp/triton_$name" app \
-    uv run python -m quickdraw.train_world model="$model" "${COMMON[@]}" "$@" experiment="$name" "${RS[@]}" \
+    uv run python -m quickdraw.train_world_model model="$model" "${COMMON[@]}" "$@" experiment="$name" "${RS[@]}" \
       run_summary.trying="$trying"
 }
 

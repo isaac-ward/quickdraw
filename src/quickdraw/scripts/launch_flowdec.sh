@@ -17,7 +17,7 @@ set -euo pipefail
 EXP="${1:-flowdec_v1}"
 DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 
-uv run python -m quickdraw.train_world \
+uv run python -m quickdraw.train_world_model \
   model=mm_flow model.d=128 model.depth=4 model.heads=8 model.window=32 \
   data.batch=64 model.recon_frac=0.25 model.diffusion.shortcut=true \
   data.root="$DATA" \

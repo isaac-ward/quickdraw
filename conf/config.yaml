@@ -18,7 +18,7 @@ defaults:
 # the goal-race step budget) is wasted here. Add any other control key to override just for language mode.
 language:
   request: red
-  head: null   # path to a train_reward run's reward_head.pt (only then does eval_control do language steering)
+  head: null   # path to a train_reward_model run's reward_head.pt (only then does eval_control do language steering)
   interpret_run: null   # eval_interpret run dir; when set (reward mode), animate the agent moving through its
                         # saved latent projections (backdrop cloud + X_c/X_r target crosses + agent sphere & tail)
   interpret_plots:      # which projections to animate (method needs an out-of-sample map: pca/lda/umap/umap-sup-*; NOT tsne)

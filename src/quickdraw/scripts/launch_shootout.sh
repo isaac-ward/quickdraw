@@ -49,7 +49,7 @@ launch () {  # $1=gpu  $2=experiment-name  $3..=model overrides
   # epoch 0). train.py also sets this in code; the env is belt-and-suspenders in case inductor inits early.
   docker compose exec -T -d -e CUDA_VISIBLE_DEVICES="$gpu" -e TORCHINDUCTOR_COMPILE_THREADS=1 \
     -e TORCHINDUCTOR_CACHE_DIR="/tmp/inductor_$name" -e TRITON_CACHE_DIR="/tmp/triton_$name" app \
-    uv run python -m quickdraw.train_world "$@" "${COMMON[@]}" experiment="$name" "${RS[@]}" \
+    uv run python -m quickdraw.train_world_model "$@" "${COMMON[@]}" experiment="$name" "${RS[@]}" \
       run_summary.trying="$RS_TRYING This run is the $name variant."
 }
 
