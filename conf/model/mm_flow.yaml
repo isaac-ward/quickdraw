@@ -1,4 +1,19 @@
 name: mm_flow
+# =============================================================================================
+# BEST PERFORMANCE (2026-07-28, bimodal data) — this recipe RECREATES it, stably (no NaN/collapse).
+# Runs repro_ptf0_{mse,flow}: this model + NO action head + warmup 4 reproduced AND beat the ptf0
+# baseline. Metrics @ep10-15  (repro_mse | repro_flow | ptf0-target):
+#     val img PSNR    18.9 | 18.3 | 19.1        OOD pointwise    0.24 | 0.32 | 0.36
+#     OOD img PSNR    14.5 | 12.6 | 13.6        control goals/5  4.12 | 3.5  | 3.88
+# KEYS TO RECREATE:
+#   - action_head OFF (joint action head killed control ~0 vs 3.88 AND destabilized -> NaN/collapse).
+#   - ViT-MSE image decode (decode_kind=mse, decode_arch=vit) slightly BEAT U-Net/flow on EVERY axis here.
+#   - p_tf in-rollout (end 0.0), warmup 4 (control online by ep5; 10 delays it), DF off.
+#   - NO conv encoder, NO num_tokens>8, NO grad-accum, NO window_stride>1, NO dynamics_detach/grad_ckpt.
+#   FULL recipe (CLI overrides over these defaults): model.d=128 depth=4 heads=8 window=32 data.batch=32
+#   data.F=64 recon_frac=0.25 diffusion.shortcut=true p_tf_warmup_epochs=4 detach_every=16
+#   modalities.1.{num_tokens=8,encode_arch=vit,decode_arch=vit,decode_kind=mse}  action_head.enabled=false.
+# =============================================================================================
 d: 32                     # backbone/token width (all modality tokens live at d)
 depth: 4
 heads: 8                   # head_dim = 4 (d/heads; power of 2 for FlexAttention)
@@ -46,7 +61,10 @@ diffusion:
 # prior used LATER as the MPPI proposal — its samples are NEVER fed back into the world model. Eyeballed via the
 # eval_action_distribution routine (true-vs-pred histograms + animation). enabled: false -> no head, bit-identical.
 action_head:
-  enabled: false            # true -> add the action-flow head + loss/flow/action (+ loss/shortcut/action)
+  enabled: false            # LOCKED false (best-performance, 2026-07-28): the JOINT action head KILLS control
+  #                           (goals ~0 vs 3.88 baseline) AND destabilizes the WM over a long run (unetflow NaN'd
+  #                           ~ep31, vitmse collapsed to a frozen 11.1). Removing it recreated the baseline + control.
+  #                           If you want the MPPI action prior, train it POST-HOC on a FROZEN checkpoint, not jointly.
   weight: 1.0               # weight of the action-flow loss in the total training loss
   shortcut: true            # K=1 sampling (fast MPPI proposal); like the dynamics diffusion.shortcut
   detach_gradient: false    # LOCKED false (user, 2026-07-21): NEVER set true. detach_gradient=true DESTABILIZED
@@ -57,5 +75,9 @@ modalities:
   # decode_kind: flow -> generative decode head per trunk (design/models/flow_heads.md). mse (default) =
   # deterministic decode, bit-identical to before. decode_shortcut: true -> K=1 sampling (EXPLICIT opt-in, like
   # the dynamics `diffusion.shortcut`; shortcut is never default-on). Starting BOTH trunks on flow to validate cross-trunk.
+  # BEST-PERFORMANCE FINDING (2026-07-28, bimodal): for the IMAGE head, decode_kind=mse + decode_arch=vit (ViT-MSE,
+  # the conditional-mean decoder) slightly BEAT decode_kind=flow + decode_arch=unet on every axis — val PSNR 18.9 vs
+  # 18.3, OOD pointwise 0.24 vs 0.32, OOD PSNR 14.5 vs 12.6, control 4.12 vs 3.5. The image is a deterministic render,
+  # so the conditional mean IS the target -> MSE has no downside here. Prefer mse/vit for the image decode.
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
   - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: flow, decode_param: x0, encode_arch: vit, decode_arch: vit}
