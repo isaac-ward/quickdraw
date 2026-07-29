@@ -183,7 +183,7 @@ See the checkbox tracker below.
 - [x] 1.2 `environments/registry.py`: `make_env(name, cfg)` (torus_world -> TorusEnv; later gym adapter).
 - [x] 1.3 `TorusEnv.reward(obs, goal)` — extract the goal-distance/settle logic from eval_control into the env.
 - [x] 1.4 `TorusEnv.render_obs(obs)` — wrap the existing FPV renderer (byte-identical).
-- [ ] 1.5 `TorusEnv.render_diagnostics(overlay, views)` — wrap the existing pyvista scene + axial renderers,
+- [x] 1.5 `TorusEnv.render_diagnostics(overlay, views)` — wrap the existing pyvista scene + axial renderers,
         driven by the overlay's agents/markers/field (byte-identical to today's rollout/control videos).
         DEFERRED to Phase 5 (co-implemented with the eval-viz rewire + video parity); `wants_diagnostics`
         correctly returns False until then.

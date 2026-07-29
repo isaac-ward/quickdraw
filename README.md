@@ -44,7 +44,7 @@ uv run python -m quickdraw.eval_diffusion   experiment=$RUN data.root=$DATA chec
 uv run python -m quickdraw.eval_interpret   experiment=$RUN data.root=$DATA checkpoint=$CKPT  # VLM-labeled latent manifolds (needs OPENAI_API_KEY; vision only)
 
 # (optional) push a generated dataset run to the Hub as one repo
-uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=torus-world +hub.private=true
+uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=torus-world
 ```
 
 Override any Hydra field on the CLI.

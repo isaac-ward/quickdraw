@@ -1,8 +1,8 @@
 """Push a generated dataset run to the HF Hub as ONE dataset repo (the whole run folder).
 
-  python -m quickdraw.push_to_hub data.root=logs/data_generation_<ts>_<exp> \
-      +hub.name=torus-world +hub.private=true
+  python -m quickdraw.push_to_hub data.root=logs/data_generation_<ts>_<exp> +hub.name=torus-world
 
+Datasets are PUBLIC by default; pass `+hub.private=true` to keep one private.
 Uploads the entire run directory (all splits' parquet/meta + normalization stats + media + summary)
 under a single repo `<namespace>/<name>`, so it is one thing to browse on the Hub. A given split
 loads back with `LeRobotDataset("torus/<split>", root="<downloaded-repo>/<split>")`. Auth uses
@@ -95,7 +95,7 @@ def main(cfg):
     api = HfApi(token=os.environ.get("HF_TOKEN"))
     namespace = hub.get("namespace") or api.whoami()["name"]
     name = hub.get("name") or os.path.basename(os.path.normpath(root))  # default: the run-folder name
-    private = bool(hub.get("private", True))
+    private = bool(hub.get("private", False))   # PUBLIC by default; +hub.private=true to keep private
     repo_id = f"{namespace}/{name}"
 
     with open(os.path.join(root, "README.md"), "w") as f:  # dataset card -> uploaded with the folder

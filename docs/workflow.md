@@ -23,7 +23,7 @@ Produces `logs/data_generation_<ts>_$RUN/` — set `DATA=` that path; everything
 ## 2. Push to the Hub
 
 ```bash
-uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=torus-world +hub.private=true
+uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=torus-world
 ```
 
 Uploads the entire run folder as ONE HF dataset repo (all splits' parquet/meta + normalization stats +
