@@ -322,6 +322,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
             # per episode e<NP: (NP,T,3)/(NP,T-1,2)/(NP,T,3)/(NP,T). Per-episode (not mean) is smooth and
             # matches each episode's own video + goal-change markers.
             "paths": np.stack([np.stack([o[e, :3].cpu().numpy() for o in c["obs"]]) for e in range(NP)]),
+            "obs_seqs": np.stack([np.stack([o[e].cpu().numpy() for o in c["obs"]]) for e in range(NP)]),  # full obs (render_obs fallback)
             "actions": np.stack([np.stack([a[e].cpu().numpy() for a in c["act"]]) for e in range(NP)]),
             "goal_seqs": gseq[:, :NP].transpose(1, 0, 2),
             "dist_curves": dcur[:, :NP].T,

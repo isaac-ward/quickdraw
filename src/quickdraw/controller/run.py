@@ -16,6 +16,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 
+from ..environments.base import SceneOverlay, wants_diagnostics
 from ..environments.registry import make_env
 from ..logging import viz
 from .mppi import MPPIConfig, run_control
@@ -128,12 +129,30 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         nf = len(agents[0]["path"])
         _plog(writer, f"[eval_control @ep{step}] rendering control video #{i} ({nf} frames, GPU/EGL)...")
         vtitle = (f'"{req_i}"' if reward is not None else f"control: true vs pred #{i}")
-        frames = viz.control_compare_frames(R, r, "hsv", agents, n_frames=nf, title=vtitle,
-                                            fan_seq=res["fan_seqs"][i],  # pred's MPPI candidate fan, colored by score
-                                            reuse=bool(cfg.control.get("reuse_render", False)),
-                                            show_goals=(reward is None),  # language mode has no target -> no goal ring
-                                            log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}"))
-        writer.video(product_tag("eval_control", "control_video", i=i), frames, fps, step)
+        vids = {}
+        if wants_diagnostics(env):   # rich scene via the env's diagnostic renderer (Phase 4.2/5 overlay:
+            # agents={true,pred} paths, markers={goal}; torus draws it byte-identical to the legacy viz call).
+            # Language mode has no target -> no goal marker -> no goal ring.
+            overlay = SceneOverlay(agents={k: res[k]["paths"][i] for k in kinds},
+                                   markers=({"goal": res["pred"]["goal_seqs"][i]} if reward is None else {}),
+                                   extras=dict(coloring="hsv", n_frames=nf, title=vtitle,
+                                               avecs={k: a["avec"] for k, a in zip(kinds, agents)},
+                                               goal_seqs={k: res[k]["goal_seqs"][i] for k in kinds},
+                                               fan_seq=res["fan_seqs"][i],  # pred's MPPI candidate fan, colored by score
+                                               reuse=bool(cfg.control.get("reuse_render", False)),
+                                               log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}")))
+            vids = env.render_diagnostics(overlay, ["scene"])
+        if vids:
+            for view, fr in vids.items():   # "scene" keeps the canonical tag; extra views get suffixed
+                writer.video(product_tag("eval_control", "control_video" if view == "scene"
+                                         else f"control_video_{view}", i=i), fr, fps, step)
+        else:   # generic env (no rich scene): pred-vs-true render_obs filmstrip video (Phase 5 fallback)
+            import torch
+            rend = {k: env.render_obs(torch.as_tensor(np.asarray(res[k]["obs_seqs"][i]), dtype=torch.float32)
+                                      ).cpu().numpy().astype(np.float32) / 255.0 for k in kinds}
+            vid = (viz.image_rollout_video(rend["true"], rend["pred"], context_len=0).astype(np.uint8)
+                   if "true" in rend else (rend["pred"] * 255).astype(np.uint8))
+            writer.video(product_tag("eval_control", "control_video", i=i), vid, fps, step)
         if reward is not None:                  # collect this episode's agent for the ONE-torus combined (all BLACK)
             combined_agents.append(_agent(res["pred"], i, "black", R, r))
         scene_desc = (f"Language-steered MPPI on the torus (episode {i}): a single GREY learned-model agent "

@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from ..controller.run import _plog, run_and_log_control
+from ..environments.registry import make_env
 from ..logging import viz
 from ..training.setup import eval_episodes
 import torch
@@ -44,12 +45,16 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
     res = eval_batched(model, norm, R, r, v_scale, P, obs, act)
     _plog(writer, f"[{prefix} @ep{step}] rollout done in {time.perf_counter() - t0:.1f}s; rendering...")
 
+    from omegaconf import OmegaConf
+    env = make_env(cfg.environments.get("name", "torus_world"),      # THIS split's geometry (may be OOD)
+                   OmegaConf.merge(cfg.environments, {"R": float(R), "r": float(r)}), 1, "cpu")
     desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
             "the model's PREDICTED path. They share the context, then diverge at the fork step. The action "
             "arrow is the applied action along the true path.")
-    emit_openloop(writer, prefix, step, R=R, r=r, coloring=coloring, fps=fps, P=P, smooth_window=win,
+    emit_openloop(writer, prefix, step, env=env, R=R, r=r, coloring=coloring, fps=fps, P=P, smooth_window=win,
                   description=desc, ctx_xyz=res["ctx_xyz"], p_true_xyz=res["p_true_xyz"],
                   p_hat_xyz=res["p_hat_xyz"], actions=res["actions"], curves=res["agg"], n_plot=n_plot,
+                  obs_true=norm.denorm_obs(obs[:n_plot]).cpu().numpy(), obs_pred=res["p_hat_obs"][:n_plot],
                   title_fn=lambda i: f"{split} #{i}", log=lambda m: _plog(writer, f"[{prefix} @ep{step}]   {m}"))
     summary = {m: float(res["agg"][m].mean()) for m in res["agg"]}  # mean over the rollout (routine return value)
     _plog(writer, f"[{prefix} @ep{step}] done in {time.perf_counter() - t0:.1f}s")
@@ -129,14 +134,18 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     prog(45, f"averaged curves (proprio + {len(img_heads)} image head(s))")
 
     # ---- everything (curves + per-episode trajectory/image visuals) via the shared open-loop emitter ----
+    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
     desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
             "the model's PREDICTED path, sharing the context then diverging at the fork.")
-    emit_openloop(writer, "eval_ood_horizon", step, R=ecfg.R, r=ecfg.r, coloring="hsv", fps=fps, P=P,
+    ctx_obs = norm.denorm_obs(pro[:n_plot]).cpu().numpy()
+    emit_openloop(writer, "eval_ood_horizon", step, env=env, R=ecfg.R, r=ecfg.r, coloring="hsv", fps=fps, P=P,
                   smooth_window=int(cfg.data.action_smooth_window), description=desc,
-                  ctx_xyz=norm.denorm_obs(pro[:n_plot]).cpu().numpy()[:, :, :3],
+                  ctx_xyz=ctx_obs[:, :, :3],
                   p_true_xyz=p_true[:n_plot, :, :3].cpu().numpy(), p_hat_xyz=p_hat[:n_plot, :, :3].cpu().numpy(),
                   actions=[eps[i][1][:P + H].astype(_np.float32) for i in range(n_plot)],
                   curves=curves, n_plot=n_plot, images=(images or None),
+                  obs_true=_np.concatenate([ctx_obs, p_true[:n_plot].cpu().numpy()], axis=1),
+                  obs_pred=p_hat[:n_plot].cpu().numpy(),
                   title_fn=lambda i: f"eval_ood_horizon #{i} H={H}", log=lambda msg: prog(50, msg))
 
     if was:

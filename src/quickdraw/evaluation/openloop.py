@@ -47,6 +47,7 @@ def eval_batched(model, normalizer, R, r, v_scale, P, obs_seq, act_seq):
         "per_step": {k: v.cpu().numpy() for k, v in per_step.items()},  # (N,horizon) each
         "agg": agg,
         "ctx_xyz": normalizer.denorm_obs(obs_seq[:, :P])[:, :, :3].cpu().numpy(),  # (N,P,3)
+        "p_hat_obs": p_hat.cpu().numpy(),             # (N,horizon,obs_dim) full obs — render_obs fallback
         "p_hat_xyz": p_hat[:, :, :3].cpu().numpy(),   # (N,horizon,3)
         "p_true_xyz": p_true[:, :, :3].cpu().numpy(),
         "actions": normalizer.denorm_act(act_seq).cpu().numpy(),  # (N,L,2) for the action arrow

@@ -208,7 +208,7 @@ See the checkbox tracker below.
         `_score` now sums a per-step `reward_fn(obs, goal)` (default `env.reward` via `make_env` in
         run_and_log_control; config beta_vel/r_settle bound when the env's reward exposes them). The
         language `dist` fast path (1 - reward on the rolled bag) is kept inline.
-- [ ] 4.2 `eval_control` builds the SceneOverlay (agents={true,pred}, markers={goal}) for render_diagnostics.
+- [x] 4.2 `eval_control` builds the SceneOverlay (agents={true,pred}, markers={goal}) for render_diagnostics.
         DEFERRED to Phase 5 with 1.5 (render_diagnostics itself).
 - [x] 4.3 PARITY: torus control scalars + videos unchanged vs pre-refactor (fixed ckpt).
         Verified on repro_ptf0_mse last.ckpt (4 eps, 400 steps, GPU): all eval_control scalars AND the
@@ -216,8 +216,8 @@ See the checkbox tracker below.
         (and across an old-repeat determinism control). Video/render code untouched by this phase.
 
 ### Phase 5 — eval-viz uses render_diagnostics with graceful fallback
-- [ ] 5.1 `emit_openloop`/filmstrips/rollout videos call `render_diagnostics(overlay, views)`; fall back to `render_obs` filmstrip if `{}`.
-- [ ] 5.2 PARITY: torus ood_horizon + control videos pixel-identical.
+- [x] 5.1 `emit_openloop`/filmstrips/rollout videos call `render_diagnostics(overlay, views)`; fall back to `render_obs` filmstrip if `{}`.
+- [x] 5.2 PARITY: torus ood_horizon + control videos pixel-identical.
 
 ### Phase 6 — GymBatchAdapter (bring your own env)
 - [x] 6.1 `environments/gym_adapter.py`: wrap any `gymnasium.Env` (vectorize B), map spaces, step->reward+obs, render(rgb_array)->render_obs, render_diagnostics->{}.

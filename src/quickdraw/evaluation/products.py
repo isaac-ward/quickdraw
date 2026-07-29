@@ -16,7 +16,9 @@ import json
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
+from ..environments.base import SceneOverlay, wants_diagnostics
 from ..logging import viz
 
 
@@ -66,40 +68,71 @@ def log_image_head(writer, routine, head, i, true_full, pred, step, fps, *,
                      pred=np.asarray(pred, np.float32), gt=np.asarray(true_full[context_len:], np.float32))
 
 
-def emit_openloop(writer, routine, step, *, R, r, coloring, fps, P, smooth_window, description,
-                  ctx_xyz, p_true_xyz, p_hat_xyz, actions, curves, n_plot, images=None, title_fn=None, log=None):
+def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_window, description,
+                  ctx_xyz, p_true_xyz, p_hat_xyz, actions, curves, n_plot, images=None,
+                  obs_true=None, obs_pred=None, title_fn=None, log=None):
     """The ONE open-loop product orchestrator, shared by eval_ood_horizon (multimodal) and _openloop_split
     (vector). Given a COMPLETED rollout's per-episode positions + aggregate curves, it emits everything:
     proprio `error_vs_step_avg` + each head's image `error_vs_step_avg`, then per-episode `trajectory_{plot,
     video}_i` (+scene) and each head's `rollout_i`/`filmstrip_i`. The rollout itself stays modality-specific
     (dict-obs image decode vs vector tensor) — only the emission is unified here.
+      env: the WorldEnv the rollout lives in. The per-episode scene video goes through
+      `env.render_diagnostics` when the env offers it (torus: byte-identical to the legacy direct viz call);
+      otherwise it falls back to an `env.render_obs` pred-vs-true filmstrip built from obs_true/obs_pred
+      (design/gym_refactor.md Phase 5).
       ctx_xyz (N,P,3); p_true_xyz/p_hat_xyz (N,H,3); actions[i] -> (T,2) applied along the true path;
       curves {metric:(H,)}; images (optional) {head: {"icurves": {m:(H,)}, "full_true": (N,P+H,s,s,3),
-      "ipred": (N,H,s,s,3)}}. title_fn(i) -> a plot title (default '<routine> #i')."""
+      "ipred": (N,H,s,s,3)}}; obs_true (N,P+H,obs_dim)/obs_pred (N,H,obs_dim) full observation vectors
+      (only the fallback reads them). title_fn(i) -> a plot title (default '<routine> #i')."""
     title_fn = title_fn or (lambda i: f"{routine} #{i}")
     log_error_curves(writer, routine, curves, step)                        # proprio averaged curves + scalars
     for head, d in (images or {}).items():                                 # per image head, mirrored (PSNR split top)
         log_error_curves(writer, routine, d["icurves"], step, head=head, split_top={"psnr"}, colors={"psnr": "red"})
+    rich = wants_diagnostics(env)
     for i in range(n_plot):
         if log is not None:
             log(f"episode {i + 1}/{n_plot} visuals")
-        anchor = ctx_xyz[i][-1:]                                           # shared launch state; branches fork here
-        log_torus_paths(writer, routine, i, R=R, r=r, coloring=coloring, ctx_xyz=ctx_xyz[i],
-                        true_xyz=np.concatenate([anchor, p_true_xyz[i]]),
-                        pred_xyz=np.concatenate([anchor, p_hat_xyz[i]]),
-                        actions=actions[i], P=P, step=step, fps=fps, smooth_window=smooth_window,
-                        title=title_fn(i), description=description, log=log)
+        if rich:
+            anchor = ctx_xyz[i][-1:]                                       # shared launch state; branches fork here
+            rich = log_torus_paths(writer, routine, i, env=env, R=R, r=r, coloring=coloring, ctx_xyz=ctx_xyz[i],
+                                   true_xyz=np.concatenate([anchor, p_true_xyz[i]]),
+                                   pred_xyz=np.concatenate([anchor, p_hat_xyz[i]]),
+                                   actions=actions[i], P=P, step=step, fps=fps, smooth_window=smooth_window,
+                                   title=title_fn(i), description=description, log=log)
+        if not rich:                                                       # generic env: render_obs filmstrip
+            if obs_true is None or obs_pred is None:
+                if log is not None:
+                    log(f"episode {i}: no diagnostic scene and no obs for the render_obs fallback — skipped")
+                continue
+            t = env.render_obs(torch.as_tensor(np.asarray(obs_true[i]), dtype=torch.float32)
+                               ).cpu().numpy().astype(np.float32) / 255.0
+            p = env.render_obs(torch.as_tensor(np.asarray(obs_pred[i]), dtype=torch.float32)
+                               ).cpu().numpy().astype(np.float32) / 255.0
+            log_image_head(writer, routine, "obs", i, t, p, step, fps, context_len=P,
+                           title=f"obs #{i} pred(top)/GT(bottom)")
         for head, d in (images or {}).items():
             log_image_head(writer, routine, head, i, d["full_true"][i], d["ipred"][i], step, fps,
                            context_len=P, title=f"{head} #{i} pred(top)/GT(bottom)")
 
 
-def log_torus_paths(writer, routine, i, *, R, r, coloring, ctx_xyz, true_xyz, pred_xyz, actions, P,
-                    step, fps, smooth_window, title, description, log=None):
+def log_torus_paths(writer, routine, i, *, env, R, r, coloring, ctx_xyz, true_xyz, pred_xyz, actions, P,
+                    step, fps, smooth_window, title, description, log=None) -> bool:
     """Proprio open-loop products for instance i: `trajectory_plot_i` (PNG), `trajectory_video_i` (MP4) +
     its scene JSON. ctx_xyz (P,3) shared context; true_xyz/pred_xyz ((H+1),3) each START with the shared
     launch state so truth and prediction branch from the same anchor. actions: applied actions along the
-    true path (len == context+branch). The two branches fork at step P."""
+    true path (len == context+branch). The two branches fork at step P. The video frames come from
+    `env.render_diagnostics` (a {true, pred} SceneOverlay); returns False without emitting anything when
+    the env declined the scene (returned {}) so the caller can fall back to the render_obs filmstrip."""
+    true_full = np.concatenate([ctx_xyz, true_xyz[1:]], axis=0)
+    pred_full = np.concatenate([ctx_xyz, pred_xyz[1:]], axis=0)
+    avec = viz.action_ambient(true_full, actions, R, r)
+    overlay = SceneOverlay(agents={"true": true_full, "pred": pred_full},
+                           extras=dict(coloring=coloring, avec=avec, fork_step=int(P),
+                                       n_frames=len(true_full), title=title,
+                                       smooth_window=smooth_window, log=log))
+    vids = env.render_diagnostics(overlay, ["scene"])
+    if not vids:
+        return False
     trajs = [{"xyz": ctx_xyz, "color": "lightgray", "start_sphere": True, "end_sphere": False,
               "start_scale": 0.5, "marker_color": "black"},
              {"xyz": true_xyz, "color": "black", "start_sphere": False, "end_sphere": True},
@@ -107,16 +140,14 @@ def log_torus_paths(writer, routine, i, *, R, r, coloring, ctx_xyz, true_xyz, pr
     fp = viz.fig_torus_atlas(R, r, trajs=trajs, coloring=coloring, title=title,
                              view_pad=viz.EVAL_VIEW_PAD, torus_opacity=viz.TORUS_OPACITY)
     writer.figure(product_tag(routine, "trajectory_plot", i=i), fp, step); plt.close(fp)
-    true_full = np.concatenate([ctx_xyz, true_xyz[1:]], axis=0)
-    pred_full = np.concatenate([ctx_xyz, pred_xyz[1:]], axis=0)
-    avec = viz.action_ambient(true_full, actions, R, r)
-    frames = viz.traj_compare_frames(R, r, coloring, true_full, pred_full, avec, P,
-                                     n_frames=len(true_full), title=title, smooth_window=smooth_window, log=log)
-    writer.video(product_tag(routine, "trajectory_video", i=i), frames, fps, step)
+    for view, frames in vids.items():   # "scene" keeps the canonical tag; extra views get suffixed
+        writer.video(product_tag(routine, "trajectory_video" if view == "scene" else f"trajectory_video_{view}",
+                                 i=i), frames, fps, step)
     writer.scene(product_tag(routine, "trajectory_video", i=i),
                  torus_scene(R, r, description=description, true_path_xyz=true_full, predicted_path_xyz=pred_full,
                              fork_step_index=int(P),
                              action_arrow_per_step={"origins_xyz": true_full[:len(avec)], "vectors_xyz": avec}), step)
+    return True
 
 
 def load_latent_projection(interpret_run, method, factor, dim, *, fc, reward, request, hull_frac=0.8):

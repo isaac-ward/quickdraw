@@ -228,6 +228,45 @@ class TorusEnv:
             self._fpv = viz.FPVRenderer(self.cfg.R, self.cfg.r, "hsv", fov=100.0, size=viz.FPV_SIZE)
         return torch.from_numpy(self._fpv.render(obs.detach().cpu().numpy())).to(self.device)
 
+    def render_diagnostics(self, overlay, views) -> dict:
+        """OPTIONAL rich diagnostic renderer (WorldEnv protocol; design/gym_refactor.md Phase 5): draw the
+        overlay's labelled world-space paths/markers on the torus. ONE view is offered — "scene", the
+        fig_torus_atlas composite (iso + 3 axial cameras in one frame) every eval video always used; other
+        view names are ignored. A thin wrapper over the SAME viz renderers with the SAME arguments as the
+        legacy direct calls, so the output is byte-identical. Two scene layouts, chosen by the presentation
+        hints the eval routine put in `overlay.extras` (roles color via base.ROLE_STYLE either way):
+          - `fork_step`: open-loop truth-vs-prediction compare (viz.traj_compare_frames). agents {true, pred}
+            full paths sharing the first fork_step steps; extras avec (ambient applied action along the true
+            path), n_frames/title/smooth_window/log.
+          - `goal_seqs`: controller race (viz.control_compare_frames). One agent per overlay role; per-role
+            extras goal_seqs/avecs; goal rings drawn iff markers['goal'] is present; extras
+            fan_seq/reuse/n_frames/title/log.
+        Returns {"scene": (T,H,W,3) uint8 frames}; {} when `views` requests nothing we can draw."""
+        if "scene" not in views:
+            return {}
+        from ..logging import viz   # lazy: keep torus.py import-light (viz pulls pyvista/matplotlib)
+        from .base import ROLE_STYLE
+        ex = overlay.extras
+        R, r, coloring = self.cfg.R, self.cfg.r, ex.get("coloring", "hsv")
+        paths = {role: _np.asarray(p) for role, p in overlay.agents.items()}
+        if "fork_step" in ex:        # open-loop compare: true vs pred, forking at step fork_step
+            frames = viz.traj_compare_frames(R, r, coloring, paths["true"], paths["pred"], ex["avec"],
+                                             ex["fork_step"], n_frames=ex.get("n_frames", 120),
+                                             title=ex.get("title", ""),
+                                             smooth_window=ex.get("smooth_window", viz.ACTION_SMOOTH_WINDOW),
+                                             log=ex.get("log"))
+        elif "goal_seqs" in ex:      # controller race: one agent (+ its goal ring/action arrow) per role
+            agents = [{"path": paths[role], "color": ROLE_STYLE[role]["color"],
+                       "goal_seq": _np.asarray(ex["goal_seqs"][role]), "avec": _np.asarray(ex["avecs"][role])}
+                      for role in overlay.agents]
+            frames = viz.control_compare_frames(R, r, coloring, agents, n_frames=ex.get("n_frames", 10000),
+                                                title=ex.get("title", ""), fan_seq=ex.get("fan_seq"),
+                                                reuse=bool(ex.get("reuse", False)),
+                                                show_goals=("goal" in overlay.markers), log=ex.get("log"))
+        else:
+            return {}
+        return {"scene": frames}
+
 
 class OUActionSampler:
     """Ornstein-Uhlenbeck action process for temporally-correlated exploration."""

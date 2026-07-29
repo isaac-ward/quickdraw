@@ -29,17 +29,22 @@ class SceneOverlay:
     agents: dict[str, Tensor] = field(default_factory=dict)   # role -> (T, 3) world-space PATH  (e.g. true, pred)
     markers: dict[str, Tensor] = field(default_factory=dict)  # role -> (K, 3) world-space POINTS (e.g. goal)
     field_: Tensor | None = None                              # optional scalar field over the manifold (language)
+    extras: dict = field(default_factory=dict)                # optional presentation hints from the eval routine
+    #   (title, per-step action arrows, candidate fan, fork step, ...). An env MAY honor them (torus does, to
+    #   keep its videos byte-identical to the pre-interface renders); any env can ignore them wholesale.
 
 
 # Shared, env-agnostic role -> style map, so every env/eval draws the same semantics the same way. An env's
 # `render_diagnostics` consults this to color/shape each overlay role; evals only ever refer to roles.
+# Colors are matplotlib/pyvista NAMED colors — exactly the ones the shipped torus renderers always used,
+# so drawing a role through this map is pixel-identical to the legacy direct viz calls.
 ROLE_STYLE: dict[str, dict] = {
-    "true":    {"color": (0.0, 0.0, 0.0), "kind": "path"},    # ground-truth path  — black
-    "pred":    {"color": (0.5, 0.5, 0.5), "kind": "path"},    # model-predicted    — grey
-    "oracle":  {"color": (0.0, 0.0, 0.0), "kind": "path"},    # control: true-dyn planner — black
-    "learned": {"color": (0.5, 0.5, 0.5), "kind": "path"},    # control: WM planner       — grey
-    "goal":    {"color": (1.0, 0.84, 0.0), "kind": "ring"},   # target                — gold ring
-    "concept": {"color": (0.85, 0.1, 0.1), "kind": "cross"},  # language concept pt   — red cross
+    "true":    {"color": "black",   "kind": "path"},   # ground-truth path
+    "pred":    {"color": "dimgray", "kind": "path"},   # model-predicted    — grey
+    "oracle":  {"color": "black",   "kind": "path"},   # control: true-dyn planner
+    "learned": {"color": "dimgray", "kind": "path"},   # control: WM planner       — grey
+    "goal":    {"color": "gold",    "kind": "ring"},   # target                — gold ring
+    "concept": {"color": "crimson", "kind": "cross"},  # language concept pt   — red cross
 }
 
 

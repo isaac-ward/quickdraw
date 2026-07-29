@@ -78,6 +78,7 @@ Two render concerns, kept separate:
 | `agents` | `{role: (T, 3)}` | world-space PATHS (e.g. `true`, `pred`) |
 | `markers` | `{role: (K, 3)}` | world-space POINTS (e.g. `goal`) |
 | `field_` | `Tensor \| None` | optional scalar field over the manifold (e.g. a language reward field) |
+| `extras` | `dict` | optional presentation hints from the eval routine (title, action arrows, candidate fan, fork step, ...) — honor what you like, ignoring them wholesale is fine |
 
 Roles map to a shared, env-agnostic style map (`ROLE_STYLE`): `true`/`oracle` = black path,
 `pred`/`learned` = grey path, `goal` = gold ring, `concept` = red cross. Honor the roles you can; ignore
@@ -90,9 +91,12 @@ What you need for what:
 | `render_obs` only | image-modality training + the pred-vs-true filmstrip eval videos (`wants_diagnostics` → False, automatic fallback) |
 | + `render_diagnostics` | the rich multi-view diagnostic videos: open-loop rollout (`agents={true, pred}`), control (`agents={oracle, learned}, markers={goal}`), language steering (`agents`, `markers={concept}`, `field_`) |
 
-Note: the eval-viz wiring that CALLS `render_diagnostics` is Phase 5 of
-[design/gym_refactor.md](../design/gym_refactor.md) and may land shortly after this doc; the protocol
-above (as defined in `environments/base.py`) is the extension point to build against.
+The eval-viz wiring that CALLS `render_diagnostics` (Phase 5 of
+[design/gym_refactor.md](../design/gym_refactor.md)) asks for the view `"scene"`: the open-loop rollout
+video and the control video both go through it, and fall back to the `render_obs` pred-vs-true filmstrip
+when `wants_diagnostics(env)` is False or the env returns `{}`. Reference implementation:
+`TorusEnv.render_diagnostics` (`environments/torus.py`) — a thin wrapper over the torus scene renderers,
+pixel-identical to the pre-interface videos.
 
 ## Worked example: a stock gym env end-to-end
 
