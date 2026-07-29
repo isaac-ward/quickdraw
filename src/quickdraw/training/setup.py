@@ -88,14 +88,31 @@ def build_model(cfg):
         raise ValueError(f"unknown model.name: {name!r}")
 
 
+_hf_root_cache: dict = {}   # hf_repo -> snapshot path (avoid re-resolving/downloading per call)
+
+
+def resolve_data_root(cfg) -> str:
+    """data.hf_repo unset -> cfg.data.root verbatim (local path, unchanged behavior). Set -> download+cache
+    the HF dataset repo (the whole run folder: per-split subdirs + normalization_stats.json) and return that
+    local snapshot path — same layout as a local run dir, so everything downstream is unchanged."""
+    repo = cfg.data.get("hf_repo", None)
+    if not repo:
+        return cfg.data.root
+    if repo not in _hf_root_cache:
+        from huggingface_hub import snapshot_download   # HF_TOKEN read from env
+        _hf_root_cache[repo] = snapshot_download(repo_id=repo, repo_type="dataset")
+    return _hf_root_cache[repo]
+
+
 def normalizer(cfg) -> Normalizer:
-    return Normalizer.from_file(cfg.data.root)
+    return Normalizer.from_file(resolve_data_root(cfg))
 
 
 def window_loaders(cfg, norm: Normalizer):
     """The ONE GPU-resident loader for every model. Loads the FPV frame store only when an image modality
     is present; proprio-only just loads (obs, act) — no frames touched."""
     P, F = cfg.data.P, cfg.data.F
+    root = resolve_data_root(cfg)
     specs = _modality_specs(cfg)
     img = next((s for s in specs if s.kind == "image"), None)   # image modality (if any) -> resident frame store
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,20 +120,21 @@ def window_loaders(cfg, norm: Normalizer):
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
         if img is not None:
-            eps = load_split_episodes_mm(cfg.data.root, split, img_size=img.img_size)
+            eps = load_split_episodes_mm(root, split, img_size=img.img_size)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, image_head=img.name, stride=stride)
         else:                                                    # proprio-only: (obs, act) pairs, no FPV frames
-            eps = load_split_episodes(cfg.data.root, split)
+            eps = load_split_episodes(root, split)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
     return loaders
 
 
 def eval_episodes(cfg, norm: Normalizer, split: str):
-    return TrajectoryDataset(load_split_episodes(cfg.data.root, split), norm)
+    return TrajectoryDataset(load_split_episodes(resolve_data_root(cfg), split), norm)
 
 
 def data_exists(cfg) -> bool:
-    return bool(cfg.data.root) and os.path.exists(os.path.join(cfg.data.root, "normalization_stats.json"))
+    root = resolve_data_root(cfg)
+    return bool(root) and os.path.exists(os.path.join(root, "normalization_stats.json"))
 
 
 def load_checkpoint(model, path: str):

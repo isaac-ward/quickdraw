@@ -193,8 +193,8 @@ See the checkbox tracker below.
         eval on a fixed ckpt) — all pixel/array/scalar exact vs the pre-Phase-1 commit. Iterate until zero diff.
 
 ### Phase 3 — train on the HF dataset (remote)
-- [ ] 3.1 `data/dataset.py`: `data.hf_repo` option -> `LeRobotDataset("<user>/<name>")` (HF download/cache); local root default unchanged.
-- [ ] 3.2 Thread `data.hf_repo` through `setup.window_loaders` + the eval loaders.
+- [x] 3.1 `data/dataset.py`: `data.hf_repo` option -> `LeRobotDataset("<user>/<name>")` (HF download/cache); local root default unchanged.
+- [x] 3.2 Thread `data.hf_repo` through `setup.window_loaders` + the eval loaders.
 - [ ] 3.3 PARITY: local-root load == hf_repo load for the same dataset (array-exact).
 
 ### Phase 2 — policy-driven, env-agnostic data generation
