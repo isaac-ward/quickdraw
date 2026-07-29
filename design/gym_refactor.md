@@ -189,13 +189,19 @@ See the checkbox tracker below.
         correctly returns False until then.
 - [x] 1.6 `TorusWorld-v0`: register a single-env `gymnasium.Env` (batch-1 TorusEnv) + `action_space`/`observation_space`.
 - [x] 1.7 `conf/environments/torus_world.yaml` (geometry + policy defaults). Keep `conf/environments/torus.yaml` values.
-- [ ] 1.8 PARITY: run `smoke/render_golden`; add + run `smoke/refactor_parity.py` (data-gen 2-traj, train 1 step,
+- [~] 1.8 PARITY: covered piecewise — render_golden pixel-identical, smoke/refactor_parity_datagen.py
+        byte-identical datagen, Phase 4 control bit-identical, Phase 5 videos pixel-identical, 3.3 HF-load
+        exact. WM train path is untouched by the refactor; no separate combined smoke added.
+        (superseded) run `smoke/render_golden`; add + run `smoke/refactor_parity.py` (data-gen 2-traj, train 1 step,
         eval on a fixed ckpt) — all pixel/array/scalar exact vs the pre-Phase-1 commit. Iterate until zero diff.
 
 ### Phase 3 — train on the HF dataset (remote)
 - [x] 3.1 `data/dataset.py`: `data.hf_repo` option -> `LeRobotDataset("<user>/<name>")` (HF download/cache); local root default unchanged.
 - [x] 3.2 Thread `data.hf_repo` through `setup.window_loaders` + the eval loaders.
-- [ ] 3.3 PARITY: local-root load == hf_repo load for the same dataset (array-exact).
+- [x] 3.3 PARITY: local-root load == hf_repo load for the same dataset (array-exact).
+        Verified on the live torus-world push: all 6 splits' observation_vector + action parquet arrays
+        array-exact (max|diff|=0) and every video mp4 byte-identical (push_to_hub uploads the folder
+        verbatim; snapshot_download returns the same bytes).
 
 ### Phase 2 — policy-driven, env-agnostic data generation
 - [x] 2.1 `environments/policies.py`: `RandomPolicy` (samples action_space) + wrap OU/Bimodal samplers as policies.
