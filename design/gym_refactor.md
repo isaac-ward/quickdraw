@@ -31,12 +31,26 @@ class WorldEnv(Protocol):
     def step(self, action: Tensor) -> Tensor: ...        # (B, obs_dim)
     def reward(self, obs, goal=None) -> Tensor: ...      # (B,) — for control eval (gym: env reward)
     def render_obs(self, obs) -> Tensor: ...             # (B,H,W,3) THE IMAGE MODALITY (model input; FPV for torus)
-    def render_diagnostics(self, obs, pred=None) -> dict[str, Tensor]: ...  # {view: (B,H,W,3)} EVAL-VIZ ONLY, optional
+    def render_scene(self, overlay: SceneOverlay, views: list[str]) -> dict[str, np.ndarray]: ...  # OPTIONAL diagnostic
 ```
 - **`render_obs`** = the image modality (always present; for torus = FPV). **Never skipped.**
-- **`render_diagnostics`** = the eval-video multi-view (torus: `{scene, axial_x, axial_y, axial_z}`); OPTIONAL —
-  a generic gym env returns `{}` or just its single `render()`, and eval-viz falls back gracefully. This keeps
-  the modality (what the model sees) cleanly separated from diagnostics (what we watch).
+- **`render_scene`** = the ONE optional diagnostic renderer, and the trick that stops it exploding into
+  per-eval methods (MPPI / long-horizon / language each want different actors). It is **declarative**: the eval
+  routine hands the env a `SceneOverlay` (what to draw, in world coords + a role) and a list of `views`, and the
+  env draws its geometry + those overlays from those cameras. The env NEVER knows about "MPPI" or "language
+  steering" — only "draw these labelled points/paths/fields in my world from these views."
+```python
+@dataclass
+class SceneOverlay:
+    agents:  dict[str, Tensor] = {}   # role -> (T,3) world PATH (roles: "true"=black, "pred"=grey, ...)
+    markers: dict[str, Tensor] = {}   # role -> (K,3) POINTS   (roles: "goal"=gold ring, "concept"=cross, ...)
+    field:   Tensor | None = None     # optional scalar field over the manifold (e.g. language reward field)
+```
+  Role→color/style lives in ONE shared `viz` style map (env-agnostic). Each eval just fills the overlay:
+  `eval_ood_horizon` → `agents={true,pred}`; `eval_control` → `agents={true,pred}, markers={goal}`;
+  language steering → `agents={agent}, field=reward, markers={concept}`. So ONE env method serves all three.
+  **Optional + graceful:** if an env doesn't implement `render_scene` (or ignores overlays/views it can't do),
+  eval-viz falls back to the `render_obs` pred-vs-true filmstrip. Torus implements it fully (scene + 3 axial).
 
 ## Phases
 
@@ -94,6 +108,47 @@ lerobot/HF I/O, datamodule, world model, training, MPPI, eval scaffolding) becom
 ## Parquet note
 Already satisfied: LeRobotDataset writes the vector/action data as **parquet** (+ mp4 video); the HF dataset
 card already points the viewer at `**/*.parquet`. No change needed.
+
+## Policies & planners — how "black oracle vs grey learned" hooks in
+Two distinct notions, both env-agnostic:
+- **Behavior policy** (data-gen): `policy(obs, generator) -> action`. Default `random`; `bimodal`/`ou` (today's
+  samplers, promoted to policies); or user-supplied. Config `data.policy=<name>`. Used only to mine play data.
+- **Control planner** (eval): the "oracle" (black) and "learned" (grey) are the SAME MPPI code parameterized by
+  the *rollout source* — `MPPI(rollout_fn, reward_fn, action_dim)`. oracle: `rollout_fn = env.step` (true
+  dynamics); learned: `rollout_fn = WM.rollout`. `reward_fn = env.reward` for both. So swapping oracle↔learned is
+  swapping one callable; nothing torus-specific. Their paths become the `agents={true→oracle, pred→learned}`
+  overlay for `render_scene`.
+
+## Bit-identical verification — the test loop I'll run and iterate on
+The refactor is re-plumbing (same renderers/sim/model called through an interface), so parity should hold by
+construction; these tests catch accidental drift, run after EVERY phase, iterate until zero diff:
+1. **Renders** — `smoke/render_golden` already asserts pixel-identical FPV + scene + axial. Run as-is.
+2. **Data-gen parity** (`smoke/refactor_parity.py`, NEW) — regen a tiny fixed-seed torus dataset with the
+   pre-refactor commit vs HEAD; assert **exact** equality of the parquet obs/act arrays, the rendered frames
+   (pixel-exact), and `normalization_stats.json`.
+3. **Train-step parity** — fixed seed + config, build model, run 1 training step old vs new; assert the loss +
+   a forward output match (bit-exact under the same seed/precision path; `torch.use_deterministic_algorithms`
+   where feasible).
+4. **Eval parity** — run `eval_ood_horizon` + `eval_control` on a FIXED checkpoint old vs new; diff the metric
+   scalars (exact) and the rendered videos (pixel-exact via the golden renderer).
+Green on 1–4 = torus is byte-identical. I fix any diff and re-run until all four pass.
+
+## GPU budget
+**Minimal.** The refactor is CPU-side plumbing + docs. Renders/`render_golden` run offscreen (OSMesa, no GPU).
+Data-gen parity is a 2-trajectory sim (negligible). Only train-step parity (1 step) and eval parity (1 eval on a
+fixed ckpt) touch a GPU, briefly. No long training runs are needed for the refactor. Caveat: both GPUs are
+currently held by the `repro_ptf0_*` runs, so I'll run the tiny GPU checks on CPU-fallback or squeeze them in
+when a card frees — the repro runs keep priority.
+
+## Phase 7 — documentation (linked from README)
+- **`docs/byo_environment.md`** — how to bring your own gym env: the minimal `WorldEnv`/gym contract, `render_obs`
+  for the image modality, the OPTIONAL `render_scene(overlay, views)` (what a full diagnostic renderer must
+  accept: the `SceneOverlay` roles + view names) with the graceful fallback, reward/goal conventions
+  (`env.reward`, gym goal-conditioned pattern), and a worked minimal example env.
+- **`docs/workflow.md`** — every main workflow end-to-end with commands: `data_generation` (mine play data) →
+  `push_to_hub` (parquet+mp4 to HF) → `train_world_model` → `train_action_model` (post-hoc, frozen WM) →
+  `train_reward_model` → eval/control, plus the config knobs each honors.
+- **`README.md`** — add links to both docs (and to this plan + `design/accelerations.md`).
 
 ## Open decisions / what I need from you
 1. **Confirm naming** (`TorusWorld-v0` / `torus-world` / package `quickdraw`).
