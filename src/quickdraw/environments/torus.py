@@ -152,7 +152,12 @@ class TorusEnv:
 
     Pure-tensor (no nn.Module needed); all ops run on `device`. Deterministic given a
     torch.Generator. The true state is always exactly on the torus.
+
+    Implements the `WorldEnv` protocol (environments/base.py): `reset`/`step`/`reward`/`render_obs`.
     """
+
+    action_dim = 2   # (a_theta, a_phi)
+    obs_dim = 6      # [p; p_dot]
 
     def __init__(self, cfg: TorusConfig, batch: int, device="cpu"):
         self.cfg = cfg
@@ -162,6 +167,7 @@ class TorusEnv:
         self.phi = torch.zeros(batch, device=self.device)
         self.theta_dot = torch.zeros(batch, device=self.device)
         self.phi_dot = torch.zeros(batch, device=self.device)
+        self._fpv = None   # lazy persistent FPV renderer for render_obs
 
     def reset(self, generator: torch.Generator | None = None) -> Tensor:
         g = generator
@@ -186,6 +192,29 @@ class TorusEnv:
 
     def observe(self) -> Tensor:
         return observation_vector(self.theta, self.phi, self.theta_dot, self.phi_dot, self.cfg.R, self.cfg.r)
+
+    def reward(self, obs: Tensor, goal: Tensor | None = None, *,
+               beta_vel: float = 0.0, r_settle: float = 0.5) -> Tensor:
+        """Per-step control return (higher = better), mirroring controller.mppi._score's per-step term:
+        negative ambient distance to `goal`, minus a near-goal velocity penalty gated inside `r_settle`
+        (so the planner settles instead of orbiting). Defaults match conf/control/mppi.yaml (beta_vel=0
+        -> pure negated goal distance). goal: (3,) or (B,3) world point; None -> zeros (no preference).
+        obs (B,6) -> (B,)."""
+        if goal is None:
+            return torch.zeros(obs.shape[0], device=obs.device)
+        p, v = split_obs(obs)
+        d = (p - goal.to(obs)).norm(dim=-1)
+        gate = (d < r_settle).float()
+        return -d - beta_vel * gate * v.norm(dim=-1)
+
+    def render_obs(self, obs: Tensor) -> Tensor:
+        """The IMAGE MODALITY: egocentric FPV of each state, (B,6) -> (B,size,size,3) uint8 on `device`.
+        Wraps the fast persistent viz.FPVRenderer with the data pipeline's defaults (hsv coloring,
+        fov=100 per conf/data/torus.yaml fpv_fov, size=viz.FPV_SIZE)."""
+        if self._fpv is None:
+            from ..logging import viz   # lazy: keep torus.py import-light (viz pulls pyvista/matplotlib)
+            self._fpv = viz.FPVRenderer(self.cfg.R, self.cfg.r, "hsv", fov=100.0, size=viz.FPV_SIZE)
+        return torch.from_numpy(self._fpv.render(obs.detach().cpu().numpy())).to(self.device)
 
 
 class OUActionSampler:

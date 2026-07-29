@@ -1,0 +1,10 @@
+# TorusWorld-v0 / `make_env("torus_world", ...)` — same physics as torus.yaml (kept in place for now;
+# this is the env-registry name introduced by design/gym_refactor.md Phase 1).
+R: 0.75           # ~1-unit torus (extent R+r = 1.0 in x/y)
+r: 0.25
+dt: 0.0166667     # 60 Hz — smaller integration step
+gamma: 0.3        # velocity damping. 0.3 caps top speed (~7, terminal 22) so long rollouts stay calm.
+                  # gamma is pure drag: it does NOT touch control authority (a_max/mass=6.67). Oracle 3/3.
+a_max: 4.0        # max action magnitude (doubled: more thrust authority to speed up AND brake hard)
+init_speed: 1.0
+mass: 0.6         # inertia: action / mass. Lowered -> a_max/mass authority 1.0 -> 6.7x (snappy accel+decel)

@@ -179,14 +179,16 @@ See the checkbox tracker below.
 ## Checkbox tracker (execute in order; parity-verify each phase)
 
 ### Phase 1 — WorldEnv interface + TorusEnv implements it + TorusWorld-v0
-- [ ] 1.1 `environments/base.py`: `WorldEnv` Protocol + `SceneOverlay` dataclass + shared `ROLE_STYLE` map.
-- [ ] 1.2 `environments/registry.py`: `make_env(name, cfg)` (torus_world -> TorusEnv; later gym adapter).
-- [ ] 1.3 `TorusEnv.reward(obs, goal)` — extract the goal-distance/settle logic from eval_control into the env.
-- [ ] 1.4 `TorusEnv.render_obs(obs)` — wrap the existing FPV renderer (byte-identical).
+- [x] 1.1 `environments/base.py`: `WorldEnv` Protocol + `SceneOverlay` dataclass + shared `ROLE_STYLE` map.
+- [x] 1.2 `environments/registry.py`: `make_env(name, cfg)` (torus_world -> TorusEnv; later gym adapter).
+- [x] 1.3 `TorusEnv.reward(obs, goal)` — extract the goal-distance/settle logic from eval_control into the env.
+- [x] 1.4 `TorusEnv.render_obs(obs)` — wrap the existing FPV renderer (byte-identical).
 - [ ] 1.5 `TorusEnv.render_diagnostics(overlay, views)` — wrap the existing pyvista scene + axial renderers,
         driven by the overlay's agents/markers/field (byte-identical to today's rollout/control videos).
-- [ ] 1.6 `TorusWorld-v0`: register a single-env `gymnasium.Env` (batch-1 TorusEnv) + `action_space`/`observation_space`.
-- [ ] 1.7 `conf/environments/torus_world.yaml` (geometry + policy defaults). Keep `conf/environments/torus.yaml` values.
+        DEFERRED to Phase 5 (co-implemented with the eval-viz rewire + video parity); `wants_diagnostics`
+        correctly returns False until then.
+- [x] 1.6 `TorusWorld-v0`: register a single-env `gymnasium.Env` (batch-1 TorusEnv) + `action_space`/`observation_space`.
+- [x] 1.7 `conf/environments/torus_world.yaml` (geometry + policy defaults). Keep `conf/environments/torus.yaml` values.
 - [ ] 1.8 PARITY: run `smoke/render_golden`; add + run `smoke/refactor_parity.py` (data-gen 2-traj, train 1 step,
         eval on a fixed ckpt) — all pixel/array/scalar exact vs the pre-Phase-1 commit. Iterate until zero diff.
 
