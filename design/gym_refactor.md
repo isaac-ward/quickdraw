@@ -31,10 +31,10 @@ class WorldEnv(Protocol):
     def step(self, action: Tensor) -> Tensor: ...        # (B, obs_dim)
     def reward(self, obs, goal=None) -> Tensor: ...      # (B,) — for control eval (gym: env reward)
     def render_obs(self, obs) -> Tensor: ...             # (B,H,W,3) THE IMAGE MODALITY (model input; FPV for torus)
-    def render_scene(self, overlay: SceneOverlay, views: list[str]) -> dict[str, np.ndarray]: ...  # OPTIONAL diagnostic
+    def render_diagnostics(self, overlay: SceneOverlay, views: list[str]) -> dict[str, np.ndarray]: ...  # OPTIONAL diagnostic
 ```
 - **`render_obs`** = the image modality (always present; for torus = FPV). **Never skipped.**
-- **`render_scene`** = the ONE optional diagnostic renderer, and the trick that stops it exploding into
+- **`render_diagnostics`** = the ONE optional diagnostic renderer, and the trick that stops it exploding into
   per-eval methods (MPPI / long-horizon / language each want different actors). It is **declarative**: the eval
   routine hands the env a `SceneOverlay` (what to draw, in world coords + a role) and a list of `views`, and the
   env draws its geometry + those overlays from those cameras. The env NEVER knows about "MPPI" or "language
@@ -49,7 +49,7 @@ class SceneOverlay:
   Role→color/style lives in ONE shared `viz` style map (env-agnostic). Each eval just fills the overlay:
   `eval_ood_horizon` → `agents={true,pred}`; `eval_control` → `agents={true,pred}, markers={goal}`;
   language steering → `agents={agent}, field=reward, markers={concept}`. So ONE env method serves all three.
-  **Optional + graceful:** if an env doesn't implement `render_scene` (or ignores overlays/views it can't do),
+  **Optional + graceful:** if an env doesn't implement `render_diagnostics` (or ignores overlays/views it can't do),
   eval-viz falls back to the `render_obs` pred-vs-true filmstrip. Torus implements it fully (scene + 3 axial).
 
 ## Phases
@@ -97,8 +97,9 @@ class SceneOverlay:
 - HF dataset repo: **`torus-world`** (kebab-case) — replaces `quickdraw-torus`.
 - display: **"Torus World"**.
 - **python package / code repo: stays `quickdraw`** → all imports, run dirs, wandb, and outputs bit-identical.
-  Only the *environment/dataset* is renamed (the `torus/<split>` lerobot repo_id → `torus_world/<split>`, and
-  the HF dataset name). This is the one place the rename is visible; it does not alter learned outputs.
+- **Internal lerobot split id STAYS `torus/<split>`** (baked into every local dataset path — renaming it would
+  break loading + not be bit-identical). Only the PUBLIC HF dataset name (`quickdraw-torus` → `torus-world`) and
+  the gym env id (`TorusWorld-v0`) change. CONFIRMED with the user.
 
 ## What stays torus-specific
 The pyvista torus mesh + FPV/scene/axial renderers, the torus geometry config, the OU/bimodal samplers (they
@@ -111,13 +112,15 @@ card already points the viewer at `**/*.parquet`. No change needed.
 
 ## Policies & planners — how "black oracle vs grey learned" hooks in
 Two distinct notions, both env-agnostic:
-- **Behavior policy** (data-gen): `policy(obs, generator) -> action`. Default `random`; `bimodal`/`ou` (today's
-  samplers, promoted to policies); or user-supplied. Config `data.policy=<name>`. Used only to mine play data.
+- **Behavior policy** (data-gen): `policy(obs, generator) -> action`, config `data.policy=<name>`, used only to
+  mine play data. **`random` (sample the env's `action_space`) is the ONLY env-agnostic default** — it works for
+  any env. `bimodal`/`ou` are **torus-specific** (they encode torus action semantics) and can't be applied to an
+  arbitrary env; they ship as torus's policies. A BYO-env uses `random` (or supplies its own policy).
 - **Control planner** (eval): the "oracle" (black) and "learned" (grey) are the SAME MPPI code parameterized by
   the *rollout source* — `MPPI(rollout_fn, reward_fn, action_dim)`. oracle: `rollout_fn = env.step` (true
   dynamics); learned: `rollout_fn = WM.rollout`. `reward_fn = env.reward` for both. So swapping oracle↔learned is
   swapping one callable; nothing torus-specific. Their paths become the `agents={true→oracle, pred→learned}`
-  overlay for `render_scene`.
+  overlay for `render_diagnostics`.
 
 ## Bit-identical verification — the test loop I'll run and iterate on
 The refactor is re-plumbing (same renderers/sim/model called through an interface), so parity should hold by
@@ -142,17 +145,78 @@ when a card frees — the repro runs keep priority.
 
 ## Phase 7 — documentation (linked from README)
 - **`docs/byo_environment.md`** — how to bring your own gym env: the minimal `WorldEnv`/gym contract, `render_obs`
-  for the image modality, the OPTIONAL `render_scene(overlay, views)` (what a full diagnostic renderer must
+  for the image modality, the OPTIONAL `render_diagnostics(overlay, views)` (what a full diagnostic renderer must
   accept: the `SceneOverlay` roles + view names) with the graceful fallback, reward/goal conventions
   (`env.reward`, gym goal-conditioned pattern), and a worked minimal example env.
-- **`docs/workflow.md`** — every main workflow end-to-end with commands: `data_generation` (mine play data) →
-  `push_to_hub` (parquet+mp4 to HF) → `train_world_model` → `train_action_model` (post-hoc, frozen WM) →
-  `train_reward_model` → eval/control, plus the config knobs each honors.
-- **`README.md`** — add links to both docs (and to this plan + `design/accelerations.md`).
+- **`docs/workflow.md`** — every main workflow end-to-end with commands, IN ORDER:
+  `data_generation` (mine play data) → `push_to_hub` (parquet+mp4 to HF) → **`train_world_model`** (with the
+  during-training val + eval routines — ood_horizon, control, manifold — documented as SUB-points here) →
+  `train_action_model` (post-hoc, frozen WM) → **`eval_interpret`** (VLM-labeled latent interpretability) →
+  `train_reward_model` (language reward head) → **language control examples** (steering MPPI by a request).
+- **`docs/interpret.md`** — its OWN doc for `eval_interpret`: how to DEFINE the concepts/factors and the VLM
+  prompts for a given env (the labeling contract), since that's env-specific and non-obvious. Referenced from
+  workflow.md at the interpret step.
+- **`docs/byo_environment.md`** dedicated section "**Diagnostic renders (optional)**": exactly what an env must
+  implement to get the rich eval videos — the `render_diagnostics(overlay, views)` signature, which `SceneOverlay`
+  roles/views it should honor, the shared role→style map, and what you lose if you skip it (fallback to the
+  `render_obs` filmstrip). Clear "you need X for Y" table.
+- **`README.md`** — link `docs/workflow.md`, `docs/byo_environment.md`, `docs/interpret.md` (+ this plan and
+  `design/accelerations.md`).
 
-## Open decisions / what I need from you
-1. **Confirm naming** (`TorusWorld-v0` / `torus-world` / package `quickdraw`).
-2. Confirm the **batched `WorldEnv` + gym adapter** split (vs forcing everything through single-env gym — the
-   batched path is much faster for data-gen and is what the code already does).
-3. Execution order: I'd do Phase 1 (interface + torus implements it, prove byte-identical) → 3 (remote HF) →
-   2 (policy-driven gen) → 4 (control reward) → 6 (gym adapter), verifying torus parity at each step.
+## Decisions (all CONFIRMED 2026-07-29)
+- Naming: `TorusWorld-v0` / HF `torus-world` / package `quickdraw` / internal `torus/<split>` kept.
+- Batched `WorldEnv` + single-env `GymBatchAdapter` split — yes.
+- Declarative `render_diagnostics(overlay, views)` + `SceneOverlay` — yes.
+- `random` is the only env-agnostic behavior policy; `bimodal`/`ou` are torus-specific.
+- Docs: `workflow.md` (order above) + `interpret.md` + `byo_environment.md` (with the diagnostic-render section),
+  all linked from README.
+
+## Execution order (parity-verified at each step)
+Phase 1 (interface + TorusEnv implements it + `TorusWorld-v0`, prove byte-identical) → 3 (remote HF) →
+2 (policy-driven gen) → 4 (control reward) → 5 (eval-viz uses render_diagnostics) → 6 (gym adapter) → 7 (docs).
+See the checkbox tracker below.
+
+## Checkbox tracker (execute in order; parity-verify each phase)
+
+### Phase 1 — WorldEnv interface + TorusEnv implements it + TorusWorld-v0
+- [ ] 1.1 `environments/base.py`: `WorldEnv` Protocol + `SceneOverlay` dataclass + shared `ROLE_STYLE` map.
+- [ ] 1.2 `environments/registry.py`: `make_env(name, cfg)` (torus_world -> TorusEnv; later gym adapter).
+- [ ] 1.3 `TorusEnv.reward(obs, goal)` — extract the goal-distance/settle logic from eval_control into the env.
+- [ ] 1.4 `TorusEnv.render_obs(obs)` — wrap the existing FPV renderer (byte-identical).
+- [ ] 1.5 `TorusEnv.render_diagnostics(overlay, views)` — wrap the existing pyvista scene + axial renderers,
+        driven by the overlay's agents/markers/field (byte-identical to today's rollout/control videos).
+- [ ] 1.6 `TorusWorld-v0`: register a single-env `gymnasium.Env` (batch-1 TorusEnv) + `action_space`/`observation_space`.
+- [ ] 1.7 `conf/environments/torus_world.yaml` (geometry + policy defaults). Keep `conf/environments/torus.yaml` values.
+- [ ] 1.8 PARITY: run `smoke/render_golden`; add + run `smoke/refactor_parity.py` (data-gen 2-traj, train 1 step,
+        eval on a fixed ckpt) — all pixel/array/scalar exact vs the pre-Phase-1 commit. Iterate until zero diff.
+
+### Phase 3 — train on the HF dataset (remote)
+- [ ] 3.1 `data/dataset.py`: `data.hf_repo` option -> `LeRobotDataset("<user>/<name>")` (HF download/cache); local root default unchanged.
+- [ ] 3.2 Thread `data.hf_repo` through `setup.window_loaders` + the eval loaders.
+- [ ] 3.3 PARITY: local-root load == hf_repo load for the same dataset (array-exact).
+
+### Phase 2 — policy-driven, env-agnostic data generation
+- [ ] 2.1 `environments/policies.py`: `RandomPolicy` (samples action_space) + wrap OU/Bimodal samplers as policies.
+- [ ] 2.2 `generate_episodes(env: WorldEnv, policy, ...)`; collect (obs, action, reward, render_obs frames).
+- [ ] 2.3 `data_generation.py`: build env+policy from config; FPV step -> `env.render_obs`. Torus path byte-identical.
+- [ ] 2.4 PARITY: torus dataset regen (fixed seed) == pre-refactor dataset (arrays + frames + norm stats).
+
+### Phase 4 — control eval via env.reward
+- [ ] 4.1 `MPPI(rollout_fn, reward_fn, action_dim)`: oracle `rollout_fn=env.step`, learned `rollout_fn=WM.rollout`; reward=`env.reward`.
+- [ ] 4.2 `eval_control` builds the SceneOverlay (agents={true,pred}, markers={goal}) for render_diagnostics.
+- [ ] 4.3 PARITY: torus control scalars + videos unchanged vs pre-refactor (fixed ckpt).
+
+### Phase 5 — eval-viz uses render_diagnostics with graceful fallback
+- [ ] 5.1 `emit_openloop`/filmstrips/rollout videos call `render_diagnostics(overlay, views)`; fall back to `render_obs` filmstrip if `{}`.
+- [ ] 5.2 PARITY: torus ood_horizon + control videos pixel-identical.
+
+### Phase 6 — GymBatchAdapter (bring your own env)
+- [ ] 6.1 `environments/gym_adapter.py`: wrap any `gymnasium.Env` (vectorize B), map spaces, step->reward+obs, render(rgb_array)->render_obs, render_diagnostics->{}.
+- [ ] 6.2 Smoke: a stock gym env (e.g. `Pendulum-v1`) end-to-end: gen -> (push) -> train 1 epoch -> control eval, core diagnostics present.
+
+### Phase 7 — docs + naming
+- [ ] 7.1 `docs/workflow.md` (order: datagen -> pushhub -> wm[+val/eval subpoints] -> am -> interpret -> rm -> language-control).
+- [ ] 7.2 `docs/interpret.md` (defining concepts/factors + VLM prompts).
+- [ ] 7.3 `docs/byo_environment.md` (+ the "Diagnostic renders (optional)" section: exact contract + what-you-lose table).
+- [ ] 7.4 `README.md` links to the three docs + this plan + accelerations.md.
+- [ ] 7.5 Public rename: HF dataset `quickdraw-torus` -> `torus-world`; gym id `TorusWorld-v0`. Internal `torus/<split>` unchanged.
