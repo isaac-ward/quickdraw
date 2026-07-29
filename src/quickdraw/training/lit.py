@@ -231,3 +231,51 @@ class LitWorldModel(L.LightningModule):
             sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / self.lr_warmup_steps))
             return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
         return opt
+
+
+class LitActionModel(L.LightningModule):
+    """POST-HOC action-prior training (train_action_model): the world model is FROZEN (eval mode,
+    requires_grad False — the caller freezes it); ONLY `model.action_flow` trains. Contexts come from the
+    frozen WM under no_grad; the action-flow loss uses the SAME leak-free alignment as
+    MultiModalFlow.loss_terms: cond = pooled h[t-1] (never saw a[t]) -> target a[t], for t=1..L-2."""
+
+    def __init__(self, model, lr: float, weight_decay: float):
+        super().__init__()
+        self.model = model
+        self.lr, self.weight_decay = lr, weight_decay
+
+    def on_train_epoch_start(self):
+        # Lightning flips the whole module to train mode each epoch; re-pin the frozen WM to eval (the
+        # trainable head has no mode-dependent layers, but keep it in train mode for correctness).
+        self.model.eval()
+        self.model.action_flow.train()
+
+    def _step(self, batch, tag):
+        m = self.model
+        obs = {"proprio": batch["obs_seq"]}
+        for name, _ in m.layout:
+            if name != "proprio":
+                obs[name] = batch[name]
+        act = batch["act_seq"]                                # (B, L, action_dim), normalized
+        L_ = act.shape[1]
+        with torch.no_grad():                                 # frozen WM: contexts only, no graph
+            h_ctx = m.action_context(obs, act)                # (B, L-1, d): h[k] predicts a[k+1] (leak-free)
+        cond = h_ctx[:, :-1]                                  # h[t-1], aligned to predict a[t] for t=1..L-2
+        a_target = act[:, 1:L_ - 1].detach()                  # a[1..L-2] — same alignment as loss_terms
+        l_flow, l_cons = m.action_flow.loss(cond, a_target, time_sampling=m.time_sampling)
+        loss = l_flow if l_cons is None else l_flow + l_cons
+        self.log(f"{tag}/loss/flow/action", l_flow)
+        if l_cons is not None:
+            self.log(f"{tag}/loss/shortcut/action", l_cons)
+        self.log(f"{tag}/loss/total", loss, prog_bar=(tag == "train"))
+        return loss
+
+    def training_step(self, batch, _):
+        return self._step(batch, "train")
+
+    def validation_step(self, batch, _):
+        return self._step(batch, "val")
+
+    def configure_optimizers(self):
+        # ONLY the action-flow head trains; every WM param is frozen (requires_grad=False, not passed here).
+        return torch.optim.AdamW(self.model.action_flow.parameters(), lr=self.lr, weight_decay=self.weight_decay)
