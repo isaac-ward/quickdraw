@@ -54,7 +54,7 @@ def main():
         ok &= bool(cond)
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
 
-    for sampler in ("ou", "bimodal"):
+    for sampler in ("ornstein_uhlenbeck", "bimodal"):
         o_old, a_old = old_gen(tc, N_TRAJ, STEPS, SEED, action_sampler=sampler)
         # new path 1: legacy TorusConfig signature (delegates to env+policy internally)
         o_leg, a_leg = generate_episodes(tc, N_TRAJ, STEPS, SEED, action_sampler=sampler)
