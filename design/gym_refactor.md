@@ -228,4 +228,4 @@ See the checkbox tracker below.
 - [x] 7.2 `docs/interpret.md` (defining concepts/factors + VLM prompts).
 - [x] 7.3 `docs/byo_environment.md` (+ the "Diagnostic renders (optional)" section: exact contract + what-you-lose table).
 - [x] 7.4 `README.md` links to the three docs + this plan + accelerations.md.
-- [ ] 7.5 Public rename: HF dataset `quickdraw-torus` -> `torus-world`; gym id `TorusWorld-v0`. Internal `torus/<split>` unchanged.
+- [x] 7.5 Public rename: HF dataset `quickdraw-torus` -> `torus-world`; gym id `TorusWorld-v0`. Internal `torus/<split>` unchanged.

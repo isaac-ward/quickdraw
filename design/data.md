@@ -50,7 +50,7 @@ each isolate ONE OOD axis (visual = recolor only, geometric = `(R,r)` only, dyna
 
 Each generated dataset is a `logs/data_generation_<timestamp>_<experiment>/` run folder (lerobot on-disk
 format, one sub-dataset per split + `media/` + `summary.json`), reused by every model via `data.root=`.
-The canonical copy is published to the HF Hub (`isaac-ronald-ward/quickdraw-torus`) via
+The canonical copy is published to the HF Hub (`isaac-ronald-ward/torus-world`) via
 `quickdraw.push_to_hub`, which clears-and-reuploads the whole folder on every push.
 
 ## Loading

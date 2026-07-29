@@ -29,7 +29,7 @@ uv run python -m quickdraw.data_generation experiment=$RUN
 #     -> set DATA=logs/data_generation_<ts>_$RUN
 
 # 1b. ...OR pull the published dataset from the Hub into a local dir, and point DATA at it
-uv run huggingface-cli download isaac-ronald-ward/quickdraw-torus --repo-type dataset --local-dir data/torus
+uv run huggingface-cli download isaac-ronald-ward/torus-world --repo-type dataset --local-dir data/torus
 #     -> set DATA=data/torus   (a split loads as LeRobotDataset("torus/<split>", root="$DATA/<split>"))
 
 # 2. train: train/val + the subscribed in-loop evals every N epochs   ->   set CKPT=logs/train_<ts>_$RUN
@@ -44,7 +44,7 @@ uv run python -m quickdraw.eval_diffusion   experiment=$RUN data.root=$DATA chec
 uv run python -m quickdraw.eval_interpret   experiment=$RUN data.root=$DATA checkpoint=$CKPT  # VLM-labeled latent manifolds (needs OPENAI_API_KEY; vision only)
 
 # (optional) push a generated dataset run to the Hub as one repo
-uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=quickdraw-torus +hub.private=true
+uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=torus-world +hub.private=true
 ```
 
 Override any Hydra field on the CLI.
@@ -84,5 +84,5 @@ where they predict, how each step is produced, how latent collapse is prevented,
 
 ## Links
 
-- [Hugging Face Dataset](https://huggingface.co/datasets/isaac-ronald-ward/quickdraw-torus)
+- [Hugging Face Dataset](https://huggingface.co/datasets/isaac-ronald-ward/torus-world)
 - [GitHub](https://github.com/isaac-ward/quickdraw)

@@ -1,7 +1,7 @@
 """Push a generated dataset run to the HF Hub as ONE dataset repo (the whole run folder).
 
   python -m quickdraw.push_to_hub data.root=logs/data_generation_<ts>_<exp> \
-      +hub.name=quickdraw-torus +hub.private=true
+      +hub.name=torus-world +hub.private=true
 
 Uploads the entire run directory (all splits' parquet/meta + normalization stats + media + summary)
 under a single repo `<namespace>/<name>`, so it is one thing to browse on the Hub. A given split
