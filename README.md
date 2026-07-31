@@ -1,6 +1,6 @@
 # quickdraw
 
-A world-models shoot-out: long-horizon consistency as staying on a torus data-manifold, with an MPPI control eval. Needs an NVIDIA GPU + the NVIDIA Container Toolkit.
+A world-models shoot-out. Needs an NVIDIA GPU + the NVIDIA Container Toolkit.
 
 ## Usage
 
@@ -21,38 +21,6 @@ From here, two docs tell you where to go:
 
 - **[docs/workflow.md](docs/workflow.md)** — the full pipeline end-to-end, one `uv run` line per step: generate data → push to the Hub → train the world model → action model → interpret (VLM labeling) → reward model → language control.
 - **[docs/byo_environment.md](docs/byo_environment.md)** — run that same pipeline on your *own* environment: any Gymnasium env (zero code) or a first-class `WorldEnv`.
-
-The quickstart below is the condensed torus path. Everything for a run lands in
-`logs/<step>_<timestamp>_<experiment>/` — dataset, plots, checkpoints, all in one place (`RUN` is your experiment name).
-
-The dataset is always **local**: `data.root` points at a run directory on disk. Either generate one
-(step 1a) or pull the published dataset from the Hub (step 1b) — both give you a local `data.root`.
-
-```bash
-# 1a. generate the dataset locally + sample plots/summary (all under one logs/ run dir; prints the path)
-uv run python -m quickdraw.data_generation experiment=$RUN
-#     -> set DATA=logs/data_generation_<ts>_$RUN
-
-# 1b. ...OR pull the published dataset from the Hub into a local dir, and point DATA at it
-uv run huggingface-cli download isaac-ronald-ward/torus-world --repo-type dataset --local-dir data/torus
-#     -> set DATA=data/torus   (a split loads as LeRobotDataset("torus/<split>", root="$DATA/<split>"))
-
-# 2. train: train/val + the subscribed in-loop evals every N epochs   ->   set CKPT=logs/train_<ts>_$RUN
-uv run python -m quickdraw.train_world_model            experiment=$RUN data.root=$DATA
-
-# 3. post-hoc evals at the best checkpoint (each writes its own logs/ run dir of plots/videos)
-uv run python -m quickdraw.eval_ood_horizon experiment=$RUN data.root=$DATA checkpoint=$CKPT  # long-horizon open-loop rollout
-uv run python -m quickdraw.eval_ood         experiment=$RUN data.root=$DATA checkpoint=$CKPT  # OOD splits (visual/geometric/dynamics)
-uv run python -m quickdraw.eval_control     experiment=$RUN data.root=$DATA checkpoint=$CKPT  # dual-MPPI control (oracle vs learned)
-uv run python -m quickdraw.eval_manifold    experiment=$RUN data.root=$DATA checkpoint=$CKPT  # recovered-manifold projections
-uv run python -m quickdraw.eval_diffusion   experiment=$RUN data.root=$DATA checkpoint=$CKPT  # denoising viz (diffusion models only)
-uv run python -m quickdraw.eval_interpret   experiment=$RUN data.root=$DATA checkpoint=$CKPT  # VLM-labeled latent manifolds (needs OPENAI_API_KEY; vision only)
-
-# (optional) push a generated dataset run to the Hub as one repo
-uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=torus-world
-```
-
-Override any Hydra field on the CLI.
 
 ## Supported methods
 
@@ -80,11 +48,6 @@ where they predict, how each step is produced, how latent collapse is prevented,
   - Physical — penalize predictions that leave the torus surface or violate its tangent constraint (optionally a kinematic `v = dp/dt` continuity term).
   - Contraction — hinge on the largest singular value of the one-step Jacobian, encouraging contractive, drift-resistant dynamics.
   - Noise injection — add Gaussian noise to the normalized observation inputs during training (robustness to the model's own rollout error).
-
-## Documentation
-
-- [docs/workflow.md](docs/workflow.md) — the end-to-end pipeline, in order, with commands
-- [docs/byo_environment.md](docs/byo_environment.md) — bring your own environment (gym adapter or the full `WorldEnv` protocol)
 
 ## Links
 
