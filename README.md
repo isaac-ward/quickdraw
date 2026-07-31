@@ -17,8 +17,13 @@ docker compose exec app python -c "import torch; print(torch.cuda.is_available()
 docker compose exec app bash
 ```
 
-Then, inside the container, run the steps in order (`RUN` is your experiment name). Everything for a
-run lands in `logs/<step>_<timestamp>_<experiment>/` — dataset, plots, checkpoints, all in one place.
+From here, two docs tell you where to go:
+
+- **[docs/workflow.md](docs/workflow.md)** — the full pipeline end-to-end, one `uv run` line per step: generate data → push to the Hub → train the world model → action model → interpret (VLM labeling) → reward model → language control.
+- **[docs/byo_environment.md](docs/byo_environment.md)** — run that same pipeline on your *own* environment: any Gymnasium env (zero code) or a first-class `WorldEnv`.
+
+The quickstart below is the condensed torus path. Everything for a run lands in
+`logs/<step>_<timestamp>_<experiment>/` — dataset, plots, checkpoints, all in one place (`RUN` is your experiment name).
 
 The dataset is always **local**: `data.root` points at a run directory on disk. Either generate one
 (step 1a) or pull the published dataset from the Hub (step 1b) — both give you a local `data.root`.
