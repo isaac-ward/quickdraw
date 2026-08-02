@@ -6,6 +6,7 @@ import lightning as L
 import torch
 
 from ..environments import torus as T
+from ..environments.registry import is_torus_name
 from .schedules import linear_schedule
 from .variations import VarContext, PhysicalLoss, make_variation_suite
 
@@ -14,12 +15,17 @@ class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
                  lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0,
-                 recon_frac: float = 1.0, lr_warmup_steps: int = 0):
+                 recon_frac: float = 1.0, lr_warmup_steps: int = 0, env_name: str = "torus_world"):
         super().__init__()
         self.model = model
         self.norm = normalizer
         self.R, self.r, self.v_scale, self.P, self.F = R, r, v_scale, P, F
         self.dt = dt
+        # torus-geometry val metrics (manifold_distance_error, tangent_velocity_error) require the torus
+        # REFERENCE ENV, not just a 6-dim proprio — gate on environments.name (registry.is_torus_name is
+        # the single source of truth for the alias set) so a future 6-dim non-torus env doesn't get them
+        # by accident.
+        self._is_torus_env = is_torus_name(env_name)
         self.recon_frac = float(recon_frac)   # <1 -> supervise the decode recon on a random subset of F frames (ALL heads)
         self.p_tf_start, self.p_tf_end, self.p_tf_warmup = p_tf_start, p_tf_end, p_tf_warmup
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
@@ -138,7 +144,7 @@ class LitWorldModel(L.LightningModule):
                     p_true = self.norm.denorm_obs(future["proprio"])
                     self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
                     self.log("val/metric/proprio/obs_error", F.mse_loss(dec["proprio"], future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
-                    if dec["proprio"].shape[-1] == 6:          # torus-geometry metrics require the torus 6-vector; other envs (e.g. 13-dim ISS) skip them
+                    if self._is_torus_env:                     # torus-geometry metrics require the torus reference env; other envs (e.g. 13-dim ISS) skip them
                         self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
                         self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
                 for name, _ in m.layout:

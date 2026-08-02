@@ -9,10 +9,18 @@ from __future__ import annotations
 from .base import WorldEnv
 
 
+def is_torus_name(name) -> bool:
+    """True if `name` (case-insensitive) is one of the aliases `make_env` resolves to the torus reference
+    env. The single source of truth for "is this the torus env" by name — anything gating torus-specific
+    behavior on `environments.name` (e.g. training/lit.py's val metrics) should call this rather than
+    duplicating the alias list."""
+    return str(name).lower() in ("torus_world", "torus", "torusworld-v0")
+
+
 def make_env(name: str, cfg, batch: int, device="cpu") -> WorldEnv:
     """Construct a batched `WorldEnv` by name. `cfg` is the resolved `environments` config group."""
     n = str(name).lower()
-    if n in ("torus_world", "torus", "torusworld-v0"):
+    if is_torus_name(name):
         from .torus import TorusEnv, TorusConfig
         tc = TorusConfig(R=cfg.R, r=cfg.r, dt=cfg.dt, gamma=cfg.gamma, a_max=cfg.a_max,
                          init_speed=cfg.init_speed, mass=cfg.mass)

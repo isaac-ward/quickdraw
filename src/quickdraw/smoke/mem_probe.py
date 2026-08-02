@@ -23,7 +23,8 @@ norm = normalizer(cfg)
 model = build_model(cfg).to(DEV)
 e = env_cfg(cfg)
 lit = LitWorldModel(model, norm, e.R, e.r, e.init_speed, cfg.data.P, cfg.data.F,
-                    0.0, 0.0, 0, cfg.optim.lr, cfg.optim.weight_decay, 0).to(DEV)  # p_tf=0 -> full rollout, detach_every=0
+                    0.0, 0.0, 0, cfg.optim.lr, cfg.optim.weight_decay, 0,
+                    env_name=str(cfg.environments.get("name", "torus_world"))).to(DEV)  # p_tf=0 -> full rollout, detach_every=0
 lit.log = lambda *a, **k: None
 B, P, F = cfg.data.batch, cfg.data.P, cfg.data.F
 batch = {"obs_seq": torch.randn(B, P + F, 6, device=DEV), "act_seq": torch.randn(B, P + F, 2, device=DEV)}

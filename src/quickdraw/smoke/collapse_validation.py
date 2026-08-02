@@ -52,7 +52,8 @@ def main():
         model = build_model(cfg).to(dev)
         lit = LitWorldModel(model, norm, e.R, e.r, e.init_speed, P, cfg.data.F,
                             args.p_tf, args.p_tf, 0, cfg.optim.lr, cfg.optim.weight_decay,
-                            cfg.model.detach_every).to(dev)
+                            cfg.model.detach_every,
+                            env_name=str(cfg.environments.get("name", "torus_world"))).to(dev)
         logged = {}
         lit.log = lambda k, v, **kw: logged.__setitem__(k, float(v))
         opt = torch.optim.AdamW(model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
