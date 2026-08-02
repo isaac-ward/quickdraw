@@ -133,12 +133,14 @@ class LitWorldModel(L.LightningModule):
         if tag == "val":
             with torch.no_grad():
                 dec = m.to_obs(src)                           # decode (mse) / 1-step sample (flow) — val metrics only
-                p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
-                p_true = self.norm.denorm_obs(future["proprio"])
-                self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
-                self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
-                self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
-                self.log("val/metric/proprio/obs_error", F.mse_loss(dec["proprio"], future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
+                if "proprio" in dec:
+                    p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
+                    p_true = self.norm.denorm_obs(future["proprio"])
+                    self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
+                    self.log("val/metric/proprio/obs_error", F.mse_loss(dec["proprio"], future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
+                    if dec["proprio"].shape[-1] == 6:          # torus-geometry metrics require the torus 6-vector; other envs (e.g. 13-dim ISS) skip them
+                        self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
+                        self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
                 for name, _ in m.layout:
                     if name == "proprio":
                         continue
@@ -150,7 +152,8 @@ class LitWorldModel(L.LightningModule):
                 if hasattr(m, "collapse_diagnostics"):        # latent-collapse (esp. for EMA); on the encoded bag
                     for k, val in m.collapse_diagnostics(obs).items():
                         self.log(f"collapse/{k}", val)
-                if not getattr(self, "_kv_logged", False) and hasattr(m, "kvcache_report"):
+                if (not getattr(self, "_kv_logged", False) and hasattr(m, "kvcache_report")
+                        and any(name == "proprio" for name, _ in m.layout)):
                     # ONE-TIME temporal KV-cache A/B (kvcache/*): realized wall-clock speedup of the inference
                     # rollout + the (benign) latent divergence. proprio-only decode -> cheap; runs once per run.
                     self._kv_logged = True
