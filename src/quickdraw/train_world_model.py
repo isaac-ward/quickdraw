@@ -13,6 +13,7 @@ import torch._inductor.config  # noqa: F401  ensure the submodule is importable 
 from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf
 
+from .environments.registry import is_torus_name
 from .logging.callback import LoggingCallback, ProgressPrinter
 from .logging.writer import make_writer
 from .utils.logging import make_run_dir
@@ -151,9 +152,14 @@ def main(cfg):
     print(summary_text, flush=True)  # after wandb.init -> captured in the wandb console logs too
     # train/val run normally; subscribe to the eval routines enabled in conf/eval/default.yaml
     # (ood_horizon | ood_visual | ood_geometric | ood_dynamics | control), run every every_epochs
+    # torus runs checkpoint on the torus-only manifold distance; other envs (e.g. ISS) checkpoint on the
+    # generic decoded-proprio MSE instead, since manifold_distance_error is only logged for the torus env.
+    ckpt_monitor = ("val/metric/proprio/manifold_distance_error"
+                    if is_torus_name(cfg.environments.get("name", "torus_world"))
+                    else "val/metric/proprio/obs_error")
     callbacks = [
         ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
-                        monitor="val/metric/proprio/manifold_distance_error",
+                        monitor=ckpt_monitor,
                         mode="min", save_top_k=cfg.trainer.save_top_k, save_last=True),
         LoggingCallback(writer, cfg, norm, e, cfg.eval.during_train.every_epochs,
                         [name for name, on in cfg.eval.during_train.evals.items() if on],
