@@ -104,12 +104,17 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
                 if log is not None:
                     log(f"episode {i}: no diagnostic scene and no obs for the render_obs fallback — skipped")
                 continue
-            t = env.render_obs(torch.as_tensor(np.asarray(obs_true[i]), dtype=torch.float32)
-                               ).cpu().numpy().astype(np.float32) / 255.0
-            p = env.render_obs(torch.as_tensor(np.asarray(obs_pred[i]), dtype=torch.float32)
-                               ).cpu().numpy().astype(np.float32) / 255.0
-            log_image_head(writer, routine, "obs", i, t, p, step, fps, context_len=P,
-                           title=f"obs #{i} pred(top)/GT(bottom)")
+            try:
+                t = env.render_obs(torch.as_tensor(np.asarray(obs_true[i]), dtype=torch.float32)
+                                   ).cpu().numpy().astype(np.float32) / 255.0
+                p = env.render_obs(torch.as_tensor(np.asarray(obs_pred[i]), dtype=torch.float32)
+                                   ).cpu().numpy().astype(np.float32) / 255.0
+            except NotImplementedError:                                    # e.g. RecordedEnv: no renderer —
+                if log is not None:                                        # image-head filmstrips still emit below
+                    log(f"episode {i}: env has no render_obs — obs filmstrip skipped")
+            else:
+                log_image_head(writer, routine, "obs", i, t, p, step, fps, context_len=P,
+                               title=f"obs #{i} pred(top)/GT(bottom)")
         for head, d in (images or {}).items():
             log_image_head(writer, routine, head, i, d["full_true"][i], d["ipred"][i], step, fps,
                            context_len=P, title=f"{head} #{i} pred(top)/GT(bottom)")

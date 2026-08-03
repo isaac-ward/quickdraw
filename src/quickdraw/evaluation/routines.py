@@ -42,12 +42,13 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
     n_plot = min(int(cfg.eval.n_plot), obs.shape[0])
     _plog(writer, f"[{prefix} @ep{step}] start: {obs.shape[0]} episodes, {obs.shape[1]}-step open-loop rollout, "
                   f"{n_plot} plot/video episodes")
-    res = eval_batched(model, norm, R, r, v_scale, P, obs, act)
+    from omegaconf import OmegaConf
+    env = make_env(cfg.environments.get("name", "torus_world"),      # THIS split's geometry (may be OOD);
+                   OmegaConf.merge(cfg.environments, {"R": float(R), "r": float(r),  # init_speed = v_scale so
+                                                      "init_speed": float(v_scale)}), 1, "cpu")  # rollout_metrics match
+    res = eval_batched(model, norm, env, P, obs, act)
     _plog(writer, f"[{prefix} @ep{step}] rollout done in {time.perf_counter() - t0:.1f}s; rendering...")
 
-    from omegaconf import OmegaConf
-    env = make_env(cfg.environments.get("name", "torus_world"),      # THIS split's geometry (may be OOD)
-                   OmegaConf.merge(cfg.environments, {"R": float(R), "r": float(r)}), 1, "cpu")
     desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
             "the model's PREDICTED path. They share the context, then diverge at the fork step. The action "
             "arrow is the applied action along the true path.")
@@ -85,7 +86,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         _plog(writer, f"[eval_ood_horizon @ep{step}] {pct:3d}% — {what}")
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size,
+                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     n_ep = min(8 if img_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(eps))
     eps = eps[:n_ep]
     H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
@@ -104,10 +106,11 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
 
     # ---- AVERAGED error-vs-step curves, one block per head (proprio + each image), mirrored. Averaged over
     #      episodes (NOT per-instance) — same policy as proprio: no per-episode curves. ----
+    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
     pred = out["proprio"]
     p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
     p_true = torch.stack([torch.from_numpy(o[P:P + H]) for o, _, _ in eps]).float().to(device)
-    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, ecfg.R, ecfg.r, ecfg.init_speed)
+    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, env)
     curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}        # mean over episodes -> (H,)
 
     images = {}                                                              # per image head: curves + frames for the emitter
@@ -134,11 +137,11 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     prog(45, f"averaged curves (proprio + {len(img_heads)} image head(s))")
 
     # ---- everything (curves + per-episode trajectory/image visuals) via the shared open-loop emitter ----
-    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
     desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
             "the model's PREDICTED path, sharing the context then diverging at the fork.")
     ctx_obs = norm.denorm_obs(pro[:n_plot]).cpu().numpy()
-    emit_openloop(writer, "eval_ood_horizon", step, env=env, R=ecfg.R, r=ecfg.r, coloring="hsv", fps=fps, P=P,
+    emit_openloop(writer, "eval_ood_horizon", step, env=env, R=getattr(ecfg, "R", None),  # R/r only read by the
+                  r=getattr(ecfg, "r", None), coloring="hsv", fps=fps, P=P,               # rich (torus) scene path
                   smooth_window=int(cfg.data.action_smooth_window), description=desc,
                   ctx_xyz=ctx_obs[:, :, :3],
                   p_true_xyz=p_true[:n_plot, :, :3].cpu().numpy(), p_hat_xyz=p_hat[:n_plot, :, :3].cpu().numpy(),
