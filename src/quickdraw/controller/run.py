@@ -252,7 +252,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 if proj is None:
                     _plog(writer, f"[eval_control @ep{step}] latent anim: {method} {dim}d has no out-of-sample map (skip)")
                     continue
-                for i in range(min(NP, 1)):   # latent animations are per-mechanism; 1 episode suffices (render cost)
+                for i in range(NP):           # one animation PER control episode (matches control_video_<i>)
                     ti = time.perf_counter()
                     vid = render_latent_video(proj, res["agent_latents"][i],
                                               title=f'"{request}"  ·  {factor} ({method} {dim}d)  #{i}',
@@ -297,24 +297,30 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                 labels = [recs[int(c)]["label"][factor] for c in clip_idx]
                 yb = {b: k for k, b in enumerate(fc["buckets"])}
                 e, red = reduce_dims(fz, "lda", n_components=2, seed=0, return_reducer=True, y=np.array([yb[l] for l in labels]))
-                for r_idx, r_txt in plot_reqs:              # LDA layout is request-independent -> fit once, reuse per request
+                multi = len(plot_reqs) > 1
+                # STATIC reward field: one per REQUEST (request-dependent, episode-independent, LDA layout shared)
+                for r_idx, r_txt in plot_reqs:
                     t_e_np, rfield = te_cache[r_idx]
-                    goal2d = red.transform(t_e_np[None])[0][:2]     # the request f_t(request) projected -> its spot in this layout
-                    # STATIC reward field in THIS factor's LDA layout (readable gradient; the reward_*.mp4 animates the same)
+                    goal2d = red.transform(t_e_np[None])[0][:2]     # f_t(request) projected -> its spot in this layout
                     ff = viz.fig_points_2d(e, color=rfield, cbar_label=f"reward  cos(f_z, f_t('{r_txt}'))",
                                            lims=pad_lims(np.concatenate([e, goal2d[None]])), point_size=6.0,
                                            annotations=[{"pos": goal2d, "text": r_txt}],
                                            title=f"reward field '{r_txt}' — {factor} LDA")
                     writer.figure(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", "reward_field", i=r_idx), ff, step)
                     plt.close(ff)
+                # AGENT ANIMATION: one PER EPISODE (matches control_video_<i>). multi-query: episode i steers to
+                # request i; single request: all NP episodes share it (each has its own trajectory through the space).
+                for i in range(len(plot_reqs) if multi else NP):
+                    r_idx = i if multi else 0
+                    r_txt, t_e_np = plot_reqs[r_idx][1], te_cache[r_idx][0]
                     with torch.no_grad():
-                        fzt = reward.f_z(torch.from_numpy(np.asarray(res["agent_latents"][r_idx], np.float32)).to(reward.device)).cpu().numpy()
+                        fzt = reward.f_z(torch.from_numpy(np.asarray(res["agent_latents"][i], np.float32)).to(reward.device)).cpu().numpy()
                     for rmode, tag in ((False, "concept"), (True, "reward")):
                         fr = animate_joint_space(fz, fzt, t_e_np, method="lda", labels=labels, factor_cfg=fc,
-                                                 reward_mode=rmode, goal_label=r_txt, title=f"'{r_txt}' · {factor} joint ({tag}) #{r_idx}")
-                        writer.video(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", f"{tag}_2d", i=r_idx),
-                                     fr, fps, step)   # <type>_<nd>d_<i>.mp4 (type = concept|reward), matching the other products
-                    _plog(writer, f"[eval_control @ep{step}] joint anim {factor}/lda #{r_idx} '{r_txt}' (concept+reward)")
+                                                 reward_mode=rmode, goal_label=r_txt, title=f"'{r_txt}' · {factor} joint ({tag}) #{i}")
+                        writer.video(product_tag(f"eval_control/joint_latent_space_plots/{factor}/lda", f"{tag}_2d", i=i),
+                                     fr, fps, step)   # <type>_<nd>d_<i>.mp4, one per control episode
+                    _plog(writer, f"[eval_control @ep{step}] joint anim {factor}/lda #{i} '{r_txt}' (concept+reward)")
 
     # aggregate scalars (over ALL episodes, once)
     summary = {"n_steps": res["n_steps"], "time/mppi_chunk_s": mppi_chunk_s, "time/mppi_chunk_hz": mppi_chunk_hz}
