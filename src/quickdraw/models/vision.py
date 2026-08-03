@@ -20,9 +20,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def img_hw(img_size) -> tuple[int, int]:
+    """img_size int (square) or (H, W) -> (H, W). The one spot that normalizes the two forms."""
+    return (img_size, img_size) if isinstance(img_size, int) else tuple(img_size)
+
+
 @dataclass
 class VisionAEConfig:
-    img_size: int = 128
+    img_size: int | tuple[int, int] = 128   # int -> square (torus); (H, W) -> non-square (recorded cams)
     patch: int = 16
     d: int = 256
     enc_depth: int = 4
@@ -86,9 +91,10 @@ class ImageAutoencoder(nn.Module):
     def __init__(self, cfg: VisionAEConfig):
         super().__init__()
         self.cfg = cfg
-        gp = cfg.img_size // cfg.patch
-        assert gp * cfg.patch == cfg.img_size, "img_size must be divisible by patch"
-        self.gp, self.np = gp, gp * gp
+        H, W = img_hw(cfg.img_size)
+        gh, gw = H // cfg.patch, W // cfg.patch
+        assert gh * cfg.patch == H and gw * cfg.patch == W, "img_size must be divisible by patch"
+        self.gh, self.gw, self.np = gh, gw, gh * gw
         pdim = cfg.patch * cfg.patch * cfg.channels
         d, h = cfg.d, cfg.heads
         # encoder
@@ -115,13 +121,13 @@ class ImageAutoencoder(nn.Module):
     # ---- linear (de)patchify, no conv ----
     def patchify(self, img):                                  # (B,H,W,C) -> (B, np, patch*patch*C)
         B, H, W, C = img.shape
-        p, gp = self.cfg.patch, self.gp
-        return img.reshape(B, gp, p, gp, p, C).permute(0, 1, 3, 2, 4, 5).reshape(B, gp * gp, p * p * C)
+        p, gh, gw = self.cfg.patch, self.gh, self.gw
+        return img.reshape(B, gh, p, gw, p, C).permute(0, 1, 3, 2, 4, 5).reshape(B, gh * gw, p * p * C)
 
     def unpatchify(self, x):                                  # (B, np, patch*patch*C) -> (B,H,W,C)
-        p, gp, C = self.cfg.patch, self.gp, self.cfg.channels
-        x = x.reshape(x.shape[0], gp, gp, p, p, C).permute(0, 1, 3, 2, 4, 5)
-        return x.reshape(x.shape[0], gp * p, gp * p, C)
+        p, gh, gw, C = self.cfg.patch, self.gh, self.gw, self.cfg.channels
+        x = x.reshape(x.shape[0], gh, gw, p, p, C).permute(0, 1, 3, 2, 4, 5)
+        return x.reshape(x.shape[0], gh * p, gw * p, C)
 
     def encode(self, img):                                    # -> (B, num_tokens, d)
         x = self.patch_embed(self.patchify(img)) + self.enc_pos
@@ -197,16 +203,16 @@ class ConvImageEncoder(nn.Module):
         self.cfg = cfg
         C, d, T = cfg.channels, cfg.d, cfg.num_tokens
         stem = 2                                                       # stride-2 stem: the full-res activation is
-        hw0 = cfg.img_size // stem                                     #   1/4 the memory (standard conv-encoder stem)
-        n_levels = max(1, int(math.log2(max(8, hw0) // 8)))           # then pool to a ~8px bottleneck
+        h0, w0 = (s // stem for s in img_hw(cfg.img_size))             #   1/4 the memory (standard conv-encoder stem)
+        n_levels = max(1, int(math.log2(max(8, min(h0, w0)) // 8)))   # then pool to a ~8px bottleneck (short side)
         chs = [base * min(4, 2 ** i) for i in range(n_levels)]
         self.in_conv = nn.Conv2d(C, chs[0], 3, stride=stem, padding=1)
         prev, self.downs = chs[0], nn.ModuleList()
         for ch in chs:
             self.downs.append(_ConvResBlock(prev, ch)); prev = ch
-        self.bott_hw = hw0 // (2 ** len(chs))                          # 8 at 128px (stem/2 then n_levels pools)
+        self.bott_hw = (h0 // (2 ** len(chs)), w0 // (2 ** len(chs)))  # (8, 8) at 128px (stem/2 then n_levels pools)
         self.to_d = nn.Conv2d(chs[-1], d, 1)                          # channels -> model dim
-        self.pos = nn.Parameter(torch.zeros(1, self.bott_hw * self.bott_hw, d))
+        self.pos = nn.Parameter(torch.zeros(1, self.bott_hw[0] * self.bott_hw[1], d))
         self.latent_q = nn.Parameter(torch.zeros(1, T, d))
         self.to_latent = CrossAttn(d, cfg.heads)
         self.latent_norm = nn.LayerNorm(d)
@@ -235,7 +241,8 @@ class ConditionalUNet(nn.Module):
         import math
         self.cfg = ae_cfg
         C, d, T = ae_cfg.channels, ae_cfg.d, ae_cfg.num_tokens
-        n_levels = max(1, int(math.log2(max(8, ae_cfg.img_size) // 8)))   # keep the bottleneck ~8px (128->4, 64->3, 32->2)
+        H, W = img_hw(ae_cfg.img_size)
+        n_levels = max(1, int(math.log2(max(8, min(H, W)) // 8)))         # keep the bottleneck ~8px (128->4, 64->3, 32->2)
         chs = [base * min(4, 2 ** i) for i in range(n_levels)]            # e.g. 128px -> [base,2b,4b,4b]
         self.gdim = d
         self.t_proj = nn.Linear(time_dim, d)                  # time (flow); unused for mse (temb=None)
@@ -244,7 +251,7 @@ class ConditionalUNet(nn.Module):
         prev, self.downs = chs[0], nn.ModuleList()
         for ch in chs:
             self.downs.append(_FiLMResBlock(prev, ch, d)); prev = ch
-        self.bott_hw = ae_cfg.img_size // (2 ** len(chs))     # 128/16 = 8
+        self.bott_hw = (H // (2 ** len(chs)), W // (2 ** len(chs)))   # (8, 8) at 128px
         self.seed_hw = 2                                       # tokens -> a small 2x2 seed, upsampled to the bottleneck
         self.cond_to_spatial = nn.Linear(T * d, chs[-1] * self.seed_hw * self.seed_hw)   # (was a dense 8x8 map = the 8M term)
         self.mid = _FiLMResBlock(chs[-1], chs[-1], d)
@@ -266,7 +273,7 @@ class ConditionalUNet(nn.Module):
         for down in self.downs:
             h = down(h, g); skips.append(h); h = F.avg_pool2d(h, 2)
         seed = self.cond_to_spatial(cond.reshape(M, -1)).reshape(M, -1, self.seed_hw, self.seed_hw)
-        h = h + F.interpolate(seed, size=(self.bott_hw, self.bott_hw), mode="nearest")
+        h = h + F.interpolate(seed, size=self.bott_hw, mode="nearest")
         h = self.mid(h, g)
         for up, skip in zip(self.ups, reversed(skips)):
             h = F.interpolate(h, scale_factor=2, mode="nearest")

@@ -186,11 +186,12 @@ class ImageFlowHead(TransportHead):
     def __init__(self, ae_cfg, *, depth: int = 4, param: str = "v", shortcut: bool = False, n_freq: int = 16,
                  time_dim: int = 32, no_noise: bool = False):
         super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim, no_noise=no_noise)
-        from .vision import CrossAttn, ViTBlock
+        from .vision import CrossAttn, ViTBlock, img_hw
         c = ae_cfg
         self.cfg = c
-        self.gp = c.img_size // c.patch
-        self.np = self.gp * self.gp
+        H, W = img_hw(c.img_size)
+        self.gh, self.gw = H // c.patch, W // c.patch
+        self.np = self.gh * self.gw
         pdim = c.patch * c.patch * c.channels
         d = c.d
         self.patch_embed = nn.Linear(pdim, d)
@@ -204,14 +205,14 @@ class ImageFlowHead(TransportHead):
         nn.init.trunc_normal_(self.pos, std=0.02)
 
     def _patchify(self, img):                                          # (M,H,W,C) -> (M, np, patch*patch*C)
-        p, gp, C = self.cfg.patch, self.gp, self.cfg.channels
+        p, gh, gw, C = self.cfg.patch, self.gh, self.gw, self.cfg.channels
         M = img.shape[0]
-        return img.reshape(M, gp, p, gp, p, C).permute(0, 1, 3, 2, 4, 5).reshape(M, gp * gp, p * p * C)
+        return img.reshape(M, gh, p, gw, p, C).permute(0, 1, 3, 2, 4, 5).reshape(M, gh * gw, p * p * C)
 
     def _unpatchify(self, x):                                          # (M, np, patch*patch*C) -> (M,H,W,C)
-        p, gp, C = self.cfg.patch, self.gp, self.cfg.channels
-        x = x.reshape(x.shape[0], gp, gp, p, p, C).permute(0, 1, 3, 2, 4, 5)
-        return x.reshape(x.shape[0], gp * p, gp * p, C)
+        p, gh, gw, C = self.cfg.patch, self.gh, self.gw, self.cfg.channels
+        x = x.reshape(x.shape[0], gh, gw, p, p, C).permute(0, 1, 3, 2, 4, 5)
+        return x.reshape(x.shape[0], gh * p, gw * p, C)
 
     def velocity(self, x: Tensor, temb: Tensor, cond: Tensor, demb: Tensor | None = None) -> Tensor:
         M = x.shape[0]
@@ -226,8 +227,9 @@ class ImageFlowHead(TransportHead):
 
     def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
                record_path: bool = False):
+        from .vision import img_hw
         c = self.cfg
-        return self._sample(cond, event_shape=(c.img_size, c.img_size, c.channels), lead=cond.shape[:-2],
+        return self._sample(cond, event_shape=(*img_hw(c.img_size), c.channels), lead=cond.shape[:-2],
                             steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
 
 
@@ -248,6 +250,7 @@ class ImageUNetFlowHead(TransportHead):
 
     def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
                record_path: bool = False):
+        from .vision import img_hw
         c = self.cfg
-        return self._sample(cond, event_shape=(c.img_size, c.img_size, c.channels), lead=cond.shape[:-2],
+        return self._sample(cond, event_shape=(*img_hw(c.img_size), c.channels), lead=cond.shape[:-2],
                             steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)

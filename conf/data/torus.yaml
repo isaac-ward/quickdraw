@@ -1,6 +1,9 @@
 root: null     # set to the data_generation run dir, e.g. data.root=logs/data_generation_<ts>_<exp>
 hf_repo: null  # null -> load from the local data.root; set to <namespace>/<name> to download+cache the
 #                HF dataset repo (the whole run folder) and load from there.
+repo_id: torus # lerobot repo prefix the splits were WRITTEN with (<repo_id>/<split>); recorded datasets
+#                use their recording name (e.g. flightroom_starling)
+cam: fpv       # camera stream name -> videos/observation.images.<cam> (torus: fpv; recorded starling: ego)
 P: 8           # past context steps fed before prediction starts (obs already carries velocity, so
                # the state is near-Markov -> little history needed; P need NOT equal F)
 F: 64          # future horizon rolled out during training (sets the BPTT length, not test horizon)

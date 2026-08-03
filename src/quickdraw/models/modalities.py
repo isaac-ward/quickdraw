@@ -51,7 +51,7 @@ class ModalitySpec:
     # vector
     dim: int = 6
     # image
-    img_size: int = 128
+    img_size: int | tuple[int, int] = 128   # int -> square; (H, W) -> non-square (e.g. recorded 112x192)
     patch: int = 16
     num_tokens: int = 8
     ae_depth: int = 4

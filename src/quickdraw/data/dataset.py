@@ -42,11 +42,12 @@ class Normalizer:
         return a * self.a_std.to(a) + self.a_mean.to(a)
 
 
-def load_split_episodes(root: str, split: str):
-    """Return list of (obs (T,6), act (T,2)) float32 arrays. ISOLATED lerobot read."""
+def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
+    """Return list of (obs (T,D), act (T,A)) float32 arrays. ISOLATED lerobot read. `repo_id` is the
+    prefix the split was written with (<repo_id>/<split>; torus datasets = "torus")."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    ds = LeRobotDataset(f"torus/{split}", root=os.path.join(root, split))
+    ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
     obs_all = np.stack(hf["observation_vector"]).astype(np.float32)
@@ -54,26 +55,34 @@ def load_split_episodes(root: str, split: str):
     return [(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)]
 
 
-def load_fpv_frames(root: str, split: str, size: int = 128, max_frames: int | None = None, cache: bool = True):
-    """All egocentric FPV frames for a split (lerobot chunked video), AREA-downsampled to size×size ONCE
-    and cached to disk (npy next to the split). Returns uint8 (N, size, size, 3). The downsample is the
+def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 128,
+                    max_frames: int | None = None, cache: bool = True, cam: str = "fpv"):
+    """All egocentric frames for a split (lerobot chunked video, camera `cam`), AREA-downsampled ONCE
+    and cached to disk (npy next to the split). `size`: int -> size×size (torus default), (H, W) tuple,
+    or None -> native resolution (no resize). Returns uint8 (N, H, W, 3). The downsample is the
     only per-frame work and it's cached, so repeat loads are instant (mmap)."""
     import glob as _glob
 
     import imageio.v2 as imageio
-    cache_path = os.path.join(root, split, f"fpv_{size}.npy")
+    hw = (size, size) if isinstance(size, int) else (tuple(size) if size is not None else None)
+    tag = size if isinstance(size, int) else ("native" if hw is None else f"{hw[0]}x{hw[1]}")
+    cache_path = os.path.join(root, split, f"{cam}_{tag}.npy")
     if cache and max_frames is None and os.path.exists(cache_path):
         return np.load(cache_path)
-    vid = os.path.join(root, split, "videos", "observation.images.fpv")
+    vid = os.path.join(root, split, "videos", f"observation.images.{cam}")
     mp4s = sorted(_glob.glob(os.path.join(vid, "*", "*.mp4")))
-    assert mp4s, f"no FPV mp4s under {vid}"
+    assert mp4s, f"no {cam} mp4s under {vid}"
     out, buf = [], []
 
     def _flush():
         if not buf:
             return
+        if hw is None:                                                         # native: no resize
+            out.append(np.stack(buf))
+            buf.clear()
+            return
         x = torch.from_numpy(np.stack(buf)).permute(0, 3, 1, 2).float()       # (b,3,H,W)
-        x = torch.nn.functional.interpolate(x, size=(size, size), mode="area")  # anti-aliased downsample
+        x = torch.nn.functional.interpolate(x, size=hw, mode="area")           # anti-aliased downsample
         out.append(x.permute(0, 2, 3, 1).round().clamp(0, 255).to(torch.uint8).numpy())
         buf.clear()
 
@@ -100,19 +109,20 @@ def load_fpv_frames(root: str, split: str, size: int = 128, max_frames: int | No
     return frames
 
 
-def load_split_episodes_mm(root: str, split: str, img_size: int = 128):
-    """Like load_split_episodes but ALSO returns per-episode FPV frames (area-downsampled to img_size,
-    uint8), aligned 1:1 with obs steps. Returns list of (obs (T,6), act (T,2), img (T,size,size,3) uint8).
-    The chunked FPV video is read in dataset row order (== obs row order), then split by episode_index."""
+def load_split_episodes_mm(root: str, split: str, img_size: int | tuple[int, int] | None = 128,
+                           cam: str = "fpv", repo_id: str = "torus"):
+    """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled to img_size,
+    uint8), aligned 1:1 with obs steps. Returns list of (obs (T,D), act (T,A), img (T,H,W,3) uint8).
+    The chunked video is read in dataset row order (== obs row order), then split by episode_index."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    ds = LeRobotDataset(f"torus/{split}", root=os.path.join(root, split))
+    ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
     obs_all = np.stack(hf["observation_vector"]).astype(np.float32)
     act_all = np.stack(hf["action"]).astype(np.float32)
-    frames_all = load_fpv_frames(root, split, size=img_size)               # (N, size, size, 3), row order
-    assert len(frames_all) == len(obs_all), f"FPV/row count mismatch: {len(frames_all)} vs {len(obs_all)}"
+    frames_all = load_fpv_frames(root, split, size=img_size, cam=cam)      # (N, H, W, 3), row order
+    assert len(frames_all) == len(obs_all), f"{cam}/row count mismatch: {len(frames_all)} vs {len(obs_all)}"
     return [(obs_all[ep_idx == e], act_all[ep_idx == e], frames_all[ep_idx == e]) for e in np.unique(ep_idx)]
 
 

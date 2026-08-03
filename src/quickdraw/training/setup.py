@@ -31,7 +31,13 @@ def _modality_specs(cfg):
     ms = cfg.model.get("modalities", None)
     if not ms:
         return [ModalitySpec(name="proprio", kind="vector", dim=int(cfg.model.get("obs_dim", 6)))]
-    return [ModalitySpec(**dict(e)) for e in ms]
+    specs = []
+    for e in ms:
+        kw = dict(e)
+        if not isinstance(kw.get("img_size", 128), int):    # yaml [H, W] (ListConfig) -> plain tuple
+            kw["img_size"] = tuple(int(s) for s in kw["img_size"])
+        specs.append(ModalitySpec(**kw))
+    return specs
 
 
 def build_model(cfg):
@@ -121,21 +127,23 @@ def window_loaders(cfg, norm: Normalizer):
     root = resolve_data_root(cfg)
     specs = _modality_specs(cfg)
     img = next((s for s in specs if s.kind == "image"), None)   # image modality (if any) -> resident frame store
+    cam, repo = str(cfg.data.get("cam", "fpv")), str(cfg.data.get("repo_id", "torus"))
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
         if img is not None:
-            eps = load_split_episodes_mm(root, split, img_size=img.img_size)
+            eps = load_split_episodes_mm(root, split, img_size=img.img_size, cam=cam, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, image_head=img.name, stride=stride)
-        else:                                                    # proprio-only: (obs, act) pairs, no FPV frames
-            eps = load_split_episodes(root, split)
+        else:                                                    # proprio-only: (obs, act) pairs, no camera frames
+            eps = load_split_episodes(root, split, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
     return loaders
 
 
 def eval_episodes(cfg, norm: Normalizer, split: str):
-    return TrajectoryDataset(load_split_episodes(resolve_data_root(cfg), split), norm)
+    return TrajectoryDataset(load_split_episodes(resolve_data_root(cfg), split,
+                                                 repo_id=str(cfg.data.get("repo_id", "torus"))), norm)
 
 
 def data_exists(cfg) -> bool:
