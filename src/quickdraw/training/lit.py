@@ -258,7 +258,11 @@ class LitActionModel(L.LightningModule):
                 obs[name] = batch[name]
         act = batch["act_seq"]                                # (B, L, action_dim), normalized
         L_ = act.shape[1]
-        with torch.no_grad():                                 # frozen WM: contexts only, no graph
+        # exclude the FLASH SDPA backend for the frozen-WM context pass: Lightning's val context selects it for
+        # the image ViT's attention, where it aborts with CUDA 'invalid configuration argument' on this head
+        # config (the WM's own training/val avoids it). mem-efficient/math handle the same shapes fine.
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        with torch.no_grad(), sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):  # frozen WM: contexts only
             h_ctx = m.action_context(obs, act)                # (B, L-1, d): h[k] predicts a[k+1] (leak-free)
         cond = h_ctx[:, :-1]                                  # h[t-1], aligned to predict a[t] for t=1..L-2
         a_target = act[:, 1:L_ - 1].detach()                  # a[1..L-2] — same alignment as loss_terms
