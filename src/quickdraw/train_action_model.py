@@ -53,15 +53,23 @@ def main(cfg):
     run = os.path.dirname(os.path.dirname(ck)) if ck.endswith(".ckpt") else ck
     cfgj = os.path.join(run, "logs", "config.json")
     OmegaConf.set_struct(cfg, False)
+    ah = cfg.model.get("action_head", None)                  # THIS run's head knobs (CLI-overridable)
+    ah_shortcut = ah.get("shortcut", None) if ah is not None else None   # explicit CLI shortcut override, if any
     if os.path.exists(cfgj):
         saved = OmegaConf.create(json.load(open(cfgj)))
-        ah = cfg.model.get("action_head", None)
         cfg.model = saved.model                              # adopt the trained WM config (arch + modalities)
         if ah is not None:
             cfg.model.action_head = ah                       # ...but the head knobs belong to THIS run
     if cfg.model.get("action_head", None) is None:
         cfg.model.action_head = {}
     cfg.model.action_head.enabled = True
+    # POST-HOC default: train the action head as PURE rectified flow (shortcut OFF). The shortcut
+    # self-consistency loss is self-referential (target = the model's own chained steps) and, on the FROZEN
+    # WM trunk with no co-adaptation to anchor it, runs away (val 1.6 -> 1e22; LR warmup only delays it to
+    # ~ep15). shortcut=false is stable + gives a better action-dist match (W1 0.13 vs diverged/NaN). Override
+    # with ++model.action_head.shortcut=true to force it back on.
+    if ah_shortcut is None:
+        cfg.model.action_head.shortcut = False
     assert str(cfg.model.name) in ("mm_flow", "flow"), (
         f"the action-flow head needs a flow world model (model.name in mm_flow/flow; got {cfg.model.name!r})")
 
