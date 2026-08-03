@@ -60,8 +60,20 @@ class WorldEnv(Protocol):
     def reward(self, obs: Tensor, goal: Tensor | None = None) -> Tensor: ...   # -> (B,) return for control eval
     def render_obs(self, obs: Tensor) -> Tensor: ...          # -> (B, H, W, 3) uint8 — the IMAGE MODALITY
 
+    # Env-specific val ROLLOUT METRICS: {name: per-element Tensor} on denormalized obs. Envs without extra
+    # geometry return `default_rollout_metrics` (generic); torus adds its manifold/tangent errors. An env MAY
+    # also set `checkpoint_metric` (a key of this dict) naming the metric train.py monitors for best.ckpt
+    # (default: pointwise_error).
+    def rollout_metrics(self, pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]: ...
+
     # OPTIONAL — envs that can draw a rich scene implement this; others omit it (callers use `wants_diagnostics`).
     def render_diagnostics(self, overlay: SceneOverlay, views: list[str]) -> dict[str, np.ndarray]: ...
+
+
+def default_rollout_metrics(pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]:
+    """The generic, env-agnostic rollout metric — full-observation L2 error per step. Valid for ANY WorldEnv
+    (recorded, pendulum, ...); geometry-aware envs override `rollout_metrics` to ADD their own errors."""
+    return {"pointwise_error": (pred_obs - true_obs).norm(dim=-1)}
 
 
 def wants_diagnostics(env: object) -> bool:

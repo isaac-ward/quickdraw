@@ -17,8 +17,11 @@ def make_env(name: str, cfg, batch: int, device="cpu") -> WorldEnv:
         tc = TorusConfig(R=cfg.R, r=cfg.r, dt=cfg.dt, gamma=cfg.gamma, a_max=cfg.a_max,
                          init_speed=cfg.init_speed, mass=cfg.mass)
         return TorusEnv(tc, batch, device=device)
+    if n == "recorded":
+        from .recorded import RecordedEnv
+        return RecordedEnv(cfg, batch, device=device)
     if n.startswith("gym:"):
         from .gym_adapter import GymBatchAdapter          # Phase 6
         env_id = str(name).split(":", 1)[1]               # from the ORIGINAL name — gym ids are case-sensitive
         return GymBatchAdapter(env_id, cfg, batch, device=device)
-    raise ValueError(f"unknown environment name: {name!r} (known: torus_world, gym:<EnvId>)")
+    raise ValueError(f"unknown environment name: {name!r} (known: torus_world, recorded, gym:<EnvId>)")

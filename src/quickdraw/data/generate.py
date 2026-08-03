@@ -78,32 +78,34 @@ def _read_frames(path: str) -> np.ndarray:
     return frames
 
 
-def write_lerobot_split(root, repo_id: str, obs: np.ndarray, act: np.ndarray, fps: int,
-                        fpv_dir: str | None = None, fpv_size: int = 256):
+def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
+                        fpv_dir: str | None = None, fpv_size=256, cam: str = "fpv", task: str = "torus"):
     """Write episodes to a LeRobotDataset on disk. ISOLATED lerobot API surface.
 
     When `fpv_dir` is given, each episode's pre-rendered clip `fpv_dir/ep_<i>.mp4` is read back and
-    stored as the lerobot-standard image observation `observation.images.fpv` (dtype=video), aligned
-    1:1 with the vector frames.
+    stored as the lerobot-standard image observation `observation.images.<cam>` (dtype=video), aligned
+    1:1 with the vector frames. `obs`/`act`: (n_traj, steps, dim) arrays OR lists of per-episode
+    (T_i, dim) arrays (recorded episodes have variable length). `fpv_size`: int (square) or (H, W).
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     video = fpv_dir is not None
+    h, w = (fpv_size, fpv_size) if isinstance(fpv_size, int) else tuple(fpv_size)
+    key = f"observation.images.{cam}"
     features = {
-        "observation_vector": {"dtype": "float32", "shape": (obs.shape[-1],), "names": None},
-        "action": {"dtype": "float32", "shape": (act.shape[-1],), "names": None},
+        "observation_vector": {"dtype": "float32", "shape": (obs[0].shape[-1],), "names": None},
+        "action": {"dtype": "float32", "shape": (act[0].shape[-1],), "names": None},
     }
     if video:
-        features["observation.images.fpv"] = {"dtype": "video", "shape": (fpv_size, fpv_size, 3),
-                                              "names": ["height", "width", "channels"]}
+        features[key] = {"dtype": "video", "shape": (h, w, 3),
+                         "names": ["height", "width", "channels"]}
     ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=root, features=features, use_videos=video)
-    n_traj, steps, _ = obs.shape
-    for i in range(n_traj):
+    for i in range(len(obs)):
         frames = _read_frames(os.path.join(fpv_dir, f"ep_{i:04d}.mp4")) if video else None
-        for t in range(steps):
-            f = {"observation_vector": obs[i, t], "action": act[i, t], "task": "torus"}
+        for t in range(len(obs[i])):
+            f = {"observation_vector": obs[i][t], "action": act[i][t], "task": task}
             if video:
-                f["observation.images.fpv"] = frames[t]
+                f[key] = frames[t]
             ds.add_frame(f)
         ds.save_episode()
     return ds

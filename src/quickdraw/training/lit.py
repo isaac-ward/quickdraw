@@ -5,7 +5,7 @@ from __future__ import annotations
 import lightning as L
 import torch
 
-from ..environments import torus as T
+from ..environments.base import default_rollout_metrics
 from .schedules import linear_schedule
 from .variations import VarContext, PhysicalLoss, make_variation_suite
 
@@ -28,10 +28,11 @@ class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
                  lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0,
-                 recon_frac: float = 1.0, lr_warmup_steps: int = 0):
+                 recon_frac: float = 1.0, lr_warmup_steps: int = 0, env=None):
         super().__init__()
         self.model = model
         self.norm = normalizer
+        self.env = env   # WorldEnv supplying val rollout_metrics (None -> the generic default); R/r/v_scale stay for VarContext
         self.R, self.r, self.v_scale, self.P, self.F = R, r, v_scale, P, F
         self.dt = dt
         self.recon_frac = float(recon_frac)   # <1 -> supervise the decode recon on a random subset of F frames (ALL heads)
@@ -149,9 +150,11 @@ class LitWorldModel(L.LightningModule):
                 dec = m.to_obs(src)                           # decode (mse) / 1-step sample (flow) — val metrics only
                 p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
                 p_true = self.norm.denorm_obs(future["proprio"])
-                self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
-                self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
-                self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
+                # env-polymorphic rollout metrics (WorldEnv.rollout_metrics): torus returns its three errors
+                # (byte-identical tags/values to the old hardcoded calls); other envs return their own set.
+                metrics_fn = self.env.rollout_metrics if self.env is not None else default_rollout_metrics
+                for mk, mv in metrics_fn(p_hat, p_true).items():
+                    self.log(f"val/metric/proprio/{mk}", mv.mean())
                 self.log("val/metric/proprio/obs_error", F.mse_loss(dec["proprio"], future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
                 for name, _ in m.layout:
                     if name == "proprio":

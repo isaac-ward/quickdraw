@@ -17,12 +17,59 @@ import hydra
 from huggingface_hub import HfApi
 
 
+def _generic_card(name: str, s: dict) -> str:
+    """Card for a run whose summary.json has NO torus geometry fields (e.g. a recording_to_lerobot run):
+    obs/action dims (from the norm stats), splits, fps — no manifold-specific prose."""
+    counts = s["counts"]
+    splits = list(counts)
+    norm = s.get("normalization_stats", {})
+    obs_dim = len(norm.get("observation_vector", {}).get("mean", [])) or "?"
+    act_dim = len(norm.get("action", {}).get("mean", [])) or "?"
+    fps, cam = s.get("fps", "?"), s.get("camera", "cam")
+    hw = s.get("image_hw")
+    hw_txt = f"{hw[0]}×{hw[1]}×3, video" if hw else "video"
+    cfgs = "\n".join(f"  - config_name: {sp}\n    data_files: {sp}/data/**/*.parquet" for sp in splits)
+    rows = "\n".join(f"| `{sp}` | {counts[sp]['episodes']} | {counts[sp]['steps_per_episode']} | "
+                     f"{counts[sp]['transitions']} |" for sp in splits)
+    return f"""---
+license: mit
+pretty_name: {name}
+tags:
+- world-models
+- robotics
+configs:
+{cfgs}
+---
+
+# {name}
+
+Recorded trajectories (no simulator) packaged as LeRobot splits for world-model training.
+Generated with [quickdraw](https://github.com/isaac-ward/quickdraw) (`recording_to_lerobot`).
+
+## Observation / action
+- **observation_vector** ({obs_dim}): the recorded state
+- **observation.images.{cam}** ({hw_txt}): the recorded camera stream, stored as MP4, aligned 1:1
+  with the vector frames — the image modality for vision models
+- **action** ({act_dim}): the recorded actions, at {fps} Hz
+
+## Splits
+| split | episodes | steps/ep (mean) | frames |
+|---|---|---|---|
+{rows}
+
+Normalization statistics are computed on **train only** and applied to every split.
+"""
+
+
 def _make_card(root: str, name: str) -> str:
     """Build a dataset card (README.md) from the run's own summary.json: YAML frontmatter with a HF
-    viewer `configs` block (so each split's parquet is browsable) + a human-readable description."""
+    viewer `configs` block (so each split's parquet is browsable) + a human-readable description.
+    Torus-generated runs get the full torus card; runs without torus fields get a generic card."""
     s = json.load(open(os.path.join(root, "summary.json")))
     counts, split_env, coloring = s["counts"], s["split_env"], s["coloring"]
     splits = list(counts)
+    if not all("R" in (split_env.get(sp) or {}) for sp in splits):   # no torus geometry -> generic card
+        return _generic_card(name, s)
     action_sampler = s.get("action_sampler", "ornstein_uhlenbeck")
     action_desc = {
         "ornstein_uhlenbeck": "an **Ornstein–Uhlenbeck** action process (temporally-correlated, unimodal, zero-mean)",

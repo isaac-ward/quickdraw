@@ -13,6 +13,7 @@ import torch._inductor.config  # noqa: F401  ensure the submodule is importable 
 from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf
 
+from .environments.registry import make_env
 from .logging.callback import BestCkptMirror, LoggingCallback, ProgressPrinter
 from .logging.writer import make_writer
 from .utils.logging import make_run_dir
@@ -135,12 +136,14 @@ def main(cfg):
                               "watch for the [startup] sanity-check and [compile] lines below.")
 
     e = env_cfg(cfg)
+    # the env supplies its OWN val rollout metrics (WorldEnv.rollout_metrics) — batch=1: metrics only, never stepped
+    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, batch=1)
     lit = LitWorldModel(model, norm, e.R, e.r, e.init_speed, cfg.data.P, cfg.data.F,
                         cfg.model.p_tf_start, cfg.model.p_tf_end, cfg.model.p_tf_warmup_epochs,
                         cfg.optim.lr, cfg.optim.weight_decay, cfg.model.detach_every,
                         variations=cfg.get("variations"), dt=e.dt,
                         recon_frac=float(cfg.model.get("recon_frac", 1.0)),
-                        lr_warmup_steps=int(cfg.optim.get("lr_warmup_steps", 0)))
+                        lr_warmup_steps=int(cfg.optim.get("lr_warmup_steps", 0)), env=env)
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py). Lightning's own
     # logger is OFF; all logging flows through the writer via LoggingCallback.
@@ -150,8 +153,10 @@ def main(cfg):
     print(summary_text, flush=True)  # after wandb.init -> captured in the wandb console logs too
     # train/val run normally; subscribe to the eval routines enabled in conf/eval/default.yaml
     # (ood_horizon | ood_visual | ood_geometric | ood_dynamics | control), run every every_epochs
+    # best.ckpt monitors the env's declared checkpoint metric (torus: manifold_distance_error, unchanged;
+    # default: the generic pointwise_error) — must be a key of env.rollout_metrics.
     ckpt_cb = ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
-                              monitor="val/metric/proprio/manifold_distance_error",
+                              monitor=f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}",
                               mode="min", save_top_k=cfg.trainer.save_top_k, save_last=True)
     callbacks = [
         ckpt_cb,

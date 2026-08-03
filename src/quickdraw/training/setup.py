@@ -13,9 +13,15 @@ from ..data.dataset import (
 from ..environments.torus import TorusConfig
 
 
-def env_cfg(cfg) -> TorusConfig:
+def env_cfg(cfg):
+    """cfg.environments -> the env's config dataclass (torus: TorusConfig, unchanged; recorded: RecordedConfig)."""
     e = cfg.environments
-    return TorusConfig(R=e.R, r=e.r, dt=e.dt, gamma=e.gamma, a_max=e.a_max, init_speed=e.init_speed, mass=e.mass)
+    if str(e.get("name", "torus_world")).lower() in ("torus_world", "torus", "torusworld-v0"):
+        return TorusConfig(R=e.R, r=e.r, dt=e.dt, gamma=e.gamma, a_max=e.a_max, init_speed=e.init_speed, mass=e.mass)
+    if str(e.name).lower() == "recorded":
+        from ..environments.recorded import RecordedConfig
+        return RecordedConfig(obs_dim=int(e.obs_dim), action_dim=int(e.action_dim), dt=float(e.dt))
+    raise ValueError(f"env_cfg: no config dataclass for environments.name={e.name!r}")
 
 
 def _modality_specs(cfg):

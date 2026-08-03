@@ -219,6 +219,18 @@ class TorusEnv:
         gate = (d < r_settle).float()
         return -d - beta_vel * gate * v.norm(dim=-1)
 
+    # train.py monitors this rollout metric for best.ckpt (WorldEnv default: pointwise_error).
+    checkpoint_metric = "manifold_distance_error"
+
+    def rollout_metrics(self, pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]:
+        """WorldEnv val rollout metrics: the SAME three torus errors (same functions, same arguments —
+        v_scale = init_speed) lit.py always logged, so torus training logs are byte-identical."""
+        return {
+            "manifold_distance_error": manifold_distance_error(pred_obs, self.cfg.R, self.cfg.r),
+            "pointwise_error": pointwise_error(pred_obs, true_obs),
+            "tangent_velocity_error": tangent_velocity_error(pred_obs, self.cfg.R, self.cfg.init_speed),
+        }
+
     def render_obs(self, obs: Tensor) -> Tensor:
         """The IMAGE MODALITY: egocentric FPV of each state, (B,6) -> (B,size,size,3) uint8 on `device`.
         Wraps the fast persistent viz.FPVRenderer with the data pipeline's defaults (hsv coloring,

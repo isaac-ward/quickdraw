@@ -1,0 +1,4 @@
+name: recorded    # env-registry name (environments/registry.make_env) — recorded trajectories, no simulator
+obs_dim: 16       # recorded state dim (flightroom-starling processed dump)
+action_dim: 4     # recorded action dim
+dt: 0.0333333     # 30 Hz recordings
