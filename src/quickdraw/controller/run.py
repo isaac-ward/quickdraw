@@ -68,16 +68,19 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         from ..language.reward import LanguageReward
         # MULTI-QUERY: language.requests = a LIST of texts -> one episode PER request, all steered in one batch
         # (so they share the torus). Single language.request -> the classic single-request run (n_episodes inits).
-        requests = [str(x) for x in (lang.get("requests") or [lang.request])]
-        request = requests[0]                     # representative text for the shared joint-space / reward-field plots
+        req_list = [str(x) for x in (lang.get("requests") or [lang.request])]
+        request = req_list[0]                     # representative text for the shared joint-space / reward-field plots
+        # single request -> requests=None so mppi BROADCASTS it across all n_episodes inits (the classic run);
+        # a LIST (>1) -> per-episode targets, one episode PER request steered in one batch.
+        requests = req_list if len(req_list) > 1 else None
         reward = LanguageReward(lang.head, device=device)
-        for rq in requests:
+        for rq in req_list:
             reward.text_embedding(rq)             # validate each up front (raises on an unknown bucket)
         ov = dict(lang.get("overrides") or {})    # language-mode control knobs (n_episodes/max_steps/...) over `control:`
-        if len(requests) > 1:                     # one episode per request; render them all
+        if requests:                              # multi-query: one episode per request; render them all
             ov["n_episodes"] = ov["n_plot"] = len(requests)
         mppi_kwargs.update(ov)
-        _plog(writer, f"[eval_control @ep{step}] LANGUAGE steering -> {requests} "
+        _plog(writer, f"[eval_control @ep{step}] LANGUAGE steering -> {req_list} "
                       f"({os.path.basename(lang.head)}); oracle OFF, learned controller"
                       + (f"; overrides {ov}" if ov else ""))
     n_ctrl = 1 if reward is not None else 2
