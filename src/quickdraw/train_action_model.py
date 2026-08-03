@@ -102,7 +102,8 @@ def main(cfg):
     _startup_log(run_dir, f"[startup] model built: {sum(p.numel() for p in model.parameters()) / 1000:.0f}K "
                           f"params total, {n_train / 1000:.1f}K trainable (action_flow ONLY; WM frozen)")
 
-    lit = LitActionModel(model, cfg.optim.lr, cfg.optim.weight_decay)
+    lit = LitActionModel(model, cfg.optim.lr, cfg.optim.weight_decay,
+                         lr_warmup_steps=int(cfg.optim.get("lr_warmup_steps", 0)))
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py); Lightning's logger is OFF.
     writer = make_writer(run_dir, cfg, job_type="train_action")

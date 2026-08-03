@@ -239,10 +239,11 @@ class LitActionModel(L.LightningModule):
     frozen WM under no_grad; the action-flow loss uses the SAME leak-free alignment as
     MultiModalFlow.loss_terms: cond = pooled h[t-1] (never saw a[t]) -> target a[t], for t=1..L-2."""
 
-    def __init__(self, model, lr: float, weight_decay: float):
+    def __init__(self, model, lr: float, weight_decay: float, lr_warmup_steps: int = 0):
         super().__init__()
         self.model = model
         self.lr, self.weight_decay = lr, weight_decay
+        self.lr_warmup_steps = int(lr_warmup_steps)
 
     def on_train_epoch_start(self):
         # Lightning flips the whole module to train mode each epoch; re-pin the frozen WM to eval (the
@@ -282,4 +283,11 @@ class LitActionModel(L.LightningModule):
 
     def configure_optimizers(self):
         # ONLY the action-flow head trains; every WM param is frozen (requires_grad=False, not passed here).
-        return torch.optim.AdamW(self.model.action_flow.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        opt = torch.optim.AdamW(self.model.action_flow.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        if self.lr_warmup_steps > 0:
+            # SAME linear LR warmup as the WM flow decode (LitFlow.configure_optimizers): the action-flow head
+            # is also a flow (regress a clean target from near-noise), so full LR from step 0 gives high-variance
+            # early updates that run the shortcut self-consistency loss away (val 1.6 -> 1e22). Warmup lets it settle.
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / self.lr_warmup_steps))
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+        return opt
