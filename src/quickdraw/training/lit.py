@@ -10,6 +10,20 @@ from .schedules import linear_schedule
 from .variations import VarContext, PhysicalLoss, make_variation_suite
 
 
+def adamw_with_warmup(params, lr: float, weight_decay: float, warmup_steps: int = 0):
+    """AdamW (+ optional linear LR warmup 0->1 over `warmup_steps` OPTIMIZER STEPS). Every flow head here
+    regresses a clean target from a near-pure-noise input -> high-variance early gradients; full LR from
+    step 0 lets one oversized early update blow up (bf16 overflow, or the shortcut self-consistency loss
+    running away). Warmup lets them settle. `interval="step"` counts batches so it finishes early in epoch 0.
+    NOT fused: Lightning's gradient_clip_val is incompatible with a fused optimizer (negligible speedup at
+    this size anyway). Shared by LitFlow (WM) and LitActionModel (action head) — one warmup, no duplication."""
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    if warmup_steps and warmup_steps > 0:
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warmup_steps))
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+    return opt
+
+
 class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
@@ -220,17 +234,7 @@ class LitWorldModel(L.LightningModule):
         return self._step(batch, "val")
 
     def configure_optimizers(self):
-        # not fused: Lightning's gradient_clip_val is incompatible with a fused optimizer, and at this
-        # model size the fused speedup is negligible while grad clipping aids autoregressive stability.
-        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        if self.lr_warmup_steps > 0:
-            # linear LR warmup 0->1 over N OPTIMIZER STEPS. The flow decode regresses a clean target from a
-            # near-pure-noise input -> high-variance early gradients; full LR from step 0 let one oversized
-            # early update blow activations up into a bf16 overflow. Warmup lets them settle. interval="step"
-            # counts batches (not epochs) so warmup finishes early in epoch 0.
-            sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / self.lr_warmup_steps))
-            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
-        return opt
+        return adamw_with_warmup(self.parameters(), self.lr, self.weight_decay, self.lr_warmup_steps)
 
 
 class LitActionModel(L.LightningModule):
@@ -282,12 +286,7 @@ class LitActionModel(L.LightningModule):
         return self._step(batch, "val")
 
     def configure_optimizers(self):
-        # ONLY the action-flow head trains; every WM param is frozen (requires_grad=False, not passed here).
-        opt = torch.optim.AdamW(self.model.action_flow.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        if self.lr_warmup_steps > 0:
-            # SAME linear LR warmup as the WM flow decode (LitFlow.configure_optimizers): the action-flow head
-            # is also a flow (regress a clean target from near-noise), so full LR from step 0 gives high-variance
-            # early updates that run the shortcut self-consistency loss away (val 1.6 -> 1e22). Warmup lets it settle.
-            sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / self.lr_warmup_steps))
-            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
-        return opt
+        # ONLY the action-flow head trains; the WM is frozen (requires_grad=False, not passed here). Same
+        # warmup as the WM flow (adamw_with_warmup) — the action head is a flow too, so it needs it just as much.
+        return adamw_with_warmup(self.model.action_flow.parameters(), self.lr, self.weight_decay,
+                                 self.lr_warmup_steps)
