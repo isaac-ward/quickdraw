@@ -8,6 +8,7 @@ through the same writer. step = epoch, so the local mirror and wandb stay in loc
 from __future__ import annotations
 
 import os
+import shutil
 import time
 
 import lightning as L
@@ -245,3 +246,41 @@ class LoggingCallback(L.Callback):
 
     def on_fit_end(self, trainer, pl_module):
         self.writer.finalize()
+
+
+class BestCkptMirror(L.Callback):
+    """Keep `checkpoints/best.ckpt` current THROUGHOUT training (not just at fit end): after every
+    validation, mirror the ModelCheckpoint's running best to best.ckpt and log the decision to
+    <run_dir>/progress.log. So an interrupted or collapsed run still leaves a correct best.ckpt, and the
+    best-so-far epoch is visible live. Must be placed AFTER the ModelCheckpoint in the callback list so its
+    best_model_path is already updated for this validation."""
+
+    def __init__(self, ckpt_cb, run_dir: str):
+        self.cb = ckpt_cb
+        self.dst = os.path.join(run_dir, "checkpoints", "best.ckpt")
+        self.path = os.path.join(run_dir, "progress.log")
+        self._prev = None
+
+    def _emit(self, line: str):
+        line = f"[{time.strftime('%m-%d %H:%M:%S')}] {line}"
+        print(line, flush=True)
+        with open(self.path, "a") as f:
+            f.write(line + "\n")
+
+    def on_validation_end(self, trainer, pl_module):
+        bp = self.cb.best_model_path
+        if not bp:                                  # no monitored checkpoint yet (e.g. sanity check)
+            return
+        ep = trainer.current_epoch
+        try:
+            score = float(self.cb.best_model_score)
+        except (TypeError, ValueError):
+            score = float("nan")
+        name = os.path.basename(bp)
+        if bp != self._prev:                        # the best changed this validation -> mirror + announce
+            if os.path.exists(bp):
+                shutil.copy(bp, self.dst)
+            self._prev = bp
+            self._emit(f"[best-ckpt] NEW BEST at epoch {ep} (monitor={score:.5f}) -> best.ckpt now {name}")
+        else:
+            self._emit(f"[best-ckpt] best unchanged: epoch {ep} did not beat {name} (best monitor={score:.5f})")

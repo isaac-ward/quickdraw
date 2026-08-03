@@ -13,7 +13,7 @@ import torch._inductor.config  # noqa: F401  ensure the submodule is importable 
 from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf
 
-from .logging.callback import LoggingCallback, ProgressPrinter
+from .logging.callback import BestCkptMirror, LoggingCallback, ProgressPrinter
 from .logging.writer import make_writer
 from .utils.logging import make_run_dir
 from .training.lit import LitWorldModel
@@ -150,14 +150,18 @@ def main(cfg):
     print(summary_text, flush=True)  # after wandb.init -> captured in the wandb console logs too
     # train/val run normally; subscribe to the eval routines enabled in conf/eval/default.yaml
     # (ood_horizon | ood_visual | ood_geometric | ood_dynamics | control), run every every_epochs
+    ckpt_cb = ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
+                              monitor="val/metric/proprio/manifold_distance_error",
+                              mode="min", save_top_k=cfg.trainer.save_top_k, save_last=True)
     callbacks = [
-        ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
-                        monitor="val/metric/proprio/manifold_distance_error",
-                        mode="min", save_top_k=cfg.trainer.save_top_k, save_last=True),
+        ckpt_cb,
         LoggingCallback(writer, cfg, norm, e, cfg.eval.during_train.every_epochs,
                         [name for name, on in cfg.eval.during_train.evals.items() if on],
                         at_epochs=cfg.eval.during_train.get("at_epochs", None)),
         ProgressPrinter(run_dir),
+        # keep checkpoints/best.ckpt current after EVERY val (not just at fit end) + log the best epoch to
+        # progress.log — so an interrupted/collapsed run still has a correct best.ckpt. Must follow ckpt_cb.
+        BestCkptMirror(ckpt_cb, run_dir),
     ]
     # single GPU: the GPU-resident loader holds the whole set on one device (no DistributedSampler),
     # so we pin devices=1 rather than let Lightning auto-pick DDP across both H100s.
