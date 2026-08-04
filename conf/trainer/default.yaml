@@ -1,6 +1,10 @@
 max_epochs: 50
 precision: bf16-mixed
 save_top_k: 2
+devices: 1
+monitor: val/metric/proprio/manifold_distance_error
+monitor_mode: min
+validation_metrics: torus
 check_val_every_n_epoch: 4   # DECIDED (user, 2026-07-20): validate every 4 epochs. DO NOT CHANGE without asking.
 #                              Val is an autoregressive rollout ~as long as a train epoch, so more-frequent val
 #                              wastes wall-clock; every-4 is the agreed cadence.

@@ -1,4 +1,6 @@
 .git
+.env
+.cache/
 logs/
 datasets/
 caches/

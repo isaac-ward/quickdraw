@@ -2,7 +2,22 @@
 
 ## Status
 
-**Planned. No implementation is complete yet.**
+**Implemented and locally validated on one RTX PRO 6000. Full training launch is pending.**
+
+Validated on 2026-08-04:
+
+- Hydra resolves the complete prescribed `robocasa_world_model` configuration.
+- All 261 episodes load as aligned float32 16-D state / 12-D action sequences.
+- The deterministic task-stratified split is 234 train / 27 validation episodes and 270,062 total windows.
+- The selected eye-in-hand stream decodes and the full 13.2 GiB 128px cache is reusable.
+- Focused model forward/backward, bounded Lightning, batch-32 memory, generic validation, W&B, and
+  best/last checkpoint smokes pass on one RTX PRO 6000 (26.85 GB measured peak at batch 32).
+- Existing model configs compose with the torus 6-D state / 2-D action defaults, and the modality regression
+  smoke remains green.
+
+Still pending from this checklist: remote Hugging Face snapshot parity and completion of the full from-scratch
+training run. Checklist boxes below remain the reviewable acceptance inventory rather than a claim that every
+remote/full-run condition has already completed.
 
 This checklist scopes the minimum work required to train QuickDraw's existing, task-agnostic world model on
 the certified RoboCasa Scene 4 dataset in either of these forms:
@@ -160,7 +175,103 @@ image num_tokens=8, encode_arch=vit, decode_arch=vit, decode_kind=mse
 action_head.enabled=false
 ```
 
-### 3. Add an offline evaluation config
+### 3. Add one complete proposed-run config
+
+Add `conf/robocasa_world_model.yaml` as the primary Hydra config for the first supported RoboCasa run. It
+must compose the normal QuickDraw config and then select/lock the approved data, model, evaluation, trainer,
+and single-GPU settings in one reviewable file. The intended structure is:
+
+```yaml
+defaults:
+  - config
+  - override /model: mm_flow
+  - override /data: robocasa
+  - override /eval: offline
+  - _self_
+
+experiment: robocasa-scene4
+
+data:
+  P: 8
+  F: 64
+  window_stride: 1
+  batch: 32
+  fast_gpu: true
+
+model:
+  d: 128
+  depth: 4
+  heads: 8
+  window: 32
+  action_dim: ${data.schema.action_dim}
+  p_tf_start: 1.0
+  p_tf_end: 0.0
+  p_tf_warmup_epochs: 4
+  recon_frac: 0.25
+  detach_every: 16
+  dynamics_detach_encoder: false
+  grad_checkpoint: false
+  diffusion:
+    shortcut: true
+    sampling_steps: 6
+    predict: residual
+    stochastic_eval: false
+    time_sampling: uniform
+    flow_hidden: 0
+  action_head:
+    enabled: false
+    weight: 1.0
+    shortcut: true
+    detach_gradient: false
+  modalities:
+    - name: proprio
+      kind: vector
+      dim: ${data.schema.state_dim}
+      weight: 1.0
+      decode_kind: flow
+      decode_param: x0
+      decode_arch: mlp
+    - name: image
+      kind: image
+      num_tokens: 8
+      img_size: 128
+      patch: 16
+      ae_depth: 4
+      weight: 1.0
+      decode_kind: mse
+      encode_arch: vit
+      decode_arch: vit
+
+trainer:
+  devices: 1
+  accumulate_grad_batches: 1
+  monitor: val/loss/total
+  monitor_mode: min
+
+variations:
+  noise_injection:
+    std: 0.0
+    observations_encoded_pre_fusion:
+      scale: 0.0
+      granularity: timestep
+  physical_loss: {weight: 0.0, continuity: 0.0, warmup_epochs: 10}
+  contraction: {weight: 0.0, target: 1.02, power_iters: 2, n_sample_steps: 4}
+```
+
+Requirements:
+
+- [ ] `python -m quickdraw.train_world_model --config-name robocasa_world_model --cfg job` composes cleanly.
+- [ ] The resolved config contains exactly the prescribed recipe; no required setting exists only in a shell
+      command or prose comment.
+- [ ] `trainer.devices=1` is honored by `train_world_model.py`; do not add DDP or distributed-loader work.
+- [ ] The config initializes the complete model from scratch unless `checkpoint=` is explicitly supplied for a
+      deliberate resume operation.
+- [ ] Data location and the five run-summary strings remain CLI inputs because they identify a particular launch,
+      not the reusable training method.
+- [ ] This config is the source of truth for the first full run and is saved verbatim through the existing
+      resolved-config artifact.
+
+### 4. Add an offline evaluation config
 
 Add `conf/eval/offline.yaml` for dataset-only world-model training.
 
@@ -170,7 +281,7 @@ Add `conf/eval/offline.yaml` for dataset-only world-model training.
       `eval=offline` until QuickDraw has a general experiment-composition group.
 - [ ] Normal Lightning validation remains enabled; only environment-dependent evaluation callbacks are disabled.
 
-### 4. Make checkpoint selection configurable
+### 5. Make checkpoint selection configurable
 
 - [ ] Add `monitor` and `monitor_mode` fields to trainer configuration.
 - [ ] Preserve the torus default:
@@ -385,13 +496,8 @@ After the tasks above pass, the supported command should be:
 
 ```bash
 uv run python -m quickdraw.train_world_model \
-  data=robocasa \
-  model=mm_flow \
-  eval=offline \
+  --config-name robocasa_world_model \
   data.hf_repo=madang6/quickdraw-robocasa-scene4-4h \
-  trainer.monitor=val/loss/total \
-  trainer.monitor_mode=min \
-  experiment=robocasa-scene4 \
   run_summary.problem='Establish the first RoboCasa offline world-model baseline' \
   run_summary.tried='Certified and validated the source trajectory package' \
   run_summary.trying='Train the existing QuickDraw multimodal flow world model on RoboCasa' \
@@ -399,15 +505,16 @@ uv run python -m quickdraw.train_world_model \
   run_summary.rationale='The adapter now presents the same canonical transition-window contract as torus data'
 ```
 
-The full documented `mm_flow` recipe overrides must either be included explicitly in this launch or captured
-in an existing non-dataset-specific model recipe config. The RoboCasa data config must not silently change the
-world-model method.
+`conf/robocasa_world_model.yaml` is the reviewed source of truth for every method, data-shape, validation,
+checkpoint, and device setting in this launch. The CLI supplies only dataset location and run identity.
 
 ## Definition of done
 
 RoboCasa dataset support is complete when all of the following are true:
 
 - [ ] The command above starts from either a local package or HF repo without modifying source data.
+- [ ] The resolved config exactly matches `conf/robocasa_world_model.yaml` and the prescribed `mm_flow` recipe.
+- [ ] The trainer uses exactly one GPU and does not initialize a distributed strategy.
 - [ ] The existing world-model classes require no RoboCasa-specific branches.
 - [ ] Batches contain aligned 16-D state, 12-D action, and one selected RGB camera.
 - [ ] Train and validation are deterministic, episode-disjoint, and represented in run artifacts.
@@ -417,4 +524,3 @@ RoboCasa dataset support is complete when all of the following are true:
 - [ ] Existing torus behavior remains unchanged.
 - [ ] No task label, reward, success predicate, simulator, or controller is required anywhere in the core
       RoboCasa world-model training path.
-

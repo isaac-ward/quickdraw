@@ -1,0 +1,33 @@
+kind: robocasa
+root: null
+hf_repo: null
+source_split: train
+cache_root: null
+
+schema:
+  state_key: observation.state
+  state_dim: 16
+  state_dtype: float64
+  action_key: action
+  action_dim: 12
+  action_dtype: float64
+  image_key: observation.images.robot0_eye_in_hand
+  image_name: image
+  source_image_size: 256
+  image_size: 128
+  fps: 20
+  expected_episodes: 261
+  expected_frames: 288593
+
+validation:
+  fraction: 0.10
+  seed: 0
+  stratify_by_episode_task: true
+  minimum_per_group: 1
+
+P: 8
+F: 64
+window_stride: 1
+batch: 32
+workers: 0
+fast_gpu: true

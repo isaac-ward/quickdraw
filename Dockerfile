@@ -20,5 +20,6 @@ RUN uv sync
 
 ENV TORCHINDUCTOR_CACHE_DIR=/caches/inductor \
     HF_HOME=/caches/hf \
+    QUICKDRAW_CACHE_DIR=/caches/quickdraw \
     PYVISTA_OFF_SCREEN=true \
     PYTHONUNBUFFERED=1

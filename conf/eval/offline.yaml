@@ -1,0 +1,21 @@
+action_dist_episodes: 0
+horizon: 0
+n_episodes: 0
+n_plot: 0
+denoising_seed: null
+denoising_max_steps: 0
+
+during_train:
+  every_epochs: 0
+  at_epochs: []
+  evals:
+    ood_horizon: false
+    ood_visual: false
+    ood_geometric: false
+    ood_dynamics: false
+    control: false
+    denoising_multistep: false
+    denoising_aggregate: false
+    manifold: false
+    interpret: false
+    action_distribution: false

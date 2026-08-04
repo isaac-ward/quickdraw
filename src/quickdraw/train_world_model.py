@@ -17,7 +17,7 @@ from .logging.callback import LoggingCallback, ProgressPrinter
 from .logging.writer import make_writer
 from .utils.logging import make_run_dir
 from .training.lit import LitWorldModel
-from .training.setup import build_model, data_exists, env_cfg, normalizer, window_loaders
+from .training.setup import build_model, data_exists, env_cfg, prepare_training_data
 
 
 _SUMMARY_FIELDS = [("problem", "Problem we are facing"), ("tried", "What we have tried"),
@@ -88,8 +88,8 @@ def main(cfg):
     _assert_summary_unique(summary_text, cfg)  # ...and fail if it merely copies a previous run's note
     if not data_exists(cfg):
         raise FileNotFoundError(
-            "No dataset found. Run `python -m quickdraw.data_generation` first, then pass its run "
-            f"dir as data.root=logs/data_generation_<ts>_<exp> (got data.root={cfg.data.root!r})."
+            "No compatible dataset found. Configure either data.root or data.hf_repo "
+            f"(got root={cfg.data.get('root')!r}, hf_repo={cfg.data.get('hf_repo')!r})."
         )
 
     run_dir = make_run_dir("train_world_model", cfg.experiment)   # logs/train_world_<ts>_<exp> (prefix names the entrypoint)
@@ -98,23 +98,20 @@ def main(cfg):
 
     _t = time.perf_counter()
     _startup_log(run_dir, "[startup] loading dataset (GPU-resident windows) + normalizer...")
-    norm = normalizer(cfg)
-    loaders = window_loaders(cfg, norm)
+    norm, loaders, inventory = prepare_training_data(cfg, run_dir)
     _startup_log(run_dir, f"[startup] data ready in {time.perf_counter() - _t:.1f}s: "
                           f"{getattr(loaders['train'], 'N', '?')} train / {getattr(loaders['val'], 'N', '?')} val windows")
     # data inventory per split (trajectories / transitions / seconds / hours / windows) so coverage is legible
-    hz = round(1.0 / cfg.environments.dt); P, Fh, strd = cfg.data.P, cfg.data.F, int(cfg.data.get("window_stride", 1)); winL = P + Fh
+    hz = int(cfg.data.schema.fps)
+    P, Fh, strd = cfg.data.P, cfg.data.F, int(cfg.data.get("window_stride", 1)); winL = P + Fh
     _startup_log(run_dir, f"[startup] data inventory ({hz} Hz, P={P} F={Fh} L={winL} window_stride={strd}):")
-    for name, s in cfg.data.splits.items():
-        nt, st = int(s["n_traj"]), int(s["steps"]); frames = nt * st; secs = frames / hz
-        line = (f"[startup]   {name:<18} {nt:>4} traj x {st:>5} steps = {frames:>8} frames "
-                f"({nt * (st - 1):>8} transitions) = {secs:8.1f}s = {secs / 3600:5.2f}h")
-        if name in ("train", "val"):
-            ss = strd if name == "train" else 1                    # val stays dense (stride 1)
-            per = (st - winL) // ss + 1 if st >= winL else 0
-            line += f" | windows: {nt} x {per} (stride {ss}) = {nt * per}"
-        else:
-            line += f" | full-traj eval rollouts: {nt}"
+    for name, item in inventory.items():
+        secs = int(item["frames"]) / hz
+        line = (f"[startup]   {name:<18} {int(item['episodes']):>4} episodes, "
+                f"{int(item['frames']):>8} frames ({int(item['transitions']):>8} transitions) "
+                f"= {secs:8.1f}s = {secs / 3600:5.2f}h")
+        if "windows" in item:
+            line += f" | windows: {int(item['windows'])} (stride {int(item['window_stride'])})"
         _startup_log(run_dir, line)
     model = build_model(cfg)
     _startup_log(run_dir, f"[startup] model built: {sum(p.numel() for p in model.parameters()) / 1000:.0f}K "
@@ -134,13 +131,16 @@ def main(cfg):
                               "forward + FlexAttention JIT-compile on the first sanity/train batch — "
                               "watch for the [startup] sanity-check and [compile] lines below.")
 
-    e = env_cfg(cfg)
-    lit = LitWorldModel(model, norm, e.R, e.r, e.init_speed, cfg.data.P, cfg.data.F,
+    validation_metrics = str(cfg.trainer.get("validation_metrics", "torus"))
+    e = env_cfg(cfg) if validation_metrics == "torus" else None
+    lit = LitWorldModel(model, norm, e.R if e else 0.0, e.r if e else 0.0, e.init_speed if e else 1.0,
+                        cfg.data.P, cfg.data.F,
                         cfg.model.p_tf_start, cfg.model.p_tf_end, cfg.model.p_tf_warmup_epochs,
                         cfg.optim.lr, cfg.optim.weight_decay, cfg.model.detach_every,
-                        variations=cfg.get("variations"), dt=e.dt,
+                        variations=cfg.get("variations"), dt=e.dt if e else 1.0 / hz,
                         recon_frac=float(cfg.model.get("recon_frac", 1.0)),
-                        lr_warmup_steps=int(cfg.optim.get("lr_warmup_steps", 0)))
+                        lr_warmup_steps=int(cfg.optim.get("lr_warmup_steps", 0)),
+                        validation_metrics=validation_metrics)
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py). Lightning's own
     # logger is OFF; all logging flows through the writer via LoggingCallback.
@@ -152,18 +152,18 @@ def main(cfg):
     # (ood_horizon | ood_visual | ood_geometric | ood_dynamics | control), run every every_epochs
     callbacks = [
         ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
-                        monitor="val/metric/proprio/manifold_distance_error",
-                        mode="min", save_top_k=cfg.trainer.save_top_k, save_last=True),
+                        monitor=str(cfg.trainer.monitor), mode=str(cfg.trainer.monitor_mode),
+                        save_top_k=cfg.trainer.save_top_k, save_last=True),
         LoggingCallback(writer, cfg, norm, e, cfg.eval.during_train.every_epochs,
                         [name for name, on in cfg.eval.during_train.evals.items() if on],
                         at_epochs=cfg.eval.during_train.get("at_epochs", None)),
         ProgressPrinter(run_dir),
     ]
-    # single GPU: the GPU-resident loader holds the whole set on one device (no DistributedSampler),
-    # so we pin devices=1 rather than let Lightning auto-pick DDP across both H100s.
+    # single GPU: the GPU-resident loader holds the whole set on one device (no DistributedSampler).
     # enable_progress_bar=False: no tqdm; ProgressPrinter emits plain per-epoch lines instead.
     trainer = L.Trainer(max_epochs=cfg.trainer.max_epochs, precision=cfg.trainer.precision,
-                        accelerator="gpu", devices=1, gradient_clip_val=1.0, enable_progress_bar=False,
+                        accelerator="gpu", devices=int(cfg.trainer.devices),
+                        gradient_clip_val=1.0, enable_progress_bar=False,
                         accumulate_grad_batches=int(cfg.trainer.get("accumulate_grad_batches", 1)),  # effective
                         #  batch = data.batch x this; use it to keep a large effective batch when the per-step
                         #  micro-batch is memory-bound (no batchnorm here, so it's gradient-equivalent).

@@ -14,7 +14,7 @@ class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
                  lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0,
-                 recon_frac: float = 1.0, lr_warmup_steps: int = 0):
+                 recon_frac: float = 1.0, lr_warmup_steps: int = 0, validation_metrics: str = "torus"):
         super().__init__()
         self.model = model
         self.norm = normalizer
@@ -24,12 +24,17 @@ class LitWorldModel(L.LightningModule):
         self.p_tf_start, self.p_tf_end, self.p_tf_warmup = p_tf_start, p_tf_end, p_tf_warmup
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
         self.lr_warmup_steps = int(lr_warmup_steps)
+        self.validation_metrics = str(validation_metrics)
+        if self.validation_metrics not in ("torus", "generic"):
+            raise ValueError(f"validation_metrics must be 'torus' or 'generic', got {self.validation_metrics!r}")
         # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
         self.variations = make_variation_suite(variations)
         # physical-loss warmup: ramp its weight 0 -> 1 over warmup_epochs (same linear schedule as p_tf;
         # logged under schedules/). Only when the physical variation is actually active. The early decode
         # is jittery, so hitting it with full physical weight at epoch 0 destabilizes -> NaN; ramp avoids it.
         self.has_physical = any(isinstance(v, PhysicalLoss) for v in self.variations.variations)
+        if self.validation_metrics == "generic" and self.has_physical:
+            raise ValueError("torus physical-loss variations are unavailable with generic validation metrics")
         pl = (variations or {})
         pl = (pl.get("physical_loss", {}) if hasattr(pl, "get") else getattr(pl, "physical_loss", {})) or {}
         self.physical_warmup = float((pl.get("warmup_epochs", 0) if hasattr(pl, "get")
@@ -133,12 +138,16 @@ class LitWorldModel(L.LightningModule):
         if tag == "val":
             with torch.no_grad():
                 dec = m.to_obs(src)                           # decode (mse) / 1-step sample (flow) — val metrics only
-                p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
-                p_true = self.norm.denorm_obs(future["proprio"])
-                self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
-                self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
-                self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
-                self.log("val/metric/proprio/obs_error", F.mse_loss(dec["proprio"], future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
+                if self.validation_metrics == "torus":
+                    p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
+                    p_true = self.norm.denorm_obs(future["proprio"])
+                    self.log("val/metric/proprio/manifold_distance_error", T.manifold_distance_error(p_hat, self.R, self.r).mean())
+                    self.log("val/metric/proprio/pointwise_error", T.pointwise_error(p_hat, p_true).mean())
+                    self.log("val/metric/proprio/tangent_velocity_error", T.tangent_velocity_error(p_hat, self.R, self.v_scale).mean())
+                    self.log("val/metric/proprio/obs_error", F.mse_loss(dec["proprio"], future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
+                else:
+                    self.log("val/metric/proprio/mse", F.mse_loss(dec["proprio"], future["proprio"]))
+                    self.log("val/metric/proprio/mae", F.l1_loss(dec["proprio"], future["proprio"]))
                 for name, _ in m.layout:
                     if name == "proprio":
                         continue

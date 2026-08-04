@@ -22,6 +22,33 @@ From here, two docs tell you where to go:
 - **[docs/workflow.md](docs/workflow.md)** — the full pipeline end-to-end, one `uv run` line per step: generate data → push to the Hub → train the world model → action model → interpret (VLM labeling) → reward model → language control.
 - **[docs/byo_environment.md](docs/byo_environment.md)** — run that same pipeline on your *own* environment: any Gymnasium env (zero code) or a first-class `WorldEnv`.
 
+### RoboCasa offline world-model training
+
+The certified Scene 4 LeRobot package is mounted read-only at `/datasets/robocasa`; decoded 128px
+eye-in-hand frames are cached under the project-local `.cache/quickdraw-runtime` directory. Verify the
+adapter and prescribed model first:
+
+```bash
+docker compose exec app uv run python -m quickdraw.smoke.robocasa_dataset /datasets/robocasa
+```
+
+The supported from-scratch launch uses one GPU, an episode-disjoint 234/27 train/validation split, train-only
+normalization, generic offline validation, and W&B project `quickdraw` / group `robocasa-world-model`:
+
+```bash
+docker compose exec app uv run python -m quickdraw.train_world_model \
+  --config-name robocasa_world_model \
+  data.root=/datasets/robocasa \
+  run_summary.problem='Establish the first RoboCasa offline world-model baseline' \
+  run_summary.tried='Certified and validated the source trajectory package' \
+  run_summary.trying='Train the existing QuickDraw multimodal flow world model on RoboCasa' \
+  run_summary.trying_detail='Use 16-D state, 12-D action, one eye-in-hand camera, and an episode holdout' \
+  run_summary.rationale='The adapter presents the same canonical transition-window contract as torus data'
+```
+
+Set `data.hf_repo=madang6/quickdraw-robocasa-scene4-4h` instead of `data.root` to use the Hugging Face
+snapshot path. Do not set both.
+
 ## Supported methods
 
 All share one modality-parameterized space-time transformer spine; they differ along independent axes —

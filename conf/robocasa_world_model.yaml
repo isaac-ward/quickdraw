@@ -1,0 +1,78 @@
+defaults:
+  - config
+  - override /model: mm_flow
+  - override /data: robocasa
+  - override /eval: offline
+  - _self_
+
+experiment: robocasa-scene4
+
+data:
+  P: 8
+  F: 64
+  window_stride: 1
+  batch: 32
+  fast_gpu: true
+
+model:
+  d: 128
+  depth: 4
+  heads: 8
+  window: 32
+  action_dim: ${data.schema.action_dim}
+  p_tf_start: 1.0
+  p_tf_end: 0.0
+  p_tf_warmup_epochs: 4
+  recon_frac: 0.25
+  detach_every: 16
+  dynamics_detach_encoder: false
+  grad_checkpoint: false
+  diffusion:
+    shortcut: true
+    sampling_steps: 6
+    predict: residual
+    stochastic_eval: false
+    time_sampling: uniform
+    flow_hidden: 0
+  action_head:
+    enabled: false
+    weight: 1.0
+    shortcut: true
+    detach_gradient: false
+  modalities:
+    - name: proprio
+      kind: vector
+      dim: ${data.schema.state_dim}
+      weight: 1.0
+      decode_kind: flow
+      decode_param: x0
+      decode_arch: mlp
+    - name: image
+      kind: image
+      num_tokens: 8
+      img_size: 128
+      patch: 16
+      ae_depth: 4
+      weight: 1.0
+      decode_kind: mse
+      encode_arch: vit
+      decode_arch: vit
+
+trainer:
+  devices: 1
+  accumulate_grad_batches: 1
+  monitor: val/loss/total
+  monitor_mode: min
+  validation_metrics: generic
+
+logging:
+  group: robocasa-world-model
+
+variations:
+  noise_injection:
+    std: 0.0
+    observations_encoded_pre_fusion:
+      scale: 0.0
+      granularity: timestep
+  physical_loss: {weight: 0.0, continuity: 0.0, warmup_epochs: 10}
+  contraction: {weight: 0.0, target: 1.02, power_iters: 2, n_sample_steps: 4}

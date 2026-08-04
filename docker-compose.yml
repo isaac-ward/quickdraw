@@ -1,14 +1,13 @@
 services:
   app:
     build: .
-    runtime: nvidia
-    gpus: all                        # expose all GPUs (Compose v2)
     deploy:
       resources:
         reservations:
           devices:
-            - capabilities: [gpu]
-              count: all
+            - driver: nvidia
+              device_ids: ["2"]      # one RTX PRO 6000; exposed as cuda:0 inside the container
+              capabilities: [gpu]
     env_file: .env
     environment:
       # graphics: lets VTK use the NVIDIA EGL ICD to render on the GPU (default is compute,utility ONLY,
@@ -21,9 +20,7 @@ services:
       - ./.env:/app/.env           # live host .env (repo root isn't mounted, so the baked copy is stale);
       #                              also loaded into the env via `env_file: .env` above (needs `up -d` to refresh)
       - ./logs:/app/logs           # run folders, checkpoints, media
-      - caches:/caches             # persist torch.compile + HF caches across runs
+      - ./.cache/quickdraw-runtime:/caches
+      - ${QUICKDRAW_DATASET_ROOT:-./.cache/robocasa-data-generation/quickdraw-hf-robocasa-scene4-certified-4h}:/datasets/robocasa:ro
     # bring the container up idle; run steps yourself via `docker compose exec app bash`
     command: sleep infinity
-
-volumes:
-  caches:
