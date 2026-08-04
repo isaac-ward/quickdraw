@@ -13,6 +13,7 @@ import torch._inductor.config  # noqa: F401  ensure the submodule is importable 
 from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf
 
+from .environments.base import log_env_capabilities
 from .environments.registry import make_env
 from .logging.callback import BestCkptMirror, LoggingCallback, ProgressPrinter
 from .logging.writer import make_writer
@@ -137,7 +138,10 @@ def main(cfg):
 
     e = env_cfg(cfg)
     # the env supplies its OWN val rollout metrics (WorldEnv.rollout_metrics) — batch=1: metrics only, never stepped
-    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, batch=1)
+    env_name = cfg.environments.get("name", "torus_world")
+    env = make_env(env_name, cfg.environments, batch=1)
+    # WorldEnv contract self-report (environments/base.py): one ✓/✗ line -> progress.log (additive, log-only)
+    log_env_capabilities(env, lambda m: _startup_log(run_dir, m), name=env_name)
     lit = LitWorldModel(model, norm, e.R, e.r, e.init_speed, cfg.data.P, cfg.data.F,
                         cfg.model.p_tf_start, cfg.model.p_tf_end, cfg.model.p_tf_warmup_epochs,
                         cfg.optim.lr, cfg.optim.weight_decay, cfg.model.detach_every,

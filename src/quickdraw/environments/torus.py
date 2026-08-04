@@ -240,6 +240,26 @@ class TorusEnv:
             "tangent_velocity_error": tangent_velocity_error(pred_obs, self.cfg.R, self.cfg.init_speed),
         }
 
+    def physical_loss(self, obs_phys: Tensor) -> dict[str, Tensor]:
+        """OPTIONAL WorldEnv physics hook (base.py): dimensionless analytic physics residuals of a
+        PHYSICAL-units obs (..., 6) — the exact terms the physical_loss training variation penalizes
+        (variations.py applies Huber/weights/warmup on top; the torus MATH lives here). Same functions and
+        argument values as the variation always used (R/r from THIS env's config, v_scale = init_speed,
+        dt = cfg.dt), so the variation's loss term is byte-identical to the pre-hook version:
+          d_off      : signed off-surface distance / r                       (algebraic, per step)
+          v_off      : velocity's normal component / init_speed              (algebraic, per step)
+          continuity : (v - central-diff dp/dt) / init_speed, interior steps (kinematic; present only when
+                       obs_phys is a rollout (B, T>=3, 6))."""
+        p_hat, v_hat = split_obs(obs_phys)
+        R, r, vs, dt = self.cfg.R, self.cfg.r, self.cfg.init_speed, self.cfg.dt
+        d_off = signed_dist(p_hat, R, r) / r                          # signed, smooth when squared
+        th, ph = angles_from_point(p_hat, R)
+        out = {"d_off": d_off, "v_off": (v_hat * normal(th, ph)).sum(-1) / vs}
+        if obs_phys.ndim >= 3 and obs_phys.shape[1] >= 3 and dt:      # kinematic continuity v = dp/dt
+            sec = (p_hat[:, 2:] - p_hat[:, :-2]) / (2.0 * dt)         # central-diff velocity, interior t
+            out["continuity"] = (v_hat[:, 1:-1] - sec) / vs
+        return out
+
     def render_obs(self, obs: Tensor) -> Tensor:
         """The IMAGE MODALITY: egocentric FPV of each state, (B,6) -> (B,size,size,3) uint8 on `device`.
         Delegates to viz.fpv_frames with THIS env's coloring/fov (defaults hsv, fov=100 per

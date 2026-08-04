@@ -32,7 +32,7 @@ class LitWorldModel(L.LightningModule):
         super().__init__()
         self.model = model
         self.norm = normalizer
-        self.env = env   # WorldEnv supplying val rollout_metrics (None -> the generic default); R/r/v_scale stay for VarContext
+        self.env = env   # WorldEnv: val rollout_metrics + the optional physical_loss hook (None -> generic defaults)
         self.R, self.r, self.v_scale, self.P, self.F = R, r, v_scale, P, F
         self.dt = dt
         self.recon_frac = float(recon_frac)   # <1 -> supervise the decode recon on a random subset of F frames (ALL heads)
@@ -127,7 +127,7 @@ class LitWorldModel(L.LightningModule):
         # lets contraction build its Jacobian graph on val (Trainer runs with inference_mode=False).
         if self.variations:
             ctx = VarContext(m, preds, future["proprio"], obs, act, self.norm,
-                             self.R, self.r, self.v_scale, self.dt, tag == "train", self._physical_ramp())
+                             tag == "train", self._physical_ramp(), env=self.env)
             with torch.enable_grad():
                 extra, comps, diags = self.variations.losses(ctx)
             if extra is not None:

@@ -29,3 +29,6 @@ reuse_render: true     # control video renderer reuse. true: FAST persistent plo
                        # number_of_peels=12 in viz.py (the iso diagonal pierces >4 translucent layers, the
                        # real cause); reuse was never the lever, so keep the fast path. false: fresh plotter
                        # per frame (slow; only if the peel fix ever proves insufficient under contention).
+reward_override: null  # optional dotted path to a callable reward_fn(obs, goal) that replaces env.reward
+                       # as the scored per-step reward for BOTH controllers (e.g. mypkg.rewards.my_fn).
+                       # null (default) = the env's own reward. language.head steering is separate/unaffected.

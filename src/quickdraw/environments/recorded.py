@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from .base import default_rollout_metrics
+from .base import default_rollout_metrics, not_provided
 
 _NO_SIM = "recorded data has no simulator — WM trains on the dataset; control/interp need a live env"
 
@@ -40,17 +40,24 @@ class RecordedEnv:
         self.action_dim = int(cfg.action_dim)
         self.dt = float(cfg.dt)
 
+    # `not_provided` marks the raising stubs / generic defaults so `log_env_capabilities` reports them ✗
+    # (reporting only — call behavior is unchanged).
+    @not_provided
     def reset(self, generator=None) -> Tensor:
         raise NotImplementedError(_NO_SIM)
 
+    @not_provided
     def step(self, action: Tensor) -> Tensor:
         raise NotImplementedError(_NO_SIM)
 
+    @not_provided
     def reward(self, obs: Tensor, goal: Tensor | None = None) -> Tensor:
         return torch.zeros(obs.shape[0], device=obs.device)   # no goal semantics in recorded data
 
+    @not_provided
     def render_obs(self, obs: Tensor) -> Tensor:
         raise NotImplementedError(_NO_SIM)   # images come from the dataset, not a renderer
 
+    @not_provided
     def rollout_metrics(self, pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]:
-        return default_rollout_metrics(pred_obs, true_obs)
+        return default_rollout_metrics(pred_obs, true_obs)   # the generic default, nothing env-specific

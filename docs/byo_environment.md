@@ -5,13 +5,14 @@ The pipeline is written against **one** interface — the `WorldEnv` protocol
 `environments/registry.make_env`. There are no env-specific branches downstream, so plugging in a new
 environment just means giving the pipeline a `WorldEnv`.
 
-There is only that one interface; you have two ways to provide it, differing only in effort:
+There is only that one interface; you have three ways to provide it, differing only in effort:
 
-- **use the built-in gym adapter** (zero code) — for any `gymnasium.Env`, or
-- **implement the protocol yourself** (full control) — for a batched, first-class env like the torus.
+- **use the built-in gym adapter** (zero code) — for any `gymnasium.Env`,
+- **implement the protocol yourself** (full control) — for a batched, first-class env like the torus, or
+- **convert recorded data** (no simulator) — train a world model straight from logged trajectories.
 
-The adapter is simply a pre-written `WorldEnv` implementation, so everything downstream is identical either
-way.
+The adapter and `RecordedEnv` are simply pre-written `WorldEnv` implementations, so everything downstream
+is identical in every case.
 
 ## Quickest: any registered `gymnasium.Env` (the built-in adapter)
 
@@ -39,21 +40,60 @@ False → graceful fallback). From here the rest of [docs/workflow.md](workflow.
 ## Full control: implement the `WorldEnv` protocol yourself
 
 For a batched, first-class env like the torus reference (`environments/torus.py`), implement the protocol
-directly — batched-torch `reset`/`step` is a big speed win for data-gen and internal rollouts:
+directly — batched-torch `reset`/`step` is a big speed win for data-gen and internal rollouts.
 
-| member | contract |
-|---|---|
-| `action_dim: int` | width of the action vector |
-| `obs_dim: int` | width of the proprio/state vector |
-| `reset(generator) -> Tensor` | `(B, obs_dim)`; deterministic given a `torch.Generator` |
-| `step(action) -> Tensor` | action `(B, action_dim)` → next obs `(B, obs_dim)` |
-| `reward(obs, goal=None) -> Tensor` | `(B,)` per-step control return (higher = better); scores the control eval |
-| `render_obs(obs) -> Tensor` | `(B, H, W, 3)` uint8 — THE image modality the model consumes (torus: FPV). Required for image world models |
-| `render_diagnostics(overlay, views)` | OPTIONAL — see below |
+Six members are REQUIRED — the pipeline trains, plans and renders through these alone:
+
+| member | signature | role |
+|---|---|---|
+| `obs_dim` | `int` | width of the proprio/state vector |
+| `action_dim` | `int` | width of the action vector |
+| `reset` | `(generator) -> (B, obs_dim)` | deterministic given a `torch.Generator` |
+| `step` | `action (B, action_dim) -> (B, obs_dim)` | next observation |
+| `reward` | `(obs, goal=None) -> (B,)` | per-step control return (higher = better); scores the control eval |
+| `render_obs` | `(obs) -> (B, H, W, 3)` | uint8 — THE image modality the model consumes (torus: FPV). Required for image world models |
+
+Everything else is OPTIONAL — each member unlocks a capability, with a graceful fallback when absent:
+
+| member | signature | unlocks | fallback when absent |
+|---|---|---|---|
+| `rollout_metrics` | `(pred_obs, true_obs) -> {name: Tensor}` | env-specific val + `ood_horizon` rollout metrics (torus adds its manifold/tangent errors) | the generic `pointwise_error` (base `default_rollout_metrics`) |
+| `render_diagnostics` | `(overlay, views) -> {view: frames}` | the rich multi-view scene eval-viz (below) | the `render_obs` pred-vs-true filmstrip |
+| `control_goals` | `(batch, n_goals, generator, device) -> [(name, point)] \| None` | goal-based control eval (the goal race) | reward-only control — MPPI maximizes `env.reward` |
+| `checkpoint_metric` | `str` (a `rollout_metrics` key) | which metric training monitors for `best.ckpt` (torus: `manifold_distance_error`) | `pointwise_error` |
+| `physical_loss` | `(...)` | the optional physical-loss training variation | variation unavailable |
+| `POLICIES` | class registry `{name: factory(env, device) -> policy}` | env-specific behavior policies (see [Policies](#policies)) | `random` only |
+
+Every run logs an `[env-contract]` ✓/✗ capability report to its `progress.log`, so you can see at a glance
+which optional members your env provides and what fell back. `TorusEnv` (`environments/torus.py`) is the
+reference that implements them all in one file; `environments/base.py` is the spec.
 
 Then register a name for it in `environments/registry.make_env` and add a
 `conf/environments/<name>.yaml` with `name: <registry-name>` plus your env's parameters (see
 `conf/environments/torus_world.yaml`).
+
+## No simulator: recorded data
+
+The third path is data-only: you have logged trajectories (states, actions, camera frames) and no
+simulator at all. `recording_to_lerobot.py` converts the dump into the standard lerobot run layout, and
+training routes through `RecordedEnv` (`environments/recorded.py`) — a `WorldEnv` that provides
+obs/action dims + `dt` (`conf/environments/recorded.yaml`) and lets the camera frames come from the
+dataset, but raises on `step`/`reset`/`render_obs` (nothing to simulate or render):
+
+```bash
+python -m quickdraw.recording_to_lerobot +recording.dir=<path> +recording.name=<name>
+#    -> logs/recording_<ts>_<name>; then train on it with
+#       environments.name=recorded data.repo_id=<name> data.cam=<cam>
+```
+
+This is the "data-only" corner of the contract: you get world-model training, validation and the
+`ood_horizon` rollout metrics (the generic `pointwise_error`), plus the pred-vs-true filmstrip — but NOT
+control, interpret or language steering, which need a live env to step.
+
+Dataset knobs the loader threads (for any dataset, recorded or generated): `data.cam` — the camera key,
+`videos/observation.images.<cam>` (default `fpv`; recordings use `ego`); `data.repo_id` — the lerobot
+repo prefix the splits were written with (default `torus`; a recorded dataset uses its recording name);
+and non-square images via `modalities.i.img_size: [H, W]` on the model's image modality.
 
 ## Policies
 
@@ -121,7 +161,7 @@ uv run python -m quickdraw.push_to_hub data.root=$DATA +hub.name=pendulum
 
 # 3. train the world model
 uv run python -m quickdraw.train_world_model experiment=pendulum data.root=$DATA 'environments.name=gym:Pendulum-v1' +run_summary.problem=... # (all 5 fields)
-#    -> set CKPT=logs/train_world_<ts>_pendulum
+#    -> set CKPT=logs/train_world_model_<ts>_pendulum
 
 # 4. train the action model (post-hoc, on the frozen WM)
 uv run python -m quickdraw.train_action_model checkpoint=$CKPT data.root=$DATA experiment=pendulum 'environments.name=gym:Pendulum-v1' +run_summary.problem=...

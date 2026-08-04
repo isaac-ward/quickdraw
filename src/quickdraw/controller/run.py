@@ -45,9 +45,9 @@ def _agent(res, i, color, R, r):
 
 
 def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) -> dict:
-    # reuse_render is a RENDER knob living in the control config; strip it before building MPPIConfig
-    # (which has no such field) so MPPIConfig(**...) doesn't choke on the extra key.
-    mppi_kwargs = {k: v for k, v in cfg.control.items() if k != "reuse_render"}
+    # reuse_render / reward_override are control-config knobs that aren't MPPIConfig fields; strip them
+    # before building MPPIConfig so MPPIConfig(**...) doesn't choke on the extra keys.
+    mppi_kwargs = {k: v for k, v in cfg.control.items() if k not in ("reuse_render", "reward_override")}
     fpv = None                                    # image models: render FPV context in the MPPI loop
     core = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
@@ -96,6 +96,15 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     knobs = {k: getattr(mppi_cfg, k) for k in ("beta_vel", "r_settle")
              if k in inspect.signature(env.reward).parameters}
     reward_fn = functools.partial(env.reward, **knobs)
+    # OPTIONAL reward override (control.reward_override = dotted path to a callable reward_fn(obs, goal)):
+    # replaces env.reward as the scored per-step reward for BOTH controllers. Default null = env.reward
+    # (the line above). Orthogonal to language steering — language.head sets `reward` below, untouched.
+    ro = cfg.control.get("reward_override", None)
+    if ro:
+        import importlib
+        mod, _, attr = str(ro).rpartition(".")
+        reward_fn = getattr(importlib.import_module(mod), attr)
+        _plog(writer, f"[eval_control @ep{step}] control.reward_override -> {ro} (replaces env.reward)")
     # NO-GOAL env: an env that supplies no control-goal source (WorldEnv.control_goals absent or -> None,
     # e.g. a gym Pendulum) has nothing to "reach" — run REWARD-ONLY control (maximize env.reward) in a
     # SEPARATE branch. Everything below (the torus goal race + language steering) is untouched.

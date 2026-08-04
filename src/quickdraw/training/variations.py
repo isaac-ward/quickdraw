@@ -4,8 +4,10 @@ Each variation is a self-contained, model-AGNOSTIC toggle that composes with any
 through the `SequenceWorldModel` hook contract — it never touches DSAR/LSAR/RSSM internals. The seams:
 
   - noise_injection -> `transform_obs`: perturbs the obs INPUTS before the model's `encode_state`.
-  - physical_loss   -> `loss` via `model.physical_state(pred)`: the physical 6-vector readout
-                       (default `to_obs`; LSAR freezes its decoder; vision supplies a head or None).
+  - physical_loss   -> `loss` via `model.physical_state(pred)` (the physical 6-vector readout; default
+                       `to_obs`; LSAR freezes its decoder; vision supplies a head or None) + the ENV's
+                       `physical_loss` hook (WorldEnv, base.py) for the physics residuals — no env-specific
+                       math lives here.
   - contraction     -> `loss` via `model.one_step_states(...)`: the shared one-step state-map, with the
                        backbone routed through its differentiable eager attention path.
 
@@ -23,8 +25,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..environments import torus as T
-
 
 @dataclass
 class VarContext:
@@ -36,12 +36,9 @@ class VarContext:
     obs_seq: Tensor        # clean full obs window (B, P+F, 6), normalized
     act_seq: Tensor        # actions (B, P+F-1, 2)
     norm: Any              # normalizer (denorm_obs for physical units)
-    R: float
-    r: float
-    v_scale: float
-    dt: float              # env timestep (physical seconds) — for the kinematic continuity term
     training: bool
     physical_ramp: float = 1.0   # warmup multiplier on the physical loss (1.0 = full; set by lit's schedule)
+    env: Any = None        # the run's WorldEnv — supplies the optional `physical_loss` residual hook
 
 
 class Variation:
@@ -80,7 +77,9 @@ class NoiseInjection(Variation):
 
 class PhysicalLoss(Variation):
     """Physics-informed penalty on the predicted state via `model.physical_state(pred)` (decoder frozen
-    for LSAR; physics math stays in torus.py). Three terms, each dimensionless:
+    for LSAR; the physics MATH is the ENV's — `env.physical_loss(obs_phys)` residuals, WorldEnv base.py;
+    envs without the hook, e.g. recorded data, skip this variation). Three terms, each dimensionless
+    (torus residuals shown):
       - ALGEBRAIC (weight): on-surface (d_off/r)^2 + tangent-velocity (v_off/v_scale)^2 — per-step;
       - CONTINUITY (continuity): the kinematic law v = dp/dt, as a central-difference residual over the
         rollout, ||v_hat_t - (p_{t+1}-p_{t-1})/(2 dt)||^2 / v_scale^2. This is the DIFFERENTIAL physics
@@ -95,23 +94,23 @@ class PhysicalLoss(Variation):
         self.continuity = float(continuity)
 
     def loss(self, ctx: VarContext) -> tuple[Tensor | None, dict]:
+        phys = getattr(ctx.env, "physical_loss", None)     # the env's physics-residual hook (base.py)
+        if phys is None:                                   # env with no analytic physics (e.g. recorded)
+            return None, {"skipped": 1.0}
         state = ctx.model.physical_state(ctx.preds)        # (B, H, 6) physical readout, or None
         if state is None:                                  # e.g. a vision model with no physical head
             return None, {"skipped": 1.0}
         obs_phys = ctx.norm.denorm_obs(state)              # to PHYSICAL units (affine -> grad preserved)
-        p_hat = obs_phys[..., :3]
-        d_off = T.signed_dist(p_hat, ctx.R, ctx.r) / ctx.r            # signed, smooth when squared
-        th, ph = T.angles_from_point(p_hat, ctx.R)
-        v_off = (obs_phys[..., 3:] * T.normal(th, ph)).sum(-1) / ctx.v_scale
+        res = phys(obs_phys)                               # dimensionless residuals (torus: d_off/v_off/continuity)
+        d_off, v_off = res["d_off"], res["v_off"]
         # HUBER, not squared: residuals are normalized to ~O(1), so Huber(delta=1) is quadratic for
         # normal jitter but LINEAR (bounded gradient) for large residuals -> a rollout jitter spike can't
         # produce an explosive gradient that diverges the weights (the failure mode that NaN'd before).
         hub = lambda x: F.huber_loss(x, torch.zeros_like(x), delta=1.0, reduction="none")
         total = self.weight * (hub(d_off).mean() + hub(v_off).mean())   # algebraic: on-surface + tangent
         diag = {"d_off": d_off.abs().mean().detach(), "v_off": v_off.abs().mean().detach()}
-        if self.continuity > 0.0 and obs_phys.shape[1] >= 3 and ctx.dt:   # kinematic continuity v = dp/dt
-            sec = (p_hat[:, 2:] - p_hat[:, :-2]) / (2.0 * ctx.dt)         # central-diff velocity, interior t
-            cont = hub((obs_phys[:, 1:-1, 3:] - sec) / ctx.v_scale).sum(-1).mean()
+        if self.continuity > 0.0 and "continuity" in res:                 # kinematic continuity v = dp/dt
+            cont = hub(res["continuity"]).sum(-1).mean()
             total = total + self.continuity * cont
             diag["continuity"] = cont.detach()
         total = ctx.physical_ramp * total   # warmup ramp (0->1) avoids hitting the jittery early decode

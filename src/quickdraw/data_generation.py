@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from .data.generate import compute_norm_stats, generate_episodes, write_lerobot_split, write_meta
+from .environments.base import log_env_capabilities
 from .environments.policies import make_policy
 from .environments.registry import make_env
 from .environments.torus import TorusConfig
@@ -101,6 +102,8 @@ def main(cfg):
     # 1. simulate every split (cheap, vector only) — env by name from the registry (design/gym_refactor.md
     # Phase 2), rolled with the configured behavior policy. Torus: byte-identical to the pre-refactor loop.
     env_name = cfg.environments.get("name", "torus_world")
+    # WorldEnv contract self-report (environments/base.py): one ✓/✗ line -> progress.log (additive, log-only)
+    log_env_capabilities(make_env(env_name, ecfg, batch=1), log, name=env_name)
     asamp = str(cfg.data.get("action_sampler", "ornstein_uhlenbeck")).lower()
     data = {}
     for name, s in cfg.data.splits.items():

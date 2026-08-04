@@ -17,7 +17,9 @@ configured environment (`environments.name`, default the torus) with the configu
 (`data.action_sampler`: `ornstein_uhlenbeck` | `bimodal` | `random`), renders each trajectory's egocentric
 clip, and writes one lerobot dataset per split (parquet vectors + mp4 `observation.images.fpv`).
 Produces `logs/data_generation_<ts>_$RUN/` — set `DATA=` that path; everything downstream takes
-`data.root=$DATA`.
+`data.root=$DATA`. `environments.name` selects the env (torus default); recorded trajectories (no
+simulator) can instead be converted with `recording_to_lerobot` — see
+[docs/byo_environment.md](byo_environment.md).
 
 ## 2. Push to the Hub
 
@@ -40,16 +42,17 @@ uv run python -m quickdraw.train_world_model experiment=$RUN data.root=$DATA \
 ```
 
 Trains the configured model (`model=...`) on `P`-context / `F`-horizon windows. Produces
-`logs/train_world_<ts>_$RUN/` with `checkpoints/` (top-k + last) — set `CKPT=` that run dir. Two things
+`logs/train_world_model_<ts>_$RUN/` with `checkpoints/` (top-k + last) — set `CKPT=` that run dir. Two things
 happen on a cadence during training:
 
 - **Validation** — every 4 epochs (`trainer.check_val_every_n_epoch`). Val is an autoregressive rollout
   roughly as long as a train epoch; it tracks the in-distribution rollout loss on held-out episodes and
   selects the best checkpoint.
 - **Evaluation** — the subscribed eval routines (`conf/eval/default.yaml` `during_train`) run at epochs
-  {5, 10, 20, 40, 60, ...}. On by default: `ood_horizon` (long-horizon open-loop rollout — how fast
+  {5, 10, 15, 20, 30, 40, 50, ...}. On by default: `ood_horizon` (long-horizon open-loop rollout — how fast
   accuracy decays past the trained horizon, proprio + image heads), `control` (dual MPPI, oracle vs
-  learned — whether the model is good enough to plan with), `manifold` (latent-space projections — whether
+  learned — whether the model is good enough to plan with; goal-based when the env supplies goals, else
+  reward-only, maximizing `env.reward`), `manifold` (latent-space projections — whether
   the latent has collapsed), and the denoising visuals (diffusion models only). The OOD-split axes
   (visual/geometric/dynamics) are off by default and run post-hoc:
   `uv run python -m quickdraw.eval_ood experiment=$RUN data.root=$DATA checkpoint=$CKPT`.
@@ -64,7 +67,7 @@ uv run python -m quickdraw.train_action_model checkpoint=$CKPT data.root=$DATA e
 Trains the action-distribution head (the learned play/behavior prior used as the MPPI proposal)
 **post-hoc, on a FROZEN world-model checkpoint** — only the action-flow head gets gradients, on context
 features computed under `no_grad`. It is post-hoc because joint training destabilized the world model
-(control collapsed to ~0 goals vs 3.88 and the WM NaN'd). Produces `logs/train_action_<ts>_$RUN/` with
+(control collapsed to ~0 goals vs 3.88 and the WM NaN'd). Produces `logs/train_action_model_<ts>_$RUN/` with
 full-model checkpoints (frozen WM + trained head) that load like any other checkpoint, and runs the
 action-distribution eval itself (learned prior vs the true data action distribution).
 
@@ -95,14 +98,14 @@ uv run python -m quickdraw.train_reward_model reward.interpret_run=$INTERP exper
 
 Distills a language reward head `R(latent, text) = cos(f_z(latent), f_t(text))` from the interpret run's
 captions via CLIP-style contrastive learning (MiniLM embeds the text; the latents come from the frozen
-WM). Produces `logs/train_reward_<ts>_$RUN/reward_head.pt` — the decode-free scorer MPPI uses to steer by
+WM). Produces `logs/train_reward_model_<ts>_$RUN/reward_head.pt` — the decode-free scorer MPPI uses to steer by
 a text request.
 
 ## 7. Language control
 
 ```bash
 uv run python -m quickdraw.eval_control checkpoint=$CKPT data.root=$DATA \
-    language.head=logs/train_reward_<ts>_$RUN/reward_head.pt \
+    language.head=logs/train_reward_model_<ts>_$RUN/reward_head.pt \
     language.request='top red' \
     language.interpret_run=$INTERP
 ```

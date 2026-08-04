@@ -50,8 +50,29 @@ ROLE_STYLE: dict[str, dict] = {
 
 @runtime_checkable
 class WorldEnv(Protocol):
-    """Batched environment. `reset`/`step` return observation vectors (B, obs_dim). Deterministic given a
-    torch.Generator. `reward`/`render_obs` are required for control/vision; `render_diagnostics` is optional."""
+    """THE ENV CONTRACT — the single spec of what the pipeline may ask of an environment. Batched:
+    `reset`/`step` return observation vectors (B, obs_dim); deterministic given a torch.Generator.
+
+    REQUIRED (every env defines these; the shared pipeline calls them unconditionally):
+      obs_dim / action_dim -- vector sizes                  -> unlocks model + normalizer construction.
+      reset / step         -- batched simulation            -> unlocks data generation + live control rollouts.
+                              (A dataset-only env, e.g. RecordedEnv, stubs them to raise — marked `not_provided`.)
+      reward               -- per-step return for a goal    -> unlocks control scoring (MPPI candidate ranking).
+      render_obs           -- the IMAGE MODALITY            -> unlocks image datagen + the pred-vs-true filmstrip.
+
+    OPTIONAL (self-reported by `log_env_capabilities`; each has an env-agnostic fallback):
+      rollout_metrics      -- extra val rollout errors      -> unlocks env-specific val+ood curves
+                              (fallback: `default_rollout_metrics`, generic pointwise L2).
+      checkpoint_metric    -- str key of rollout_metrics    -> which metric train.py monitors for best.ckpt
+                              (default: 'pointwise_error').
+      render_diagnostics   -- rich multi-view eval videos   -> unlocks rich eval-viz
+                              (fallback: render_obs filmstrip; see `wants_diagnostics`).
+      control_goals        -- world goal points             -> unlocks the goal-reaching control eval
+                              (fallback: REWARD-ONLY control, maximize env.reward(obs, None)).
+      physical_loss        -- analytic physics residuals    -> unlocks the physical_loss training variation
+                              (fallback: the variation skips itself).
+      POLICIES             -- name -> factory(env, device)  -> unlocks env-shipped datagen behavior policies
+                              (see environments/policies.make_policy; 'random' always available)."""
     action_dim: int
     obs_dim: int
 
@@ -77,6 +98,12 @@ class WorldEnv(Protocol):
     # per-episode goal subsetting lives in run_control, unchanged).
     def control_goals(self, batch: int, n_goals: int, generator=None, device=None): ...
 
+    # OPTIONAL — dimensionless analytic physics residuals {name: per-element Tensor} of a PHYSICAL-units obs
+    # batch/rollout (torus: off-surface distance, normal velocity, kinematic continuity). Consumed by the
+    # physical_loss training variation (training/variations.py), which applies Huber/weights/warmup on top;
+    # the physics MATH lives here in the env. Envs without analytic physics omit it -> the variation skips.
+    def physical_loss(self, obs_phys: Tensor) -> dict[str, Tensor]: ...
+
 
 def default_rollout_metrics(pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]:
     """The generic, env-agnostic rollout metric — full-observation L2 error per step. Valid for ANY WorldEnv
@@ -89,3 +116,42 @@ def wants_diagnostics(env: object) -> bool:
     request the rich multi-view; otherwise it falls back to the `render_obs` pred-vs-true filmstrip."""
     fn = getattr(type(env), "render_diagnostics", None)
     return callable(fn) and getattr(fn, "_is_default", False) is False
+
+
+def not_provided(fn):
+    """Decorator: mark a WorldEnv member an env defines only as a STUB or generic DEFAULT (raises, or returns
+    the env-agnostic fallback) so `log_env_capabilities` reports it ✗. Same `_is_default` convention
+    `wants_diagnostics` already checks. Reporting only — never changes behavior."""
+    fn._is_default = True
+    return fn
+
+
+# The self-report rows of `log_env_capabilities`: (contract member, what ✓ unlocks, the ✗ fallback).
+_CONTRACT_HOOKS = [
+    ("reset",              "sim",               "no-sim"),
+    ("step",               "sim",               "no-sim"),
+    ("reward",             "control",           "no-control"),
+    ("render_obs",         "datagen+filmstrip", "dataset-images-only"),
+    ("rollout_metrics",    "val+ood",           "default(pointwise)"),
+    ("render_diagnostics", "rich-viz",          "filmstrip"),
+    ("control_goals",      "goal-control",      "reward-only"),
+    ("physical_loss",      "physics-shaping",   "off"),
+]
+
+
+def log_env_capabilities(env, log_fn=print, name: str | None = None) -> str:
+    """One-line ✓/✗ self-report of the WorldEnv contract (see the protocol docstring above, the source of
+    truth): for each hook, ✓ + what it unlocks if the env provides it (present and not a `not_provided`
+    stub/default), else ✗ + the fallback. Emitted at the START of training, data generation and the
+    standalone evals — purely informational, never changes behavior."""
+    def _has(member: str) -> bool:
+        fn = getattr(type(env), member, None)
+        return callable(fn) and not getattr(fn, "_is_default", False)
+    parts = [f"{m} {'✓ ' + ok if _has(m) else '✗ ' + miss}" for m, ok, miss in _CONTRACT_HOOKS]
+    parts.append(f"checkpoint_metric={getattr(env, 'checkpoint_metric', 'pointwise_error')}")
+    pol = list(getattr(env, "POLICIES", {}) or {})
+    parts.append(f"policies={','.join(pol) if pol else '-'}")
+    line = (f"[env-contract] {name or type(env).__name__} | obs_dim={env.obs_dim} action_dim={env.action_dim} | "
+            + " | ".join(parts))
+    log_fn(line)
+    return line
