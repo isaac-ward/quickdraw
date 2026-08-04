@@ -1,0 +1,22 @@
+# owm-envs ISS docking datasets (generated outside quickdraw; see docs/owm_iss.md).
+# Only the keys the TRAINING path reads are kept — the torus-only generation/eval knobs
+# (action_sampler, fpv_fov, composite_grid, n_plot_trajectories, action_smooth_window) are
+# dropped, as are `workers`/`fast_gpu`, which no code reads.
+root: null     # local dataset dir; leave null and set hf_repo to pull from the Hub instead
+hf_repo: null  # override per variant: data.hf_repo=<namespace>/owm-iss-<variant>. NOTE: the during-train
+#                eval routines read data.root directly (not the HF snapshot), so keep them OFF when
+#                loading from the Hub — see docs/owm_iss.md.
+repo_id: iss   # lerobot repo prefix the splits were WRITTEN with -> iss/train, iss/val
+cam: fpv       # camera stream name -> videos/observation.images.fpv (only read by image models)
+P: 8           # past context steps fed before prediction starts
+F: 64          # future horizon rolled out during training (sets the BPTT length)
+window_stride: 1   # LOCKED at 1 (user, 2026-07-20): never subsample training-window starts
+batch: 1024    # matches the torus baseline; the 13/25-dim proprio vectors are smaller, so this fits
+
+# Startup INVENTORY LOG only (train_world_model.py:109 prints traj/frames/hours from these). The loaders
+# read the dataset itself, so stale numbers only misreport the log — they cannot change what is trained on.
+# Values mirror owm-envs configs/generation_default.yaml; `steps` is that config's max_steps CAP, so real
+# episodes may be shorter (docking runs terminate early). Update if the published datasets differ.
+splits:
+  train: {n_traj: 64, steps: 7200}
+  val:   {n_traj: 8,  steps: 7200}

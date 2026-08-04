@@ -17,10 +17,11 @@ docker compose exec app python -c "import torch; print(torch.cuda.is_available()
 docker compose exec app bash
 ```
 
-From here, two docs tell you where to go:
+From here, these docs tell you where to go:
 
 - **[docs/workflow.md](docs/workflow.md)** — the full pipeline end-to-end, one `uv run` line per step: generate data → push to the Hub → train the world model → action model → interpret (VLM labeling) → reward model → language control.
 - **[docs/byo_environment.md](docs/byo_environment.md)** — run that same pipeline on your *own* environment: any Gymnasium env (zero code) or a first-class `WorldEnv`.
+- **[docs/owm_iss.md](docs/owm_iss.md)** — train on the externally generated owm-envs ISS docking datasets (recorded data, no simulator).
 
 ## Supported methods
 
