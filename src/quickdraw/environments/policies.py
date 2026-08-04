@@ -3,7 +3,7 @@
 
 `random` is the only env-agnostic policy (uniform over the env's action range) — the default for a BYO env.
 Env-specific policies ship WITH their env via a `POLICIES` class registry (name -> factory(env, device));
-torus registers `ornstein_uhlenbeck`/`bimodal` (environments/torus.py) wrapping its EXISTING action samplers
+torus registers `ornstein_uhlenbeck`/`bimodal` (environments/examples/torus.py) wrapping its EXISTING action samplers
 unchanged — same math, same RNG draw order (`sample(obs, g)` forwards as the legacy `sampler.sample(g,
 state=obs)` call), so torus datasets stay byte-identical (proven by smoke/refactor_parity_datagen)."""
 

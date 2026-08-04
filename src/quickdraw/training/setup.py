@@ -10,7 +10,7 @@ from ..data.dataset import (
     MMWindowLoader, Normalizer, TrajectoryDataset,
     load_split_episodes, load_split_episodes_mm,
 )
-from ..environments.torus import TorusConfig
+from ..environments.torus_utils import TorusConfig
 
 
 def env_cfg(cfg):

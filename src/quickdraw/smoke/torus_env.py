@@ -1,5 +1,5 @@
-"""Smoke test for the torus COLOR/POSITION ground truth in environments/torus.py: prove it matches the
-RENDERER and behaves. Run: uv run python -m quickdraw.smoke.torus_env"""
+"""Smoke test for the torus COLOR/POSITION ground truth in environments/torus_utils.py: prove it matches
+the RENDERER and behaves. Run: uv run python -m quickdraw.smoke.torus_env"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import math
 
 import numpy as np
 
-from ..environments import torus as T
+from ..environments import torus_utils as T
 from ..logging import viz
 
 

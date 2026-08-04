@@ -14,7 +14,7 @@ import os
 import torch
 from hydra import compose, initialize_config_dir
 
-from quickdraw.environments import torus as T
+from quickdraw.environments import torus_utils as T
 from quickdraw.training.lit import LitWorldModel
 from quickdraw.training.setup import build_model, env_cfg, normalizer, window_loaders
 

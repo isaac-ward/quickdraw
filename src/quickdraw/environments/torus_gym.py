@@ -13,7 +13,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from .torus import TorusConfig, TorusEnv
+from .examples.torus import TorusEnv
+from .torus_utils import TorusConfig
 
 
 class TorusWorldEnv(gym.Env):

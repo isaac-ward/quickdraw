@@ -27,7 +27,7 @@ from .data.generate import compute_norm_stats, generate_episodes, write_lerobot_
 from .environments.base import log_env_capabilities
 from .environments.policies import make_policy
 from .environments.registry import make_env
-from .environments.torus import TorusConfig
+from .environments.torus_utils import TorusConfig
 from .logging import viz
 from .training.setup import env_cfg
 from .utils.logging import make_run_dir

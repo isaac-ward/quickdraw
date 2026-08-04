@@ -19,8 +19,9 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
+from ..environments.examples.torus import TorusEnv
 from ..environments.policies import make_policy
-from ..environments.torus import TorusConfig, TorusEnv
+from ..environments.torus_utils import TorusConfig
 
 
 def generate_episodes(env, n_traj: int, steps: int, seed: int, device="cpu",

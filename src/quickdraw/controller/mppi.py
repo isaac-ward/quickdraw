@@ -16,7 +16,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from ..environments.torus import TorusConfig, TorusEnv, control_goals
+from ..environments.examples.torus import TorusEnv
+from ..environments.torus_utils import TorusConfig, control_goals
 
 
 @dataclass

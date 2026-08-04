@@ -21,7 +21,7 @@ import numpy as np
 from ..data.generate import generate_episodes
 from ..environments.policies import make_policy
 from ..environments.registry import make_env
-from ..environments.torus import TorusConfig
+from ..environments.torus_utils import TorusConfig
 
 N_TRAJ, STEPS, SEED = 2, 16, 0
 

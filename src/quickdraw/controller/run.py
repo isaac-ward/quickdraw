@@ -202,7 +202,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         # distance_to_request curve — that was just 1 - achieved(reward head), already a line here.
         if reward is not None:
             rc = np.asarray(res["pred"]["dist_curves"][i])
-            from ..environments import torus as T
+            from ..environments import torus_utils as T
             rq, xyz = str(req_i).lower(), np.asarray(agents[0]["path"])
 
             def _gt(path):   # torus ground-truth reward on a path for the buckets named in the request
