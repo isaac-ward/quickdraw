@@ -20,7 +20,7 @@ docker compose exec app bash
 From here, the fastest start is the **wizard** — point your AI assistant (Claude, Codex, …) at it and it
 drives the whole setup:
 
-- **[wizard/prompt.md](wizard/prompt.md)** — *"look at wizard/prompt.md and talk me through the choices for `<my dataset or env>`"*. It interviews you about your data/env and model, inspects a HuggingFace dataset (cameras, dims, fps) and **resolves all the dims for you**, applies the documented learnings, verifies the dataset fits (`check_dataset`) and reports the model shape (`model_summary`), then compiles a runnable pipeline script to `wizard/scripts/`.
+- **[wizard/prompt.md](wizard/prompt.md)** — *"look at wizard/prompt.md and talk me through the choices for `<my dataset or env>`"*. It interviews you about your data/env and model and **resolves all the dims for you** — either **inspecting a HuggingFace dataset** (cameras, dims, fps) if you bring *recorded data*, or wiring up **`data_generation`** from the simulator if you bring an *environment* (a Gym env or a full `WorldEnv`). It applies the documented learnings, verifies the setup (`check_dataset` for the data, `model_summary` for the model), then compiles a runnable pipeline script to `wizard/scripts/`.
 
 Or read the docs directly:
 

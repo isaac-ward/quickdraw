@@ -70,12 +70,21 @@ Ask: **"What are you bringing?"** One of three (this mirrors `docs/byo.md`):
   unlocks one eval (rollout_metrics, checkpoint_metric, render_diagnostics, control_goals, physical_loss,
   POLICIES, fork).
 
+**Where the data comes from depends on the path:**
+- **Recorded data** → there IS a dataset; you inspected it, so process it (`data.processors`) and point
+  `data.root` at the run_dir. No `data_generation`.
+- **An environment** (Gym or full custom) → there is NO dataset to inspect; the **first pipeline stage is
+  `data_generation`**, which ROLLS the env with a behavior policy to CREATE the dataset, and *that* becomes
+  the `data.root` for training. Read the dims off the env (Gym: `observation_space`/`action_space`; custom:
+  `obs_dim`/`action_dim`), not a dataset.
+
 **Output of Part A:** the concrete `obs_dim`, `action_dim`, image size(s) + camera key(s), fps, and which
 env name (`gym:<id>` / `recorded` / a registered custom name). **YOU (the wizard) carry these dims through
 into every override in the generated script** — `environments.obs_dim`/`action_dim`, `model.action_dim`,
-`model.modalities.<i>.dim`/`img_size` — from what you inspected. **The user never types a dim.** You then
-confirm them with `check_dataset` (Part D), which will flag any that don't line up. (E.g. robocasa →
-`obs_dim=16 action_dim=12`, three 256×256 cams; the wizard sets those, the user just picks the camera.)
+`model.modalities.<i>.dim`/`img_size` — from the recorded dataset you inspected OR read off the env. **The
+user never types a dim.** You then confirm on the resulting run_dir with `check_dataset` (Part D). (E.g.
+robocasa → `obs_dim=16 action_dim=12`, three 256×256 cams; the wizard sets those, the user just picks the
+camera.)
 
 ---
 
