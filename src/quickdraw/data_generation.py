@@ -16,10 +16,12 @@ import json
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, replace
+from dataclasses import asdict, is_dataclass, replace
+from types import SimpleNamespace
 
 import hydra
 import matplotlib.pyplot as plt
+import torch
 
 from .data.generate import compute_norm_stats, generate_episodes, write_lerobot_split, write_meta
 from .environments.policies import make_policy
@@ -31,8 +33,11 @@ from .utils.logging import make_run_dir
 
 
 def _render_fpv(job: dict):
-    """One trajectory's 256x256 egocentric clip (rendered in parallel, ingested into lerobot later)."""
-    frames = viz.fpv_frames(job["R"], job["r"], job["coloring"], job["obs"], fov=job["fov"], size=job["size"])
+    """One trajectory's egocentric clip (rendered in parallel, ingested into lerobot later) via the split
+    ENV's `render_obs` — the env OWNS its image modality (torus: FPV, byte-identical to the old direct
+    viz.fpv_frames call; a generic env, e.g. gym:*, supplies its own frames with no torus params)."""
+    env = make_env(job["env_name"], job["scfg"], batch=1)
+    frames = env.render_obs(torch.as_tensor(job["obs"])).cpu().numpy()
     viz.save_mp4(job["out"], frames, job["fps"])
     return job["out"]
 
@@ -138,12 +143,15 @@ def main(cfg):
         for k, done in enumerate(ex.map(_render_summary, summary_jobs), 1):
             log(f"[summary] {k}/{len(summary_jobs)} complete: {done}  ({time.time() - t0:.0f}s)")
 
-    # 3. render every trajectory's FPV clip at full parallelism (the heavy step)
+    # 3. render every trajectory's FPV clip at full parallelism (the heavy step). Each worker rebuilds the
+    # SPLIT's env and renders through its `render_obs`: the split's coloring/fov are threaded into the env
+    # config (torus honors them, byte-identical to the old direct fpv_frames call; a dataclass-less/generic
+    # env cfg passes through untouched and the env renders its own image modality).
     fpv_jobs = []
     for name, (scfg, obs, _, coloring) in data.items():
+        rcfg = SimpleNamespace(**asdict(scfg), coloring=coloring, fov=fov) if is_dataclass(scfg) else scfg
         for i in range(obs.shape[0]):
-            fpv_jobs.append({"R": scfg.R, "r": scfg.r, "coloring": coloring, "fov": fov, "fps": fps,
-                             "size": size, "obs": obs[i],
+            fpv_jobs.append({"env_name": env_name, "scfg": rcfg, "fps": fps, "obs": obs[i],
                              "out": os.path.join(fpv_root, name, f"ep_{i:04d}.mp4")})
     log(f"[fpv] rendering {len(fpv_jobs)} clips on {workers} workers...")
     with ProcessPoolExecutor(max_workers=workers) as ex:

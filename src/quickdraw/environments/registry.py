@@ -16,7 +16,10 @@ def make_env(name: str, cfg, batch: int, device="cpu") -> WorldEnv:
         from .torus import TorusEnv, TorusConfig
         tc = TorusConfig(R=cfg.R, r=cfg.r, dt=cfg.dt, gamma=cfg.gamma, a_max=cfg.a_max,
                          init_speed=cfg.init_speed, mass=cfg.mass)
-        return TorusEnv(tc, batch, device=device)
+        # optional render params (texture coloring + camera fov for render_obs) — per split in data
+        # generation (hsv vs circles); absent from most cfgs -> the env's defaults (hsv, 100).
+        return TorusEnv(tc, batch, device=device, coloring=getattr(cfg, "coloring", "hsv"),
+                        fov=float(getattr(cfg, "fov", 100.0)))
     if n == "recorded":
         from .recorded import RecordedEnv
         return RecordedEnv(cfg, batch, device=device)

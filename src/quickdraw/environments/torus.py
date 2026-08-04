@@ -171,7 +171,7 @@ class TorusEnv:
             BimodalActionSampler(getattr(env, "batch", 1), float(env.cfg.a_max), device=device)),
     }
 
-    def __init__(self, cfg: TorusConfig, batch: int, device="cpu"):
+    def __init__(self, cfg: TorusConfig, batch: int, device="cpu", coloring: str = "hsv", fov: float = 100.0):
         self.cfg = cfg
         self.batch = batch
         self.device = torch.device(device)
@@ -179,7 +179,10 @@ class TorusEnv:
         self.phi = torch.zeros(batch, device=self.device)
         self.theta_dot = torch.zeros(batch, device=self.device)
         self.phi_dot = torch.zeros(batch, device=self.device)
-        self._fpv = None   # lazy persistent FPV renderer for render_obs
+        # render_obs appearance (NOT dynamics, so kept off TorusConfig — dataset_card.json stays unchanged):
+        # texture coloring + camera fov, per split in data generation (hsv vs circles for ood_visual).
+        self.coloring = str(coloring)
+        self.fov = float(fov)
 
     def reset(self, generator: torch.Generator | None = None) -> Tensor:
         g = generator
@@ -233,12 +236,13 @@ class TorusEnv:
 
     def render_obs(self, obs: Tensor) -> Tensor:
         """The IMAGE MODALITY: egocentric FPV of each state, (B,6) -> (B,size,size,3) uint8 on `device`.
-        Wraps the fast persistent viz.FPVRenderer with the data pipeline's defaults (hsv coloring,
-        fov=100 per conf/data/torus.yaml fpv_fov, size=viz.FPV_SIZE)."""
-        if self._fpv is None:
-            from ..logging import viz   # lazy: keep torus.py import-light (viz pulls pyvista/matplotlib)
-            self._fpv = viz.FPVRenderer(self.cfg.R, self.cfg.r, "hsv", fov=100.0, size=viz.FPV_SIZE)
-        return torch.from_numpy(self._fpv.render(obs.detach().cpu().numpy())).to(self.device)
+        Delegates to viz.fpv_frames with THIS env's coloring/fov (defaults hsv, fov=100 per
+        conf/data/torus.yaml fpv_fov; size=viz.FPV_SIZE), so it is byte-identical to the data pipeline's
+        renderer — including the sequential heading smoothing when `obs` is one trajectory over time."""
+        from ..logging import viz   # lazy: keep torus.py import-light (viz pulls pyvista/matplotlib)
+        frames = viz.fpv_frames(self.cfg.R, self.cfg.r, self.coloring, obs.detach().cpu().numpy(),
+                                fov=self.fov, size=viz.FPV_SIZE)
+        return torch.from_numpy(frames).to(self.device)
 
     def render_diagnostics(self, overlay, views) -> dict:
         """OPTIONAL rich diagnostic renderer (WorldEnv protocol; design/gym_refactor.md Phase 5): draw the
