@@ -66,7 +66,23 @@ action_head:
   #                           ~ep31, vitmse collapsed to a frozen 11.1). Removing it recreated the baseline + control.
   #                           If you want the MPPI action prior, train it POST-HOC on a FROZEN checkpoint, not jointly.
   weight: 1.0               # weight of the action-flow loss in the total training loss
-  shortcut: true            # K=1 sampling (fast MPPI proposal); like the dynamics diffusion.shortcut
+  shortcut: false           # PURE RECTIFIED FLOW for the action prior — NOT default-on like the dynamics
+  #   (diffusion.shortcut) / decode shortcuts, because the action prior is fundamentally different from
+  #   OBSERVATION prediction. Those predict observations: given state+action the next state is (near-)
+  #   DETERMINISTIC — a tight, unimodal target, so the noise->target field is smooth/straight and a single
+  #   big step of size 2d lands in the SAME place as two chained steps of size d. The shortcut self-
+  #   consistency loss TRAINS "1x(2d) == 2x(d)"; on a straight field that's free and buys fast K=1 sampling.
+  #   The action head instead models p(action | context) — a DISTRIBUTION over BEHAVIOR, genuinely MULTIMODAL
+  #   (the bimodal sampler's two thrust basins). There the field must CURVE to route different noise to
+  #   different modes, so 1x(2d) and 2x(d) land in DIFFERENT places: the single straight step lands BETWEEN
+  #   the modes (the mean), the two smaller steps follow the curve toward a mode. Forcing them equal then
+  #   (a) COLLAPSES the modes toward the mean (loses multimodality) and (b) is a self-referential bootstrap
+  #   (target = the model's own chained steps, stop-grad) with no ground-truth anchor -> trained POST-HOC on
+  #   the frozen trunk it RAN AWAY (val 0.004 -> 8.8e6 -> ~1e22, NaN). shortcut=false (K-step ODE integration)
+  #   is stable AND faithful — it samples BOTH basins (W1 ~0.1 vs diverged/NaN). The lost speedup is
+  #   irrelevant: a 2-D action integrated over a few ODE steps is ~free (vs the WM, sampled in-rollout + in
+  #   MPPI thousands of times, where K=1 matters). train_action_model defaults this false for the post-hoc
+  #   path; override with ++model.action_head.shortcut=true only to reproduce the divergence.
   detach_gradient: false    # LOCKED false (user, 2026-07-21): NEVER set true. detach_gradient=true DESTABILIZED
   #                           the action flow — it exploded to ~1e22 (vit-mse run) and even when finite HURT OOD
   #                           (unetflow pointwise 1.13 vs 0.36 baseline). false = gradient flows into the trunk
