@@ -127,10 +127,13 @@ def log_torus_paths(writer, routine, i, *, env, R, r, coloring, ctx_xyz, true_xy
     launch state so truth and prediction branch from the same anchor. actions: applied actions along the
     true path (len == context+branch). The two branches fork at step P. The video frames come from
     `env.render_diagnostics` (a {true, pred} SceneOverlay); returns False without emitting anything when
-    the env declined the scene (returned {}) so the caller can fall back to the render_obs filmstrip."""
+    the env declined the scene (returned {}) so the caller can fall back to the render_obs filmstrip.
+    The torus-only extras — ambient-action arrows, the `trajectory_plot_i` atlas PNG and the scene JSON —
+    are gated on R/r being present; a generic env (R=r=None) emits only the diagnostics video."""
     true_full = np.concatenate([ctx_xyz, true_xyz[1:]], axis=0)
     pred_full = np.concatenate([ctx_xyz, pred_xyz[1:]], axis=0)
-    avec = viz.action_ambient(true_full, actions, R, r)
+    is_torus = R is not None and r is not None
+    avec = viz.action_ambient(true_full, actions, R, r) if is_torus else None
     overlay = SceneOverlay(agents={"true": true_full, "pred": pred_full},
                            extras=dict(coloring=coloring, avec=avec, fork_step=int(P),
                                        n_frames=len(true_full), title=title,
@@ -138,20 +141,23 @@ def log_torus_paths(writer, routine, i, *, env, R, r, coloring, ctx_xyz, true_xy
     vids = env.render_diagnostics(overlay, ["scene"])
     if not vids:
         return False
-    trajs = [{"xyz": ctx_xyz, "color": "lightgray", "start_sphere": True, "end_sphere": False,
-              "start_scale": 0.5, "marker_color": "black"},
-             {"xyz": true_xyz, "color": "black", "start_sphere": False, "end_sphere": True},
-             {"xyz": pred_xyz, "color": "dimgray", "start_sphere": False, "end_sphere": True}]
-    fp = viz.fig_torus_atlas(R, r, trajs=trajs, coloring=coloring, title=title,
-                             view_pad=viz.EVAL_VIEW_PAD, torus_opacity=viz.TORUS_OPACITY)
-    writer.figure(product_tag(routine, "trajectory_plot", i=i), fp, step); plt.close(fp)
+    if is_torus:
+        trajs = [{"xyz": ctx_xyz, "color": "lightgray", "start_sphere": True, "end_sphere": False,
+                  "start_scale": 0.5, "marker_color": "black"},
+                 {"xyz": true_xyz, "color": "black", "start_sphere": False, "end_sphere": True},
+                 {"xyz": pred_xyz, "color": "dimgray", "start_sphere": False, "end_sphere": True}]
+        fp = viz.fig_torus_atlas(R, r, trajs=trajs, coloring=coloring, title=title,
+                                 view_pad=viz.EVAL_VIEW_PAD, torus_opacity=viz.TORUS_OPACITY)
+        writer.figure(product_tag(routine, "trajectory_plot", i=i), fp, step); plt.close(fp)
     for view, frames in vids.items():   # "scene" keeps the canonical tag; extra views get suffixed
         writer.video(product_tag(routine, "trajectory_video" if view == "scene" else f"trajectory_video_{view}",
                                  i=i), frames, fps, step)
-    writer.scene(product_tag(routine, "trajectory_video", i=i),
-                 torus_scene(R, r, description=description, true_path_xyz=true_full, predicted_path_xyz=pred_full,
-                             fork_step_index=int(P),
-                             action_arrow_per_step={"origins_xyz": true_full[:len(avec)], "vectors_xyz": avec}), step)
+    if is_torus:
+        writer.scene(product_tag(routine, "trajectory_video", i=i),
+                     torus_scene(R, r, description=description, true_path_xyz=true_full,
+                                 predicted_path_xyz=pred_full, fork_step_index=int(P),
+                                 action_arrow_per_step={"origins_xyz": true_full[:len(avec)],
+                                                        "vectors_xyz": avec}), step)
     return True
 
 

@@ -16,8 +16,9 @@ OPTIONAL hook, so `log_env_capabilities` reports all ✓ and the whole pipeline 
   OPTIONAL  rollout_metrics     : angle_error (wrapped |theta_pred - theta_true|) + the generic pointwise L2.
             checkpoint_metric   : "angle_error" — train.py selects best.ckpt on the pendulum-meaningful metric.
             control_goals       : 4 named TARGET tip points (upright/right/down/left) in the world plane.
-            render_diagnostics  : draws the world plane — pivot, rod(s), overlay agent tip-paths + goal
-                                  markers — one "scene" view (matplotlib, ROLE_STYLE-colored).
+            render_diagnostics  : the rollout on the pendulum's OWN view — pivot + one swinging rod per
+                                  overlay agent + faint goal target rods — one "scene" view
+                                  (matplotlib, ROLE_STYLE-colored).
             physical_loss       : analytic residuals (off-unit-circle, energy drift beyond torque work,
                                   kinematic continuity) for the physical_loss training variation.
             POLICIES            : env-shipped datagen behavior policies — swingup (bang-bang energy
@@ -257,11 +258,13 @@ class PendulumEnv:
         return out
 
     def render_diagnostics(self, overlay, views) -> dict:
-        """OPTIONAL rich diagnostic renderer (WorldEnv protocol): draw the pendulum's 2-D world plane —
-        the pivot, each overlay agent's CURRENT rod + its tip PATH so far (roles styled via
-        base.ROLE_STYLE: true/oracle black, pred/learned grey), and goal MARKERS as gold rings. ONE view
-        is offered — "scene"; other view names are ignored ({} when nothing to draw, so callers fall
-        back to the render_obs filmstrip).
+        """OPTIONAL rich diagnostic renderer (WorldEnv protocol): the rollout on the pendulum's OWN
+        view — the same world plane `render_obs` draws, with the overlay's rods laid over one another.
+        Per frame t: the pivot, one rod per overlay agent at its step-t angle (recovered from the path
+        via `_tip_path`; roles styled via base.ROLE_STYLE: true/oracle black, pred/learned grey — the
+        diagnostic IS watching the pred rod track or drift from the true one), and each goal MARKER as
+        a faint dashed target rod. ONE view is offered — "scene"; other view names are ignored ({} when
+        nothing to draw, so callers fall back to the render_obs filmstrip).
 
         overlay.agents paths arrive in either of the two (T, 3) forms the pipeline produces, detected by
         the z column (see `_tip_path`): raw obs rows [cos, sin, theta_dot] (the generic obs[..., :3]
@@ -289,13 +292,14 @@ class PendulumEnv:
             ax.set_xlim(-span, span), ax.set_ylim(-span, span)
             ax.set_aspect("equal"), ax.set_xticks([]), ax.set_yticks([])
             ax.set_title(str(ex.get("title", "")), fontsize=9)
-            for role, pts in markers.items():                          # goal markers: gold rings
+            for role, pts in markers.items():                          # goal markers: faint target rods
                 color = ROLE_STYLE.get(role, {"color": "gold"})["color"]
-                ax.scatter(pts[:, 0], pts[:, 1], s=140, facecolors="none", edgecolors=color, linewidths=2.0)
-            for role, tips in agents.items():                          # each agent: path-so-far + current rod
+                for gx, gy in pts:
+                    ax.plot([0.0, gx], [0.0, gy], color=color, lw=2.0, ls="--", alpha=0.4)
+                    ax.plot(gx, gy, "o", color=color, ms=5, alpha=0.4)
+            for role, tips in agents.items():                          # one swinging rod per agent
                 color = ROLE_STYLE.get(role, {"color": "dimgray"})["color"]
                 k = min(t, len(tips) - 1)
-                ax.plot(tips[: k + 1, 0], tips[: k + 1, 1], color=color, lw=1.0, alpha=0.6)
                 ax.plot([0.0, tips[k, 0]], [0.0, tips[k, 1]], color=color, lw=3.0, label=role)
                 ax.plot(tips[k, 0], tips[k, 1], "o", color=color, ms=5)
             ax.plot(0.0, 0.0, "o", color="black", ms=6)                # the pivot
