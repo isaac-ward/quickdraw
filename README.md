@@ -7,7 +7,7 @@ A world-models shoot-out. Needs an NVIDIA GPU + the NVIDIA Container Toolkit.
 Bring the container up and shell in:
 
 ```bash
-# copy the keys template and set WANDB_API_KEY
+# copy the keys template and set the key values
 cp .env.template .env
 # build the image and start the container (idle)
 docker compose up -d --build
