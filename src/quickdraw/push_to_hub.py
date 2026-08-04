@@ -21,6 +21,14 @@ def _make_card(root: str, name: str) -> str:
     """Build a dataset card (README.md) from the run's own summary.json: YAML frontmatter with a HF
     viewer `configs` block (so each split's parquet is browsable) + a human-readable description."""
     s = json.load(open(os.path.join(root, "summary.json")))
+    if s.get("dataset_kind") == "robocasa_scene4_certified_clutter":
+        readme = os.path.join(root, "README.md")
+        if not os.path.exists(readme):
+            raise FileNotFoundError(
+                "The RoboCasa package is not finalized: README.md is missing."
+            )
+        with open(readme) as stream:
+            return stream.read()
     counts, split_env, coloring = s["counts"], s["split_env"], s["coloring"]
     splits = list(counts)
     action_sampler = s.get("action_sampler", "ornstein_uhlenbeck")
@@ -98,8 +106,12 @@ def main(cfg):
     private = bool(hub.get("private", False))   # PUBLIC by default; +hub.private=true to keep private
     repo_id = f"{namespace}/{name}"
 
+    # Build the card before opening README.md for writing. RoboCasa packages
+    # preserve their prebuilt card, so opening first would truncate the very
+    # file that _make_card() needs to read.
+    card = _make_card(root, name)
     with open(os.path.join(root, "README.md"), "w") as f:  # dataset card -> uploaded with the folder
-        f.write(_make_card(root, name))
+        f.write(card)
     api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
     # delete_patterns="*" -> a CLEAN reupload: every remote file not in this upload is removed in the same
     # commit, so a regenerated dataset fully replaces the old one (no stale splits/media left behind).
