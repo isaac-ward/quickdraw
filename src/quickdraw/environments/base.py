@@ -69,6 +69,10 @@ class WorldEnv(Protocol):
                               (fallback: render_obs filmstrip; see `wants_diagnostics`).
       control_goals        -- world goal points             -> unlocks the goal-reaching control eval
                               (fallback: REWARD-ONLY control, maximize env.reward(obs, None)).
+      fork                 -- batched state fork            -> unlocks the goal-race ORACLE's true-dynamics
+                              planner (fallback: per-candidate deepcopy forks, slower).
+      goal_point           -- obs -> goal-space world point -> how the control eval measures "at the goal"
+                              (fallback: obs[..., :3], the torus convention).
       physical_loss        -- analytic physics residuals    -> unlocks the physical_loss training variation
                               (fallback: the variation skips itself).
       POLICIES             -- name -> factory(env, device)  -> unlocks env-shipped datagen behavior policies
@@ -97,6 +101,17 @@ class WorldEnv(Protocol):
     # batch/n_goals/generator let a future env sample per-episode goals; torus ignores them (its
     # per-episode goal subsetting lives in run_control, unchanged).
     def control_goals(self, batch: int, n_goals: int, generator=None, device=None): ...
+
+    # OPTIONAL — batched STATE FORK for the goal-race oracle (controller.mppi._true_rollout_fn): return a
+    # NEW env of batch B*k whose state is this env's current state repeat_interleaved k times (candidate k
+    # of episode g at row g*k + k). Envs without it fall back to per-candidate deepcopy forks (the
+    # reward-only oracle's mechanism) — correct but slower.
+    def fork(self, k: int) -> "WorldEnv": ...
+
+    # OPTIONAL — map obs -> the WORLD POINT compared against `control_goals` targets (settle/advance
+    # distance in the control eval). Default (envs that omit it): obs[..., :3] — the torus convention,
+    # where the first three obs channels ARE the ambient position. Pendulum maps obs -> rod tip.
+    def goal_point(self, obs: Tensor) -> Tensor: ...
 
     # OPTIONAL — dimensionless analytic physics residuals {name: per-element Tensor} of a PHYSICAL-units obs
     # batch/rollout (torus: off-surface distance, normal velocity, kinematic continuity). Consumed by the

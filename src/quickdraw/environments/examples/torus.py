@@ -5,8 +5,8 @@ protocol (or one of its documented optional hooks). Copy this file to build your
 torus-specific math (geometry, rollout errors, config dataclass, action samplers, color ground
 truth) lives in `environments/torus_utils.py` — an env is the CONTRACT; utilities live elsewhere.
 
-For a second, more minimal example see `environments/examples/pendulum.py` (reward-only, no
-diagnostics). For wrapping an existing gymnasium.Env instead, see `environments/gym_adapter.py`.
+For a second full-contract example see `environments/examples/pendulum.py` (a batched pendulum that
+also implements every optional hook). For wrapping an existing gymnasium.Env, see `environments/gym_adapter.py`.
 """
 
 from __future__ import annotations
@@ -113,6 +113,18 @@ class TorusEnv:
     # goal subsetting/ordering (unchanged); envs without goals return None -> reward-only control.
     def control_goals(self, batch: int = 0, n_goals: int = 0, generator=None, device=None):
         return control_goals(self.cfg.R, self.cfg.r, device=device)
+
+    # OPTIONAL WorldEnv state fork (base.py): a fresh env of batch B*k with this env's state
+    # repeat_interleaved k times — the goal-race oracle's planner (controller.mppi._true_rollout_fn).
+    # EXACTLY the fork that function always inlined (same construction + repeat_interleave order), so the
+    # torus oracle rollout is byte-identical.
+    def fork(self, k: int) -> "TorusEnv":
+        sim = TorusEnv(self.cfg, batch=self.batch * k, device=self.device)
+        sim.theta = self.theta.repeat_interleave(k)
+        sim.phi = self.phi.repeat_interleave(k)
+        sim.theta_dot = self.theta_dot.repeat_interleave(k)
+        sim.phi_dot = self.phi_dot.repeat_interleave(k)
+        return sim
 
     # train.py monitors this rollout metric for best.ckpt (WorldEnv default: pointwise_error).
     checkpoint_metric = "manifold_distance_error"

@@ -191,6 +191,20 @@ class PendulumEnv:
         l = self.cfg.l
         return torch.stack((l * obs[..., 1], l * obs[..., 0], torch.zeros_like(obs[..., 0])), dim=-1)
 
+    # OPTIONAL WorldEnv hook (base.py): the control eval's obs -> goal-space point map (settle/advance
+    # distance to `control_goals` targets). For the pendulum that map IS the tip point.
+    goal_point = tip_point
+
+    def fork(self, k: int) -> "PendulumEnv":
+        """OPTIONAL WorldEnv state fork (base.py): a fresh env of batch B*k with this env's current state
+        repeat_interleaved k times — the goal-race oracle's true-dynamics planner forks the live env with
+        this (candidate k of episode g at row g*k + k), exactly like the torus."""
+        sim = PendulumEnv(self.cfg, batch=self.batch * k, device=self.device)
+        sim.theta = self.theta.repeat_interleave(k)
+        sim.theta_dot = self.theta_dot.repeat_interleave(k)
+        sim._torque = self._torque.repeat_interleave(k)
+        return sim
+
     def rollout_metrics(self, pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]:
         """WorldEnv val rollout metrics, elementwise over leading dims ((N, H, 3) -> (N, H) curves,
         consumed by openloop/lit): the env-specific `angle_error` — the WRAPPED absolute angle gap

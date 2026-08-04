@@ -18,6 +18,10 @@ def env_cfg(cfg):
     e = cfg.environments
     if str(e.get("name", "torus_world")).lower() in ("torus_world", "torus", "torusworld-v0"):
         return TorusConfig(R=e.R, r=e.r, dt=e.dt, gamma=e.gamma, a_max=e.a_max, init_speed=e.init_speed, mass=e.mass)
+    if str(e.name).lower() == "pendulum":
+        from ..environments.examples.pendulum import PendulumConfig
+        return PendulumConfig(dt=float(e.dt), max_torque=float(e.max_torque), g=float(e.g),
+                              m=float(e.m), l=float(e.l))
     if str(e.name).lower() == "recorded":
         from ..environments.recorded import RecordedConfig
         return RecordedConfig(obs_dim=int(e.obs_dim), action_dim=int(e.action_dim), dt=float(e.dt))

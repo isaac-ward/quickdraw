@@ -53,12 +53,16 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
     if img_head is not None:                       # only render FPV when there's a real image head
         img_size = next((mod.ae.cfg.img_size for mod in core.modalities.values() if hasattr(mod, "ae")), 128)
-        try:
-            coloring = json.load(open(os.path.join(cfg.data.root, "dataset_card.json"))).get("coloring", {}).get("train", "rainbow")
-        except OSError:
-            coloring = "rainbow"
-        fpv = {"coloring": coloring, "fov": float(cfg.data.fpv_fov), "size": int(img_size)}
-        _plog(writer, f"[eval_control @ep{step}] multimodal: FPV render in the MPPI loop (coloring={coloring}, size={img_size})")
+        if hasattr(ecfg, "R"):                     # torus: the FPVRenderer fast path (parity-critical, unchanged)
+            try:
+                coloring = json.load(open(os.path.join(cfg.data.root, "dataset_card.json"))).get("coloring", {}).get("train", "rainbow")
+            except OSError:
+                coloring = "rainbow"
+            fpv = {"coloring": coloring, "fov": float(cfg.data.fpv_fov), "size": int(img_size)}
+            _plog(writer, f"[eval_control @ep{step}] multimodal: FPV render in the MPPI loop (coloring={coloring}, size={img_size})")
+        else:                                      # generic env: mppi falls back to env.render_obs in the loop
+            fpv = {"size": int(img_size)}
+            _plog(writer, f"[eval_control @ep{step}] multimodal: in-loop image context via env.render_obs (size={img_size})")
 
     # language steering: request + reward head -> the LEARNED controller maximizes R(latent, request) with the
     # oracle OFF (a single controller, same code spine). Otherwise the default dual goal race (oracle vs learned).
@@ -92,7 +96,9 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     # TRUE env's reward. Torus: TorusEnv.reward == the old inline goal cost, so torus numbers are unchanged;
     # a generic env brings its own reward. Shaping knobs bound only when the env's reward exposes them.
     mppi_cfg = MPPIConfig(**mppi_kwargs)
-    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, mppi_cfg.n_episodes, device)
+    env_factory = lambda: make_env(cfg.environments.get("name", "torus_world"), cfg.environments,
+                                   mppi_cfg.n_episodes, device)
+    env = env_factory()
     knobs = {k: getattr(mppi_cfg, k) for k in ("beta_vel", "r_settle")
              if k in inspect.signature(env.reward).parameters}
     reward_fn = functools.partial(env.reward, **knobs)
@@ -117,7 +123,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     res, _ = run_control(model, normalizer, ecfg, mppi_cfg, device=device,
                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv,
                          reward=reward, request=request, requests=requests, oracle=(reward is None), n_plot=n_plot,
-                         reward_fn=reward_fn)
+                         reward_fn=reward_fn, env=env, env_factory=env_factory)
     t_ctrl = time.perf_counter() - t
     # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers the controller(s) + chunk
     # execution over n_chunks replans, so per-chunk wall time = t_ctrl / n_chunks.
@@ -125,7 +131,8 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     mppi_chunk_hz = 1.0 / mppi_chunk_s if mppi_chunk_s > 0 else 0.0
     _plog(writer, f"[eval_control @ep{step}] MPPI done: {res['n_chunks']} replans over {res['n_steps']} steps "
                   f"-> {mppi_chunk_s * 1000:.0f} ms/chunk ({mppi_chunk_hz:.1f} hz)")
-    R, r, fps = ecfg.R, ecfg.r, round(1.0 / ecfg.dt)
+    R, r = getattr(ecfg, "R", None), getattr(ecfg, "r", None)   # torus geometry; None for a generic env
+    fps = round(1.0 / ecfg.dt)
     from ..evaluation.products import log_image_head, product_tag
 
     # controllers present: 'pred' (learned) always; 'true' (oracle) only in the goal race (oracle on).
@@ -144,23 +151,27 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     combined_agents = []                        # (language) one pred agent per episode -> ALL on ONE torus (combined)
     for i in range(NP):
         ti = time.perf_counter()
-        agents = [_agent(res[k], i, colors[k], R, r) for k in kinds]
+        agents = [_agent(res[k], i, colors[k], R, r) for k in kinds] if R is not None else []
         req_i = ep_requests[i] if ep_requests else request
-        nf = len(agents[0]["path"])
+        nf = len(agents[0]["path"]) if agents else len(res[kinds[0]]["paths"][i])
         _plog(writer, f"[eval_control @ep{step}] rendering control video #{i} ({nf} frames, GPU/EGL)...")
         vtitle = (f'"{req_i}"' if reward is not None else f"control: true vs pred #{i}")
         vids = {}
         if wants_diagnostics(env):   # rich scene via the env's diagnostic renderer (Phase 4.2/5 overlay:
             # agents={true,pred} paths, markers={goal}; torus draws it byte-identical to the legacy viz call).
             # Language mode has no target -> no goal marker -> no goal ring.
+            extras = (dict(coloring="hsv", n_frames=nf, title=vtitle,
+                           avecs={k: a["avec"] for k, a in zip(kinds, agents)},
+                           goal_seqs={k: res[k]["goal_seqs"][i] for k in kinds},
+                           fan_seq=res["fan_seqs"][i],  # pred's MPPI candidate fan, colored by score
+                           reuse=bool(cfg.control.get("reuse_render", False)),
+                           log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}"))
+                      if R is not None else            # generic env: no torus presentation hints
+                      dict(n_frames=nf, title=vtitle,
+                           log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}")))
             overlay = SceneOverlay(agents={k: res[k]["paths"][i] for k in kinds},
                                    markers=({"goal": res["pred"]["goal_seqs"][i]} if reward is None else {}),
-                                   extras=dict(coloring="hsv", n_frames=nf, title=vtitle,
-                                               avecs={k: a["avec"] for k, a in zip(kinds, agents)},
-                                               goal_seqs={k: res[k]["goal_seqs"][i] for k in kinds},
-                                               fan_seq=res["fan_seqs"][i],  # pred's MPPI candidate fan, colored by score
-                                               reuse=bool(cfg.control.get("reuse_render", False)),
-                                               log=lambda m, i=i: _plog(writer, f"[eval_control @ep{step}]   video #{i} {m}")))
+                                   extras=extras)
             vids = env.render_diagnostics(overlay, ["scene"])
         if vids:
             for view, fr in vids.items():   # "scene" keeps the canonical tag; extra views get suffixed
@@ -182,15 +193,16 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
                       f"Dual MPPI control on the torus (episode {i}): a BLACK oracle agent (true dynamics) and a "
                       f"GREY learned-model agent, each navigating to a sequence of goals. Each goal is a RING zone "
                       f"on the surface; the action arrow per step is the applied control.")
-        writer.scene(product_tag("eval_control", "control_video", i=i), {
-            "description": scene_desc,
-            "coordinate_system": "world xyz, same space as the torus",
-            "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
-            "goal_zone_ring_radius": float(0.0675 * (R + r)),
-            "agents": [{"name": labels[k], "color": a["color"], "path_xyz": a["path"], "goal_per_step_xyz": a["goal_seq"],
-                        "action_arrow_per_step": {"origins_xyz": a["path"], "vectors_xyz": a["avec"]}}
-                       for k, a in zip(kinds, agents)],
-        }, step)
+        if R is not None:   # the scene JSON is torus-specific (worded + R/r geometry); generic envs skip it
+            writer.scene(product_tag("eval_control", "control_video", i=i), {
+                "description": scene_desc,
+                "coordinate_system": "world xyz, same space as the torus",
+                "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
+                "goal_zone_ring_radius": float(0.0675 * (R + r)),
+                "agents": [{"name": labels[k], "color": a["color"], "path_xyz": a["path"], "goal_per_step_xyz": a["goal_seq"],
+                            "action_arrow_per_step": {"origins_xyz": a["path"], "vectors_xyz": a["avec"]}}
+                           for k, a in zip(kinds, agents)],
+            }, step)
 
         # (MM) predictor-in-the-loop video: the model's imagined FPV for the SELECTED plan vs the actual FPV.
         if res.get("pred_fpv_videos") is not None:

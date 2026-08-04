@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from ..environments.examples.torus import TorusEnv
-from ..environments.torus_utils import TorusConfig, control_goals
+from ..environments.torus_utils import control_goals
 
 
 @dataclass
@@ -63,10 +63,10 @@ def _mppi_step(rollout_fn, mean, goal, mppi, a_max, g, reward_fn=None):
     and the first action (G,2). rollout_fn(cand) -> (p_xyz, v_xyz, dist): dist is a per-step distance
     override (G,K,H) for the language reward, or None -> score with reward_fn (the env's reward). _score
     applies the same velocity/control shaping either way."""
-    G, H = mean.shape[0], mppi.horizon
+    G, H, A = mean.shape[0], mppi.horizon, mean.shape[-1]      # A: env action_dim (torus: 2, unchanged)
     K = mppi.num_samples
-    noise = torch.randn(G, K, H, 2, device=mean.device, generator=g) * mppi.noise_sigma
-    cand = (mean[:, None] + noise).clamp(-a_max, a_max)        # (G,K,H,2)
+    noise = torch.randn(G, K, H, A, device=mean.device, generator=g) * mppi.noise_sigma
+    cand = (mean[:, None] + noise).clamp(-a_max, a_max)        # (G,K,H,A)
     p_xyz, v_xyz, dist = rollout_fn(cand)                     # dist: per-step (G,K,H) override, or None
     ret = _score(p_xyz, v_xyz, cand, goal, mppi, dist=dist, reward_fn=reward_fn)   # (G,K) higher = better
     w = torch.softmax(ret / max(mppi.lambda_, 1e-6), dim=1)   # (G,K)
@@ -74,18 +74,21 @@ def _mppi_step(rollout_fn, mean, goal, mppi, a_max, g, reward_fn=None):
     return new_mean, new_mean[:, 0], p_xyz, ret               # p_xyz/ret expose the candidate fan
 
 
-def _true_rollout_fn(env: TorusEnv, cfg: TorusConfig, device):
-    """Roll candidate action sequences through the TRUE dynamics from env's current state."""
-    def fn(cand):                                             # cand: (G,K,H,2)
+def _true_rollout_fn(env):
+    """Roll candidate action sequences through the TRUE dynamics from env's current state. Env-agnostic:
+    the state fork goes through the env's OPTIONAL `fork(k)` hook (base.py) — a batch-(G*K) copy with each
+    state repeat_interleaved K times. TorusEnv.fork reproduces the exact fork this function always inlined,
+    so the torus oracle rollout is byte-identical. Envs without `fork` fall back to per-candidate deepcopy
+    forks (the reward-only oracle's mechanism, _true_rollout_obs_fn)."""
+    def fn(cand):                                             # cand: (G,K,H,A)
         G, K, H = cand.shape[:3]
-        sim = TorusEnv(cfg, batch=G * K, device=device)
-        sim.theta = env.theta.repeat_interleave(K)
-        sim.phi = env.phi.repeat_interleave(K)
-        sim.theta_dot = env.theta_dot.repeat_interleave(K)
-        sim.phi_dot = env.phi_dot.repeat_interleave(K)
-        a = cand.reshape(G * K, H, 2)
-        obs = torch.stack([sim.step(a[:, h]) for h in range(H)], dim=1)   # (G*K,H,6)
-        obs = obs.view(G, K, H, 6)
+        if hasattr(env, "fork"):
+            sim = env.fork(K)
+            a = cand.reshape(G * K, H, cand.shape[-1])
+            obs = torch.stack([sim.step(a[:, h]) for h in range(H)], dim=1)   # (G*K,H,obs_dim)
+            obs = obs.view(G, K, H, obs.shape[-1])
+        else:
+            obs = _true_rollout_obs_fn(env)(cand)             # (G,K,H,obs_dim) via deepcopy forks
         return obs[..., :3], obs[..., 3:], None               # dist=None -> goal distance (true dynamics = oracle only)
     return fn
 
@@ -95,22 +98,25 @@ def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa, img_head, dist
     context is encoded ONCE and shared across the K candidates (imagine_shared). Returns (p_xyz, v_xyz, dist):
     dist = dist_bag(rolled latent bag) is a per-step (G,K,H) distance for the learned-reward objective
     (1 - reward), else None (goal-distance). Either way _score applies its velocity/control shaping."""
-    def fn(cand):                                           # cand: (G,K,H,2)
-        G, K, H = cand.shape[:3]
-        ctx = {"proprio": normalizer.norm_obs(ctx_pro)}                      # (G,p,6)
+    def fn(cand):                                           # cand: (G,K,H,A)
+        G, K, H, A = cand.shape
+        ctx = {"proprio": normalizer.norm_obs(ctx_pro)}                      # (G,p,obs_dim)
         if img_head is not None:
             ctx[img_head] = ctx_fpv                                          # (G,p,s,s,3) rendered FPV context
-        paK = pa[:, None].expand(G, K, pa.shape[1], 2).reshape(G * K, pa.shape[1], 2)
-        actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, 2)], dim=1))  # (G*K, p-1+H, 2)
+        paK = pa[:, None].expand(G, K, pa.shape[1], A).reshape(G * K, pa.shape[1], A)
+        actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, A)], dim=1))  # (G*K, p-1+H, A)
         out = model.imagine_shared(ctx, actK, H, K, heads=["proprio"], return_bag=(dist_bag is not None))
-        pr = normalizer.denorm_obs(out["proprio"]).view(G, K, H, 6)
+        pr = normalizer.denorm_obs(out["proprio"]).view(G, K, H, -1)
         dist = dist_bag(out["_bag"].view(G, K, H, -1)) if dist_bag is not None else None   # (G,K,H) reward distance
         return pr[..., :3], pr[..., 3:], dist
     return fn
 
 
-def _init_controller(cfg, B, device, seed):
-    env = TorusEnv(cfg, batch=B, device=device)
+def _init_controller(cfg, B, device, seed, env_factory=None):
+    """One controller's live env + logs. env_factory (the real env's factory, e.g. registry.make_env bound
+    to the run's config) makes this env-agnostic; None keeps the legacy TorusEnv(cfg) construction. Either
+    way the reset seed is the same, so the torus race inits are byte-identical."""
+    env = env_factory() if env_factory is not None else TorusEnv(cfg, batch=B, device=device)
     env.reset(torch.Generator(device=device).manual_seed(seed))
     return {"env": env, "obs": [env.observe()], "act": [],
             "gidx": torch.zeros(B, dtype=torch.long, device=device),
@@ -118,9 +124,11 @@ def _init_controller(cfg, B, device, seed):
 
 
 @torch.no_grad()
-def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, device="cpu", log=None, fpv=None,
-                reward=None, request=None, oracle=True, n_plot=1, requests=None, reward_fn=None):
-    """MPPI control on the torus. Default: race the oracle (true dynamics) vs the learned model through
+def run_control(model, normalizer, env_cfg, mppi: MPPIConfig, device="cpu", log=None, fpv=None,
+                reward=None, request=None, oracle=True, n_plot=1, requests=None, reward_fn=None,
+                env=None, env_factory=None):
+    """MPPI GOAL-RACE control (torus: byte-identical to the legacy torus-only version). Default: race the
+    oracle (true dynamics) vs the learned model through
     spatial goals. `oracle=False` -> learned controller only (same code spine). `reward` (a
     language.reward.LanguageReward) + `request` -> the learned controller maximizes R(latent, request)
     instead of reaching goals: goal advancement is OFF and each controller's `dist_curve` holds the realized
@@ -128,20 +136,33 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     n_plot: render per-episode products (paths/fan/FPV) for the first n_plot of the n_episodes parallel
     episodes (all run in ONE batched rollout; n_plot only controls how many we keep for visuals).
     reward_fn(obs, goal) -> per-step (…,) reward: the env-agnostic MPPI scorer (WorldEnv.reward), used by
-    BOTH controllers; None -> the true env's reward with the config's beta_vel/r_settle (torus default)."""
+    BOTH controllers; None -> the true env's reward with the config's beta_vel/r_settle (torus default).
+    env (the run's live WorldEnv) + env_factory (fresh batch-B instances for the controllers) make this
+    env-agnostic: goals come from env.control_goals, the oracle forks the real env (env.fork), and a
+    generic image-head env renders its in-loop image context via env.render_obs. Both None (legacy torus
+    callers) -> the exact torus-only construction (TorusEnv + module-level control_goals), unchanged."""
     core = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
     use_fpv = img_head is not None and fpv is not None                     # render FPV in the loop ONLY with a real image head
     from ..logging import viz
-    fpv_rend = viz.FPVRenderer(env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"]) if use_fpv else None
+    # The torus in-loop FPV FAST PATH (parity-critical — render_obs would change torus control scalars):
+    # kept whenever the env cfg carries the torus geometry. A generic env falls back to env.render_obs.
+    fpv_rend = viz.FPVRenderer(env_cfg.R, env_cfg.r, fpv["coloring"], fpv["fov"], fpv["size"]) \
+        if (use_fpv and hasattr(env_cfg, "R")) else None
 
-    def _fpv(states):                                   # (B,6) -> (B,s,s,3) [0,1] on device (persistent plotter)
-        return torch.from_numpy(fpv_rend.render(states.detach().cpu().numpy())).float().div_(255.0).to(device)
-    goals = control_goals(env_cfg.R, env_cfg.r, device=device)
+    def _fpv(states):                                   # (B,obs_dim) -> (B,s,s,3) [0,1] on device
+        if fpv_rend is not None:                        # torus: persistent FPV plotter (unchanged)
+            return torch.from_numpy(fpv_rend.render(states.detach().cpu().numpy())).float().div_(255.0).to(device)
+        return env.render_obs(states).to(device).float().div_(255.0)   # generic: the env's image modality
+    goals = (env.control_goals(mppi.n_episodes, mppi.n_goals, None, device) if env is not None
+             else control_goals(env_cfg.R, env_cfg.r, device=device))   # torus env returns the SAME 8 goals
     names = [n for n, _ in goals]
     n_goals = min(mppi.n_goals, len(goals))                   # visit this many per episode (subset of the 8)
-    tgt = torch.stack([p for _, p in goals]).to(device)       # (8,3) all goal points
-    B, P, H, a_max = mppi.n_episodes, model.window, mppi.horizon, env_cfg.a_max
+    tgt = torch.stack([p for _, p in goals]).to(device)       # (n,3) all goal points
+    B, P, H = mppi.n_episodes, model.window, mppi.horizon
+    a_max = getattr(env, "a_max", None) if env is not None else None    # TorusEnv carries it on cfg only
+    a_max = env_cfg.a_max if a_max is None else float(a_max)
+    A = int(env.action_dim) if env is not None else 2         # env action_dim (torus: 2, unchanged)
     NP = max(1, min(n_plot, B))                               # episodes to keep per-episode visuals for
     g = torch.Generator(device=device).manual_seed(0)         # candidate-noise stream
     # per episode: a random n_goals-subset of the 8 goals, in random order (variety across episodes)
@@ -163,13 +184,13 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     # settles ON red instead of orbiting it, and the "score" reads as a distance (0 = perfectly red).
     dist_bag = (lambda bag: 1.0 - reward.score(bag, t_e)) if reward is not None else None   # (G,K,H,D)->(G,K,H)
     kinds = ["true", "pred"] if oracle else ["pred"]          # oracle=False -> learned controller only (same spine)
-    ctrls = {k: _init_controller(env_cfg, B, device, 2) for k in kinds}
+    ctrls = {k: _init_controller(env_cfg, B, device, 2, env_factory) for k in kinds}
     if reward_fn is None:   # default scorer: the TRUE env's reward with the config's shaping knobs
         reward_fn = lambda o, gl: ctrls[kinds[0]]["env"].reward(o, gl, beta_vel=mppi.beta_vel,
                                                                 r_settle=mppi.r_settle)
     arange = torch.arange(B, device=device)
     for c in ctrls.values():
-        c["mean"] = torch.zeros(B, H, 2, device=device)
+        c["mean"] = torch.zeros(B, H, A, device=device)
         c["done_step"] = torch.full((B,), -1, dtype=torch.long, device=device)
         c["dist_log"] = []  # per executed step: distance to current goal, OR (reward mode) the realized reward
     if use_fpv and "pred" in ctrls:   # learned controller needs the FPV context (proprio comes from the env)
@@ -196,12 +217,12 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
             cur = tgt[order[arange, c["gidx"].clamp(max=n_goals - 1)]]
             if kind == "pred":
                 ctx = torch.stack(c["obs"][-P:], dim=1)
-                pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, 2, device=device)
+                pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, A, device=device)
                 ctx_fpv = torch.stack(c["fpv"][-P:], dim=1) if use_fpv else None   # (B,p,s,s,3) FPV context, or None (proprio-only)
                 rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa, img_head if use_fpv else None,
                                                dist_bag=dist_bag)   # reward mode -> per-step distance 1-R on the rolled bag
             else:
-                rollout = _true_rollout_fn(c["env"], env_cfg, device)
+                rollout = _true_rollout_fn(c["env"])
             c["plan"], _, p_xyz, ret = _mppi_step(rollout, c["mean"], cur, mppi, a_max, g, reward_fn)
             if kind == "pred":  # per-episode candidate fan, ANCHORED at the current known position: prepend
                 # the dot (last true obs) so the first segment joins where-we-are -> first prediction.
@@ -269,7 +290,8 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                     c["goal_log"].append(new_obs[:, :3].cpu().numpy())          # no target -> mark the agent itself
                 else:                    # goal-reaching control: distance to current goal + advance on settle
                     c["goal_log"].append(cur.cpu().numpy())
-                    d = (new_obs[:, :3] - cur).norm(dim=-1)                      # (B,)
+                    gp = getattr(c["env"], "goal_point", None)                   # optional obs -> goal-space map
+                    d = ((gp(new_obs) if gp is not None else new_obs[:, :3]) - cur).norm(dim=-1)   # (B,)
                     c["dist_log"].append(d.cpu().numpy())
                     c["settle"] = torch.where(d < mppi.tol, c["settle"] + 1, torch.zeros_like(c["settle"]))
                     advance = (c["settle"] >= mppi.settle_steps) & (c["gidx"] < n_goals)
@@ -279,7 +301,7 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
                     c["done_step"] = torch.where(just_done, torch.full_like(c["done_step"], step + 1), c["done_step"])
             step += 1
         for c in ctrls.values():  # warm-start: shift the executed chunk off the plan
-            c["mean"] = torch.cat([c["plan"][:, chunk:], torch.zeros(B, chunk, 2, device=device)], dim=1) * mppi.mean_decay
+            c["mean"] = torch.cat([c["plan"][:, chunk:], torch.zeros(B, chunk, A, device=device)], dim=1) * mppi.mean_decay
         if log is not None and step >= next_log:  # periodic progress (so eval_control time is visible live)
             el = time.perf_counter() - t0
             eta = el / max(1, step) * max(0, mppi.max_steps - step)   # upper bound (may end early once all goals hit)
