@@ -19,7 +19,7 @@ clip, and writes one lerobot dataset per split (parquet vectors + mp4 `observati
 Produces `logs/data_generation_<ts>_$RUN/` — set `DATA=` that path; everything downstream takes
 `data.root=$DATA`. `environments.name` selects the env (torus default); recorded trajectories (no
 simulator) can instead be converted with `recording_to_lerobot` — see
-[docs/byo_environment.md](byo_environment.md).
+[docs/byo.md](byo.md).
 
 ## 2. Push to the Hub
 

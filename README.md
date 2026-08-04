@@ -20,7 +20,7 @@ docker compose exec app bash
 From here, two docs tell you where to go:
 
 - **[docs/workflow.md](docs/workflow.md)** — the full pipeline end-to-end, one `uv run` line per step: generate data → push to the Hub → train the world model → action model → interpret (VLM labeling) → reward model → language control.
-- **[docs/byo_environment.md](docs/byo_environment.md)** — run that same pipeline on your *own* environment: any Gymnasium env (zero code) or a first-class `WorldEnv`.
+- **[docs/byo.md](docs/byo.md)** — run that same pipeline on your *own* environment: recorded data, a required-contract env (or any Gymnasium env, zero code), or a full `WorldEnv`.
 
 ## Supported methods
 
