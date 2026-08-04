@@ -18,7 +18,7 @@ configured environment (`environments.name`, default the torus) with the configu
 clip, and writes one lerobot dataset per split (parquet vectors + mp4 `observation.images.fpv`).
 Produces `logs/data_generation_<ts>_$RUN/` — set `DATA=` that path; everything downstream takes
 `data.root=$DATA`. `environments.name` selects the env (torus default); recorded trajectories (no
-simulator) can instead be converted with `recording_to_lerobot` — see
+simulator) can instead be converted with `data.processors` — see
 [docs/byo.md](byo.md).
 
 ## 2. Push to the Hub

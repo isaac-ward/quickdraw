@@ -91,13 +91,13 @@ def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     video = fpv_dir is not None
-    h, w = (fpv_size, fpv_size) if isinstance(fpv_size, int) else tuple(fpv_size)
     key = f"observation.images.{cam}"
     features = {
         "observation_vector": {"dtype": "float32", "shape": (obs[0].shape[-1],), "names": None},
         "action": {"dtype": "float32", "shape": (act[0].shape[-1],), "names": None},
     }
-    if video:
+    if video:   # vector-only splits pass fpv_dir=None and no fpv_size -> no image feature
+        h, w = (fpv_size, fpv_size) if isinstance(fpv_size, int) else tuple(fpv_size)
         features[key] = {"dtype": "video", "shape": (h, w, 3),
                          "names": ["height", "width", "channels"]}
     ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=root, features=features, use_videos=video)

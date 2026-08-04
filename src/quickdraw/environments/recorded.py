@@ -1,6 +1,6 @@
 """Recorded-data "environment": collected trajectories with NO simulator behind them.
 
-The world model trains purely on the dataset (recording_to_lerobot run folder); there is nothing to
+The world model trains purely on the dataset (data.processors run folder); there is nothing to
 step, reset or render, so those raise. Implements just enough of `WorldEnv` for the training path:
 dims/dt from config, a flat zero `reward`, the generic `rollout_metrics`. No `render_diagnostics`
 -> `wants_diagnostics` is False -> eval-viz falls back to the filmstrip."""

@@ -38,26 +38,41 @@ Every run prints an `[env-contract]` ✓/✗ report to its `progress.log`, so yo
 you're in. Two full-contract reference envs ship in `environments/examples/`: `pendulum.py` and
 `torus.py`; `base.py` is the spec. The three sections below walk up the ladder left-to-right.
 
+**Data source is a separate axis.** *Where* the training data comes from — `data_generation` (the env
+generates it) or a `data/processors.py` processor (an existing dump) — is independent of *which env* you
+provide. The **Recorded data** column is specifically the *no-env* case. If you have pre-generated data
+**and** an env (gym or full), you're in column 2 or 3: skip `data_generation`, point `data.root` at the
+processed dataset, and set `environments.name` to your env — you get that column's **full** evals, trained
+on your own data. (`env = make_env(environments.name)` and the dataset loader are wired independently, so
+nothing requires the data to have come from that env.)
+
 ---
 
 ## 1. Recorded data (no simulator)
 
-You have logged trajectories (states, actions, camera frames) and **no simulator**.
-`recording_to_lerobot.py` converts the dump into the standard lerobot layout, and training routes through
+You have logged trajectories (states, actions, camera frames) and **no simulator**. A **processor** in
+`data/processors.py` fixes up the raw dump into the standard lerobot layout, and training routes through
 `RecordedEnv` (`environments/recorded.py`) — a `WorldEnv` that provides `obs_dim`/`action_dim`/`dt`
 (`conf/environments/recorded.yaml`) and serves camera frames from the dataset, but raises on
 `step`/`reset`/`render_obs` and stubs `reward` to zeros (all `@not_provided`, so the contract report flags
 them ✗):
 
 ```bash
-python -m quickdraw.recording_to_lerobot +recording.dir=<path> +recording.name=<name>
+python -m quickdraw.data.processors +processor=starling +source.dir=<path> +source.name=<name>
 #    -> logs/recording_<ts>_<name>; then train with
 #       environments.name=recorded data.repo_id=<name> data.cam=<cam>
 ```
 
-You get WM training + validation, the `ood_horizon` pointwise metric, and the `pred`/GT filmstrip (from the
-image modality's decode vs the dataset frames). You **can't** get anything that must *step* the world —
-control, goals, oracle, language steering.
+Each dataset gets a small bespoke processor (`starling`, `robocasa`, …) that parses its quirks and emits
+the same layout via a shared builder; **non-image** datasets are supported too (a processor yields
+`frames=None` → a proprio-only WM). You get WM training + validation, the `ood_horizon` pointwise metric,
+and the `pred`/GT filmstrip (image head decode vs the dataset frames). You **can't** get anything that must
+*step* the world — control, goals, oracle, language steering.
+
+Training reads this **local** `data.root` directly — pushing to the Hub is optional
+(`push_to_hub data.root=<run_dir> +hub.name=<name>`), and re-pushing is a clean **clear-and-reupload** to
+the same repo each time (`delete_patterns="*"`), for sharing or for training elsewhere via
+`data.hf_repo=<repo>`.
 
 Dataset knobs the loader threads (any dataset, recorded or generated): `data.cam` — the camera key
 `videos/observation.images.<cam>` (default `fpv`; recordings use `ego`); `data.repo_id` — the lerobot repo

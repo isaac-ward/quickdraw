@@ -18,7 +18,7 @@ from huggingface_hub import HfApi
 
 
 def _generic_card(name: str, s: dict) -> str:
-    """Card for a run whose summary.json has NO torus geometry fields (e.g. a recording_to_lerobot run):
+    """Card for a run whose summary.json has NO torus geometry fields (e.g. a data.processors run):
     obs/action dims (from the norm stats), splits, fps — no manifold-specific prose."""
     counts = s["counts"]
     splits = list(counts)
@@ -44,7 +44,7 @@ configs:
 # {name}
 
 Recorded trajectories (no simulator) packaged as LeRobot splits for world-model training.
-Generated with [quickdraw](https://github.com/isaac-ward/quickdraw) (`recording_to_lerobot`).
+Generated with [quickdraw](https://github.com/isaac-ward/quickdraw) (`data.processors`).
 
 ## Observation / action
 - **observation_vector** ({obs_dim}): the recorded state
