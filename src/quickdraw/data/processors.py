@@ -83,13 +83,19 @@ def _frame_hw(frames) -> tuple[int, int]:
     return tuple(imageio.imread(frames[0]).shape[:2])
 
 
-def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: str, log=None) -> str:
+def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: str, log=None,
+                           extra_splits: dict[str, list[Episode]] | None = None) -> str:
     """Turn canonical `Episode`s into a standard recorded run folder. Returns the run_dir.
 
-    make_run_dir -> deterministic ~10% val split BY EPISODE (seed 0) -> parallel-encode each episode's
-    frames to media/<cam>/<split>/ep_XXXX.mp4 (SKIPPED entirely when frames is None) -> write one
-    lerobot dataset per split (with the clips as observation.images.<cam>, or vector-only) -> write_meta
-    + summary.json + dataset_card.json (generic; no torus geometry fields)."""
+    make_run_dir -> deterministic ~10% val split BY EPISODE (seed 0) of `episodes` into train/val ->
+    parallel-encode each episode's frames to media/<cam>/<split>/ep_XXXX.mp4 (SKIPPED entirely when
+    frames is None) -> write one lerobot dataset per split (with the clips as observation.images.<cam>,
+    or vector-only) -> write_meta + summary.json + dataset_card.json (generic; no torus geometry fields).
+
+    `extra_splits` = {split_name: [Episode]} adds EXTRA named splits (e.g. a held-out `eval`
+    collection) alongside the normal train/val: each is written to its OWN split directory VERBATIM
+    (NO random splitting), encoded/recorded exactly like train/val. Extra splits never affect the
+    train/val random split nor the train-only norm stats."""
     log = log or (lambda m: print(m, flush=True))
     has_frames = episodes[0].frames is not None
 
@@ -101,11 +107,16 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: st
     val_ids = set(np.random.default_rng(SPLIT_SEED).choice(len(episodes), size=n_val, replace=False).tolist())
     split_eps = {"train": [ep for k, ep in enumerate(episodes) if k not in val_ids],
                  "val": [ep for k, ep in enumerate(episodes) if k in val_ids]}
+    # extra named splits (e.g. a held-out `eval` collection): kept in their OWN dir, verbatim, no split
+    for sp_name, sp_eps in (extra_splits or {}).items():
+        split_eps[sp_name] = list(sp_eps)
 
     hw = _frame_hw(episodes[0].frames) if has_frames else None
-    log(f"[recorded] {name}: {len(episodes)} episodes / {sum(len(e.states) for e in episodes)} frames "
+    all_eps = [ep for eps in split_eps.values() for ep in eps]
+    split_desc = ", ".join(f"{sp} {len(eps)}" for sp, eps in split_eps.items())
+    log(f"[recorded] {name}: {len(all_eps)} episodes / {sum(len(e.states) for e in all_eps)} frames "
         f"({'proprio-only' if not has_frames else f'{hw[0]}x{hw[1]}'} @ {fps} Hz) -> "
-        f"train {len(split_eps['train'])} / val {len(split_eps['val'])} (seed {SPLIT_SEED})")
+        f"{split_desc} (train/val seed {SPLIT_SEED})")
 
     workers = int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4))
     ego_root = os.path.join(run_dir, "media", cam)
@@ -179,22 +190,9 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: st
 # bespoke processors: parse ONE raw format -> (name, episodes, fps, cam)
 # ---------------------------------------------------------------------------
 
-def starling(cfg) -> tuple[str, list[Episode], int, str]:
-    """Flightroom-starling processed dump: `data.npz` (`states`, `actions`, `episode_indices_mapping`)
-    + `images/ego/<global_idx>.jpg`. Episodes are CONTIGUOUS global-index runs of the episode map;
-    each `Episode.frames` is that run's jpg paths in temporal order (lazy). Camera: `ego`.
-
-    Args: +source.dir=<processed folder> +source.name=<name> [+source.max_episodes=N] [+source.fps=30]."""
-    src_cfg = cfg.get("source", None)
-    if src_cfg is None or not src_cfg.get("dir"):
-        raise ValueError("pass +source.dir=<processed recording folder> "
-                         "(optional: +source.name=..., +source.max_episodes=N, +source.fps=30)")
-    src = os.path.expanduser(str(src_cfg.dir))
-    name = str(src_cfg.get("name", "starling"))
-    max_eps = int(src_cfg.get("max_episodes", 0) or 0)
-    fps = int(src_cfg.get("fps", 30))
-    cam = "ego"
-
+def _parse_starling_dir(src: str, cam: str) -> list[Episode]:
+    """Parse one flightroom-starling processed folder into canonical Episodes (CONTIGUOUS runs of
+    the episode map; each Episode.frames is that run's jpg paths in temporal order, lazy)."""
     npz = np.load(os.path.join(src, "data.npz"))
     states = npz["states"].astype(np.float32)
     actions = npz["actions"].astype(np.float32)
@@ -211,12 +209,44 @@ def starling(cfg) -> tuple[str, list[Episode], int, str]:
     for s, e in zip(starts, ends):
         frames = [os.path.join(img_dir, f"{i}.jpg") for i in range(s, e)]
         episodes.append(Episode(states=states[s:e], actions=actions[s:e], frames=frames))
+    return episodes
+
+
+def starling(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None]:
+    """Flightroom-starling processed dump: `data.npz` (`states`, `actions`, `episode_indices_mapping`)
+    + `images/ego/<global_idx>.jpg`. Episodes are CONTIGUOUS global-index runs of the episode map;
+    each `Episode.frames` is that run's jpg paths in temporal order (lazy). Camera: `ego`.
+
+    With `+source.eval_dir=<path>`, that folder is parsed the SAME way and returned as an EXTRA held-out
+    `eval` split (its own dir, verbatim; NOT train/val); `dir` still gets the normal seed-0 train/val split.
+
+    Args: +source.dir=<processed folder> +source.name=<name>
+          [+source.eval_dir=<path>] [+source.max_episodes=N] [+source.fps=30]."""
+    src_cfg = cfg.get("source", None)
+    if src_cfg is None or not src_cfg.get("dir"):
+        raise ValueError("pass +source.dir=<processed recording folder> "
+                         "(optional: +source.name=..., +source.eval_dir=<path>, +source.max_episodes=N, +source.fps=30)")
+    src = os.path.expanduser(str(src_cfg.dir))
+    name = str(src_cfg.get("name", "starling"))
+    max_eps = int(src_cfg.get("max_episodes", 0) or 0)
+    fps = int(src_cfg.get("fps", 30))
+    cam = "ego"
+
+    episodes = _parse_starling_dir(src, cam)
     if max_eps:
         episodes = episodes[:max_eps]
-    return name, episodes, fps, cam
+
+    extra_splits = None
+    if src_cfg.get("eval_dir"):
+        eval_src = os.path.expanduser(str(src_cfg.eval_dir))
+        eval_episodes = _parse_starling_dir(eval_src, cam)
+        if max_eps:
+            eval_episodes = eval_episodes[:max_eps]
+        extra_splits = {"eval": eval_episodes}
+    return name, episodes, fps, cam, extra_splits
 
 
-def robocasa(cfg) -> tuple[str, list[Episode], int, str]:
+def robocasa(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None]:
     """HF dataset `madang6/quickdraw-robocasa-scene4-4h` — already lerobot-native (one parquet per
     episode under train/data/, one mp4 per episode per camera under train/videos/). Columns:
     `observation.state` (16), `action` (12); fps 20; 3 cameras (256x256x3). We pull only the episodes
@@ -258,7 +288,7 @@ def robocasa(cfg) -> tuple[str, list[Episode], int, str]:
         rd.close()
         frames = frames[:len(states)]   # align 1:1 with the vector rows (drop any trailing decode frame)
         episodes.append(Episode(states=states, actions=actions, frames=frames))
-    return name, episodes, fps, cam
+    return name, episodes, fps, cam, None   # robocasa: no extra splits (builder's seed-0 train/val only)
 
 
 PROCESSORS = {"starling": starling, "robocasa": robocasa}
@@ -269,7 +299,7 @@ def main(cfg):
     proc = cfg.get("processor", None)
     if proc is None or str(proc) not in PROCESSORS:
         raise ValueError(f"pass +processor=<{'|'.join(PROCESSORS)}> (got {proc!r})")
-    name, episodes, fps, cam = PROCESSORS[str(proc)](cfg)
+    name, episodes, fps, cam, extra_splits = PROCESSORS[str(proc)](cfg)
 
     log_lines = []
 
@@ -277,7 +307,7 @@ def main(cfg):
         print(msg, flush=True)
         log_lines.append(msg)
 
-    run_dir = build_recorded_dataset(name, episodes, fps, cam, log=log)
+    run_dir = build_recorded_dataset(name, episodes, fps, cam, log=log, extra_splits=extra_splits)
     with open(os.path.join(run_dir, "progress.log"), "w") as f:
         f.write("\n".join(log_lines) + "\n")
 
