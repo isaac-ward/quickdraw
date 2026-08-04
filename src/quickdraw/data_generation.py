@@ -129,19 +129,24 @@ def main(cfg):
     workers = int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4))   # cap to leave CPU for concurrent training
 
     # 2. SUMMARY atlas plot + video per split FIRST, so the new physics can be eyeballed before the long
-    # FPV render. Each runs in a worker and streams its own frame progress to progress.log.
-    summary_jobs = []
-    for name, (scfg, obs, act, coloring) in data.items():
-        pos = obs[:n_plot, :, :3]
-        avec = viz.action_ambient(pos, act[:n_plot], scfg.R, scfg.r)
-        summary_jobs.append({"name": name, "scfg": {"R": scfg.R, "r": scfg.r, "dt": scfg.dt,
-                             "gamma": scfg.gamma, "a_max": scfg.a_max, "init_speed": scfg.init_speed},
-                             "coloring": coloring, "fps": fps, "pos": pos, "avec": avec, "sp": sp, "sv": sv,
-                             "smooth": int(cfg.data.action_smooth_window), "log_path": log_path})
-    log(f"[summary] rendering {len(summary_jobs)} split summary plots+videos FIRST (check media/summary_*)...")
-    with ProcessPoolExecutor(max_workers=min(len(summary_jobs), workers)) as ex:
-        for k, done in enumerate(ex.map(_render_summary, summary_jobs), 1):
-            log(f"[summary] {k}/{len(summary_jobs)} complete: {done}  ({time.time() - t0:.0f}s)")
+    # FPV render. Each runs in a worker and streams its own frame progress to progress.log. The atlas is
+    # TORUS-specific eyeball viz (needs the torus geometry) — skip it for other envs; the FPV clips below
+    # (env.render_obs) are the env-agnostic eyeball path.
+    if env_name in ("torus_world", "torus"):
+        summary_jobs = []
+        for name, (scfg, obs, act, coloring) in data.items():
+            pos = obs[:n_plot, :, :3]
+            avec = viz.action_ambient(pos, act[:n_plot], scfg.R, scfg.r)
+            summary_jobs.append({"name": name, "scfg": {"R": scfg.R, "r": scfg.r, "dt": scfg.dt,
+                                 "gamma": scfg.gamma, "a_max": scfg.a_max, "init_speed": scfg.init_speed},
+                                 "coloring": coloring, "fps": fps, "pos": pos, "avec": avec, "sp": sp, "sv": sv,
+                                 "smooth": int(cfg.data.action_smooth_window), "log_path": log_path})
+        log(f"[summary] rendering {len(summary_jobs)} split summary plots+videos FIRST (check media/summary_*)...")
+        with ProcessPoolExecutor(max_workers=min(len(summary_jobs), workers)) as ex:
+            for k, done in enumerate(ex.map(_render_summary, summary_jobs), 1):
+                log(f"[summary] {k}/{len(summary_jobs)} complete: {done}  ({time.time() - t0:.0f}s)")
+    else:
+        log(f"[summary] atlas skipped (torus-specific eyeball viz; env={env_name})")
 
     # 3. render every trajectory's FPV clip at full parallelism (the heavy step). Each worker rebuilds the
     # SPLIT's env and renders through its `render_obs`: the split's coloring/fov are threaded into the env
@@ -160,7 +165,8 @@ def main(cfg):
                 log(f"[fpv] {j}/{len(fpv_jobs)}  ({time.time() - t0:.0f}s)")
 
     # 4. write lerobot datasets, ingesting the rendered clips (one dataset per split, in parallel)
-    lr_jobs = [{"name": name, "root_split": os.path.join(run_dir, name), "repo_id": f"torus/{name}",
+    repo = str(cfg.data.get("repo_id", "torus"))   # dataset repo prefix; loaders read the same data.repo_id
+    lr_jobs = [{"name": name, "root_split": os.path.join(run_dir, name), "repo_id": f"{repo}/{name}",
                 "obs": obs, "act": act, "fps": fps, "size": size,
                 "fpv_dir": os.path.join(fpv_root, name)} for name, (_, obs, act, _) in data.items()]
     log(f"[lerobot] writing {len(lr_jobs)} split datasets (vectors + observation.images.fpv): "
