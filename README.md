@@ -17,7 +17,12 @@ docker compose exec app python -c "import torch; print(torch.cuda.is_available()
 docker compose exec app bash
 ```
 
-From here, two docs tell you where to go:
+From here, the fastest start is the **wizard** — point your AI assistant (Claude, Codex, …) at it and it
+drives the whole setup:
+
+- **[wizard/prompt.md](wizard/prompt.md)** — *"look at wizard/prompt.md and talk me through the choices for `<my dataset or env>`"*. It interviews you about your data/env and model, inspects a HuggingFace dataset (cameras, dims, fps) and **resolves all the dims for you**, applies the documented learnings, verifies the dataset fits (`check_dataset`) and reports the model shape (`model_summary`), then compiles a runnable pipeline script to `wizard/scripts/`.
+
+Or read the docs directly:
 
 - **[docs/workflow.md](docs/workflow.md)** — the full pipeline end-to-end, one `uv run` line per step: generate data → push to the Hub → train the world model → action model → interpret (VLM labeling) → reward model → language control.
 - **[docs/byo.md](docs/byo.md)** — run that same pipeline on your *own* environment: recorded data, a required-contract env (or any Gymnasium env, zero code), or a full `WorldEnv`.

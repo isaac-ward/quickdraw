@@ -71,7 +71,11 @@ Ask: **"What are you bringing?"** One of three (this mirrors `docs/byo.md`):
   POLICIES, fork).
 
 **Output of Part A:** the concrete `obs_dim`, `action_dim`, image size(s) + camera key(s), fps, and which
-env name (`gym:<id>` / `recorded` / a registered custom name). These drive the model config in Part B.
+env name (`gym:<id>` / `recorded` / a registered custom name). **YOU (the wizard) carry these dims through
+into every override in the generated script** — `environments.obs_dim`/`action_dim`, `model.action_dim`,
+`model.modalities.<i>.dim`/`img_size` — from what you inspected. **The user never types a dim.** You then
+confirm them with `check_dataset` (Part D), which will flag any that don't line up. (E.g. robocasa →
+`obs_dim=16 action_dim=12`, three 256×256 cams; the wizard sets those, the user just picks the camera.)
 
 ---
 
