@@ -189,7 +189,11 @@ def main(cfg):
                         #   val for val/loss/contraction. Measured to have NO speed cost vs inference_mode.
                         limit_train_batches=cfg.trainer.get("limit_train_batches", 1.0),
                         limit_val_batches=cfg.trainer.get("limit_val_batches", 1.0))
-    trainer.fit(lit, loaders["train"], loaders["val"])
+    resume = cfg.get("resume", None)   # +resume=<ckpt> -> Lightning restores weights+optimizer+LR-sched+epoch
+    if resume:                          # (p_tf/physical warmups are current_epoch-keyed, LR warmup is a
+        resume = os.path.expanduser(str(resume))   # step-keyed LambdaLR -> both restored correctly on resume)
+        print(f"[train] RESUMING from ckpt_path={resume}", flush=True)
+    trainer.fit(lit, loaders["train"], loaders["val"], ckpt_path=resume)
 
     # stable name for the best checkpoint, used by eval_ood / eval_control
     best = callbacks[0].best_model_path
