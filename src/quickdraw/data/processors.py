@@ -3,7 +3,8 @@
 Each raw dump (starling jpgs, a robocasa lerobot repo, ...) has its own quirks; a small `processor`
 parses ONE format into a list of canonical `Episode`s, and the SHARED `build_recorded_dataset`
 machinery turns those into a run folder identical in shape to `data_generation` (minus the
-simulator/summary renders). Point training at the run folder with `environments.name=recorded`.
+simulator/summary renders). Point training at the run folder with `environments=recorded` (the config
+GROUP — it carries obs_dim/action_dim/dt; override those for non-starling dims). Verify with `check_dataset`.
 
     python -m quickdraw.data.processors +processor=starling \\
         +source.dir=~/user_irw/seamstress/assets/flightroom-starling_processed_112x192_30hz \\
@@ -181,7 +182,7 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: st
         json.dump({**summary, "normalization_stats": norm}, f, indent=2)
 
     log(f"[done] {run_dir}  ({time.time() - t0:.0f}s total)")
-    log(f"[done] now train with:  data.root={run_dir} environments.name=recorded "
+    log(f"[done] now train with:  data.root={run_dir} environments=recorded "
         f"data.repo_id={name}" + (f" data.cam={cam}" if has_frames else ""))
     return run_dir
 

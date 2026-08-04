@@ -61,18 +61,28 @@ them ✗):
 
 ```bash
 python -m quickdraw.data.processors +processor=starling +source.dir=<path> +source.name=<name>
-#    -> logs/recording_<ts>_<name>; then train with
-#       environments.name=recorded data.repo_id=<name> data.cam=<cam>
+#    -> logs/recording_<ts>_<name>; then verify the fit, then train:
+python -m quickdraw.check_dataset data.root=<run_dir> data.repo_id=<name> environments=recorded
+python -m quickdraw.train_world_model data.root=<run_dir> data.repo_id=<name> data.cam=<cam> \
+    environments=recorded environments.obs_dim=<D> environments.action_dim=<A>   # (+ model/ run_summary)
 ```
+
+Use **`environments=recorded`** — the config *group*, which carries the dims — **not**
+`environments.name=recorded`, which only renames the default (torus) env and leaves the dims unresolved.
+`conf/environments/recorded.yaml` defaults to starling's `16`/`4`, so override `environments.obs_dim` /
+`action_dim` (and `model.action_dim` / `modalities.0.dim`) for other datasets. `check_dataset` counts the
+`P+F` training windows and flags any obs/action-dim mismatch **before** you burn a run.
 
 Each dataset gets a small bespoke processor (`starling`, `robocasa`, …) that parses its quirks and emits
 the same layout via a shared builder; **non-image** datasets are supported too (a processor yields
 `frames=None` → a proprio-only WM). You get WM training + validation, the `ood_horizon` pointwise metric,
 the `pred`/GT filmstrip (image head decode vs the dataset frames), **and the whole interpret stack** —
 `eval_interpret` (latent-space interpretation + VLM labeling) and `train_reward_model` (the language reward
-head), since those use only the frozen WM + data + a VLM and never step the env. What you **can't** get is
-anything that must *step* the world — MPPI **control** (the goal race *and* language steering/execution) and
-the oracle baseline. So on recorded data you can *interpret and label* the latent space, just not *act* with it.
+head), since those use only the frozen WM + data + a VLM and never step the env. (The interpret **factors +
+VLM prompt are env-specific** — author a `conf/interpret/<env>.yaml`; `conf/interpret/pendulum.yaml` is a
+copyable example. This is the one interpret input that isn't automatic.) What you **can't** get is anything
+that must *step* the world — MPPI **control** (the goal race *and* language steering/execution) and the
+oracle baseline. So on recorded data you can *interpret and label* the latent space, just not *act* with it.
 
 Training reads this **local** `data.root` directly — pushing to the Hub is optional
 (`push_to_hub data.root=<run_dir> +hub.name=<name>`), and re-pushing is a clean **clear-and-reupload** to

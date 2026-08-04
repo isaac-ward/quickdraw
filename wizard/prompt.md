@@ -51,7 +51,10 @@ Ask: **"What are you bringing?"** One of three (this mirrors `docs/byo.md`):
 - Convert with `data/processors.py`: `python -m quickdraw.data.processors +processor=<name> +source.<...>`
   (existing processors: `robocasa`, `starling`; write a thin new one for a different layout — copy an
   existing processor, emit the `Episode` intermediate). Non-image datasets → `frames=None` (proprio-only).
-  Then train with `environments.name=recorded` (data-only) **or** a real env if they have a matching
+  Then train with **`environments=recorded`** (data-only — the config *group*, which carries
+  `obs_dim`/`action_dim`/`dt`; NOT `environments.name=recorded`, which only renames the default env.
+  `conf/environments/recorded.yaml` defaults to `16`/`4`, so override `environments.obs_dim`/`action_dim` +
+  `model.action_dim`/`modalities.0.dim` to the dataset's real dims) **or** a real env if they have a matching
   simulator (see the *data ⟂ env* note — pre-generated data + a real env gives you that env's full evals,
   trained on your data).
 - **What recorded-only gets you** (no simulator): WM training, the `ood_horizon` pointwise metric, the
@@ -93,11 +96,11 @@ Walk each choice, suggest the default, and **quote the learning** (exact numbers
   rollout. Diffusion Forcing is NOT a substitute (it made collapse *worse* at scale 0.25/1.0) — keep DF off.
 - **Size** — ask for a **target total parameter count** (or a tier: small ~0.5M / base ~3M / large).
   Back out `d` / `depth` / `heads` / `window` / `num_tokens` to hit it. **Constraint: `head_dim = d/heads`
-  must be a power of 2** (FlexAttention) — e.g. d=128,heads=8 → 16 ✓. Then **build the model dry (CPU) and
-  REPORT**, mirroring the `[startup]` line in `progress.log`: total params + a per-component breakdown
-  (backbone spine; per-modality encode + decode head shapes; action head if on). Easiest way to get the
-  exact number: run the WM train command with `trainer.fast_dev_run=true` (prints `MultiModalFlow N params`)
-  or a quick `build_model(cfg)` + `sum(p.numel())` with a per-submodule table.
+  must be a power of 2** (FlexAttention) — e.g. d=128,heads=8 → 16 ✓. Then **report the exact shape** with
+  **`python -m quickdraw.model_summary model=<...> <your overrides>`** — CPU, no data/env, it prints the
+  same `[train]` (total params) + `[arch]` (per-component: each modality's encode/decode head, the
+  space-time backbone, the dynamics flow head, the action head) table that training writes at the top of
+  `progress.log`. Iterate `d`/`depth`/`num_tokens` against its output to hit the target param count.
 - **Modalities** — `proprio` dim = data `obs_dim`; one `image` modality per chosen camera
   (`img_size=[H,W]` per that camera, `patch=16`, `num_tokens=8`, `encode_arch=vit`). Multiple cameras =
   multiple `image` entries (trunks).
@@ -125,6 +128,13 @@ Ask which stages to include, and gate them on the env:
 stages that need a **steppable** env]. So: for recorded/data-only, everything through the **reward head** is
 available; only the control/steering stages are unavailable.
 
+**Interpret needs env-specific factors — scaffold them.** `eval_interpret` labels the latent space by the
+semantic factors + VLM prompt in `conf/interpret/<env>.yaml`; a new env/dataset has none. If the user wants
+interpret, **draft a starter `conf/interpret/<env>.yaml`** for them: copy `conf/interpret/pendulum.yaml` as
+the shape, then propose factors that fit *their* domain (from the dataset's task/camera — e.g. gripper
+open/closed, object present, region of the scene) with a VLM prompt describing what the frames show. Show it
+to the user to edit; it's the one interpret input that isn't automatic.
+
 ---
 
 ## Part D — Compile the script → `wizard/scripts/<slug>.sh`
@@ -140,9 +150,19 @@ Write ONE runnable bash script (this dir is gitignored). It should:
   trying_detail/rationale=…`) — training fails fast on a missing or duplicated summary.
 - End with a commented resume hint: `# resume: +resume=<run_dir>/checkpoints/last.ckpt`.
 
-Then **do a `trainer.fast_dev_run=true` pre-flight** of the WM train command to prove the data loads and the
-model builds/forwards (and to capture the param count) BEFORE the user launches for real. Finally, report:
-the script path, the intended model shape + param breakdown, and the specific learnings you applied.
+**Also write a companion choices-record** `wizard/scripts/<slug>.md` (same gitignored dir): the user's
+answers, the defaults + **learnings you applied** (with the mm_flow.yaml quotes), and the `model_summary`
+output — so the run is self-documenting and reproducible.
+
+**Pre-flight before handing off** — run these and paste their output into the record:
+1. `python -m quickdraw.check_dataset data.root=… data.repo_id=… environments=recorded` (or the real env) —
+   confirms `P+F` training windows > 0 and that data dims match the env; fix any mismatch it reports.
+2. `python -m quickdraw.model_summary model=… <overrides>` — the param count + per-component shapes.
+3. `trainer.fast_dev_run=true` on the WM train command — proves the data loads and the model builds/forwards
+   on 1 batch (this recorded + non-square path may be new for their dataset).
+
+Finally, report: the script + record paths, the model shape + param breakdown, the checker result, and the
+specific learnings you applied.
 
 ---
 

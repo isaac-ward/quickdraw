@@ -16,6 +16,31 @@ import torch
 from omegaconf import OmegaConf
 
 
+def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
+    """The model architecture summary — total params + the per-component `arch_table` dataflow (component |
+    shape transform | params) — as a list of printable lines. SHARED by the training
+    `LoggingCallback.on_fit_start` (the top of progress.log) and the standalone `quickdraw.model_summary`
+    entrypoint, so the two never drift."""
+    m = getattr(m, "_orig_mod", m)   # unwrap torch.compile's OptimizedModule
+    n = sum(p.numel() for p in m.parameters())
+    head = f"[train] {type(m).__name__} {n / 1e6:.2f}M params"
+    if max_epochs is not None:
+        head += f" | max_epochs={max_epochs}"
+    if device is not None:
+        head += f" | device={device}"
+    lines = [head]
+    if hasattr(m, "arch_table"):   # token-bag dataflow (component | shape transform | params)
+        lines.append(f"[arch] d={m.d} window={m.window} | per-step bag = {m.n_state} state token(s) + 1 action = {m.n_input} tokens")
+        for comp, shape, params in m.arch_table():
+            lines.append(f"  {comp:<34} {shape:<60} {params / 1e6:7.3f}M")
+    else:
+        for name, mod in m.named_children():
+            sub = sum(p.numel() for p in mod.parameters())
+            if sub:
+                lines.append(f"  [model] {name:<14} {sub / 1000:8.1f}K params")
+    return lines
+
+
 @torch.no_grad()
 def _bench_rollout(model, P, F, obs_dim, act_dim, device, B, warmup=1, iters=3):
     """Mean wall-clock seconds for ONE full F-step autoregressive rollout at batch B. Warmup +
@@ -64,18 +89,8 @@ class ProgressPrinter(L.Callback):
             f.write(line + "\n")
 
     def on_fit_start(self, trainer, pl_module):
-        m = getattr(pl_module.model, "_orig_mod", pl_module.model)  # unwrap torch.compile's OptimizedModule
-        n = sum(p.numel() for p in m.parameters())
-        self._emit(f"[train] {type(m).__name__} {n/1e6:.2f}M params | max_epochs={trainer.max_epochs} | device={pl_module.device}")
-        if hasattr(m, "arch_table"):   # token-bag dataflow (component | shape transform | params) — see model.arch_table
-            self._emit(f"[arch] d={m.d} window={m.window} | per-step bag = {m.n_state} state token(s) + 1 action = {m.n_input} tokens")
-            for comp, shape, params in m.arch_table():
-                self._emit(f"  {comp:<34} {shape:<60} {params/1e6:7.3f}M")
-        else:
-            for name, mod in m.named_children():
-                sub = sum(p.numel() for p in mod.parameters())
-                if sub:
-                    self._emit(f"  [model] {name:<14} {sub/1000:8.1f}K params")
+        for line in arch_summary_lines(pl_module.model, max_epochs=trainer.max_epochs, device=pl_module.device):
+            self._emit(line)
 
     def on_sanity_check_start(self, trainer, pl_module):
         self._emit("[startup] sanity-check validation running (this JIT-compiles the val/forward path)...")
