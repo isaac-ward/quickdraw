@@ -22,8 +22,8 @@ path demands of you, and what it unlocks (**✓** works · **✗** unavailable /
 | WM training + validation | ✓ | ✓ | ✓ |
 | pointwise rollout metrics (`ood_horizon`) | ✓ | ✓ | ✓ |
 | `pred`/GT image filmstrip | ✓ | ✓ | ✓ |
-| reward-scored MPPI control | ✗ | ✓ | ✓ |
-| interpret / language steering ² | ✗ | ✓ | ✓ |
+| interpret + reward head (latent labeling) ² | ✓ | ✓ | ✓ |
+| MPPI control — goal race + language steering | ✗ | ✓ | ✓ |
 | env-meaningful metrics + `best.ckpt` on them | ✗ | ✗ | ✓ |
 | diagnostic scene video | ✗ | ✗ | ✓ |
 | goal-race control + oracle baseline | ✗ | ✗ | ✓ |
@@ -32,7 +32,9 @@ path demands of you, and what it unlocks (**✓** works · **✗** unavailable /
 
 ¹ `rollout_metrics`, `checkpoint_metric`, `render_diagnostics`, `control_goals`, `physical_loss`,
 `POLICIES`, `fork` — each independent, each with a graceful fallback (the ✗ rows above).
-² also needs a `conf/interpret/<env>.yaml` + a VLM.
+² interpret + the reward head use only the frozen WM + data + a VLM — **no env stepping** — so recorded
+(no-simulator) data can do them (they need a `conf/interpret/<env>.yaml` + a VLM). Only the **control** row
+needs a steppable env: the goal race *and* language steering both execute plans in the env.
 
 Every run prints an `[env-contract]` ✓/✗ report to its `progress.log`, so you can always see which column
 you're in. Two full-contract reference envs ship in `environments/examples/`: `pendulum.py` and
@@ -66,8 +68,11 @@ python -m quickdraw.data.processors +processor=starling +source.dir=<path> +sour
 Each dataset gets a small bespoke processor (`starling`, `robocasa`, …) that parses its quirks and emits
 the same layout via a shared builder; **non-image** datasets are supported too (a processor yields
 `frames=None` → a proprio-only WM). You get WM training + validation, the `ood_horizon` pointwise metric,
-and the `pred`/GT filmstrip (image head decode vs the dataset frames). You **can't** get anything that must
-*step* the world — control, goals, oracle, language steering.
+the `pred`/GT filmstrip (image head decode vs the dataset frames), **and the whole interpret stack** —
+`eval_interpret` (latent-space interpretation + VLM labeling) and `train_reward_model` (the language reward
+head), since those use only the frozen WM + data + a VLM and never step the env. What you **can't** get is
+anything that must *step* the world — MPPI **control** (the goal race *and* language steering/execution) and
+the oracle baseline. So on recorded data you can *interpret and label* the latent space, just not *act* with it.
 
 Training reads this **local** `data.root` directly — pushing to the Hub is optional
 (`push_to_hub data.root=<run_dir> +hub.name=<name>`), and re-pushing is a clean **clear-and-reupload** to

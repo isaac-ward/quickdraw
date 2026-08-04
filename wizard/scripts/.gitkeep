@@ -1,0 +1,2 @@
+# The wizard writes generated pipeline scripts here. Contents are gitignored (see .gitignore);
+# this .gitkeep only preserves the directory.

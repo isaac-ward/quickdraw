@@ -132,3 +132,7 @@ dmypy.json
 
 # run outputs
 logs/
+
+# wizard-generated scripts (AI output — never committed; keep the dir via .gitkeep)
+wizard/scripts/*
+!wizard/scripts/.gitkeep
