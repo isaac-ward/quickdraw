@@ -106,6 +106,23 @@ physics loss, and scripted policies all fall back until rung 3.
 Register a name in `environments/registry.make_env` (pendulum is `name=pendulum`) and add a
 `conf/environments/<name>.yaml`.
 
+**Train pre-generated data through this env.** The data source and the env are wired independently
+(`env = make_env(environments.name)` vs `root = resolve_data_root(data.root | data.hf_repo)`), so you can
+skip `data_generation` entirely: process a logged dump once (§1's `data/processors.py`), then point
+`data.root` at it while naming your *real* env — you get this column's full evals (control, oracle, …),
+trained on your own data:
+
+```bash
+# 1. one-time: your dump -> recorded lerobot layout
+python -m quickdraw.data.processors +processor=starling +source.dir=<dump> +source.name=mydata
+# 2. train YOUR data through YOUR env  (NOT environments=recorded)
+uv run python -m quickdraw.train_world_model data.root=logs/recording_<ts>_mydata \
+    environments.name=<your-registered-env> +run_summary.problem=...   # (all 5 fields)
+```
+
+The only requirement: the dataset's `obs_dim`/`action_dim` (and camera view) match the env's. `RecordedEnv`
+(§1) is only for when you have *no* env — give it a real env and you leave the recorded column.
+
 ---
 
 ## 3. Full implementation (add the optional hooks)
