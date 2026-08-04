@@ -69,6 +69,14 @@ class WorldEnv(Protocol):
     # OPTIONAL — envs that can draw a rich scene implement this; others omit it (callers use `wants_diagnostics`).
     def render_diagnostics(self, overlay: SceneOverlay, views: list[str]) -> dict[str, np.ndarray]: ...
 
+    # OPTIONAL — the env's control-GOAL source for the goal-reaching control eval: a list of
+    # (name, goal_point (3,)) world points, or None. Envs WITHOUT goals (e.g. a gym Pendulum, where the task
+    # is the env's OWN reward, not visiting points) omit it / return None -> the control eval runs
+    # REWARD-ONLY (controller.mppi.run_control_reward_only maximizes env.reward(obs, None)).
+    # batch/n_goals/generator let a future env sample per-episode goals; torus ignores them (its
+    # per-episode goal subsetting lives in run_control, unchanged).
+    def control_goals(self, batch: int, n_goals: int, generator=None, device=None): ...
+
 
 def default_rollout_metrics(pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]:
     """The generic, env-agnostic rollout metric — full-observation L2 error per step. Valid for ANY WorldEnv

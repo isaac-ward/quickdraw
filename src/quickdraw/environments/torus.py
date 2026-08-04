@@ -222,6 +222,12 @@ class TorusEnv:
         gate = (d < r_settle).float()
         return -d - beta_vel * gate * v.norm(dim=-1)
 
+    # OPTIONAL WorldEnv goal source (base.py): the SAME 8 module-level control goals, so the control eval's
+    # torus behavior is identical. batch/n_goals/generator are unused — run_control does its own per-episode
+    # goal subsetting/ordering (unchanged); envs without goals return None -> reward-only control.
+    def control_goals(self, batch: int = 0, n_goals: int = 0, generator=None, device=None):
+        return control_goals(self.cfg.R, self.cfg.r, device=device)
+
     # train.py monitors this rollout metric for best.ckpt (WorldEnv default: pointwise_error).
     checkpoint_metric = "manifold_distance_error"
 

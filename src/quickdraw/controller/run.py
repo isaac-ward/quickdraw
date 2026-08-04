@@ -96,6 +96,14 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     knobs = {k: getattr(mppi_cfg, k) for k in ("beta_vel", "r_settle")
              if k in inspect.signature(env.reward).parameters}
     reward_fn = functools.partial(env.reward, **knobs)
+    # NO-GOAL env: an env that supplies no control-goal source (WorldEnv.control_goals absent or -> None,
+    # e.g. a gym Pendulum) has nothing to "reach" — run REWARD-ONLY control (maximize env.reward) in a
+    # SEPARATE branch. Everything below (the torus goal race + language steering) is untouched.
+    goals_fn = getattr(env, "control_goals", None)
+    if reward is None and (goals_fn is None
+                           or goals_fn(mppi_cfg.n_episodes, mppi_cfg.n_goals, None, device) is None):
+        return _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, device, step,
+                                                env, mppi_cfg, n_plot, reward_fn)
     t = time.perf_counter()
     res, _ = run_control(model, normalizer, ecfg, mppi_cfg, device=device,
                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv,
@@ -344,6 +352,73 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     writer.scalars({f"eval_control/{k}": v for k, v in summary.items()}, step)
     # write the raw summary next to THIS epoch's control media (logs/epoch_<i>/eval_control/), not the flat run
     # root — mirrors how writer.video/figure organize by epoch, so it's per-epoch (not clobbered each eval).
+    ep_dir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_control")   # writer.dir is already run_dir/logs
+    os.makedirs(ep_dir, exist_ok=True)
+    with open(os.path.join(ep_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    return summary
+
+
+def _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, device, step,
+                                     env, mppi_cfg, n_plot, reward_fn) -> dict:
+    """REWARD-ONLY control eval for an env with NO goal source (WorldEnv.control_goals -> None): the env's
+    OWN reward is the objective (mppi.run_control_reward_only), so there are no goals/success metrics —
+    logs eval_control/{true,pred,diff}/{mean_reward,final_reward} instead, per-episode reward curves, and a
+    control video (rich scene if the env draws one — agents only, NO goal marker — else the render_obs
+    filmstrip). A SEPARATE branch from run_and_log_control's goal race, which stays untouched."""
+    from ..controller.mppi import run_control_reward_only
+    from ..evaluation.products import product_tag
+    _plog(writer, f"[eval_control @ep{step}] env supplies NO control goals -> REWARD-ONLY control "
+                  f"(maximize env.reward); oracle (true dynamics) vs learned")
+    env_factory = lambda: make_env(cfg.environments.get("name", "torus_world"), cfg.environments,
+                                   mppi_cfg.n_episodes, device)
+    t = time.perf_counter()
+    res = run_control_reward_only(model, normalizer, env_factory, mppi_cfg, device=device,
+                                  log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"),
+                                  oracle=True, n_plot=n_plot, reward_fn=reward_fn)
+    t_ctrl = time.perf_counter() - t
+    mppi_chunk_s = t_ctrl / max(1, res["n_chunks"])
+    mppi_chunk_hz = 1.0 / mppi_chunk_s if mppi_chunk_s > 0 else 0.0
+    _plog(writer, f"[eval_control @ep{step}] MPPI done: {res['n_chunks']} replans over {res['n_steps']} steps "
+                  f"-> {mppi_chunk_s * 1000:.0f} ms/chunk ({mppi_chunk_hz:.1f} hz)")
+    fps = round(1.0 / ecfg.dt)
+    kinds = [k for k in ("true", "pred") if k in res]
+    labels = {"true": "oracle", "pred": "learned"}
+    NP = res["n_plot"]
+    for i in range(NP):
+        vids = {}
+        if wants_diagnostics(env) and "paths" in res["pred"]:   # rich scene: agents only, NO goal marker
+            overlay = SceneOverlay(agents={k: res[k]["paths"][i] for k in kinds},
+                                   extras=dict(n_frames=len(res["pred"]["paths"][i]),
+                                               title=f"reward-only control #{i}"))
+            vids = env.render_diagnostics(overlay, ["scene"])
+        if vids:
+            for view, fr in vids.items():
+                writer.video(product_tag("eval_control", "control_video" if view == "scene"
+                                         else f"control_video_{view}", i=i), fr, fps, step)
+        else:   # generic env: pred-vs-true render_obs filmstrip video (same fallback as the goal race)
+            import torch
+            rend = {k: env.render_obs(torch.as_tensor(np.asarray(res[k]["obs_seqs"][i]), dtype=torch.float32)
+                                      ).cpu().numpy().astype(np.float32) / 255.0 for k in kinds}
+            vid = (viz.image_rollout_video(rend["true"], rend["pred"], context_len=0).astype(np.uint8)
+                   if "true" in rend else (rend["pred"] * 255).astype(np.uint8))
+            writer.video(product_tag("eval_control", "control_video", i=i), vid, fps, step)
+        # per-episode realized-reward curve (oracle black vs learned grey, like the goal-distance curve)
+        lines = {f"{labels[k]}: env reward per step": res[k]["reward_curves"][i] for k in kinds}
+        cols = {f"{labels[k]}: env reward per step": ("black" if k == "true" else "dimgray") for k in kinds}
+        curve = viz.fig_error_vs_step(lines, colors=cols, yscale="linear")
+        writer.figure(product_tag("eval_control", "reward_curve", i=i), curve, step)
+        plt.close(curve)
+    # aggregate scalars: reward-based (no goals -> no success_rate / goals_reached)
+    summary = {"n_steps": res["n_steps"], "time/mppi_chunk_s": mppi_chunk_s, "time/mppi_chunk_hz": mppi_chunk_hz}
+    for m in ("mean_reward", "final_reward"):
+        for k in kinds:
+            summary[f"{k}/{m}"] = res[k][m]
+        if "true" in res:
+            summary[f"diff/{m}"] = res["true"][m] - res["pred"][m]
+    _plog(writer, f"[eval_control @ep{step}] reward: " + " ".join(
+        f"{labels[k]} mean={res[k]['mean_reward']:.3f} final={res[k]['final_reward']:.3f}" for k in kinds))
+    writer.scalars({f"eval_control/{k}": v for k, v in summary.items()}, step)
     ep_dir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_control")   # writer.dir is already run_dir/logs
     os.makedirs(ep_dir, exist_ok=True)
     with open(os.path.join(ep_dir, "summary.json"), "w") as f:

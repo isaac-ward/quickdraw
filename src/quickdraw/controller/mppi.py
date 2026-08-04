@@ -334,3 +334,136 @@ def run_control(model, normalizer, env_cfg: TorusConfig, mppi: MPPIConfig, devic
     if fpv_rend is not None:
         fpv_rend.close()
     return out, names
+
+
+# --------------------------------------------------------------------------------------
+# REWARD-ONLY control: MPPI for a WorldEnv with NO goal source (env.control_goals -> None, e.g. a gym
+# Pendulum) — the objective is the env's OWN reward, not visiting goal points. A SEPARATE branch from
+# `run_control` above (which stays byte-identical for the torus): structurally the language mode (no goal
+# sequence, no gidx advancement, runs to max_steps) with env.reward(obs, None) as the per-step objective.
+# Generic action_dim/obs_dim (the goal-based helpers above are torus-shaped: 2D actions, obs split p/v).
+# --------------------------------------------------------------------------------------
+def _mppi_step_reward(rollout_fn, mean, mppi, a_max, g, reward_fn):
+    """One MPPI update for reward-only control: sample candidates around `mean` (G,H,A), roll them out to
+    obs (G,K,H,obs_dim), score sum_h env.reward(obs_h, None) (+ the optional control cost), softmax-weight.
+    `reward_fn(obs, None)` must broadcast over leading dims ((...,obs_dim) -> (...))."""
+    G, H, A = mean.shape
+    K = mppi.num_samples
+    noise = torch.randn(G, K, H, A, device=mean.device, generator=g) * mppi.noise_sigma
+    cand = (mean[:, None] + noise).clamp(-a_max, a_max)        # (G,K,H,A)
+    obs = rollout_fn(cand)                                     # (G,K,H,obs_dim)
+    ret = reward_fn(obs, None).sum(dim=-1)                     # (G,K) env reward summed over the horizon
+    if mppi.beta_ctrl > 0.0:                                   # cheaper thrust preferred (energy/jitter)
+        ret = ret - mppi.beta_ctrl * cand.pow(2).sum(dim=-1).sum(dim=-1)
+    w = torch.softmax(ret / max(mppi.lambda_, 1e-6), dim=1)    # (G,K)
+    return (w[..., None, None] * cand).sum(dim=1)              # (G,H,A) new mean == the plan
+
+
+def _model_rollout_obs_fn(model, normalizer, ctx_pro, pa, obs_dim):
+    """Learned proprio rollout for reward-only control: context encoded ONCE, K action variants per episode
+    (imagine_shared), decode proprio, denorm -> (G,K,H,obs_dim). Proprio-only: a generic env has no in-loop
+    FPV renderer (the torus FPV path lives in _mm_model_rollout_fn, unchanged)."""
+    def fn(cand):                                              # cand: (G,K,H,A)
+        G, K, H, A = cand.shape
+        ctx = {"proprio": normalizer.norm_obs(ctx_pro)}                      # (G,p,obs_dim)
+        paK = pa[:, None].expand(G, K, pa.shape[1], A).reshape(G * K, pa.shape[1], A)
+        actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, A)], dim=1))  # (G*K, p-1+H, A)
+        out = model.imagine_shared(ctx, actK, H, K, heads=["proprio"])
+        return normalizer.denorm_obs(out["proprio"]).view(G, K, H, obs_dim)
+    return fn
+
+
+def _true_rollout_obs_fn(env):
+    """TRUE-dynamics rollout for reward-only control (the oracle's planner): the WorldEnv protocol has no
+    state get/set, so fork the live env by deepcopy — one fork per candidate, stepped batched over episodes.
+    Cheap for batched-tensor envs; envs that can't deepcopy+step should run with oracle=False."""
+    import copy
+    def fn(cand):                                              # cand: (G,K,H,A)
+        G, K, H = cand.shape[:3]
+        cols = []
+        for k in range(K):
+            sim = copy.deepcopy(env)
+            cols.append(torch.stack([sim.step(cand[:, k, h]) for h in range(H)], dim=1))  # (G,H,obs_dim)
+        return torch.stack(cols, dim=1)                        # (G,K,H,obs_dim)
+    return fn
+
+
+@torch.no_grad()
+def run_control_reward_only(model, normalizer, env_factory, mppi: MPPIConfig, device="cpu", log=None,
+                            oracle=True, n_plot=1, reward_fn=None):
+    """REWARD-ONLY MPPI control for an env with NO goal source: maximize the env's own reward. `env_factory`
+    builds a fresh batched WorldEnv (batch == mppi.n_episodes, exposing action_dim/obs_dim/a_max); each
+    controller gets its OWN instance, reset with the same seed (2, matching _init_controller) so oracle and
+    learned race the same inits. oracle=True -> dual true-dynamics vs learned controllers (same spine as the
+    goal race); the oracle plans via deepcopy env forks (_true_rollout_obs_fn). No goal sequence / advancement
+    / markers: every episode runs the full max_steps and logs its realized per-step env reward.
+    reward_fn(obs, goal) -> per-step reward, broadcasting over leading dims; None -> env.reward."""
+    B, P, H = mppi.n_episodes, model.window, mppi.horizon
+    NP = max(1, min(n_plot, B))
+    chunk = max(1, min(mppi.chunk, H))
+    g = torch.Generator(device=device).manual_seed(0)          # candidate-noise stream (as in run_control)
+    kinds = ["true", "pred"] if oracle else ["pred"]
+    ctrls = {}
+    for k in kinds:
+        e = env_factory()
+        obs0 = e.reset(torch.Generator(device=device).manual_seed(2))
+        ctrls[k] = {"env": e, "obs": [obs0], "act": [], "reward_log": []}
+    env0 = ctrls[kinds[0]]["env"]
+    A, obs_dim, a_max = int(env0.action_dim), int(env0.obs_dim), float(env0.a_max)
+    core = getattr(model, "_orig_mod", model)
+    assert all(n == "proprio" for n, _ in core.layout), \
+        "reward-only control is proprio-only (a generic env has no in-loop image renderer)"
+    if reward_fn is None:
+        reward_fn = env0.reward
+    for c in ctrls.values():
+        c["mean"] = torch.zeros(B, H, A, device=device)
+
+    t0 = time.perf_counter()
+    step = 0
+    n_chunks = 0
+    next_log = 100
+    while step < mppi.max_steps:
+        n_chunks += 1
+        for kind, c in ctrls.items():  # plan once per chunk (re-grounded on the latest true state)
+            if kind == "pred":
+                ctx = torch.stack(c["obs"][-P:], dim=1)
+                pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, A, device=device)
+                rollout = _model_rollout_obs_fn(model, normalizer, ctx, pa, obs_dim)
+            else:
+                rollout = _true_rollout_obs_fn(c["env"])
+            c["plan"] = _mppi_step_reward(rollout, c["mean"], mppi, a_max, g, reward_fn)
+        for j in range(chunk):         # execute `chunk` actions of each plan open-loop, then replan
+            if step >= mppi.max_steps:
+                break
+            for kind, c in ctrls.items():
+                new_obs = c["env"].step(c["plan"][:, j])
+                c["obs"].append(new_obs)
+                c["act"].append(c["plan"][:, j])
+                # realized per-step reward of the ACTUAL state, from the controller's OWN env (so envs whose
+                # reward is step-native, e.g. the gym adapter, report the right controller's reward).
+                c["reward_log"].append(c["env"].reward(new_obs, None).cpu().numpy())   # (B,)
+            step += 1
+        for c in ctrls.values():       # warm-start: shift the executed chunk off the plan
+            c["mean"] = torch.cat([c["plan"][:, chunk:], torch.zeros(B, chunk, A, device=device)], dim=1) * mppi.mean_decay
+        if log is not None and step >= next_log:
+            el = time.perf_counter() - t0
+            eta = el / max(1, step) * max(0, mppi.max_steps - step)
+            finish = time.strftime("%H:%M:%S", time.localtime(time.time() + eta))
+            msg = "reward " + " ".join(f"{k}={float(np.mean(c['reward_log'][-1])):.3f}" for k, c in ctrls.items())
+            log(f"step {step}/{mppi.max_steps} ({int(100 * step / mppi.max_steps)}%) | elapsed {el:.0f}s "
+                f"ETA {eta:.0f}s (~{finish}) | {n_chunks} replans ({1000 * el / max(1, n_chunks):.0f} ms/replan) | {msg}")
+            next_log += 50
+
+    out = {"n_chunks": n_chunks, "n_steps": step, "n_plot": NP}
+    for kind, c in ctrls.items():
+        rew = np.stack(c["reward_log"])                                     # (T,B)
+        out[kind] = {
+            "obs_seqs": np.stack([np.stack([o[e].cpu().numpy() for o in c["obs"]]) for e in range(NP)]),  # (NP,T+1,obs_dim)
+            "actions": np.stack([np.stack([a[e].cpu().numpy() for a in c["act"]]) for e in range(NP)]),   # (NP,T,A)
+            "reward_curves": rew[:, :NP].T,                                 # (NP,T) realized reward per step
+            "mean_reward": float(rew.mean()),                               # over ALL steps x episodes
+            "final_reward": float(rew[-1].mean()),                          # last executed step, over episodes
+        }
+        if obs_dim >= 3:               # world-space paths for envs with a diagnostic scene renderer
+            out[kind]["paths"] = out[kind]["obs_seqs"][..., :3]
+    return out
