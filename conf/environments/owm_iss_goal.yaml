@@ -1,0 +1,4 @@
+name: recorded    # env-registry name (environments/registry.make_env) — owm-envs ISS docking datasets, no simulator
+obs_dim: 25       # 13-dim chaser state + goal errors: pos(3), vel(3), attitude(3), rate(3)
+action_dim: 6     # body-frame force(3) + torque(3)
+dt: 0.05          # 20 Hz
