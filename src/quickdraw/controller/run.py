@@ -19,6 +19,7 @@ import numpy as np
 from ..environments.base import SceneOverlay, wants_diagnostics
 from ..environments.registry import make_env
 from ..logging import viz
+from ..training.setup import resolve_data_root
 from .mppi import MPPIConfig, run_control
 
 
@@ -55,7 +56,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
         img_size = next((mod.ae.cfg.img_size for mod in core.modalities.values() if hasattr(mod, "ae")), 128)
         if hasattr(ecfg, "R"):                     # torus: the FPVRenderer fast path (parity-critical, unchanged)
             try:
-                coloring = json.load(open(os.path.join(cfg.data.root, "dataset_card.json"))).get("coloring", {}).get("train", "rainbow")
+                coloring = json.load(open(os.path.join(resolve_data_root(cfg), "dataset_card.json"))).get("coloring", {}).get("train", "rainbow")
             except OSError:
                 coloring = "rainbow"
             fpv = {"coloring": coloring, "fov": float(cfg.data.fpv_fov), "size": int(img_size)}
