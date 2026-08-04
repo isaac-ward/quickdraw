@@ -95,8 +95,8 @@ Register a name in `environments/registry.make_env` (pendulum is `name=pendulum`
 
 ## 3. Full implementation (add the optional hooks)
 
-Same pendulum, now implement the optional hooks. Each is **independent** — add the ones whose eval you
-want. This is the extra-in → extra-out:
+Continuing with the pendulum, implement the optional hooks — each is **independent**, add the ones whose
+eval you want. This is the extra-in → extra-out:
 
 | add this hook | extra code (pendulum's) | unlocks | fallback if skipped |
 |---|---|---|---|
@@ -108,8 +108,7 @@ want. This is the extra-in → extra-out:
 | `POLICIES` | `swingup` (bang-bang) + `sinusoid` | scripted play policies (`data.action_sampler=swingup`) | `random` only |
 | `fork` | copy `θ`/`θ̇`/torque into a `k`-batch clone | the **oracle** rollout baseline in control | control skips the oracle |
 
-Implement all seven and pendulum runs the **entire** pipeline — the same as the torus reference, minus its
-torus-only 3D atlas bonus.
+Implement all seven and pendulum runs the **entire** pipeline.
 
 **The diagnostic scene (`render_diagnostics`).** Optional, and *declarative*: the eval hands the env a
 `SceneOverlay` — `agents` (world-space paths, e.g. `true`/`pred`), `markers` (points, e.g. `goal`),

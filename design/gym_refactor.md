@@ -144,7 +144,7 @@ currently held by the `repro_ptf0_*` runs, so I'll run the tiny GPU checks on CP
 when a card frees — the repro runs keep priority.
 
 ## Phase 7 — documentation (linked from README)
-- **`docs/byo_environment.md`** — how to bring your own gym env: the minimal `WorldEnv`/gym contract, `render_obs`
+- **`docs/byo.md`** — how to bring your own gym env: the minimal `WorldEnv`/gym contract, `render_obs`
   for the image modality, the OPTIONAL `render_diagnostics(overlay, views)` (what a full diagnostic renderer must
   accept: the `SceneOverlay` roles + view names) with the graceful fallback, reward/goal conventions
   (`env.reward`, gym goal-conditioned pattern), and a worked minimal example env.
@@ -156,11 +156,11 @@ when a card frees — the repro runs keep priority.
 - **`docs/interpret.md`** — its OWN doc for `eval_interpret`: how to DEFINE the concepts/factors and the VLM
   prompts for a given env (the labeling contract), since that's env-specific and non-obvious. Referenced from
   workflow.md at the interpret step.
-- **`docs/byo_environment.md`** dedicated section "**Diagnostic renders (optional)**": exactly what an env must
+- **`docs/byo.md`** dedicated section "**Diagnostic renders (optional)**": exactly what an env must
   implement to get the rich eval videos — the `render_diagnostics(overlay, views)` signature, which `SceneOverlay`
   roles/views it should honor, the shared role→style map, and what you lose if you skip it (fallback to the
   `render_obs` filmstrip). Clear "you need X for Y" table.
-- **`README.md`** — link `docs/workflow.md`, `docs/byo_environment.md`, `docs/interpret.md` (+ this plan and
+- **`README.md`** — link `docs/workflow.md`, `docs/byo.md`, `docs/interpret.md` (+ this plan and
   `design/accelerations.md`).
 
 ## Decisions (all CONFIRMED 2026-07-29)
@@ -168,7 +168,7 @@ when a card frees — the repro runs keep priority.
 - Batched `WorldEnv` + single-env `GymBatchAdapter` split — yes.
 - Declarative `render_diagnostics(overlay, views)` + `SceneOverlay` — yes.
 - `random` is the only env-agnostic behavior policy; `bimodal`/`ou` are torus-specific.
-- Docs: `workflow.md` (order above) + `interpret.md` + `byo_environment.md` (with the diagnostic-render section),
+- Docs: `workflow.md` (order above) + `interpret.md` + `byo.md` (with the diagnostic-render section),
   all linked from README.
 
 ## Execution order (parity-verified at each step)
@@ -232,6 +232,6 @@ See the checkbox tracker below.
 ### Phase 7 — docs + naming
 - [x] 7.1 `docs/workflow.md` (order: datagen -> pushhub -> wm[+val/eval subpoints] -> am -> interpret -> rm -> language-control).
 - [x] 7.2 `docs/interpret.md` (defining concepts/factors + VLM prompts).
-- [x] 7.3 `docs/byo_environment.md` (+ the "Diagnostic renders (optional)" section: exact contract + what-you-lose table).
+- [x] 7.3 `docs/byo.md` (+ the "Diagnostic renders (optional)" section: exact contract + what-you-lose table).
 - [x] 7.4 `README.md` links to the three docs + this plan + accelerations.md.
 - [x] 7.5 Public rename: HF dataset `quickdraw-torus` -> `torus-world`; gym id `TorusWorld-v0`. Internal `torus/<split>` unchanged.
