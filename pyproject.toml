@@ -3,7 +3,9 @@ name = "quickdraw"
 version = "0.1.0"
 description = "Who's the fastest gun in the west? A world models shoot out."
 readme = "README.md"
-requires-python = ">=3.11"
+# >=3.12 because lerobot 0.6.1 requires it. Leaving 3.11 open is what made the
+# unpinned lerobot below resolve differently per interpreter.
+requires-python = ">=3.12"
 dependencies = [
   "numpy",
   "scipy",
@@ -13,7 +15,12 @@ dependencies = [
   "torch>=2.5",
   "lightning>=2.3",
   "wandb",
-  "lerobot",
+  # Pinned exactly. lerobot versions its on-disk dataset layout
+  # (`codebase_version`) independently of its Python API, so the release
+  # resolved here decides which layouts can be read -- and unpinned it
+  # resolved by interpreter: 0.4.4 under Python 3.11, a v3-era release under
+  # 3.12+. owm-envs, which writes the ISS datasets, pins the same version.
+  "lerobot[dataset]==0.6.1",
   "torchcodec",
   "imageio[ffmpeg]",
   "pyvista",
