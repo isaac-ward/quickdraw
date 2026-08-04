@@ -1,4 +1,4 @@
-# The minimal reward-only example env (environments/examples/pendulum.py) — gym Pendulum-v1 physics.
+# The single-file full-contract example env (environments/examples/pendulum.py) — gym Pendulum-v1 physics.
 name: pendulum    # env-registry name (environments/registry.make_env)
 dt: 0.05          # integration step
 max_torque: 2.0   # action clip: torque in [-max_torque, max_torque]

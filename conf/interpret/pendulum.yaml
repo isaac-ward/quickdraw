@@ -1,0 +1,65 @@
+# Per-environment interpretability config (eval_interpret) for the pendulum example env
+# (environments/examples/pendulum.py) — select with interpret=pendulum. Same shape as conf/interpret/torus.yaml:
+# eval_interpret imagines short clips, VLM-labels them by semantic factor, and recolors the eval_manifold
+# latent projections by those labels (see design/interpretability.md).
+
+n_clips: 512          # imagined clips to label + embed (the pendulum latent is tiny; 512 covers the phase cylinder)
+n_captions: 8         # detailed free-form VLM captions per clip (0 = off), for CLIP-style reward training
+point: per_step       # per_step = every step's latent, clip label broadcast; mean = one clip-mean latent per clip
+clip_len: 10          # frames per clip (0.5 s @ 20 Hz — dt = 0.05)
+batch: 32             # clips imagined per forward pass (image-decode memory)
+vlm_frames: 6         # frames subsampled from each clip fed to the VLM (enough to read the swing direction)
+seed: 0
+imaginations: true    # dump per-clip imaginations (one dir per clip + manifest.json) for a web explorer
+umap_sup_weights: [0.1, 0.3, 0.9]    # supervised-UMAP target weights (presentation, not evidence); >=~0.99 degenerate
+
+vlm:
+  model: gpt-4o
+  max_workers: 8      # concurrent Responses-API calls (labeling is I/O-bound)
+  # OPENAI_API_KEY is read from the environment (falls back to a repo-root .env)
+
+# semantic factors. BOTH are source: vlm (the VLM reads the rendered rod) — the analytic scalar kinds in
+# evaluation/interpret.py (hue_at_position / z_band / speed_quantile) are torus-shaped today (they read
+# ecfg.R / ecfg.r), so pendulum `analytic` cross-check blocks (theta quadrant, theta_dot sign — both exact
+# from the imagined proprio) need kinds added there before they can be declared here.
+factors:
+  region:                      # which quadrant the rod TIP points to (theta = 0 is straight UP)
+    source: vlm
+    buckets: [upright, right, down, left]
+    colors:
+      upright: "#d62728"
+      right: "#2ca02c"
+      down: "#1f77b4"
+      left: "#9467bd"
+  swing:                       # which way the rod sweeps across the clip's frames (theta_dot > 0 = clockwise)
+    source: vlm
+    buckets: [clockwise, counterclockwise, still]
+    colors:
+      clockwise: "#ff7f0e"
+      counterclockwise: "#17becf"
+      still: "#7f7f7f"
+
+prompt: |
+  You are labeling a short rendered video clip (about half a second) of a SINGLE rigid pendulum: a reddish
+  rod attached to a fixed black pivot at the CENTER of the frame, swinging in the image plane on a white
+  background. The frames may be LOW-RESOLUTION or BLURRY — judge the rod's overall direction, not fine detail.
+  Report two things. (1) "region": in the MIDDLE frame of the clip, which quadrant does the rod point into
+  from the pivot? Straight or mostly UP = upright; mostly toward the RIGHT edge = right; straight or mostly
+  DOWN = down; mostly toward the LEFT edge = left. Pick the single closest direction. (2) "swing": comparing
+  the frames IN ORDER, which way does the rod tip sweep around the pivot? clockwise, counterclockwise, or
+  still (no visible motion across the frames). In "reasoning", FIRST briefly describe where the rod points
+  and how it moves (a few words), THEN commit to the labels. Also give a self_reported_confidence in [0,1]
+  (lower it when the frames are blurry or the rod barely moves). Return ONLY the structured fields.
+
+# appended to `prompt` when n_captions>0 (asks for exactly {n} detailed, diverse captions of THIS clip). These
+# train f_t on real phrasings (CLIP-style), so any wording steers — NOT a fixed template set.
+caption_prompt: |
+  ALSO write exactly {n} short, natural-language captions, each describing THIS specific clip in a DIFFERENT
+  way, as if telling someone what the pendulum is doing. Take into account where the rod points (hanging down,
+  balanced upright, out to the left or right) and any motion you can see (swinging clockwise or
+  counterclockwise, speeding up, slowing down, hovering near the top, hanging still). Vary the wording, word
+  order, and level of detail across the {n} captions — some terse ("rod hanging straight down"), some fuller
+  ("the pendulum sweeps quickly counterclockwise past the right side, heading for the top"). Do NOT number
+  them or reuse a fixed template; make them read like distinct human descriptions of the same moment. If any
+  "Known exact facts" are given, treat them as ground truth and make EVERY caption consistent with them — the
+  frames can be misleading, so trust the stated facts there.

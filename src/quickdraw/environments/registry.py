@@ -2,7 +2,7 @@
 `make_env` so a run selects its environment purely by config (`environments.name`), never by import.
 
 Registered: `torus_world` (the reference env — batched TorusEnv, environments/examples/torus.py).
-`pendulum` (the minimal reward-only example — environments/examples/pendulum.py). `gym:<EnvId>`
+`pendulum` (the single-file full-contract example — environments/examples/pendulum.py). `gym:<EnvId>`
 (Phase 6) wraps an arbitrary gymnasium.Env via GymBatchAdapter."""
 
 from __future__ import annotations
