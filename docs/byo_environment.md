@@ -142,9 +142,20 @@ What you need for what:
 The eval-viz wiring that CALLS `render_diagnostics` (Phase 5 of
 [design/gym_refactor.md](../design/gym_refactor.md)) asks for the view `"scene"`: the open-loop rollout
 video and the control video both go through it, and fall back to the `render_obs` pred-vs-true filmstrip
-when `wants_diagnostics(env)` is False or the env returns `{}`. Reference implementation:
-`TorusEnv.render_diagnostics` (`environments/torus.py`) — a thin wrapper over the torus scene renderers,
-pixel-identical to the pre-interface videos.
+when `wants_diagnostics(env)` is False or the env returns `{}`.
+
+Two reference implementations live in `environments/examples/`, and they show the design rule — **draw the
+overlay in the env's OWN view**, don't invent a second visualization:
+
+| example | what `render_diagnostics` draws | true-vs-pred readout |
+|---|---|---|
+| `TorusEnv` (`examples/torus.py`) | the 3D torus surface with the `agents` paths *on the manifold* (true black + sphere-ended, pred grey), fork marker, ambient action arrows | pred path diverging from the true path across the surface |
+| `PendulumEnv` (`examples/pendulum.py`) | the pendulum's own 2D view — pivot + one swinging rod *per agent overlaid in the same frame* (true black, pred grey) at each step's angle, goal a faint dashed target rod | watch the grey pred rod track/drift from the black true rod |
+
+Because the pendulum's rod render *is* its image modality (`render_obs`), a pendulum `ood_horizon` run *also*
+emits the standard `pred(top)/GT(bottom)` decoded-image filmstrip — so you get the true-vs-pred comparison
+twice: superimposed (the diagnostic scene) and stacked (the image filmstrip). Torus's static atlas PNG + 3D
+scene JSON are torus-only bonus products (they need the `R/r` geometry) and are gated off for other envs.
 
 ## Worked example: a stock gym env end-to-end
 
