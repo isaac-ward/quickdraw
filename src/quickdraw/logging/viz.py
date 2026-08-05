@@ -607,8 +607,8 @@ def control_compare_frames(R, r, coloring, agents, n_frames=10000, title="",
                 ai = min(k - 1, len(a["avec"]) - 1)
                 trajs.append({"xyz": a["path"][lo:k], "color": c, "tip": {"color": c, "lighting": False}})
                 if show_goals:
-                    trajs.append({"xyz": _tangent_ring(a["goal_seq"][gi], R, 0.0675 * sc), "color": c,
-                                  "radius": 0.008 * sc, "start_sphere": False, "end_sphere": False})  # goal ring (1.5x agent
+                    trajs.append({"xyz": _tangent_ring(a["goal_seq"][gi], R, 0.135 * sc), "color": c,
+                                  "radius": 0.008 * sc, "start_sphere": False, "end_sphere": False})  # goal ring (2x'd 2026-08-05 to match control.tol=0.30)
                     #                                     diam; tube thickness == the main agent tail thickness)
                 arrows.append((a["path"][k - 1], a["avec"][ai], c))
             fan = fan_seq[min(k - 1, len(fan_seq) - 1)] if fan_seq else None  # this step's candidate fan

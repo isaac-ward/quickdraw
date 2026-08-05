@@ -87,6 +87,10 @@ action_head:
   #                           the action flow — it exploded to ~1e22 (vit-mse run) and even when finite HURT OOD
   #                           (unetflow pointwise 1.13 vs 0.36 baseline). false = gradient flows into the trunk
   #                           (co-shapes it), the STABLE setting (matches the working 07-17 action-head run). DO NOT CHANGE.
+  #                           RE-CONFIRMED 2026-08-05 (joint WM+action runs, shortcut=false, vit-mse): detachF (false)
+  #                           beat detachT (true) on EVERY axis @ep10 — control 2.88 vs 1.75 goals/5, OOD pointwise
+  #                           0.222 vs 0.470, learned-action-prior W1 0.011 vs 0.140 (13x better). detach=false lets the
+  #                           action gradient co-shape the trunk -> better dynamics AND a better prior. (design/rollout_throughput.md)
 modalities:
   # decode_kind: flow -> generative decode head per trunk (design/models/flow_heads.md). mse (default) =
   # deterministic decode, bit-identical to before. decode_shortcut: true -> K=1 sampling (EXPLICIT opt-in, like

@@ -28,7 +28,7 @@ class MPPIConfig:
     noise_sigma: float = 0.5
     lambda_: float = 1.0
     mean_decay: float = 1.0
-    tol: float = 0.15          # within this ambient distance of the goal counts as "at" it
+    tol: float = 0.30          # within this ambient distance of the goal counts as "at" it (2x'd 2026-08-05)
     settle_steps: int = 4      # consecutive in-tol steps before advancing to the next goal
     max_steps: int = 800       # per-episode step budget for the whole goal sequence
     beta_vel: float = 0.3      # velocity penalty weight, gated to near-goal (encourages settling)

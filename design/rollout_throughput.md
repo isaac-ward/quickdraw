@@ -151,8 +151,9 @@ flow. The fixed-window `pad_block_mask` already gives the **static per-step shap
 - **`p_tf` sampling** — teacher-forcing is a data-dependent branch, but the expensive steady regime is
   `p_tf=0` (post-warmup); graph the `p_tf=0` path, fall back to eager during the short warmup epochs.
 - **Double-backward conflict** — FlexAttention has no double-backward under compile (`variations.md`), so the
-  contraction penalty needs the eager attn path → **gate the graphed rollout OFF when `variations.contraction`
-  is on**.
+  contraction penalty needs the eager attn path. These two are mutually exclusive → **RAISE at startup if BOTH
+  the graphed rollout and `variations.contraction` are enabled** (fail fast, user picks one); do NOT silently
+  disable either.
 
 **Parity gate (hard requirement — a fast-but-wrong rollout is worse than slow):**
 - graphed vs eager: forward outputs **and** backward grads within tolerance on fixed inputs;
