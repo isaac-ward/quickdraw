@@ -137,8 +137,12 @@ def main(cfg):
     _startup_log(run_dir, f"[startup] model built: {sum(p.numel() for p in model.parameters()) / 1000:.0f}K "
                           f"params (model={cfg.model.name})")
     if torch.cuda.is_available() and not cfg.model.get("modalities"):
-        # (multimodal token-bag models skip compile: the per-batch image gather + ViT AE complicate it;
-        # FlexAttention still runs, just eager.)
+        # (multimodal token-bag models skip WHOLE-MODEL compile: the per-batch image gather + ViT AE
+        # complicate it. But FlexAttention still SELF-COMPILES its kernel per call — MEASURED fused
+        # (FlexAttentionAutogradOp + flash-SDPA kernels, no B×H×T×T reference path); see
+        # design/rollout_throughput.md. So attention is NOT the bottleneck: the AR rollout is DISPATCH-bound
+        # by the serial F-step Python loop (Self CPU ~3.5s >> Self CUDA ~0.68s, GPU ~15-20% util). The free
+        # lever is batch (fills the idle GPU: 2x batch ~ +7% wall-clock), NOT fusing already-fused attention.)
         # Compile the parallel forward only; the rollout stays EAGER. Compiling the transformer for the
         # rollout backfired badly: the rollout hits ~57 distinct sequence lengths, which blows past
         # torch._dynamo's recompile cache limit and thrashes (~18x slower). Eager rollout = the fast path.
