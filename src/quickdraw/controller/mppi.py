@@ -22,21 +22,23 @@ from ..environments.torus_utils import control_goals
 
 @dataclass
 class MPPIConfig:
-    horizon: int = 24
-    chunk: int = 4             # execute this many steps of each plan before replanning (action chunking)
-    num_samples: int = 512
-    noise_sigma: float = 0.5
-    lambda_: float = 1.0
+    # NOTE: defaults MIRROR conf/control/mppi.yaml (the authoritative values used at runtime) — keep them in
+    # sync. The yaml overrides these anyway; matching just stops the dataclass from misleading readers.
+    horizon: int = 64
+    chunk: int = 8             # execute this many steps of each plan before replanning (action chunking)
+    num_samples: int = 128
+    noise_sigma: float = 2.0
+    lambda_: float = 0.3
     mean_decay: float = 1.0
     tol: float = 0.30          # within this ambient distance of the goal counts as "at" it (2x'd 2026-08-05)
-    settle_steps: int = 4      # consecutive in-tol steps before advancing to the next goal
-    max_steps: int = 800       # per-episode step budget for the whole goal sequence
-    beta_vel: float = 0.3      # velocity penalty weight, gated to near-goal (encourages settling)
-    r_settle: float = 0.5      # distance under which the velocity penalty turns on
-    beta_ctrl: float = 0.0     # control (action-magnitude) cost weight: penalizes sum_h ||a_h||^2 over the
+    settle_steps: int = 45     # consecutive in-tol steps before advancing (~0.75s @60Hz dwell to confirm arrival)
+    max_steps: int = 1000      # per-episode step budget for the whole goal sequence
+    beta_vel: float = 0.0      # near-goal velocity penalty OFF: it made the controller stall at the gate boundary
+    r_settle: float = 0.5      # distance under which the velocity penalty would turn on (unused while beta_vel=0)
+    beta_ctrl: float = 0.02    # control (action-magnitude) cost weight: penalizes sum_h ||a_h||^2 over the
     #                            horizon, so the planner prefers cheaper thrust (and settles with less jitter).
     #                            Applies to BOTH controllers (shared _score). 0 = off (no control cost).
-    n_episodes: int = 16       # parallel control episodes (random inits/orders); video is episode 0
+    n_episodes: int = 8        # parallel control episodes (random inits/orders); video is episode 0
     n_goals: int = 5           # goals visited per episode (random subset of the 8 NESW in/out goals)
 
 
