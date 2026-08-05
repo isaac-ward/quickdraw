@@ -203,7 +203,10 @@ def main(cfg):
                         #   not inference_mode) lets the contraction variation build its Jacobian graph on
                         #   val for val/loss/contraction. Measured to have NO speed cost vs inference_mode.
                         limit_train_batches=cfg.trainer.get("limit_train_batches", 1.0),
-                        limit_val_batches=cfg.trainer.get("limit_val_batches", 1.0))
+                        limit_val_batches=cfg.trainer.get("limit_val_batches", 1.0),
+                        # +trainer.fast_dev_run=true -> 1 train + 1 val batch, no ckpt/logger: a build+forward
+                        # preflight (used by the wizard) to prove data loads and the model runs before a real launch.
+                        fast_dev_run=bool(cfg.trainer.get("fast_dev_run", False)))
     # `resume` (+ its run_dir continuation) was resolved at the top of main. ckpt_path restores
     # weights+optimizer+LR-scheduler+epoch — p_tf/physical warmups are current_epoch-keyed and the LR warmup
     # is a step-keyed Lightning LambdaLR, so every schedule restores correctly on resume.

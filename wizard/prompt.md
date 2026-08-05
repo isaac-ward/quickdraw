@@ -54,7 +54,8 @@ Ask: **"What are you bringing?"** One of three (this mirrors `docs/byo.md`):
   Then train with **`environments=recorded`** (data-only — the config *group*, which carries
   `obs_dim`/`action_dim`/`dt`; NOT `environments.name=recorded`, which only renames the default env.
   `conf/environments/recorded.yaml` defaults to `16`/`4`, so override `environments.obs_dim`/`action_dim` +
-  `model.action_dim`/`modalities.0.dim` to the dataset's real dims) **or** a real env if they have a matching
+  `model.action_dim`/`modalities.0.dim` to the dataset's real dims. `dt` you do NOT set — `env_cfg` auto-reads
+  the dataset's fps from `summary.json` (warns if absent)) **or** a real env if they have a matching
   simulator (see the *data ⟂ env* note — pre-generated data + a real env gives you that env's full evals,
   trained on your data).
 - **What recorded-only gets you** (no simulator): WM training, the `ood_horizon` pointwise metric, the

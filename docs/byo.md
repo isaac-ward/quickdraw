@@ -70,8 +70,10 @@ python -m quickdraw.train_world_model data.root=<run_dir> data.repo_id=<name> da
 Use **`environments=recorded`** — the config *group*, which carries the dims — **not**
 `environments.name=recorded`, which only renames the default (torus) env and leaves the dims unresolved.
 `conf/environments/recorded.yaml` defaults to starling's `16`/`4`, so override `environments.obs_dim` /
-`action_dim` (and `model.action_dim` / `modalities.0.dim`) for other datasets. `check_dataset` counts the
-`P+F` training windows and flags any obs/action-dim mismatch **before** you burn a run.
+`action_dim` (and `model.action_dim` / `modalities.0.dim`) for other datasets. **`dt` you do *not* set** —
+`env_cfg` auto-reads the dataset's own fps from `summary.json` (`dt=1/fps`), warning only if the dataset has
+no fps. `check_dataset` counts the `P+F` training windows and flags any obs/action-dim mismatch **before**
+you burn a run.
 
 Each dataset gets a small bespoke processor (`starling`, `robocasa`, …) that parses its quirks and emits
 the same layout via a shared builder; **non-image** datasets are supported too (a processor yields

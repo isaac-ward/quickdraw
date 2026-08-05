@@ -1,4 +1,5 @@
 name: recorded    # env-registry name (environments/registry.make_env) — recorded trajectories, no simulator
 obs_dim: 16       # recorded state dim (flightroom-starling processed dump)
 action_dim: 4     # recorded action dim
-dt: 0.0333333     # 30 Hz recordings
+dt: 0.0333333     # FALLBACK ONLY. env_cfg auto-reads the dataset's own fps (summary.json) as dt=1/fps; this
+                  # value is used only if the dataset has no fps, with a loud warning. 30 Hz = starling default.

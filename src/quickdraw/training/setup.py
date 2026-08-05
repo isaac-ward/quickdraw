@@ -13,6 +13,30 @@ from ..data.dataset import (
 from ..environments.torus_utils import TorusConfig
 
 
+def _recorded_dt(cfg, fallback: float) -> float:
+    """A recorded env's dt is DATASET-SPECIFIC (velocity/physics quantities scale with it), but
+    conf/environments/recorded.yaml ships one default (starling's 30 Hz). Prefer the dataset's OWN frame
+    rate: read `fps` from the run folder's summary.json (dt = 1/fps). Fall back to environments.dt with a
+    LOUD warning when the dataset's fps is unknown, so a silent Hz mismatch can't quietly corrupt training."""
+    import json
+    try:
+        root = resolve_data_root(cfg)
+        fps = json.load(open(os.path.join(root, "summary.json"))).get("fps")
+    except Exception as ex:   # noqa: BLE001
+        print(f"[env_cfg] WARNING: could not read fps from the dataset ({type(ex).__name__}); using "
+              f"environments.dt={fallback}. If that's not your data's 1/fps, set +environments.dt.", flush=True)
+        return fallback
+    if fps:
+        dt = 1.0 / float(fps)
+        if abs(dt - fallback) > 1e-6:
+            print(f"[env_cfg] recorded dt <- dataset fps {fps} => dt={dt:.5f} "
+                  f"(overrides environments.dt={fallback})", flush=True)
+        return dt
+    print(f"[env_cfg] WARNING: dataset summary.json has no fps; using environments.dt={fallback}. "
+          f"Set +environments.dt to your data's 1/fps if that's wrong.", flush=True)
+    return fallback
+
+
 def env_cfg(cfg):
     """cfg.environments -> the env's config dataclass (torus: TorusConfig, unchanged; recorded: RecordedConfig)."""
     e = cfg.environments
@@ -24,7 +48,8 @@ def env_cfg(cfg):
                               m=float(e.m), l=float(e.l))
     if str(e.name).lower() == "recorded":
         from ..environments.recorded import RecordedConfig
-        return RecordedConfig(obs_dim=int(e.obs_dim), action_dim=int(e.action_dim), dt=float(e.dt))
+        return RecordedConfig(obs_dim=int(e.obs_dim), action_dim=int(e.action_dim),
+                              dt=_recorded_dt(cfg, float(e.dt)))
     raise ValueError(f"env_cfg: no config dataclass for environments.name={e.name!r}")
 
 

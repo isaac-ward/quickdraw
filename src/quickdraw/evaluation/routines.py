@@ -17,7 +17,7 @@ import numpy as np
 from ..controller.run import _plog, run_and_log_control
 from ..environments.registry import make_env
 from ..logging import viz
-from ..training.setup import eval_episodes
+from ..training.setup import eval_episodes, resolve_data_root
 import torch
 
 from .openloop import eval_batched, proprio_curves
@@ -86,7 +86,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         _plog(writer, f"[eval_ood_horizon @ep{step}] {pct:3d}% — {what}")
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size,
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     n_ep = min(8 if img_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(eps))
     eps = eps[:n_ep]
@@ -160,7 +160,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
 def _ood_axis(cfg, model, norm, ecfg, writer, device, step, split):
     """Open-loop on one OOD split, scored on its own geometry + drawn with its coloring (from the
     dataset card). Shared by the visual/geometric/dynamics axes."""
-    card = json.load(open(os.path.join(cfg.data.root, "dataset_card.json")))
+    card = json.load(open(os.path.join(resolve_data_root(cfg), "dataset_card.json")))
     split_env, coloring = card.get("split_env", {}), card.get("coloring", {})
     se = split_env.get(split, {"R": ecfg.R, "r": ecfg.r})
     s = _openloop_split(cfg, model, norm, writer, device, split, se["R"], se["r"],
@@ -215,7 +215,7 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     m.eval()
     t0 = time.perf_counter()
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    mm_eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)   # decodes proprio; latent = flattened bag
+    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)   # decodes proprio; latent = flattened bag
     _, latents, _, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
                                                   stride=1, seed=0, device=device)
     sub = (f"each point = one committed 1-step next-state prediction from a real val context "
@@ -261,7 +261,7 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     P, W, d, K, n_swarm = cfg.data.P, m.window, m.d, m.sampling_steps, 16
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)
     # per-eval variety: a seed drives WHICH trajectory + the swarm angle, so a bad-looking eval won't recur (the
     # next eval shows a different one from a different angle) yet stays reproducible. Defaults to the epoch `step`.
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
@@ -358,7 +358,7 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     t0 = time.perf_counter()
     R, r, K, P = ecfg.R, ecfg.r, m.sampling_steps, cfg.data.P
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
     _plog(writer, f"[denoising_aggregate @ep{step}] seed={seed} pooling val contexts, K={K}...")
     paths6d, _, _, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=5000, cube=3.0, stride=1, seed=seed, device=device)
@@ -411,7 +411,7 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     P, H, fps = cfg.data.P, int(ic["clip_len"]), round(1.0 / ecfg.dt)
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)
 
     # ---- sample N clips (episode, t0): P context frames + H imagined steps ----
     rng = _np.random.RandomState(int(ic["seed"]))
@@ -633,10 +633,10 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     # it so we always produce the FULL set of products (never a partial run gated on a stale cfg.data.action_sampler).
     asamp = "ornstein_uhlenbeck"
     try:
-        asamp = json.load(open(os.path.join(cfg.data.root, "summary.json"))).get("action_sampler", asamp)
+        asamp = json.load(open(os.path.join(resolve_data_root(cfg), "summary.json"))).get("action_sampler", asamp)
     except Exception:
         pass
-    eps = load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)
     n_ep = min(int(cfg.eval.get("action_dist_episodes", 64) or 64), len(eps))   # default 64 = full val split (max distinct contexts)
     eps = eps[:n_ep]
     L = min(len(o) for o, _, _ in eps)
