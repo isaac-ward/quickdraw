@@ -19,7 +19,7 @@ from .logging.callback import BestCkptMirror, LoggingCallback, ProgressPrinter
 from .logging.writer import make_writer
 from .utils.logging import make_run_dir
 from .training.lit import LitWorldModel
-from .training.setup import build_model, data_exists, env_cfg, normalizer, window_loaders
+from .training.setup import autobatch_find, build_model, data_exists, env_cfg, normalizer, window_loaders
 
 
 _SUMMARY_FIELDS = [("problem", "Problem we are facing"), ("tried", "What we have tried"),
@@ -112,6 +112,13 @@ def main(cfg):
         run_dir = make_run_dir("train_world_model", cfg.experiment)   # logs/train_world_<ts>_<exp> (prefix names the entrypoint)
         os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
         OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))
+
+    # Auto-size the batch to fill VRAM (the AR step is dispatch-bound -> bigger batch is nearly-free
+    # throughput; accelerations.md Exp 8). Fresh runs only — a resume keeps its original batch. Disable with
+    # data.autobatch=false for controlled A/Bs where a FIXED batch matters.
+    if not resume and bool(cfg.data.get("autobatch", True)) and torch.cuda.is_available():
+        cfg.data.batch = int(autobatch_find(cfg, torch.device("cuda"), log=lambda m: _startup_log(run_dir, m)))
+        OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))  # record chosen batch
 
     _t = time.perf_counter()
     _startup_log(run_dir, "[startup] loading dataset (GPU-resident windows) + normalizer...")

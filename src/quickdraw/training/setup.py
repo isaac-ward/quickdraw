@@ -132,6 +132,84 @@ def build_model(cfg):
 _hf_root_cache: dict = {}   # hf_repo -> snapshot path (avoid re-resolving/downloading per call)
 
 
+def autobatch_find(cfg, device, log=print) -> int:
+    """Binary-search the largest `data.batch` whose AR training step fits `VRAM*(1-headroom)`, capped at
+    `autobatch_max`. The AR step is DISPATCH-bound (accelerations.md Exp 8), so bigger batch is nearly-free
+    throughput until memory binds — pick the largest that fits with headroom. Builds a THROWAWAY model +
+    SYNTHETIC batches (memory is shape- not value-dependent), probes real `rollout_train` fwd + decode + bwd,
+    then frees. Headroom covers the optimizer states, eval-phase spikes, and allocator reserve — raise
+    `data.autobatch_headroom` if an eval OOMs. Config: data.autobatch{,_headroom,_max,_base}."""
+    import gc
+    headroom = float(cfg.data.get("autobatch_headroom", 0.15))
+    cap = int(cfg.data.get("autobatch_max", 512))
+    base = int(cfg.data.get("autobatch_base", 16))
+    total = torch.cuda.get_device_properties(device).total_memory
+    budget = int(total * (1.0 - headroom))
+    P, F = int(cfg.data.P), int(cfg.data.F); L = P + F
+    de = int(cfg.model.get("detach_every", 16)); rf = float(cfg.model.get("recon_frac", 1.0))
+    specs = _modality_specs(cfg); adim = int(cfg.model.get("action_dim", 2))
+    model = build_model(cfg).to(device).train()
+
+    def synth(B):
+        obs = {}
+        for s in specs:
+            if getattr(s, "kind", "vector") == "image":
+                sz = getattr(s, "img_size", 128)
+                hw = (sz, sz) if isinstance(sz, int) else tuple(int(x) for x in sz)
+                obs[s.name] = torch.rand(B, L, hw[0], hw[1], 3, device=device)
+            else:
+                obs[s.name] = torch.randn(B, L, int(getattr(s, "dim", 6)), device=device)
+        act = torch.randn(B, L - 1, adim, device=device)
+        return {k: v[:, :P] for k, v in obs.items()}, act, {k: v[:, P:] for k, v in obs.items()}
+
+    def probe(B):   # peak bytes for one real AR step, or None on OOM
+        torch.cuda.synchronize(device); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
+        try:
+            ctx, act, fut = synth(B)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                preds = model.rollout_train(ctx, act, fut, 0.0, de)
+                loss = preds.float().pow(2).mean()
+                try:   # add the decode-backward footprint (recon_frac subset) — deterministic decoders only
+                    k = max(1, int(round(rf * preds.shape[1])))
+                    loss = loss + sum(v.float().pow(2).mean() for v in model.to_obs(preds[:, :k]).values())
+                except Exception:   # flow/other decoders that don't decode cleanly here — rollout-only estimate
+                    pass
+            loss.backward(); model.zero_grad(set_to_none=True)
+            return torch.cuda.max_memory_allocated(device)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if not (isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower()):
+                raise
+            model.zero_grad(set_to_none=True); torch.cuda.empty_cache(); return None
+
+    def fits(B):
+        p = probe(B); return (p is not None and p <= budget), p
+
+    def done(b):   # free probe activations before the caller builds loaders + the real model
+        gc.collect(); torch.cuda.empty_cache(); return b
+
+    ok, p = fits(base)
+    if not ok:
+        log(f"[autobatch] base batch {base} already over budget ({(p or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — using {base}")
+        return done(base)
+    lo = hi = base
+    while hi * 2 <= cap:                       # double to bracket [lo fits, hi over]
+        ok, p = fits(hi * 2)
+        if ok: lo = hi = hi * 2
+        else: hi = hi * 2; break
+    if lo == hi:                               # fit to the cap without going over
+        log(f"[autobatch] fits to cap: data.batch={lo} (VRAM {total/1e9:.0f}GB @ {int(headroom*100)}% headroom, cap {cap})")
+        return done(lo)
+    while hi - lo > 8:                          # bisect to a multiple of 8
+        mid = (((lo + hi) // 2) // 8) * 8
+        if mid <= lo or mid >= hi: break
+        ok, p = fits(mid)
+        if ok: lo = mid
+        else: hi = mid
+    log(f"[autobatch] chose data.batch={lo}  (VRAM {total/1e9:.0f}GB, budget {budget/1e9:.0f}GB @ "
+        f"{int(headroom*100)}% headroom; probed rollout_train fwd+decode+bwd)")
+    return done(lo)
+
+
 def resolve_data_root(cfg) -> str:
     """data.hf_repo unset -> cfg.data.root verbatim (local path, unchanged behavior). Set -> download+cache
     the HF dataset repo (the whole run folder: per-split subdirs + normalization_stats.json) and return that

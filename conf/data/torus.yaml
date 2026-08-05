@@ -10,7 +10,16 @@ F: 64          # future horizon rolled out during training (sets the BPTT length
 window_stride: 1   # LOCKED at 1 (user, 2026-07-20): NEVER use window_stride > 1. It skips training-window starts
                    # (e.g. 8 = only every 8th start -> 8x fewer batches/epoch); the user does not want this speed
                    # shortcut — always full dense coverage (stride 1). DO NOT CHANGE.
-batch: 1024    # fast baseline: 515K model + F=64 full BPTT fits ~51 GB at this batch
+batch: 1024    # fast baseline: 515K model + F=64 full BPTT fits ~51 GB at this batch. OVERRIDDEN at startup
+               #   by the autobatch finder below (unless autobatch=false) — this is only the fallback/floor.
+autobatch: true            # DEFAULT ON (2026-08-05): probe the AR step at startup + set data.batch to the
+                           #   largest that fits VRAM*(1-headroom). The AR step is dispatch-bound so bigger
+                           #   batch is ~free throughput (accelerations.md Exp 8). Set false for controlled
+                           #   A/Bs that need a FIXED batch. Resumes keep their original batch (never re-probed).
+autobatch_headroom: 0.15   # reserve fraction of VRAM for optimizer states + eval-phase spikes + allocator
+                           #   fragmentation. RAISE if an eval OOMs (control/denoising spike above the train step).
+autobatch_max: 512         # cap (memory usually binds first for image models; this bounds proprio-only runs).
+autobatch_base: 16         # smallest probe batch (assumed to fit).
 workers: 16    # image mp4-decode is CPU-heavy; too few workers starves the GPU (low util). 80 cores here.
 fast_gpu: true   # vector stage: hold all windows resident on GPU, batch by on-device index (no workers/copies)
 n_plot_trajectories: 4     # how many sample trajectories to draw per split plot
