@@ -222,7 +222,7 @@ mechanism-vs-mechanism comparison apples-to-apples. The decoder shares no weight
 Seed `P` context steps → `enc` → latent buffer; feed the true `action` sequence; predict `ẑ`
 autoregressively in **latent space** for 2048 steps; `dec` each predicted latent to ℝ⁶ and score with
 the `environment.md` errors (`manifold_distance_error`, `pointwise_error`, `tangent_velocity_error`).
-MPPI control reuses the same compiled rollout, decoding latents to obs for the reward — no
+MPPI control reuses the same (eager) rollout, decoding latents to obs for the reward — no
 control-code change vs DSAR. **Collapse diagnostics** to log alongside the standard metrics: latent
 variance / effective rank, off-diagonal covariance mass, and `L_pred` magnitude (a near-zero
 `L_pred` with a high obs-space error is the collapse signature). These are logged as a `collapse/`

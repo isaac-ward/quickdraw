@@ -71,7 +71,7 @@ logs to W&B. Two invocations, no duplication:
 ## control routine — MPPI with learned dynamics
 
 The trained world model is the predictive dynamics inside a receding-horizon MPPI loop (reuses the
-same compiled rollout fn — no duplication). Own routines, own W&B group `eval/control/`.
+same (eager) rollout fn — no duplication). Own routines, own W&B group `eval/control/`.
 
 **Targets (16).** 4 poloidal rings × 4 toroidal compass directions:
 rings = outer `φ=0`, top `φ=π/2`, inner `φ=π`, bottom `φ=3π/2`; compass = E `θ=0`, N `θ=π/2`,
