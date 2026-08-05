@@ -89,9 +89,9 @@ def main(cfg):
     resume = cfg.get("resume", None)   # +resume=<ckpt> -> CONTINUE that checkpoint's own run (see run_dir below)
     if resume:
         resume = os.path.expanduser(str(resume))
-    if not resume:                              # a resume is a CONTINUATION, not a new run: skip the unique
-        summary_text = _run_summary_text(cfg)   # run-note gate (the original run already passed it) and the
-        _assert_summary_unique(summary_text, cfg)   # config.resolved.yaml write (keep the original's)
+    summary_text = _run_summary_text(cfg)   # fail if the run note is missing (present on resume via the
+    if not resume:                          # resolved config). A resume is a CONTINUATION, so skip the unique
+        _assert_summary_unique(summary_text, cfg)   # run-note gate + the config.resolved.yaml re-write below.
     if not data_exists(cfg):
         raise FileNotFoundError(
             "No dataset found. Run `python -m quickdraw.data_generation` first, then pass its run "
