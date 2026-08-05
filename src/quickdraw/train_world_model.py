@@ -52,15 +52,21 @@ def _run_summary_text(cfg) -> str:
     return "\n".join(lines + ["========================="])
 
 
-def _assert_summary_unique(summary_text, cfg, root="logs") -> None:
+def _assert_summary_unique(summary_text, cfg, root=None) -> None:
     """A run_summary must NEVER duplicate a prior run's. Every launch describes THIS run's current
     hypothesis + what changed since the last attempt — a reused note is a stale, meaningless note.
     Escape hatch: run_summary.allow_duplicate=true for a deliberate exact rerun."""
     import glob
     if bool((cfg.get("run_summary") or {}).get("allow_duplicate", False)):
         return
+    # Resolve the SAME root make_run_dir uses (QUICKDRAW_LOG_ROOT else "logs"); otherwise this globs "logs/"
+    # while grouped runs land in "logs/<group>/<run>/" and the check silently never matches. Glob one AND two
+    # levels deep to catch both flat (logs/<run>/) and grouped (logs/<group>/<run>/) layouts.
+    root = root or os.environ.get("QUICKDRAW_LOG_ROOT", "logs")
     norm = " ".join(summary_text.split())
-    for f in sorted(glob.glob(os.path.join(root, "*", "auto_run_summary.txt"))):
+    prev = (glob.glob(os.path.join(root, "*", "auto_run_summary.txt"))
+            + glob.glob(os.path.join(root, "*", "*", "auto_run_summary.txt")))
+    for f in sorted(prev):
         try:
             prev = " ".join(open(f).read().split())
         except OSError:
@@ -145,16 +151,15 @@ def main(cfg):
                           f"params (model={cfg.model.name})")
     if torch.cuda.is_available() and not cfg.model.get("modalities"):
         # (multimodal token-bag models skip WHOLE-MODEL compile: the per-batch image gather + ViT AE
-        # complicate it. But FlexAttention still SELF-COMPILES its kernel per call — MEASURED fused
-        # (FlexAttentionAutogradOp + flash-SDPA kernels, no B×H×T×T reference path); see
-        # design/rollout_throughput.md. So attention is NOT the bottleneck: the AR rollout is DISPATCH-bound
-        # by the serial F-step Python loop (Self CPU ~3.5s >> Self CUDA ~0.68s, GPU ~15-20% util). The free
-        # lever is batch (fills the idle GPU: 2x batch ~ +7% wall-clock), NOT fusing already-fused attention.)
-        # Compile the parallel forward only; the rollout stays EAGER. Compiling the transformer for the
-        # rollout ONCE backfired (~57 distinct sequence lengths -> dynamo recompile thrash, ~18x slower) —
-        # but the fixed-window pad_block_mask now bounds that to ~57 CACHED shapes, so a CUDA-graph /
-        # compiled+reduce-overhead rollout is feasible and is the real dispatch-killing lever (Exp 8 +
-        # design/rollout_throughput.md). Eager rollout = the current default until that lands.
+        # complicate it.) This compile wraps the PARALLEL forward, which does get a fused FlexAttention kernel.
+        # The AR rollout is DISPATCH-bound by the serial F-step Python loop (Self CPU ~3.5s >> Self CUDA ~0.68s,
+        # GPU ~15-20% util; Exp 8). Two levers: (1) batch — fills the idle GPU, nearly free; (2) compile the
+        # rollout STEP — MEASURED ~6x, parity-safe (opt-in model.compile_rollout, Exp 9): in the eager rollout
+        # attention runs UNFUSED, and compiling the step both fuses it and collapses the ~256 dispatches.
+        # Compile the parallel forward only; the rollout stays EAGER by default. (mode="reduce-overhead"/CUDA
+        # graphs does NOT work for the rollout — incompatible with retained-BPTT; the old ~57-shape recompile
+        # thrash that made rollout-compile look hopeless is fixed by the fixed-window pad_block_mask. Exp 9 +
+        # design/rollout_throughput.md.)
         # NOTE: keep compile ON — FlexAttention needs torch.compile to build its kernel (disabling it
         # forces a slow eager-attention fallback). Use DEFAULT mode, not max-autotune: the forward is
         # used ~1 epoch under the p_tf curriculum, so max-autotune's long kernel search isn't worth the

@@ -52,9 +52,18 @@ class MultiModalSequenceModel(nn.Module):
     #                       used in training (needs the full backprop graph); toggled off for the parity A/B.
 
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
-                 mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False):
+                 mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
+                 compile_rollout: bool = False):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
+        # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)
+        # to fuse the step (incl. the FlexAttention kernel, which runs UNFUSED in the eager rollout) and collapse
+        # the dispatch-bound serial F-loop (design/rollout_throughput.md Phase 1B.1). NOT mode="reduce-overhead"
+        # (CUDA graphs): that is fundamentally incompatible with the retained-BPTT rollout — see _compiled_step.
+        # Applied ONLY in the steady p_tf==0 regime; eager everywhere else. Held in a 1-elem list so the
+        # OptimizedModule wrapper is NOT registered as a submodule of self (which wraps self -> recursion).
+        self.compile_rollout = bool(compile_rollout)
+        self._compiled_step_holder: list = []
         self.modalities = build_modalities(specs, d)
         self.layout = [(m.name, m.n_tokens) for m in self.modalities.values()]  # bag order + slices
         self.n_state = sum(n for _, n in self.layout)
@@ -178,6 +187,29 @@ class MultiModalSequenceModel(nn.Module):
         carries the observation, compounding error in data space (the defining DSAR property)."""
         return bag
 
+    def _rollout_step(self, s_win: Tensor, a_win: Tensor, bm, prev_bag: Tensor) -> Tensor:
+        """One rollout advance as backbone(+readout): (s_win (B,W,n_state,d), a_win (B,W,2), bm, prev_bag
+        (B,n_state,d)) -> next state bag (B,n_state,d). This is the unit wrapped by torch.compile (mode="default")
+        when compile_rollout is on. Bit-identical to the inline eager body; factored out so the compiled and eager
+        paths run the SAME code (detach/teacher-forcing/carry stay OUTSIDE, in the Python loop, per detach-segment)."""
+        h_last = self.backbone(self._to_input(s_win, a_win), temporal_block_mask=bm)[:, -1]
+        return self.readout(h_last, prev_bag)
+
+    def _compiled_step(self):
+        """Lazily build (once) the compiled per-step fn. Each distinct pad -> a distinct temporal_block_mask ->
+        one compiled variant (the ~25 pad shapes at P=8/W=32 are cached under train.py's cache_size_limit=256).
+
+        mode="default" (inductor fusion), NOT "reduce-overhead" (CUDA graphs), even though Phase 1B.1 proposed
+        the latter: reduce-overhead's per-replay STATIC memory pool is fundamentally incompatible with the
+        retained-BPTT training rollout — it clobbers the saved-for-backward activations of earlier F-steps and
+        raises "accessing tensor output of CUDAGraphs that has been overwritten"; its cudagraph fast-path is also
+        disabled outright ("pending, uninvoked backwards"). mode="default" still fuses the per-step backbone (incl.
+        the FlexAttention kernel, which runs UNFUSED in the eager rollout) + flow readout, collapsing the
+        dispatch-bound serial loop: parity-verified, ~6x faster on the joint mm_flow step (design/rollout_throughput.md)."""
+        if not self._compiled_step_holder:
+            self._compiled_step_holder.append(torch.compile(self._rollout_step))
+        return self._compiled_step_holder[0]
+
     def one_step_states(self, bag_win: Tensor, act_win: Tensor, attn_eager: bool = False) -> Tensor:
         """One advance of the rollout as a pure bag->bag map (token-bag analogue of SequenceWorldModel):
         (bag_win (B,W,n_state,d), act_win (B,W,2)) -> next bag (B,n_state,d) at the LAST position. Backbone-
@@ -210,6 +242,10 @@ class MultiModalSequenceModel(nn.Module):
         W = self.window
         bag_buf = list(bag_buf)
         B = bag_buf[0].shape[0]
+        # Compiled per-step path is opt-in AND only for the steady AR regime (p_tf==0, training). Teacher-forcing
+        # (p_tf>0, warmup) is a data-dependent branch -> stays eager; the graph captures the p_tf==0 step only.
+        compiled = self.compile_rollout and p_tf == 0.0 and self.training
+        step_fn = self._compiled_step() if compiled else self._rollout_step
         preds = []
         for h in range(horizon):
             Lh = len(bag_buf)
@@ -220,18 +256,20 @@ class MultiModalSequenceModel(nn.Module):
             if pad:
                 s_win = F.pad(s_win, (0, 0, 0, 0, pad, 0))          # pad the TIME axis at front
                 a_win = F.pad(a_win, (0, 0, pad, 0))
-            x = self._to_input(s_win, a_win)                        # (B,W,n_input,d)
-            bm = pad_block_mask(W, pad, x.device)                   # temporal causal + drop padded steps
-            if self.grad_checkpoint and self.training:
+            bm = pad_block_mask(W, pad, s_win.device)               # temporal causal + drop padded steps
+            if compiled:
+                s_pred = step_fn(s_win, a_win, bm, bag_buf[-1])     # backbone+readout as one fused compiled step
+            elif self.grad_checkpoint and self.training:
                 # recompute this step's backbone forward during backward instead of storing its activations
                 # -> AR memory ∝ detach_every, not F (design/accelerations.md Exp 6). bm (a BlockMask, not a
                 # tensor) is bound as a default arg so the backward-time recompute uses THIS step's mask.
+                x = self._to_input(s_win, a_win)                    # (B,W,n_input,d)
                 h_last = torch.utils.checkpoint.checkpoint(
                     lambda x_, _bm=bm: self.backbone(x_, temporal_block_mask=_bm)[:, -1],
                     x, use_reentrant=False)                         # (B,n_input,d)
+                s_pred = self.readout(h_last, bag_buf[-1])          # (B,n_state,d)
             else:
-                h_last = self.backbone(x, temporal_block_mask=bm)[:, -1]  # (B,n_input,d)
-            s_pred = self.readout(h_last, bag_buf[-1])              # (B,n_state,d)
+                s_pred = self._rollout_step(s_win, a_win, bm, bag_buf[-1])  # (B,n_state,d)
             preds.append(s_pred)                                   # raw prediction -> loss/decode
             carried = self.carry_transform(s_pred)                 # data-space re-encode for DSAR; identity else
             if tf_future is not None and p_tf > 0.0:
@@ -339,11 +377,12 @@ class MultiModalLSAR(MultiModalSequenceModel):
     pred_latent = MSE to the encoded true-next bag (Reconstruction collapse: obs heads ground the encoder)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 grad_checkpoint: bool = False,
+                 grad_checkpoint: bool = False, compile_rollout: bool = False,
                  pred_hidden: int = 0, lambda_pred_latent: float = 1.0,
                  collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
-                         rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint)
+                         rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
+                         compile_rollout=compile_rollout)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
@@ -425,7 +464,7 @@ class MultiModalFlow(MultiModalSequenceModel):
     (deterministic ε=0 at eval unless stochastic_eval — the committed prediction)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 grad_checkpoint: bool = False,
+                 grad_checkpoint: bool = False, compile_rollout: bool = False,
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = False, time_sampling: str = "uniform", flow_hidden: int = 0,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
@@ -434,7 +473,8 @@ class MultiModalFlow(MultiModalSequenceModel):
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
                  dynamics_detach_encoder: bool = False):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
-                         rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint)
+                         rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
+                         compile_rollout=compile_rollout)
         assert predict in ("residual", "absolute")
         self.predict_residual = predict == "residual"
         self.sampling_steps = int(sampling_steps)

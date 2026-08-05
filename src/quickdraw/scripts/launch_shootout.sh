@@ -5,8 +5,9 @@
 # ============================================================================================
 # !!! DO NOT disable compile here. DO NOT set TORCHDYNAMO_DISABLE=1. !!!
 # Why: the transformer uses FlexAttention, which REQUIRES torch.compile to build its attention
-# kernel (it self-compiles even in the eager rollout). Disabling compile globally forces a slow
-# eager-attention fallback: ~260% CPU, GPU idle, no training progress. The one-time compile at
+# kernel (the parallel epoch-0 forward compiles it; NOTE the serial AR rollout actually runs attention
+# UNFUSED unless model.compile_rollout is set — see design/accelerations.md Exp 9). Disabling compile
+# globally forces a slow eager-attention fallback: ~260% CPU, GPU idle, no training progress. The one-time compile at
 # startup (the "slow start") is the NECESSARY cost of FlexAttention, not a waste. Leave compile on.
 # (If startup is too slow, the lever is the COMPILE MODE in train.py — it already uses the default
 #  mode (not max-autotune) — NOT disabling compile. That is a train.py change, coordinate before touching it.)

@@ -41,10 +41,12 @@ it waits on that serial dependency chain, not because attention is unfused. Dire
   proportionally."*
 - Named levers: **F, max_epochs, activation-checkpointing, the contraction penalty** — NOT attention fusion.
 
-**Unresolved sub-fact:** is attention even unfused for mm models? The comments contradict each other:
-- `train_world_model.py:141`: "multimodal … skip compile … FlexAttention still runs, **just eager**."
-- `launch_shootout.sh:8`: "FlexAttention … **self-compiles even in the eager rollout**."
-If FlexAttention self-compiles its kernel regardless of whole-model compile, A's premise is largely false.
+**Sub-fact — RESOLVED (2026-08-05, see Phase 1B.1 result above):** the eager AR rollout runs FlexAttention
+**UNFUSED** (it emits `flex_attention called without torch.compile()`). So `train_world_model.py:141` ("just
+eager") was right; `launch_shootout.sh:8` ("self-compiles even in the eager rollout") was WRONG (now fixed).
+The comments used to contradict each other:
+- `train_world_model.py:141`: "multimodal … skip compile … FlexAttention still runs, **just eager**." ✓
+- `launch_shootout.sh:8`: "FlexAttention … **self-compiles even in the eager rollout**." ✗ (corrected)
 
 Both diagnoses are consistent with the observed "batch is nearly free," but for OPPOSITE reasons (A: launch
 overhead amortizes over samples; B: batch fills the serial loop's idle slots). So "batch is free" does not
@@ -128,6 +130,30 @@ gate the compile off when `variations.contraction` is on (double-backward constr
 
 ### Phase 1B.1 — the CUDA-graph rollout (THE big dispatch-killer) — its own parity-gated project (NOT a launch bundle)
 
+> ## ✅ PHASE 1B.1 PROTOTYPE RESULT (2026-08-05) — opt-in `model.compile_rollout` (default off).
+> Prototyped on the joint mm_flow config (d=128/F=64/W=32/P=8, image head). Compiled the per-step
+> backbone+flow-readout unit (`multimodal._rollout_step`), applied only in the steady `p_tf==0` regime.
+> - **`mode="reduce-overhead"` (CUDA graphs, the proposed approach) does NOT work for training.** It (a) can
+>   never hit the cudagraph fast-path — `"Unable to hit fast path of CUDAGraphs because of pending, uninvoked
+>   backwards"` — and (b) hard-crashes with `"accessing tensor output of CUDAGraphs that has been overwritten
+>   by a subsequent run"`. **Fundamental, not fixable by output-cloning:** cudagraphs reuse ONE static memory
+>   pool per replay, but the retained BPTT graph needs EVERY F-step's saved-for-backward activations to stay
+>   live until the single end-of-rollout `backward()`. The next step's replay clobbers them. CUDA graphs assume
+>   fwd→bwd per capture (delimited by `cudagraph_mark_step_begin`), which a retained-graph AR rollout violates.
+> - **`mode="default"` (inductor fusion, no cudagraphs) WORKS and is the win.** PARITY: fwd max rel-diff
+>   **1.6e-3**, all 163 param grads max abs-diff **5e-8** (bf16 tol). SPEED: **2.76→0.45 s/batch = ~6.1×** on a
+>   dedicated H100, **GPU util 27%→82%**, same 22.9 GB peak, one-time ~96 s compile. The gain has TWO sources:
+>   (1) the eager rollout runs **FlexAttention UNFUSED** (`"flex_attention called without torch.compile() …
+>   materializes the full scores matrix"`) — compiling fuses it; (2) inductor fuses the ~256 tiny per-step
+>   dispatches. **This resolves the repo contradiction: `launch_shootout.sh:8` ("FlexAttention self-compiles
+>   even in the eager rollout") is WRONG — eager rollout flex is unfused; `train_world_model.py:141` ("just
+>   eager") is right.** (Exp 8's "already fused" was the COMPILED parallel forward, not the eager rollout.)
+> - **Verdict:** the plan's GOAL (kill the dispatch-bound serial loop) is achievable and parity-safe — via
+>   compiling the step, NOT via CUDA graphs. Committed flag uses `mode="default"`. Not yet integrated into a
+>   training run; the outer `model=torch.compile(model)` forward-wrap + this rollout-step compile coexisting is
+>   untested end-to-end. Startup RAISE if `compile_rollout` and `variations.contraction`(w>0) both set (no flex
+>   double-backward under compile) is in `setup.build_model`.
+
 **Target.** Self CPU 3.36 s ≫ Self CUDA 0.68 s, GPU ~20% busy (Exp 8): the cost is *calling* the fused ops
 ~256× (F·depth) through the serial Python loop. A CUDA graph records that launch sequence ONCE and replays it
 with a single CPU call — collapsing ~256 dispatches into ~1. Wall-clock then falls toward the CUDA time →
@@ -193,8 +219,8 @@ Beyond s/batch, GPU util, and first-epoch compile overhead:
 ## Consistency cleanup (do AFTER Phase 0 establishes ground truth)
 
 The repo currently tells two stories about attention/slowness; make them one:
-- Reconcile `train_world_model.py:141` ("just eager") with `launch_shootout.sh:8` ("self-compiles even
-  eager") to whatever the profile shows.
+- ~~Reconcile `train_world_model.py:141` ("just eager") with `launch_shootout.sh:8` ("self-compiles even
+  eager")~~ **DONE (2026-08-05):** eager rollout flex is UNFUSED; `launch_shootout.sh:8` corrected.
 - Annotate the `train_world_model.py:143` "~18× thrash" comment as the PRE-fix state (pad_block_mask +
   cache_size_limit fixed it) so it doesn't read as a current problem.
 - Append a Phase-0 experiment row to `design/accelerations.md` with the attribution + the A-vs-B resolution.

@@ -105,7 +105,9 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
     if max_frames is not None:
         frames = frames[:max_frames]
     elif cache:
-        np.save(cache_path, frames)
+        tmp = f"{cache_path}.{os.getpid()}.tmp.npy"   # atomic: write to a per-pid temp then rename, so two
+        np.save(tmp, frames)                           # concurrent cold starts can't read a half-written .npy
+        os.replace(tmp, cache_path)                    # (12+ GB here; a torn npy silently corrupts training)
     return frames
 
 

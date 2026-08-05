@@ -162,7 +162,8 @@ def _ood_axis(cfg, model, norm, ecfg, writer, device, step, split):
     dataset card). Shared by the visual/geometric/dynamics axes."""
     card = json.load(open(os.path.join(resolve_data_root(cfg), "dataset_card.json")))
     split_env, coloring = card.get("split_env", {}), card.get("coloring", {})
-    se = split_env.get(split, {"R": ecfg.R, "r": ecfg.r})
+    se = split_env.get(split) or {"R": getattr(ecfg, "R", None), "r": getattr(ecfg, "r", None)}   # lazy + guarded:
+    #                            a .get default is eval'd eagerly, so ecfg.R/.r must not be bare (crashes on non-torus envs)
     s = _openloop_split(cfg, model, norm, writer, device, split, se["R"], se["r"],
                         se.get("init_speed", ecfg.init_speed), split, step,
                         coloring.get(split, "rainbow"), fps=round(1.0 / ecfg.dt))
@@ -215,7 +216,8 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     m.eval()
     t0 = time.perf_counter()
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)   # decodes proprio; latent = flattened bag
+    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+                                    cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
     _, latents, _, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
                                                   stride=1, seed=0, device=device)
     sub = (f"each point = one committed 1-step next-state prediction from a real val context "
@@ -256,12 +258,14 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    R, r = ecfg.R, ecfg.r
+    R, r = getattr(ecfg, "R", None), getattr(ecfg, "r", None)
+    has_geom = R is not None and r is not None   # torus render needs geometry; the flow scalar below does NOT
     dev = device if isinstance(device, str) else device.type
     P, W, d, K, n_swarm = cfg.data.P, m.window, m.d, m.sampling_steps, 16
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+                                    cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     # per-eval variety: a seed drives WHICH trajectory + the swarm angle, so a bad-looking eval won't recur (the
     # next eval shows a different one from a different angle) yet stays reproducible. Defaults to the epoch `step`.
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
@@ -304,7 +308,7 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     ms_cur = o[ms_t0, :3]
     ms_tail = o[max(0, ms_t0 - 60):ms_t0 + 1, :3]
     ms_future = o[ms_t0:ms_t0 + n_ms + 1, :3]                       # fixed black future line spanning the N steps
-    ms_act = viz.action_ambient(ms_cur, a[ms_t0], R, r)
+    ms_act = viz.action_ambient(ms_cur, a[ms_t0], R, r) if has_geom else None
     _plog(writer, f"[denoising_multistep @ep{step}] seed={seed} {n_ms} steps from t0={ms_t0}, K={K} swarm={n_swarm}")
     ms_steps, spreads, sample_times = [], [], []
     for i in range(n_ms):
@@ -316,20 +320,23 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
         if (i + 1) % max(1, n_ms // 5) == 0:
             _plog(writer, f"[denoising_multistep @ep{step}] sampling {int(100 * (i + 1) / n_ms):3d}% "
                           f"({i + 1}/{n_ms} swarms) | elapsed {time.perf_counter() - t0:.0f}s")
-    _plog(writer, f"[denoising_multistep @ep{step}] swarm sampling done in {time.perf_counter() - t0:.0f}s; "
-                  f"rendering {sum(len(s['per_frame']) for s in ms_steps)} frames (torus atlas, GPU/EGL)...")
-    ms_frames = viz.diffusion_quiver_sequential_frames(R, r, "rainbow", ms_cur, ms_act, ms_tail, ms_future,
-                                                       ms_steps, title="denoising multistep",
-                                                       log=lambda mm: _plog(writer, f"[denoising_multistep @ep{step}] render {mm}"))
-    writer.video("eval_flow/denoising_multistep", ms_frames, 60, step)
-    writer.scene("eval_flow/denoising_multistep", {
-        "description": "Sequential swarms at a FIXED agent: each swarm denoises, then its tails collapse onto the "
-                       "convergence point along the (fixed) black future line, before the next swarm; agent, history "
-                       "and future do not move.",
-        "coordinate_system": "world xyz, same space as the torus",
-        "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
-        "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,
-        "swarm_target_per_step_xyz": [s["true_next"] for s in ms_steps]}, step)
+    if has_geom:
+        _plog(writer, f"[denoising_multistep @ep{step}] swarm sampling done in {time.perf_counter() - t0:.0f}s; "
+                      f"rendering {sum(len(s['per_frame']) for s in ms_steps)} frames (torus atlas, GPU/EGL)...")
+        ms_frames = viz.diffusion_quiver_sequential_frames(R, r, "rainbow", ms_cur, ms_act, ms_tail, ms_future,
+                                                           ms_steps, title="denoising multistep",
+                                                           log=lambda mm: _plog(writer, f"[denoising_multistep @ep{step}] render {mm}"))
+        writer.video("eval_flow/denoising_multistep", ms_frames, 60, step)
+        writer.scene("eval_flow/denoising_multistep", {
+            "description": "Sequential swarms at a FIXED agent: each swarm denoises, then its tails collapse onto the "
+                           "convergence point along the (fixed) black future line, before the next swarm; agent, history "
+                           "and future do not move.",
+            "coordinate_system": "world xyz, same space as the torus",
+            "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
+            "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,
+            "swarm_target_per_step_xyz": [s["true_next"] for s in ms_steps]}, step)
+    else:   # geometry-free flow scalars still logged below; only the torus render is skipped (option 2)
+        _plog(writer, f"[denoising_multistep @ep{step}] no env geometry (R/r); logging flow scalars only, no torus render")
     writer.scalars({"eval_flow/std_of_samples": float(_np.mean(spreads)),      # predicted uncertainty
                     "eval_flow/time/sample_s": float(_np.mean(sample_times)),
                     "eval_flow/time/sample_ms_per_euler_step": float(1000.0 * _np.mean(sample_times) / max(1, K))}, step)
@@ -351,14 +358,15 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     from ..models.multimodal import MultiModalFlow
     from .manifold import manifold_clouds
     m = getattr(model, "_orig_mod", model)
-    if not isinstance(m, MultiModalFlow):
-        return {}
+    if not isinstance(m, MultiModalFlow) or getattr(ecfg, "R", None) is None:
+        return {}   # pure torus render (no geometry-free product) -> self-skip on non-torus envs
     was = m.training
     m.eval()
     t0 = time.perf_counter()
     R, r, K, P = ecfg.R, ecfg.r, m.sampling_steps, cfg.data.P
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+                                    cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
     _plog(writer, f"[denoising_aggregate @ep{step}] seed={seed} pooling val contexts, K={K}...")
     paths6d, _, _, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=5000, cube=3.0, stride=1, seed=seed, device=device)
@@ -411,7 +419,8 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     P, H, fps = cfg.data.P, int(ic["clip_len"]), round(1.0 / ecfg.dt)
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
 
     # ---- sample N clips (episode, t0): P context frames + H imagined steps ----
     rng = _np.random.RandomState(int(ic["seed"]))
@@ -636,7 +645,8 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
         asamp = json.load(open(os.path.join(resolve_data_root(cfg), "summary.json"))).get("action_sampler", asamp)
     except Exception:
         pass
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size)
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     n_ep = min(int(cfg.eval.get("action_dist_episodes", 64) or 64), len(eps))   # default 64 = full val split (max distinct contexts)
     eps = eps[:n_ep]
     L = min(len(o) for o, _, _ in eps)

@@ -299,14 +299,23 @@ raised "is compiling FlexAttention a big speedup?". A candidate diagnosis said F
 
 **Finding 1 — FlexAttention is already FUSED.** The profiler shows `FlexAttentionAutogradOp` + a `Torch-Compiled
 Region` (the temporal sliding-window attn *self-compiles per call*) and `_flash_attention` (spatial + image-AE attn,
-flash-fused) — **no T×T score materialization**. This settles the repo's own contradiction: `launch_shootout.sh:8`
-("self-compiles even eager") was right; `train_world_model.py`'s "just eager" comment was misleading (now corrected).
+flash-fused) — **no T×T score materialization**.
+
+> ⚠️ **CORRECTED 2026-08-05 (later same day) — see Experiment 9.** This finding's *conclusion* ("attention is
+> already fused → compiling the rollout buys ~0") is **wrong**. A dedicated-GPU prototype compiled the rollout
+> step and measured **~6× faster, parity-safe** — so compiling emphatically *does* help. On the eager path the
+> step even emits `flex_attention called without torch.compile()… materializes the full scores matrix` (i.e.
+> UNFUSED), contradicting the "no T×T materialization" reading above. So the contradiction resolves the OPPOSITE
+> way from what this said: `train_world_model.py`'s "just eager" (= unfused in the serial rollout) was RIGHT;
+> `launch_shootout.sh:8`'s "self-compiles even eager" was WRONG (now fixed). Findings 2 & 3 below
+> (dispatch-bound, batch-nearly-free) stand — they're independently confirmed.
 
 **Finding 2 — the step is DISPATCH-bound, not compute-bound.** At batch 32: **Self CPU 3.36 s ≫ Self CUDA 0.68 s**
 → GPU **~20% busy, ~80% idle**. The top CPU costs are the `Torch-Compiled Region` FlexAttention dispatch (0.78 s) +
-`FlexAttentionAutogradOpBackward` (0.62 s) — i.e. the cost of *calling* the fused op ~256× (F·depth) through the
+`FlexAttentionAutogradOpBackward` (0.62 s) — i.e. the cost of *calling* the op ~256× (F·depth) through the
 **serial F-step Python loop**, not the kernels. This is exactly the latency-bound thesis of Exp 5–7, confirmed at the
-kernel level. **Compiling attention would not help — it's already fused.**
+kernel level. (The original conclusion here — "compiling attention would not help — it's already fused" — was
+**wrong**; compiling the whole step *does* collapse those dispatches: ~6×, see Exp 9.)
 
 **Finding 3 — batch is nearly FREE** (the dispatch-bound corollary: extra samples ride the idle GPU). Clean sweep:
 
@@ -323,9 +332,10 @@ kernel level. **Compiling attention would not help — it's already fused.**
    the eval spikes. This alone ~halves any AR-training wall-clock. (Do NOT use `accumulate_grad_batches`/`window_stride`
    — forbidden; you don't need them, real batch is the lever.)
 2. **Bigger, its own parity-gated project (NOT a launch bundle): kill the per-step dispatch.** The overhead is the
-   FlexAttention compiled-op *call* ×256/step. Eliminate it with CUDA-graph capture / a compiled+`reduce-overhead`
-   rollout — the fixed-window `pad_block_mask` already supplies the static shapes that needs (and is why the old
-   ~57-shape thrash was fixed). See `design/rollout_throughput.md` for the plan, parity gate, and `progress.log` signals.
+   per-step op *call* ×256/step. **DONE — see Experiment 9:** `torch.compile(step, mode="default")` collapses the
+   dispatches (parity-safe, ~6×). Note the originally-proposed `reduce-overhead` (CUDA graphs) does **NOT** work here
+   — it's fundamentally incompatible with the retained-BPTT rollout (Exp 9). Behind the opt-in `model.compile_rollout`.
+   See `design/rollout_throughput.md` for the plan + parity gate.
 
 ### Measured headroom: mm_flow d=64 in-rollout (2026-07-15)
 The flow-x0 / mse-control pair (d=64, batch 128, in-rollout, dynamics shortcut, flow-x0 decode, recon_frac 0.25,
@@ -338,6 +348,14 @@ than cutting wall-clock proportionally — but it's free memory-wise and the rig
 
 ## Why the "compile FlexAttention for a 3–5× win" idea was a red herring (2026-08-05)
 
+> ⚠️ **PARTIALLY SUPERSEDED 2026-08-05 (later same day) — see Experiment 9.** The reasoning below (the *fix* the
+> candidate proposed — swapping in a fused attention kernel — buys nothing, because the bottleneck is dispatch,
+> not kernel efficiency) is correct **about dispatch**. But its headline "there is no compile speedup to get" is
+> **wrong**: compiling the *whole step* (`mode="default"`) — which is a different lever than "fuse the attention
+> kernel" — collapses the per-step dispatch and is **~6× faster, parity-safe**. It also assumed the eager rollout
+> ran attention *fused*; the prototype found it runs **UNFUSED** (emits the without-`torch.compile` warning). Keep
+> this section for the dispatch-vs-compute method; take the ~6× result from Exp 9.
+
 The candidate diagnosis reasoned: *FlexAttention needs `torch.compile` to be fast → multimodal models skip
 `torch.compile` (`train_world_model.py`, `not cfg.model.get("modalities")`) → so attention runs the eager
 `B×H×T×T` reference path → that's why the GPU idles.* **The middle link is false.** `flex_attention`
@@ -346,19 +364,95 @@ attention was already fused. Two things caused the wrong read: (1) the repo's ow
 still runs, **just eager**," where "eager" meant "not inside the outer compiled graph," NOT "unfused reference
 kernel" (now corrected); and (2) it conflated **kernel efficiency** (fused ✓) with **dispatch/launch
 overhead** (the real bottleneck). The GPU idles because the AR rollout is a serial F-step Python loop that
-*calls* the already-fused ops ~256× (F·depth), each with CPU dispatch cost. Fusing an already-fused kernel
-does nothing for the *number of dispatches*, so the proposed fix would have bought ~0.
+*calls* the per-step ops ~256× (F·depth), each with CPU dispatch cost. Swapping in a fused *attention kernel*
+does nothing for the *number of dispatches* — so *that* fix would have bought ~0. (The lever that DID work is
+different: compile the whole step so inductor collapses the ~256 dispatches — ~6×, Exp 9.)
 
 **How this was established (method — reproducible via `scripts/profile_rollout.py`):**
 1. Ran the real `rollout_train` step at `p_tf=0` under `torch.profiler` (CPU+CUDA), a few steps post-warmup,
    on a dedicated H100.
 2. **Fusion check** — the CUDA kernel table showed `FlexAttentionAutogradOp` + `_flash_attention_*` kernels
    and **no** `B×H×T×T` score tensor (an eager reference would show explicit `bmm → softmax → bmm` over a
-   materialized `T×T`). ⇒ fused.
+   materialized `T×T`). ⇒ read as fused. **(This read was wrong for the rollout — Exp 9: the eager rollout
+   step emits the without-`torch.compile` warning and compiling it is ~6×. The fused kernels this step saw
+   were the compiled parallel forward, not the serial eager rollout.)**
 3. **Bottleneck check** — **Self CPU 3.36 s vs Self CUDA 0.68 s** (GPU ~20% busy) ⇒ dispatch/launch-bound,
    not compute-bound. The top CPU lines were the `Torch-Compiled Region` (FlexAttention) dispatch (0.78 s) +
    its autograd (0.62 s) — the *calls*, not the kernels.
 4. **Batch-scaling check** — clean sweep 32→64 = +1.9% wall / 32→96 = +10% confirms it: extra samples ride
    the idle GPU nearly free (a compute-bound step would scale ~per-sample). This is what motivates the
-   `autobatch` finder (fill VRAM ≈ free) and the CUDA-graph rollout (kill the dispatch) in
+   `autobatch` finder (fill VRAM ≈ free) and the compiled rollout (kill the dispatch) in
    `design/rollout_throughput.md`.
+
+---
+
+## Experiment 9 — compiling the AR rollout step: ~6× (mode=default), and why CUDA graphs can't (2026-08-05)
+
+Exp 8 concluded the dispatch-bound serial loop needed a **CUDA-graph** (`torch.compile(step, mode="reduce-overhead")`)
+rollout to kill the per-step dispatch, and that fusing attention would buy ~0. A dedicated-GPU prototype tested
+both claims on the joint `mm_flow` config (d=128 / F=64 / W=32 / P=8, image head). **Both were partly wrong: the
+CUDA-graph mechanism can't work here, but compiling the step *does* — ~6×.** Behind the opt-in flag
+`model.compile_rollout` (default **off**); implemented as `torch.compile` of the per-step backbone+flow-readout
+unit (`multimodal._rollout_step`), applied only in the steady `p_tf==0` regime (teacher-forcing warmup stays eager).
+
+**Gate 1 — parity: PASS.** One `rollout_train` step, compiled vs eager, same weights/batch/seed, flow sampler
+forced deterministic (ε=0) to isolate compile fidelity from the sampler RNG:
+- forward latent bag: max abs diff **5.5e-3**, max rel diff **1.6e-3**
+- all **163** parameter grads: max abs diff **5.0e-8** (mean 1.2e-9), **0** None-mismatches
+- threshold bf16 rollout 3e-2 rel — comfortably inside.
+
+**Gate 2 — speed: the proposed mechanism fails; a variant beats the target.**
+
+- **`mode="reduce-overhead"` (CUDA graphs — what Exp 8 / Phase 1B.1 asked for) does NOT work for training, and
+  it's not fixable.** It never hits the cudagraph fast-path (`"Unable to hit fast path of CUDAGraphs … pending,
+  uninvoked backwards"`) and hard-crashes with `"accessing tensor output of CUDAGraphs that has been overwritten
+  by a subsequent run"`. **Fundamental:** CUDA graphs reuse ONE static memory pool per replay, but the retained
+  BPTT graph needs *every* F-step's saved-for-backward activations alive until the single end-of-rollout
+  `backward()`; the next step's replay clobbers them. CUDA graphs assume fwd→bwd per capture; a retained-graph AR
+  rollout violates that. Output-cloning doesn't help (tried). So the "big dispatch-killer" of Exp 8 rec #2 is a
+  dead end for the training rollout.
+
+- **`mode="default"` (inductor fusion, no CUDA graphs, BPTT-safe) WORKS: ~6.1×.** Dedicated H100:
+
+  | | eager rollout | compiled step (default) |
+  |---|--:|--:|
+  | s/batch | 2.76 | **0.45** (~6.1×) |
+  | samples/s | 11.6 | **70.6** |
+  | GPU util | 27% | **82%** |
+  | peak mem | 22.9 GB | 22.9 GB |
+  | compile | — | one-time ~96 s |
+
+  The win has **two sources**, and the second one corrects Exp 8: (1) inductor collapses the ~256 tiny per-step
+  dispatches (the dispatch-bound bottleneck Exp 8 correctly identified); (2) **the eager rollout runs FlexAttention
+  UNFUSED** — it emits `flex_attention called without torch.compile() … materializes the full scores matrix` —
+  so compiling the step *also* fuses attention. Exp 8's "already fused" observation was of the **compiled parallel
+  forward**, not the serial eager rollout; this resolves the repo contradiction the OPPOSITE way from Exp 8's call
+  (`train_world_model.py`'s "just eager" = unfused was right; `launch_shootout.sh:8`'s "self-compiles even eager"
+  was wrong — both now fixed in-repo).
+
+**Constraints (both fail-fast in `setup.build_model`, no silent disable):**
+- **`head_dim = d/heads` must be ≥ 16.** The compiled FlexAttention Triton kernel raises `NYI: embedding dimension
+  … must be at least 16` mid-compile below that. The **eager** rollout has no such floor (unfused fallback), so
+  this only blocks `compile_rollout`. The default `mm_flow` (d=32/heads=8 → head_dim=**4**) is *ineligible*; the
+  joint config (d=128/heads=8 → head_dim=**16**) is exactly at the floor. Discovered the hard way: the first
+  end-to-end run used the d=32 default and crashed 12 min in at the epoch-4 compile — hence the build-time guard.
+- **Mutually exclusive with `variations.contraction` (weight>0)** — FlexAttention has no double-backward under
+  `torch.compile`, which the contraction Jacobian power-iteration needs.
+
+**Ship-gate (end-to-end validation) — DONE 2026-08-05.** The ~6.1× was measured on the rollout step in isolation
+(`profile_rollout.py`). Ran a real side-by-side through the full Lightning loop: identical joint `mm_flow` config
+(**d=128**, image head, F=64, batch 32, detach_every 16), 60 train batches/epoch, 8 epochs, eval off, one run per
+dedicated H100 — only `compile_rollout` differs.
+
+- **Speed — CONFIRMED ~6.2×.** Steady AR train epoch (p_tf=0, no val): **eager ~228 s/ep (~3.8 s/batch)** vs
+  **compiled ~37 s/ep (~0.6 s/batch)** (epochs 5–6 on both). The epoch-4 transition ate the one-time compile
+  (first 15 batches 89 s) then fell to ~0.6 s/batch — amortized *within* that epoch. Matches the isolation number.
+- **Stability — CONFIRMED.** The compiled run completed all 8 epochs, no NaN/crash, loss descending
+  (train 0.81→0.73, val 2.34→0.95 as p_tf ramped to 0). The eager→compiled transition at epoch 4 is safe.
+- **Parity — NOT testable from this A/B, and that's expected.** No global seed is pinned (`seed_everything` absent),
+  so the two runs diverge from init: their epoch-3 losses already differ (train 0.77 vs 0.81, val 2.00 vs 2.34)
+  *before* compile engages (epochs 0–3 are identical code). Bitwise parity is the isolation test's job, already
+  passed (fwd rel 1.6e-3, grad abs 5e-8). This run corroborates behaviorally-equivalent, healthy training + the win.
+- **head_dim trap found here.** The first attempt used the `mm_flow` **default d=32** (head_dim=4) and crashed 12 min
+  in at the epoch-4 compile with the inductor NYI. Fixed by the build-time guard above; rerun at d=128 (head_dim=16)
+  passed. Net: the isolation ~6.1× **does** survive the full training loop, on any config with head_dim ≥ 16.

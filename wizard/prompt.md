@@ -172,7 +172,8 @@ output — so the run is self-documenting and reproducible.
 1. `python -m quickdraw.check_dataset data.root=… data.repo_id=… environments=recorded` (or the real env) —
    confirms `P+F` training windows > 0 and that data dims match the env; fix any mismatch it reports.
 2. `python -m quickdraw.model_summary model=… <overrides>` — the param count + per-component shapes.
-3. `trainer.fast_dev_run=true` on the WM train command — proves the data loads and the model builds/forwards
+3. `+trainer.fast_dev_run=true` on the WM train command (note the `+` — it's not in the trainer struct, so the
+   bare form is rejected) — proves the data loads and the model builds/forwards
    on 1 batch (this recorded + non-square path may be new for their dataset).
 
 Finally, report: the script + record paths, the model shape + param breakdown, the checker result, and the

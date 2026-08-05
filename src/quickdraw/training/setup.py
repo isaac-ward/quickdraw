@@ -78,9 +78,32 @@ def build_model(cfg):
     specs = _modality_specs(cfg)
     if specs is not None:
         from ..models.multimodal import MultiModalFlow, MultiModalDSAR, MultiModalLSAR
+        compile_rollout = bool(m.get("compile_rollout", False))
+        if compile_rollout:
+            # FlexAttention has NO double-backward under torch.compile (design/variations.md), so the compiled
+            # rollout and the contraction penalty (needs the eager sdpa-MATH double-backward path) are mutually
+            # exclusive. Fail fast so the user picks one (don't silently disable either).
+            cv = (cfg.get("variations") or {}).get("contraction", {}) or {}
+            cw = float((cv.get("weight", 0.0) if hasattr(cv, "get") else getattr(cv, "weight", 0.0)) or 0.0)
+            if cw > 0.0:
+                raise ValueError("model.compile_rollout is mutually exclusive with variations.contraction "
+                                 "(weight>0): FlexAttention has no double-backward under torch.compile, which the "
+                                 "contraction Jacobian power-iteration requires. Disable one (compile_rollout=false "
+                                 "or contraction.weight=0).")
+            # The compiled FlexAttention Triton kernel requires per-head dim >= 16 (inductor raises
+            # "NYI: embedding dimension ... must be at least 16" mid-compile otherwise). The EAGER rollout has
+            # no such floor (it runs the unfused fallback), so this only blocks compile_rollout. Fail fast here
+            # at build time, not with a cryptic inductor error ~15 min in at the first p_tf==0 compile.
+            head_dim = int(m.d) // int(m.heads)
+            if head_dim < 16:
+                raise ValueError(
+                    f"model.compile_rollout needs head_dim (d/heads) >= 16 for the compiled FlexAttention kernel, "
+                    f"but d={m.d}/heads={m.heads} -> head_dim={head_dim}. Raise d or lower heads so d/heads >= 16 "
+                    f"(e.g. d=128/heads=8), or disable compile_rollout (eager has no floor).")
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
                       mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2),
-                      grad_checkpoint=bool(m.get("grad_checkpoint", False)))
+                      grad_checkpoint=bool(m.get("grad_checkpoint", False)),
+                      compile_rollout=compile_rollout)
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}
@@ -149,6 +172,12 @@ def autobatch_find(cfg, device, log=print) -> int:
     de = int(cfg.model.get("detach_every", 16)); rf = float(cfg.model.get("recon_frac", 1.0))
     specs = _modality_specs(cfg); adim = int(cfg.model.get("action_dim", 2))
     model = build_model(cfg).to(device).train()
+    # The eager binary search sizes MEMORY, which is ~compile-independent (validation: 22.9 GB compiled vs eager),
+    # so probe EAGER — else the compiled path recompiles at every probe batch size (~96 s each = thrash). If
+    # compile_rollout is on, confirm_compiled() re-enables it and validates the chosen batch once on the real
+    # compiled step (stepping down on OOM), so the returned batch is checked on the exact path training will run.
+    compiled_run = bool(cfg.model.get("compile_rollout", False))
+    model.compile_rollout = False
 
     def synth(B):
         obs = {}
@@ -187,6 +216,23 @@ def autobatch_find(cfg, device, log=print) -> int:
     def done(b):   # free probe activations before the caller builds loaders + the real model
         gc.collect(); torch.cuda.empty_cache(); return b
 
+    def confirm_compiled(b):   # validate the eager-chosen batch on the REAL compiled step (recompiles per shape)
+        if not compiled_run:
+            return b
+        model.compile_rollout = True
+        for _ in range(4):
+            log(f"[autobatch] compiled-confirm: probing batch {b} on the compiled step (one-time ~1-2 min compile)...")
+            ok_, p_ = fits(b)
+            if ok_:
+                log(f"[autobatch] compiled-confirm OK: batch {b} ({(p_ or 0)/1e9:.1f}/{budget/1e9:.0f}GB compiled)")
+                return b
+            if b - 8 < base:
+                log(f"[autobatch] compiled step over budget down to base {base}; using {base}")
+                return base
+            log(f"[autobatch] compiled step over budget at {b} — stepping down to {b - 8}")
+            b -= 8
+        return b
+
     ok, p = fits(base)
     if not ok:
         log(f"[autobatch] base batch {base} already over budget ({(p or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — using {base}")
@@ -198,7 +244,7 @@ def autobatch_find(cfg, device, log=print) -> int:
         else: hi = hi * 2; break
     if lo == hi:                               # fit to the cap without going over
         log(f"[autobatch] fits to cap: data.batch={lo} (VRAM {total/1e9:.0f}GB @ {int(headroom*100)}% headroom, cap {cap})")
-        return done(lo)
+        return done(confirm_compiled(lo))
     while hi - lo > 8:                          # bisect to a multiple of 8
         mid = (((lo + hi) // 2) // 8) * 8
         if mid <= lo or mid >= hi: break
@@ -207,7 +253,7 @@ def autobatch_find(cfg, device, log=print) -> int:
         else: hi = mid
     log(f"[autobatch] chose data.batch={lo}  (VRAM {total/1e9:.0f}GB, budget {budget/1e9:.0f}GB @ "
         f"{int(headroom*100)}% headroom; probed rollout_train fwd+decode+bwd)")
-    return done(lo)
+    return done(confirm_compiled(lo))
 
 
 def resolve_data_root(cfg) -> str:

@@ -10,8 +10,8 @@
 # UMAP, ood_horizon proprio long-horizon, control MPPI with FPV rendered in the loop).
 # ============================================================================================
 # !!! DO NOT set TORCHDYNAMO_DISABLE=1. (MM models skip whole-model torch.compile anyway — the per-batch image
-#     gather + ViT AE aren't compiled; but FlexAttention self-compiles its kernel per call (fused) even without
-#     whole-model compile. See design/accelerations.md Exp 8 + train.py.)
+#     gather + ViT AE aren't compiled; the parallel epoch-0 forward still compiles a fused FlexAttention kernel,
+#     but the serial AR rollout runs attention UNFUSED unless model.compile_rollout is on. See design/accelerations.md Exp 9 + train.py.)
 # ============================================================================================
 #
 # RUN SUMMARY IS NOT HARDCODED — supply it FRESH each launch via env vars (train.py rejects duplicates).

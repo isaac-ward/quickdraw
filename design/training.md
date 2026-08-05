@@ -36,19 +36,23 @@ conf/
 
 - `torch.compile(...)`; `precision="bf16-mixed"`; `torch.set_float32_matmul_precision("high")` (TF32).
   > SUPERSEDED (see `accelerations.md` Exp 8): **multimodal models SKIP whole-model compile** (the per-batch
-  > image gather + ViT AE complicate it) — but FlexAttention **self-compiles its kernel per call regardless**,
-  > so attention is fused either way. Non-mm models compile in **default** mode (not `max-autotune`: the
+  > image gather + ViT AE complicate it). The **parallel** forward (epoch-0, p_tf=1) still gets a fused
+  > FlexAttention kernel — but the **serial AR rollout runs attention UNFUSED** (it emits `flex_attention called
+  > without torch.compile()`), which is why the opt-in `model.compile_rollout` (compile the step, ~6×) is a real
+  > win, not a no-op — see Exp 9. Non-mm models compile in **default** mode (not `max-autotune`: the
   > parallel forward runs ~1 epoch under the p_tf curriculum, so the long autotune search isn't worth it).
 - **FlexAttention** for the causal + sliding-window (`W`) mask: one `mask_mod` (causal AND within
   `W`) compiled to a block-sparse kernel that skips out-of-window blocks — faster than a dense SDPA
   mask. Built once, reused every layer and rollout step.
 - Fused `AdamW(fused=True)`; DataLoader pinned + workers + prefetch (`data.md`).
 - The AR rollout fn is shared by training, open-loop eval, and control.
-  > SUPERSEDED: the rollout runs **EAGER**, not compiled — compiling it hit a ~57-shape recompile thrash
-  > (~18×), since bounded by the fixed-window `pad_block_mask` (cached shapes). The AR step is **dispatch-bound**
-  > (the serial F-step loop, GPU ~20% util), so the throughput levers are batch (nearly free) and a future
-  > CUDA-graph/compiled-`reduce-overhead` rollout — NOT attention fusion (already fused). See `accelerations.md`
-  > Exp 8 + `design/rollout_throughput.md`.
+  > The rollout runs **EAGER by default**. The AR step is **dispatch-bound** (the serial F-step loop, GPU ~20%
+  > util), so the throughput levers are batch (nearly free) and compiling the step. Opt-in `model.compile_rollout`
+  > does the latter: `torch.compile(step, mode="default")` — **~6×, parity-safe** (Exp 9). It both fuses the
+  > per-step attention (which is UNFUSED in the eager rollout) and collapses the ~256 dispatches. Note
+  > `mode="reduce-overhead"` (CUDA graphs) does NOT work — incompatible with the retained-BPTT rollout. The old
+  > "~57-shape recompile thrash" that made rollout-compile look hopeless is gone (fixed-window `pad_block_mask`
+  > caps the shapes). See `accelerations.md` Exp 8/9 + `design/rollout_throughput.md`.
 
 ## Pipeline (4 steps; run-dir prefix = step)
 
