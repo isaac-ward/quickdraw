@@ -35,7 +35,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 #   parallel epoch 0 (~15 min/ep at F=24) -> ~2 days for 200 ep, hence 50 epochs. data.F=24 is only the TRAINING
 #   window; eval rolls the full long horizon. eval every 10 skipping 0; control un-trimmed (mppi.yaml defaults).
 GROUP="${GROUP:-vis_shootout}"    # wandb group: all runs of this sweep grouped in the UI (override with GROUP=..)
-COMMON=( data.root="$DATA" data.batch=96 data.autobatch=false data.F=24 logging.group="$GROUP"  # autobatch off: this experiment holds batch fixed
+COMMON=( data.root="$DATA" data.batch=96 data.F=24 logging.group="$GROUP"  # 1 run/GPU -> autobatch (default ON) sizes the batch to fill the card; data.batch=96 is only the fallback if autobatch is disabled
          eval.horizon=256 eval.vision_horizon=256 eval.n_episodes=16 )
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED"
      run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )

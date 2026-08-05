@@ -27,7 +27,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 
 # fixed across all 6: recon LSAR, full BPTT, batch 256, v8 data. Per-run variation overrides are passed
 # to launch(). All variations default OFF, so var_recon_baseline is a clean (unmodified) recon run.
-COMMON=( data.root="$DATA" data.batch=256 data.autobatch=false model.detach_every=16   # autobatch off: this experiment holds batch fixed. truncated BPTT (16-step chunks):
+COMMON=( data.root="$DATA" data.batch=256 data.autobatch=false model.detach_every=16   # autobatch=false REQUIRED: PACKS 3 runs/GPU and autobatch fills a WHOLE card -> OOM if packed. truncated BPTT (16-step chunks):
          # ~4x faster than full BPTT (detach_every=0); near-Markov torus loses little long-range credit.
          model=mm_lsar_proprio +collapse=reconstruction )
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED"

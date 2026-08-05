@@ -29,7 +29,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"  # v8: base gamma0.
 : "${RS_TRIED:?missing RS_TRIED}"; : "${RS_TRYING:?missing RS_TRYING}"
 : "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
 
-COMMON=( data.root="$DATA" data.batch=256 data.autobatch=false model.detach_every=0 )  # eval at conf/eval at_epochs; autobatch off: this experiment holds batch fixed
+COMMON=( data.root="$DATA" data.batch=256 data.autobatch=false model.detach_every=0 )  # eval at conf/eval at_epochs. autobatch=false is REQUIRED here: this PACKS 3 runs/GPU and autobatch sizes for a WHOLE card -> would OOM a packed GPU
 # `trying` is set per-variant in launch() (appends the run name) so each of the 6 notes is unique.
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED" run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )
 
