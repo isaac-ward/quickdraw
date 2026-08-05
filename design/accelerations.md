@@ -288,6 +288,45 @@ in the launch env (`docker exec -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:T
 > Note (2026-07-20): conv/deconv `base` channel width is a **weak** batch lever — halving base 32→16 only moved the
 > ceiling batch 20→~30 (and hurts decode). Memory is dominated by the ∝`batch·F` rollout (Exp 6), not conv channels.
 
+---
+
+## Experiment 8 — profiling the AR step: attention is FUSED, the loop is DISPATCH-bound (2026-08-05)
+
+Motivation: an off-machine perf probe (robocasa, batch 32 / F 64: **3.9 s/batch, GPU 0–13% util, ~12.7 days / 30 ep**)
+raised "is compiling FlexAttention a big speedup?". A candidate diagnosis said FlexAttention runs on the eager
+`B×H×T×T` reference path (mm models skip `torch.compile`). **Measured — it's wrong.** Harness:
+`scripts/profile_rollout.py` (the real `rollout_train` at p_tf=0, joint mm_flow d=128/F=64), dedicated H100.
+
+**Finding 1 — FlexAttention is already FUSED.** The profiler shows `FlexAttentionAutogradOp` + a `Torch-Compiled
+Region` (the temporal sliding-window attn *self-compiles per call*) and `_flash_attention` (spatial + image-AE attn,
+flash-fused) — **no T×T score materialization**. This settles the repo's own contradiction: `launch_shootout.sh:8`
+("self-compiles even eager") was right; `train_world_model.py`'s "just eager" comment was misleading (now corrected).
+
+**Finding 2 — the step is DISPATCH-bound, not compute-bound.** At batch 32: **Self CPU 3.36 s ≫ Self CUDA 0.68 s**
+→ GPU **~20% busy, ~80% idle**. The top CPU costs are the `Torch-Compiled Region` FlexAttention dispatch (0.78 s) +
+`FlexAttentionAutogradOpBackward` (0.62 s) — i.e. the cost of *calling* the fused op ~256× (F·depth) through the
+**serial F-step Python loop**, not the kernels. This is exactly the latency-bound thesis of Exp 5–7, confirmed at the
+kernel level. **Compiling attention would not help — it's already fused.**
+
+**Finding 3 — batch is nearly FREE** (the dispatch-bound corollary: extra samples ride the idle GPU). Clean sweep:
+
+| batch | s/batch | peak GB | throughput vs 32 |
+|--:|--:|--:|--:|
+| 32 | 2.752 | 22.9 | 1.00× |
+| 64 | 2.803 (+1.9%) | 45.7 | **1.96×** |
+| 96 | 3.040 (+10%) | 68.5 | **2.72×** |
+| 128 | 3.356 (+22%) | 91.3 | **3.29×** |
+
+### Recommendation
+1. **Immediate, free, modeling-neutral: raise `data.batch`.** 32→**96** = **2.7× throughput** for +10% per-step, at
+   68 GB (leaves ~27 GB eval headroom — respect the eval-OOM caution in Exp 3/5). 128 = 3.3× but 91 GB is too tight for
+   the eval spikes. This alone ~halves any AR-training wall-clock. (Do NOT use `accumulate_grad_batches`/`window_stride`
+   — forbidden; you don't need them, real batch is the lever.)
+2. **Bigger, its own parity-gated project (NOT a launch bundle): kill the per-step dispatch.** The overhead is the
+   FlexAttention compiled-op *call* ×256/step. Eliminate it with CUDA-graph capture / a compiled+`reduce-overhead`
+   rollout — the fixed-window `pad_block_mask` already supplies the static shapes that needs (and is why the old
+   ~57-shape thrash was fixed). See `design/rollout_throughput.md` for the plan, parity gate, and `progress.log` signals.
+
 ### Measured headroom: mm_flow d=64 in-rollout (2026-07-15)
 The flow-x0 / mse-control pair (d=64, batch 128, in-rollout, dynamics shortcut, flow-x0 decode, recon_frac 0.25,
 detach_every 16) sits at **~63.8 GB / 93 GB** and **~15–20% GPU util** at ~30 min/epoch — latency-bound exactly as the

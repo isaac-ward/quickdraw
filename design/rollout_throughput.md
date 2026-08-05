@@ -9,6 +9,17 @@ contradicted by this repo's own measured record. **Do not implement a fix until 
 resolves which bottleneck is real.** That is this repo's own rule (`design/accelerations.md`: *"PROBE —
 never infer; never infer memory/cost from the cheap epoch-0 phase"*).
 
+> ## ✅ PHASE 0 RESULT (2026-08-05) — resolved. Diagnosis **B** is correct.
+> Profiled the real AR step (`scripts/profile_rollout.py`, joint mm_flow d=128/F=64, dedicated H100). See
+> `design/accelerations.md` **Experiment 8** for the full numbers.
+> - **FlexAttention is ALREADY FUSED** (`FlexAttentionAutogradOp` + flash-SDPA, no `B×H×T×T`). Diagnosis A's
+>   "eager reference path" premise is **false**; there is **no attention-compile speedup to get**.
+> - **The step is DISPATCH-bound:** Self CPU 3.36 s ≫ Self CUDA 0.68 s (GPU ~20% busy). The cost is *calling*
+>   the fused ops ~256× through the serial F-step Python loop — exactly Diagnosis B / Exp 5–7.
+> - **Immediate free win: raise `data.batch`** (dispatch-bound ⇒ nearly free): 32→96 = **2.7× throughput**
+>   (+10% per-step, 68 GB). The bigger lever (its own project) is killing the per-step dispatch via
+>   CUDA-graph / compiled+`reduce-overhead` rollout — Phase 1B below.
+
 ---
 
 ## The two diagnoses (they conflict)
