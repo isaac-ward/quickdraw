@@ -86,17 +86,32 @@ def main(cfg):
     # right after the FlexAttention compile starts and never reaches epoch 0. Single-threaded compile is
     # a touch slower per kernel (~60s startup) but reliable; with 6 concurrent runs the CPU cost is fine.
     torch._inductor.config.compile_threads = 1
-    summary_text = _run_summary_text(cfg)  # fail BEFORE any setup if the run note is missing
-    _assert_summary_unique(summary_text, cfg)  # ...and fail if it merely copies a previous run's note
+    resume = cfg.get("resume", None)   # +resume=<ckpt> -> CONTINUE that checkpoint's own run (see run_dir below)
+    if resume:
+        resume = os.path.expanduser(str(resume))
+    if not resume:                              # a resume is a CONTINUATION, not a new run: skip the unique
+        summary_text = _run_summary_text(cfg)   # run-note gate (the original run already passed it) and the
+        _assert_summary_unique(summary_text, cfg)   # config.resolved.yaml write (keep the original's)
     if not data_exists(cfg):
         raise FileNotFoundError(
             "No dataset found. Run `python -m quickdraw.data_generation` first, then pass its run "
             f"dir as data.root=logs/data_generation_<ts>_<exp> (got data.root={cfg.data.root!r})."
         )
 
-    run_dir = make_run_dir("train_world_model", cfg.experiment)   # logs/train_world_<ts>_<exp> (prefix names the entrypoint)
-    os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
-    OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))
+    if resume:
+        # CONTINUE the checkpoint's OWN run_dir so ModelCheckpoint's dirpath is unchanged -> Lightning reloads
+        # best_model_score and best.ckpt tracks again (a fresh run_dir leaves best_model_score=NaN, which
+        # freezes best.ckpt at the resumed epoch). Falls back to a new run_dir if the ckpt isn't laid out as
+        # <run_dir>/checkpoints/<file>.
+        ckpt_dir = os.path.dirname(resume)
+        run_dir = (os.path.dirname(ckpt_dir) if os.path.basename(ckpt_dir) == "checkpoints"
+                   else make_run_dir("train_world_model", cfg.experiment))
+        os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
+        print(f"[train] RESUMING from ckpt_path={resume} -> continuing run_dir={run_dir}", flush=True)
+    else:
+        run_dir = make_run_dir("train_world_model", cfg.experiment)   # logs/train_world_<ts>_<exp> (prefix names the entrypoint)
+        os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
+        OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))
 
     _t = time.perf_counter()
     _startup_log(run_dir, "[startup] loading dataset (GPU-resident windows) + normalizer...")
@@ -189,10 +204,9 @@ def main(cfg):
                         #   val for val/loss/contraction. Measured to have NO speed cost vs inference_mode.
                         limit_train_batches=cfg.trainer.get("limit_train_batches", 1.0),
                         limit_val_batches=cfg.trainer.get("limit_val_batches", 1.0))
-    resume = cfg.get("resume", None)   # +resume=<ckpt> -> Lightning restores weights+optimizer+LR-sched+epoch
-    if resume:                          # (p_tf/physical warmups are current_epoch-keyed, LR warmup is a
-        resume = os.path.expanduser(str(resume))   # step-keyed LambdaLR -> both restored correctly on resume)
-        print(f"[train] RESUMING from ckpt_path={resume}", flush=True)
+    # `resume` (+ its run_dir continuation) was resolved at the top of main. ckpt_path restores
+    # weights+optimizer+LR-scheduler+epoch — p_tf/physical warmups are current_epoch-keyed and the LR warmup
+    # is a step-keyed Lightning LambdaLR, so every schedule restores correctly on resume.
     trainer.fit(lit, loaders["train"], loaders["val"], ckpt_path=resume)
 
     # stable name for the best checkpoint, used by eval_ood / eval_control
