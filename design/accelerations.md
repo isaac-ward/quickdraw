@@ -333,3 +333,32 @@ detach_every 16) sits at **~63.8 GB / 93 GB** and **~15–20% GPU util** at ~30 
 callout above predicts. So **batch 256 fits with room to spare for this setup** (memory ~doubles from ~64 GB, still
 < 93 GB; detach_every caps the in-rollout graph). It mainly raises utilization (fills the idle sequential steps) rather
 than cutting wall-clock proportionally — but it's free memory-wise and the right default next time we launch this config.
+
+---
+
+## Why the "compile FlexAttention for a 3–5× win" idea was a red herring (2026-08-05)
+
+The candidate diagnosis reasoned: *FlexAttention needs `torch.compile` to be fast → multimodal models skip
+`torch.compile` (`train_world_model.py`, `not cfg.model.get("modalities")`) → so attention runs the eager
+`B×H×T×T` reference path → that's why the GPU idles.* **The middle link is false.** `flex_attention`
+**self-compiles its own kernel on every call**, independent of the outer model's compile status — so the
+attention was already fused. Two things caused the wrong read: (1) the repo's own comment said "FlexAttention
+still runs, **just eager**," where "eager" meant "not inside the outer compiled graph," NOT "unfused reference
+kernel" (now corrected); and (2) it conflated **kernel efficiency** (fused ✓) with **dispatch/launch
+overhead** (the real bottleneck). The GPU idles because the AR rollout is a serial F-step Python loop that
+*calls* the already-fused ops ~256× (F·depth), each with CPU dispatch cost. Fusing an already-fused kernel
+does nothing for the *number of dispatches*, so the proposed fix would have bought ~0.
+
+**How this was established (method — reproducible via `scripts/profile_rollout.py`):**
+1. Ran the real `rollout_train` step at `p_tf=0` under `torch.profiler` (CPU+CUDA), a few steps post-warmup,
+   on a dedicated H100.
+2. **Fusion check** — the CUDA kernel table showed `FlexAttentionAutogradOp` + `_flash_attention_*` kernels
+   and **no** `B×H×T×T` score tensor (an eager reference would show explicit `bmm → softmax → bmm` over a
+   materialized `T×T`). ⇒ fused.
+3. **Bottleneck check** — **Self CPU 3.36 s vs Self CUDA 0.68 s** (GPU ~20% busy) ⇒ dispatch/launch-bound,
+   not compute-bound. The top CPU lines were the `Torch-Compiled Region` (FlexAttention) dispatch (0.78 s) +
+   its autograd (0.62 s) — the *calls*, not the kernels.
+4. **Batch-scaling check** — clean sweep 32→64 = +1.9% wall / 32→96 = +10% confirms it: extra samples ride
+   the idle GPU nearly free (a compute-bound step would scale ~per-sample). This is what motivates the
+   `autobatch` finder (fill VRAM ≈ free) and the CUDA-graph rollout (kill the dispatch) in
+   `design/rollout_throughput.md`.

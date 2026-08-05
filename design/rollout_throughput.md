@@ -112,15 +112,59 @@ alone), **not** the whole model (that's what the image-gather/ViT-AE skip was ab
 pad-variant compiles (cached; a slow first epoch that amortizes). Keep the eager `attn_eager` fallback and
 gate the compile off when `variations.contraction` is on (double-backward constraint).
 
-## Phase 1B — serial-loop levers (if Phase 0 says latency-bound)
+## Phase 1B — the serial-loop levers (Phase 0 RESOLVED: this is the path)
 
-- **Batch-for-utilization** — free memory-wise; measure the ACTUAL wall-clock delta on the target config (the
-  A/B disagreement above means don't assume 2×).
+**Shipped:**
+- **`autobatch` (default on)** — the AR step is dispatch-bound, so a bigger batch fills the idle GPU nearly
+  free. `setup.py::autobatch_find` probes the real step at startup + sets `data.batch` to the largest that
+  fits `VRAM*(1-headroom)`. Measured 32→96 = **2.7× throughput** (+10% per-step). Cheap + modeling-neutral;
+  does NOT touch the per-step dispatch overhead (that's Phase 1B.1).
+
+**Available (modeling tradeoffs, use as needed):**
 - **Activation-checkpoint the rollout** (`torch.utils.checkpoint`, per detach-segment) — decouples F from
   memory (~1.3× compute), lets F grow (`accelerations.md` Exp 6). Helps memory/F, NOT the ∝F time.
-- **F / max_epochs** — direct but modeling tradeoffs (F is the BPTT horizon).
-- **Contraction penalty + decode→encode carry** — cheaper long-horizon stability than brute-force F
-  (`accelerations.md` Exp 6 verdict).
+- **F / max_epochs** — direct but modeling tradeoffs (F = BPTT horizon).
+- **Contraction penalty + decode→encode carry** — cheaper long-horizon stability than brute-force F (Exp 6).
+
+### Phase 1B.1 — the CUDA-graph rollout (THE big dispatch-killer) — its own parity-gated project (NOT a launch bundle)
+
+**Target.** Self CPU 3.36 s ≫ Self CUDA 0.68 s, GPU ~20% busy (Exp 8): the cost is *calling* the fused ops
+~256× (F·depth) through the serial Python loop. A CUDA graph records that launch sequence ONCE and replays it
+with a single CPU call — collapsing ~256 dispatches into ~1. Wall-clock then falls toward the CUDA time →
+potentially **~3–5×**, and it **stacks with `autobatch`** (fills, then removes, the idle) — combined ≈ an
+order of magnitude (robocasa ~12.7 d → ~1–2 d).
+
+**Approach.** Prefer `torch.compile(step_fn, mode="reduce-overhead")` on the *rollout step* (that mode uses
+CUDA graphs under the hood) over hand-rolled `torch.cuda.CUDAGraph` capture — less bespoke, reuses existing
+shapes. Compile the per-step / F-loop, **not** the whole model (the image gather + ViT AE are why whole-model
+compile is skipped).
+
+**Why feasible now.** CUDA graphs need static shapes + static input/output memory + no data-dependent control
+flow. The fixed-window `pad_block_mask` already gives the **static per-step shape** (it's what killed the old
+~57-shape thrash), so the hardest requirement is met.
+
+**Control flow / correctness to handle (the real work):**
+- **Static memory buffers** — capture pins input/output addresses; copy each step's inputs into fixed buffers
+  (the KV-cache path already keeps fixed-size buffers — reuse it).
+- **`detach_every` truncation** — the BPTT graph is cut every `detach_every` steps; capture *per
+  detach-segment* (a fixed-length sub-rollout) and replay, not one graph over all F.
+- **`p_tf` sampling** — teacher-forcing is a data-dependent branch, but the expensive steady regime is
+  `p_tf=0` (post-warmup); graph the `p_tf=0` path, fall back to eager during the short warmup epochs.
+- **Double-backward conflict** — FlexAttention has no double-backward under compile (`variations.md`), so the
+  contraction penalty needs the eager attn path → **gate the graphed rollout OFF when `variations.contraction`
+  is on**.
+
+**Parity gate (hard requirement — a fast-but-wrong rollout is worse than slow):**
+- graphed vs eager: forward outputs **and** backward grads within tolerance on fixed inputs;
+- val-loss + env metrics unchanged over ≥ a few epochs vs an eager baseline at the same seed.
+
+**Benchmark + `progress.log` signals:** s/batch (steady 50→75% delta), samples/s, GPU+CPU util, peak/steady
+mem, **first-epoch capture overhead** (separate from steady), **recompile count / dynamo cache occupancy**
+(guard against the ~57-shape thrash returning), and **val-loss parity vs baseline**.
+
+**Risk / why standalone:** the old rollout-compile thrash (~18×) is exactly why this earns its own benchmark
+rather than riding a training launch — though `pad_block_mask` + `cache_size_limit` are what should prevent
+its recurrence. Scope: prototype `reduce-overhead` on the step → parity-test → benchmark → decide.
 
 ---
 
