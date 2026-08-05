@@ -144,8 +144,10 @@ def main(cfg):
         # by the serial F-step Python loop (Self CPU ~3.5s >> Self CUDA ~0.68s, GPU ~15-20% util). The free
         # lever is batch (fills the idle GPU: 2x batch ~ +7% wall-clock), NOT fusing already-fused attention.)
         # Compile the parallel forward only; the rollout stays EAGER. Compiling the transformer for the
-        # rollout backfired badly: the rollout hits ~57 distinct sequence lengths, which blows past
-        # torch._dynamo's recompile cache limit and thrashes (~18x slower). Eager rollout = the fast path.
+        # rollout ONCE backfired (~57 distinct sequence lengths -> dynamo recompile thrash, ~18x slower) —
+        # but the fixed-window pad_block_mask now bounds that to ~57 CACHED shapes, so a CUDA-graph /
+        # compiled+reduce-overhead rollout is feasible and is the real dispatch-killing lever (Exp 8 +
+        # design/rollout_throughput.md). Eager rollout = the current default until that lands.
         # NOTE: keep compile ON — FlexAttention needs torch.compile to build its kernel (disabling it
         # forces a slow eager-attention fallback). Use DEFAULT mode, not max-autotune: the forward is
         # used ~1 epoch under the p_tf curriculum, so max-autotune's long kernel search isn't worth the

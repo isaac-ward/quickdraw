@@ -57,7 +57,8 @@ launch () {  # $1=gpu  $2=experiment-name  $3..=model overrides
 # startup for ~10 min is FIXED (fixed-window rollout in sequence.py + cache_size_limit in train.py), so
 # this is no longer about compile contention. It just desyncs the first in-loop eval (epoch 0:
 # ood_horizon + control + VTK video render, which is CPU-heavy ~minutes) so 6 renders don't all peak
-# together. Training itself is fast now (~18s/epoch).
+# together. (Startup compile contention is no longer the issue; the per-epoch cost is the AR rollout, which
+# is dispatch/latency-bound — see design/accelerations.md Exp 4-8, NOT ~18s/epoch as an earlier note claimed.)
 STAGGER=45
 launch 0 so_dsar        model=mm_dsar_proprio;                                                sleep $STAGGER
 launch 1 so_lsar_ema    model=mm_lsar_proprio +collapse=ema;            sleep $STAGGER

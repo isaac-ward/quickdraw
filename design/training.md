@@ -33,13 +33,21 @@ conf/
 
 ## Speed (CUDA)
 
-- `torch.compile(model, mode="max-autotune")`; `precision="bf16-mixed"`;
-  `torch.set_float32_matmul_precision("high")` (TF32 matmuls).
+- `torch.compile(...)`; `precision="bf16-mixed"`; `torch.set_float32_matmul_precision("high")` (TF32).
+  > SUPERSEDED (see `accelerations.md` Exp 8): **multimodal models SKIP whole-model compile** (the per-batch
+  > image gather + ViT AE complicate it) — but FlexAttention **self-compiles its kernel per call regardless**,
+  > so attention is fused either way. Non-mm models compile in **default** mode (not `max-autotune`: the
+  > parallel forward runs ~1 epoch under the p_tf curriculum, so the long autotune search isn't worth it).
 - **FlexAttention** for the causal + sliding-window (`W`) mask: one `mask_mod` (causal AND within
   `W`) compiled to a block-sparse kernel that skips out-of-window blocks — faster than a dense SDPA
   mask. Built once, reused every layer and rollout step.
 - Fused `AdamW(fused=True)`; DataLoader pinned + workers + prefetch (`data.md`).
-- One `torch.compile`d rollout fn shared by training, open-loop eval, and control.
+- The AR rollout fn is shared by training, open-loop eval, and control.
+  > SUPERSEDED: the rollout runs **EAGER**, not compiled — compiling it hit a ~57-shape recompile thrash
+  > (~18×), since bounded by the fixed-window `pad_block_mask` (cached shapes). The AR step is **dispatch-bound**
+  > (the serial F-step loop, GPU ~20% util), so the throughput levers are batch (nearly free) and a future
+  > CUDA-graph/compiled-`reduce-overhead` rollout — NOT attention fusion (already fused). See `accelerations.md`
+  > Exp 8 + `design/rollout_throughput.md`.
 
 ## Pipeline (4 steps; run-dir prefix = step)
 
