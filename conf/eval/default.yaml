@@ -26,8 +26,12 @@ during_train:
     denoising_multistep: true  # diffusion ONLY: fixed-agent sequential-swarm flow-field video (self-skips for other models)
     denoising_aggregate: true  # diffusion ONLY: pooled next-states collapsing from noise onto the manifold (self-skips)
     manifold: true         # ANY method: recovered-manifold UMAPs (data + latent space, 2D + 3D)
-    interpret: false       # vision ONLY, POST-HOC (VLM-labeled latent manifolds); needs OPENAI_API_KEY -> run standalone (python -m quickdraw.eval_interpret), keep OFF in the train loop
-    action_distribution: false  # DECIDED (2026-07-29): the action head is NO LONGER trained during world-model
-    #                             training (it destabilized the WM). It is now a POST-HOC model trained on a FROZEN
-    #                             WM via `python -m quickdraw.train_action_model`, which runs this eval itself.
+    interpret: true        # ON every eval epoch (user, 2026-08-05). VLM-labeled latent manifolds; SELF-SKIPS on
+    #                        non-vision models. COST: needs OPENAI_API_KEY (crashes at the eval epoch without it)
+    #                        + a conf/interpret/<env>.yaml, and ~20-30 min + OpenAI $ PER eval epoch. Turn off
+    #                        (eval.during_train.evals.interpret=false) for key-less / cost-sensitive runs.
+    action_distribution: true   # ON (user, 2026-08-05): whenever the action head is trained (model.action_head.
+    #                             enabled=true, e.g. the joint runs) this eval reports learned-prior vs true data
+    #                             action distribution. The routine SELF-SKIPS when there's no action head
+    #                             (routines.py: action_head_enabled), so it's a safe default for post-hoc/no-head runs too.
     # (image FPV rollout/filmstrip/metrics are now part of ood_horizon — under eval_ood_horizon/<head>/)
