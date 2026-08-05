@@ -140,13 +140,14 @@ def control_goals(R: float, r: float, device=None) -> list[tuple[str, Tensor]]:
 # --------------------------------------------------------------------------------------
 @dataclass
 class TorusConfig:
+    # defaults MIRROR conf/environments/torus.yaml (authoritative); keep in sync
     R: float = 0.75
     r: float = 0.25
     dt: float = 1.0 / 60.0
-    gamma: float = 0.1  # damping
-    a_max: float = 2.0
+    gamma: float = 0.3  # damping
+    a_max: float = 4.0
     init_speed: float = 1.0  # magnitude of the (nonzero) initial angular velocity
-    mass: float = 1.3  # inertia: action is divided by mass, so higher = harder to push around
+    mass: float = 0.6  # inertia: action is divided by mass; lowered -> more control authority (a_max/mass ~6.7)
 
 
 class OUActionSampler:

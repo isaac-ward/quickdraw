@@ -9,8 +9,9 @@
 # fused on the factorized space-time backbone. In-loop eval = the four MM routines (vision rollout, manifold
 # UMAP, ood_horizon proprio long-horizon, control MPPI with FPV rendered in the loop).
 # ============================================================================================
-# !!! DO NOT set TORCHDYNAMO_DISABLE=1. (MM models skip torch.compile anyway — the per-batch image gather +
-#     ViT AE aren't compiled; FlexAttention still runs eager. See train.py.)
+# !!! DO NOT set TORCHDYNAMO_DISABLE=1. (MM models skip whole-model torch.compile anyway — the per-batch image
+#     gather + ViT AE aren't compiled; but FlexAttention self-compiles its kernel per call (fused) even without
+#     whole-model compile. See design/accelerations.md Exp 8 + train.py.)
 # ============================================================================================
 #
 # RUN SUMMARY IS NOT HARDCODED — supply it FRESH each launch via env vars (train.py rejects duplicates).
@@ -34,7 +35,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 #   parallel epoch 0 (~15 min/ep at F=24) -> ~2 days for 200 ep, hence 50 epochs. data.F=24 is only the TRAINING
 #   window; eval rolls the full long horizon. eval every 10 skipping 0; control un-trimmed (mppi.yaml defaults).
 GROUP="${GROUP:-vis_shootout}"    # wandb group: all runs of this sweep grouped in the UI (override with GROUP=..)
-COMMON=( data.root="$DATA" data.batch=96 data.F=24 logging.group="$GROUP"
+COMMON=( data.root="$DATA" data.batch=96 data.autobatch=false data.F=24 logging.group="$GROUP"  # autobatch off: this experiment holds batch fixed
          eval.horizon=256 eval.vision_horizon=256 eval.n_episodes=16 )
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED"
      run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )

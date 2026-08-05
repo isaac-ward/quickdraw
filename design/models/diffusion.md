@@ -155,7 +155,8 @@ the rest of the model.
   take the true `Δz`, noise it at a random `τ`, regress the velocity. One `v_θ` forward per position —
   as cheap as the deterministic head. *Caveat:* the model only sees true contexts, so it doesn't
   practice recovering from its own rollout drift (a real disadvantage on the long-horizon metric).
-- **In-rollout (`shortcut: true`, `train_rollout: auto`).** Sample `Δẑ` each rollout step (K=1 via the
+- **In-rollout (`shortcut: true`; the `train_rollout` knob was removed — superseded by flow_heads.md).**
+  Sample `Δẑ` each rollout step (K=1 via the
   shortcut), feed it forward, so the model sees its own drift — apples-to-apples with DSAR/LSAR. Uses
   the **same `detach_every` truncation** as the other models. Cost: backprop runs through the sampler
   *and* the AR chain, so it is O(T·K) — only sane at **K=1**, which only the shortcut provides. Hence the
@@ -333,7 +334,7 @@ diffusion:
   shortcut: false             # false = plain flow (needs sampling_steps 4–8).
                               # true  = step-size-conditioned net + self-consistency loss -> K=1 works.
   sampling_steps: 6           # K Euler steps / AR step at inference. off -> 4–8 ; on -> 1 (any K). >= 1.
-  train_rollout: auto         # SUPPORTED: "auto" (= shortcut: off->one-step, on->in-rollout) | true | false.
+  # train_rollout: (removed — superseded by flow_heads.md; not in conf/model/mm_flow.yaml)
   stochastic_eval: false      # false = deterministic ODE from fixed noise (reproducible metrics).
                               # true  = fresh-noise samples (video spread only).
   time_sampling: uniform      # SUPPORTED: "uniform" (default) | "logit_normal" (SD3-style, mid-noise weighted).

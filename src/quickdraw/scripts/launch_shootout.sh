@@ -8,8 +8,8 @@
 # kernel (it self-compiles even in the eager rollout). Disabling compile globally forces a slow
 # eager-attention fallback: ~260% CPU, GPU idle, no training progress. The one-time compile at
 # startup (the "slow start") is the NECESSARY cost of FlexAttention, not a waste. Leave compile on.
-# (If startup is too slow, the lever is the COMPILE MODE in train.py — e.g. drop max-autotune to the
-#  default mode — NOT disabling compile. That is a train.py change, coordinate before touching it.)
+# (If startup is too slow, the lever is the COMPILE MODE in train.py — it already uses the default
+#  mode (not max-autotune) — NOT disabling compile. That is a train.py change, coordinate before touching it.)
 # ============================================================================================
 #
 # Usage:  bash src/quickdraw/scripts/launch_shootout.sh
@@ -29,7 +29,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"  # v8: base gamma0.
 : "${RS_TRIED:?missing RS_TRIED}"; : "${RS_TRYING:?missing RS_TRYING}"
 : "${RS_DETAIL:?missing RS_DETAIL}"; : "${RS_RATIONALE:?missing RS_RATIONALE}"
 
-COMMON=( data.root="$DATA" data.batch=256 model.detach_every=0 )  # eval at conf/eval at_epochs
+COMMON=( data.root="$DATA" data.batch=256 data.autobatch=false model.detach_every=0 )  # eval at conf/eval at_epochs; autobatch off: this experiment holds batch fixed
 # `trying` is set per-variant in launch() (appends the run name) so each of the 6 notes is unique.
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED" run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )
 
@@ -42,7 +42,8 @@ launch () {  # $1=gpu  $2=experiment-name  $3..=model overrides
   echo "[shootout] launching $name on GPU $gpu"
   # compile stays ON (FlexAttention needs it — see banner). PER-RUN compile caches: 6 concurrent runs
   # sharing the default inductor/triton cache contend on it and stall for ~10 min; isolated caches let
-  # each compile independently (single run with its own cache compiles + trains in ~1 min / 18s-epoch).
+  # each compile independently (single run with its own cache compiles in ~1 min; per-epoch cost is the
+  # dispatch/latency-bound AR rollout, minutes-range — see design/accelerations.md Exp 8).
   # TORCHINDUCTOR_COMPILE_THREADS=1: compile inductor kernels in-process. The default async SubprocPool
   # forks ~32 compile workers from a parent holding a live CUDA context + big thread pool -> fork-after-
   # CUDA deadlock that wedges the run at 0% GPU right after the FlexAttention compile (it never reaches

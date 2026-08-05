@@ -32,7 +32,7 @@ DATA="logs/data_generation_2026_06_27_04_49_59_regen_dyn_v8"
 #
 # fixed across both: diffusion model, full backbone, batch 256, v8 data, truncated BPTT (16) — the
 # variation-campaign settings, so diffusion is comparable. denoising viz on (the headline artifacts).
-COMMON=( model=mm_flow_proprio data.root="$DATA" data.batch=256 model.detach_every=16
+COMMON=( model=mm_flow_proprio data.root="$DATA" data.batch=256 data.autobatch=false model.detach_every=16  # autobatch off: this experiment holds batch fixed
          eval.during_train.evals.denoising_multistep=true eval.during_train.evals.denoising_aggregate=true )
 RS=( run_summary.problem="$RS_PROBLEM" run_summary.tried="$RS_TRIED"
      run_summary.trying_detail="$RS_DETAIL" run_summary.rationale="$RS_RATIONALE" )
