@@ -74,8 +74,8 @@ def _modality_specs(cfg):
 # compiled FlexAttention -> small uses heads=12 so 192/12=16); num_tokens = image latent tokens; decode_base = U-Net
 # decoder width. Keys in _SIZE_MODEL_KEYS live at model level; the rest are set on the image modality.
 SIZE_PRESETS = {
-    "tiny":  {"d": 64, "heads": 4, "num_tokens": 8, "decode_base": 32},      # d=64/heads=4 -> head_dim 16 (min power-of-2)
-    "mini":  {"d": 128, "num_tokens": 8, "decode_base": 48},                 # heads=8 -> head_dim 16; wider U-Net decoder than tiny
+    "tiny":  {"d": 64, "heads": 4, "num_tokens": 8, "decode_base": 16},      # d=64/heads=4 -> head_dim 16 (min power-of-2); narrow U-Net decoder
+    "mini":  {"d": 128, "num_tokens": 8, "decode_base": 16},                 # heads=8 -> head_dim 16; narrow (16) U-Net decoder, wider backbone than tiny
     "small": {"d": 192, "heads": 12, "num_tokens": 16, "decode_base": 64},   # heads=12 -> head_dim 16 (power of 2)
 }
 _SIZE_MODEL_KEYS = ("d", "heads", "depth")
