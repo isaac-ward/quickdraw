@@ -33,4 +33,8 @@ during_train:
     #                             enabled=true, e.g. the joint runs) this eval reports learned-prior vs true data
     #                             action distribution. The routine SELF-SKIPS when there's no action head
     #                             (routines.py: action_head_enabled), so it's a safe default for post-hoc/no-head runs too.
+    #                             NOTE (detach): these products reflect model.action_head.detach_gradient — our runs use
+    #                             FALSE (NOT detached: the action-flow gradient flows INTO the trunk, the detachF setting
+    #                             that beat detachT on every axis). So the prior is co-trained with the dynamics, not read
+    #                             off a stop-grad head; flip detach_gradient=true and the prior no longer shapes the trunk.
     # (image FPV rollout/filmstrip/metrics are now part of ood_horizon — under eval_ood_horizon/<head>/)
