@@ -13,8 +13,8 @@ name: mm_flow
 #   FULL recipe (CLI overrides over these defaults): model.d=128 depth=4 heads=8 window=32 data.batch=32
 #   data.F=64 recon_frac=0.25 diffusion.shortcut=true p_tf_warmup_epochs=4 detach_every=16
 #   modalities.1.{num_tokens=8,encode_arch=vit,decode_arch=vit,decode_kind=mse}  action_head.enabled=false.
-#   UPDATE 2026-08-06: the CURRENT defaults below differ from the 2026-07-28 recipe — detach_every=0 (full-F BPTT:
-#   less detach fixes the ~ep10 long-horizon control collapse), action_head.enabled=true (UNLOCKED; longer BPTT
+#   UPDATE 2026-08-06: the CURRENT defaults below differ from the 2026-07-28 recipe — detach_every=32 (the validated
+#   point: less detach than det16 fixes the ~ep10 long-horizon control collapse), action_head.enabled=true (UNLOCKED; longer BPTT
 #   rehabilitated the joint head), and IMAGE decode is now decode_kind=mse + decode_arch=unet (conv decoder, no patch
 #   grid — UNTESTED on metrics, see the image note below). Recipe above = historical det16/vit best.
 # =============================================================================================
