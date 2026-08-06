@@ -111,8 +111,9 @@ Walk each choice, suggest the default, and **quote the learning** (exact numbers
 - **Size** — for `mm_flow`, prefer the **`model.size` presets** (one knob; each sets the hidden capacity levers).
   These are **basic starting points, NOT tuned for every problem.** Present them by *what they change*, not a param
   guess:
-    - `model.size=tiny`  → d=128, image latent tokens=16, U-Net decoder width=32
-    - `model.size=small` → d=192 (heads=12), image latent tokens=16, U-Net decoder width=48
+    - `model.size=tiny`  → d=64 (heads=4), image latent tokens=8, U-Net decoder width=32
+    - `model.size=mini`  → d=128 (heads=8), image latent tokens=8, U-Net decoder width=48
+    - `model.size=small` → d=192 (heads=12), image latent tokens=16, U-Net decoder width=64
   Ask which fits their compute/quality target, pass `model.size=<choice>`. **Do NOT also override
   `d`/`heads`/`num_tokens`/`decode_base` individually — it RAISES a clash** (use the preset OR the knobs, not both).
   For a custom size, set those knobs directly instead — **constraint with `compile_rollout`: `head_dim = d/heads`
