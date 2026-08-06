@@ -196,3 +196,9 @@ class TorusEnv:
         else:
             return {}
         return {"scene": frames}
+
+    def action_dist_split(self, obs):
+        """OPTIONAL WorldEnv by-state split (base.py) for eval_action_distribution: the sign of ambient x
+        (obs[...,0]) is the torus's slow/fast basin divide, unchanged from the pre-hook hardcoded split."""
+        obs = _np.asarray(obs)
+        return obs[..., 0] < 0, "slow", "fast"

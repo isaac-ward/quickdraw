@@ -124,7 +124,7 @@ def main(cfg):
                                         seed=int(cfg.data.splits["train"]["seed"]),
                                         policy=make_policy(asamp, ad_env))
     # conditioned on ambient x (obs[...,0]) so a STATE-dependent sampler shows its dependence: slow on -x, fast on +x.
-    adfig = viz.fig_action_by_state(ad_acts, ad_obs[..., 0], ecfg.a_max, sampler_name=asamp)
+    adfig = viz.fig_action_by_state(ad_acts, ad_obs[..., 0] < 0, ecfg.a_max, sampler_name=asamp)
     adfig.savefig(os.path.join(media, "action_distribution.png"), dpi=viz.DPI)
     plt.close(adfig)
     log(f"[action-dist] media/action_distribution.png ({viz.ACTION_DIST_N_SAMPLES} traj, by-x, sampler={asamp})")

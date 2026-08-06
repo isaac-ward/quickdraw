@@ -75,6 +75,9 @@ class WorldEnv(Protocol):
                               (fallback: obs[..., :3], the torus convention).
       physical_loss        -- analytic physics residuals    -> unlocks the physical_loss training variation
                               (fallback: the variation skips itself).
+      action_dist_split    -- obs -> (labels, low_name,     -> unlocks the by-state action-distribution
+                              high_name) split by a             products (fallback: pooled-only panels).
+                              MEANINGFUL state feature
       POLICIES             -- name -> factory(env, device)  -> unlocks env-shipped datagen behavior policies
                               (see environments/policies.make_policy; 'random' always available)."""
     action_dim: int
@@ -118,6 +121,13 @@ class WorldEnv(Protocol):
     # physical_loss training variation (training/variations.py), which applies Huber/weights/warmup on top;
     # the physics MATH lives here in the env. Envs without analytic physics omit it -> the variation skips.
     def physical_loss(self, obs_phys: Tensor) -> dict[str, Tensor]: ...
+
+    # OPTIONAL — split obs rows by a MEANINGFUL state feature, for the by-state action-distribution eval
+    # products (eval_action_distribution). obs: (..., obs_dim). Return (labels, low_name, high_name) where
+    # `labels` is a bool array over obs rows (True -> low_name group, False -> high_name group), or None to
+    # skip those products entirely (pooled-only panels). Envs without a meaningful split (e.g. RecordedEnv,
+    # PendulumEnv) omit it.
+    def action_dist_split(self, obs) -> tuple[np.ndarray, str, str] | None: ...
 
 
 def default_rollout_metrics(pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]:

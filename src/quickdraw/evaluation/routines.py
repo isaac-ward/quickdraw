@@ -43,9 +43,11 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
     _plog(writer, f"[{prefix} @ep{step}] start: {obs.shape[0]} episodes, {obs.shape[1]}-step open-loop rollout, "
                   f"{n_plot} plot/video episodes")
     from omegaconf import OmegaConf
+    override = {"R": float(R), "r": float(r)}          # init_speed = v_scale so rollout_metrics match; v_scale
+    if v_scale is not None:                            # may be None (env has no init_speed knob) -> leave as-is
+        override["init_speed"] = float(v_scale)
     env = make_env(cfg.environments.get("name", "torus_world"),      # THIS split's geometry (may be OOD);
-                   OmegaConf.merge(cfg.environments, {"R": float(R), "r": float(r),  # init_speed = v_scale so
-                                                      "init_speed": float(v_scale)}), 1, "cpu")  # rollout_metrics match
+                   OmegaConf.merge(cfg.environments, override), 1, "cpu")
     res = eval_batched(model, norm, env, P, obs, act)
     _plog(writer, f"[{prefix} @ep{step}] rollout done in {time.perf_counter() - t0:.1f}s; rendering...")
 
@@ -165,7 +167,7 @@ def _ood_axis(cfg, model, norm, ecfg, writer, device, step, split):
     se = split_env.get(split) or {"R": getattr(ecfg, "R", None), "r": getattr(ecfg, "r", None)}   # lazy + guarded:
     #                            a .get default is eval'd eagerly, so ecfg.R/.r must not be bare (crashes on non-torus envs)
     s = _openloop_split(cfg, model, norm, writer, device, split, se["R"], se["r"],
-                        se.get("init_speed", ecfg.init_speed), split, step,
+                        se.get("init_speed", getattr(ecfg, "init_speed", None)), split, step,
                         coloring.get(split, "rainbow"), fps=round(1.0 / ecfg.dt))
     return {split: s}
 
@@ -622,10 +624,11 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
 def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     """The learned action PRIOR (action-flow head) vs the TRUE data action distribution. Self-skips unless
     the model has an action head. All under eval_action_distribution/:
-      - by_state_{true,pred}: |a| split by sign of ambient x (slow x<0 / fast x>=0) x uniform timesteps.
-      - animation_pooled: true(green)|pred(red)|both, POOLED over all episodes/frame, ALL timesteps (no cap).
-      - animation_byx: same, split into x<0 / x>=0 rows so each basin's mode stays crisp.
-      - action_true_pred_w1: 1D-Wasserstein between pooled true and pred |a| (scalar, lower=better).
+      - marginals: PRIMARY product, dataset/env-agnostic per-dim marginals (recorded vs head), one panel/dim.
+      - animation_pooled: |a| true(green)|pred(red)|both, POOLED over all episodes/frame, ALL timesteps (no cap).
+      - by_state_{true,pred} / animation_byx: |a| split by the env's `action_dist_split` hook (base.py) —
+        TORUS-ONLY (the only env implementing it today); envs without it skip these two products entirely.
+      - action_true_pred_w1 / w1_mean / w1/dim_*: 1D-Wasserstein, pooled |a| and per-dim (lower=better).
     TRUE = the RECORDED actions (actual history-conditioned data); PRED = one head draw/context (h[k] -> a[k+1],
     leak-free) — the fair comparison for a history-conditioned head. Smoothness scales with #episodes, not samples."""
     m = getattr(model, "_orig_mod", model)
@@ -645,6 +648,14 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
         asamp = json.load(open(os.path.join(resolve_data_root(cfg), "summary.json"))).get("action_sampler", asamp)
     except Exception:
         pass
+    # per-dim names (item 4c): from the DATASET's own meta (not the cfg), null for most datasets -> a[i] fallback.
+    action_names = None
+    try:
+        info = json.load(open(os.path.join(resolve_data_root(cfg), "train", "meta", "info.json")))
+        action_names = info.get("features", {}).get("action", {}).get("names") or None
+    except Exception:
+        pass
+    a_max = getattr(ecfg, "a_max", None)   # torus-only histogram x-limit knob; None -> viz derives it from the data
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     n_ep = min(int(cfg.eval.get("action_dist_episodes", 64) or 64), len(eps))   # default 64 = full val split (max distinct contexts)
@@ -660,7 +671,11 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     with torch.no_grad():                                        # no grad: this eval also runs on the TRAINING GPU
         h_ctx = m.action_context(ctx, act)                       # (E,L-1,d): h[k] predicts a[k+1] (leak-free)
         pred_norm = m.sample_action(h_ctx).cpu()                 # (E,L-1,2) head, 1/context
-    x = np.stack([o[1:L, 0] for o, _, _ in eps]).astype(np.float32)   # ambient x at each action's state (E,L-1)
+    # obs at each action's state (E,L-1,obs_dim), for the env's OPTIONAL by-state split hook (item 3).
+    obs_stack = np.stack([o[1:L] for o, _, _ in eps]).astype(np.float32)
+    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
+    split_fn = getattr(env, "action_dist_split", None)
+    split_info = split_fn(obs_stack) if split_fn is not None else None   # (labels, low_name, high_name) | None
     prog(30, "context")
 
     # TRUE = the RECORDED actions (the actual history-conditioned data distribution) — the fair reference for a
@@ -672,28 +687,44 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     pred_a = norm.denorm_act(pred_norm).numpy()                  # (E,L-1,2) head, 1/context (sampled under no_grad)
     prog(50, "head sampling")
 
+    # PRIMARY product: per-dim marginals (dataset/env-agnostic — no a_max/state-split/geometry needed).
+    fig = viz.fig_action_marginals(true_a, pred_a, names=action_names)
+    writer.figure("eval_action_distribution/marginals", fig, step); plt.close(fig)
+    prog(55, "marginals (primary product)")
+
     # window: pool +/-w timesteps per frame/tile -> ~(2w+1)x more samples (the dist changes slowly, so bias is
     # tiny). This is the way to densify PAST the #episodes ceiling. w=4 -> ~9x for both true and pred.
     win = int(cfg.eval.get("action_dist_window", 4) or 0)
-    for name, arr in (("true", true_a), ("pred", pred_a)):       # by-x 2-row static: recorded vs head
-        fig = viz.fig_action_by_state(arr, x, ecfg.a_max, sampler_name=f"{asamp} · {name}", window=win)
-        writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
+    if split_info is not None:                                   # by-state products: TORUS-ONLY (item 3)
+        labels, low_name, high_name = split_info
+        for name, arr in (("true", true_a), ("pred", pred_a)):   # by-state 2-row static: recorded vs head
+            fig = viz.fig_action_by_state(arr, labels, a_max, low_name=low_name, high_name=high_name,
+                                          sampler_name=f"{asamp} · {name}", window=win)
+            writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
 
     tm, pm = np.linalg.norm(true_a, axis=-1).reshape(-1), np.linalg.norm(pred_a, axis=-1).reshape(-1)
     q = np.linspace(0.0, 1.0, 512)
     w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a| (vs recorded)
     writer.scalar("eval_action_distribution/true_pred_w1", w1, step)
-    prog(70, f"by-x static + distance (w1={w1:.3f})")
+    # per-dim W1 (item 4b): `live` skips constant dims (W1~=0) so w1_mean isn't flattered by dead dims.
+    w1_per_dim = [float(np.mean(np.abs(np.quantile(true_a[..., i], q) - np.quantile(pred_a[..., i], q))))
+                  for i in range(true_a.shape[-1])]
+    live = [i for i in range(true_a.shape[-1]) if true_a[..., i].std() > 1e-6]
+    writer.scalars({f"eval_action_distribution/w1/dim_{i}": w for i, w in enumerate(w1_per_dim)}, step)
+    w1_mean = float(np.mean([w1_per_dim[i] for i in live])) if live else 0.0
+    writer.scalar("eval_action_distribution/w1_mean", w1_mean, step)
+    prog(70, f"distance (w1={w1:.3f}, w1_mean={w1_mean:.3f})")
 
     fps = round(1.0 / ecfg.dt)
     # POOLED over all episodes per frame (recorded green vs head red), ALL timesteps (no frame cap), +/-win pooled.
-    frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max, window=win)
+    frames = viz.anim_action_distribution(true_a, pred_a, a_max, window=win)
     writer.video("eval_action_distribution/animation_pooled", frames, fps, step)
     prog(85, "animation (pooled)")
-    # BY-X: split into x<0 / x>=0 rows so each basin's mode stays crisp (pooling over all x smears them).
-    frames_bx = viz.anim_action_by_state(true_a, pred_a, x, ecfg.a_max, window=win)
-    writer.video("eval_action_distribution/animation_byx", frames_bx, fps, step)
-    prog(95, "animation (by-x)")
+    if split_info is not None:                                   # by-state animation: TORUS-ONLY (item 3)
+        frames_bx = viz.anim_action_by_state(true_a, pred_a, labels, a_max, low_name=low_name,
+                                             high_name=high_name, window=win)
+        writer.video("eval_action_distribution/animation_byx", frames_bx, fps, step)
+    prog(95, "animation (by-state)")
 
     if was:
         m.train()

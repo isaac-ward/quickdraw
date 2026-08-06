@@ -1170,7 +1170,8 @@ def fig_action_distribution(act, a_max, sampler_name="", timesteps=None):
     steps = mag.shape[1]
     if timesteps is None:                          # 8 timesteps spanning the episode (near-start ... end)
         timesteps = [int(round(f * (steps - 1))) for f in (0.02, 0.06, 0.12, 0.25, 0.4, 0.6, 0.8, 1.0)]
-    hi = min(float(a_max), float(np.nanmax(mag)) * 1.2)   # fit the data (a_max can be >> used range), 20% headroom
+    data_hi = float(np.nanmax(mag)) * 1.2                 # fit the data, 20% headroom
+    hi = data_hi if a_max is None else min(float(a_max), data_hi)   # a_max: torus-only x-limit knob; None -> data-derived
     fig, axes = plt.subplots(2, 4, figsize=(16, 7))
     for ax, t in zip(axes.ravel(), timesteps):
         ax.hist(mag[:, t], bins=60, range=(0, hi), color="steelblue")
@@ -1194,7 +1195,8 @@ def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=No
     steps = tm.shape[1]
     def win(a, t):                                          # samples pooled over [t-w, t+w]
         return a[:, max(0, t - window): t + window + 1].reshape(-1)
-    hi = min(float(a_max), max(float(tm.max()), float(pm.max())) * 1.05)   # x-lim over ALL data
+    data_hi = max(float(tm.max()), float(pm.max())) * 1.05                # x-lim over ALL data
+    hi = data_hi if a_max is None else min(float(a_max), data_hi)   # a_max: torus-only x-limit knob; None -> data-derived
     edges = np.linspace(0.0, hi, bins + 1)
     ymax = 0.0                                                              # y-lim = worst-case density over ALL frames
     for t in range(steps):
@@ -1222,39 +1224,42 @@ def anim_action_distribution(true_acts, pred_acts, a_max, bins=60, max_frames=No
     return np.stack(frames)
 
 
-def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=None, dpi=90, window=0):
-    """Animated BY-X action-magnitude histograms over time: 2 rows (TOP x<0 slow, BOTTOM x>=0 fast) x 3 cols
-    (true green | pred red | both). Splitting by the sign of ambient x keeps each basin's mode crisp — pooling
-    over all x smears the state-dependent scale together. Densities (comparable despite differing per-frame
-    counts); x-range and y-range are locked across every frame and panel. true/pred: (N, steps, 2); x: (N, steps).
+def anim_action_by_state(true_acts, pred_acts, split, a_max, low_name="slow", high_name="fast", bins=55,
+                          max_frames=None, dpi=90, window=0):
+    """Animated BY-STATE action-magnitude histograms over time: 2 rows (TOP=low_name, BOTTOM=high_name) x 3 cols
+    (true green | pred red | both). Splitting by a meaningful state feature (see WorldEnv.action_dist_split,
+    environments/base.py) keeps each group's mode crisp — pooling over all rows smears the state-dependent scale
+    together. Densities (comparable despite differing per-frame counts); x-range and y-range are locked across
+    every frame and panel. true/pred: (N, steps, 2); split: (N, steps) bool (True -> low_name group).
     window>0 -> each frame pools timesteps [t-w, t+w] (~(2w+1)x more samples/frame, the way to densify past #episodes)."""
     tm = np.linalg.norm(np.asarray(true_acts), axis=-1)      # (N, steps)
     pm = np.linalg.norm(np.asarray(pred_acts), axis=-1)
-    x = np.asarray(x)
+    split = np.asarray(split, dtype=bool)
     steps = tm.shape[1]
-    def wsel(a, t, neg):                                      # samples in [t-w,t+w] on the requested x-half
+    def wsel(a, t, low):                                      # samples in [t-w,t+w] on the requested group
         lo, hiw = max(0, t - window), t + window + 1
-        aw, xw = a[:, lo:hiw], x[:, lo:hiw]
-        return aw[(xw < 0.0) if neg else (xw >= 0.0)]
-    hi = min(float(a_max), max(float(tm.max()), float(pm.max())) * 1.05)
+        aw, sw = a[:, lo:hiw], split[:, lo:hiw]
+        return aw[sw if low else ~sw]
+    data_hi = max(float(tm.max()), float(pm.max())) * 1.05
+    hi = data_hi if a_max is None else min(float(a_max), data_hi)   # a_max: torus-only x-limit knob; None -> data-derived
     edges = np.linspace(0.0, hi, bins + 1)
     ymax = 0.0                                                # locked y (density) over all frames/rows/panels
     for t in range(steps):
-        for neg in (True, False):
-            for m in (wsel(tm, t, neg), wsel(pm, t, neg)):
+        for low in (True, False):
+            for m in (wsel(tm, t, low), wsel(pm, t, low)):
                 if m.size:
                     ymax = max(ymax, float(np.histogram(m, bins=edges, density=True)[0].max()))
     ymax = ymax * 1.08 or 1.0
     ts = (range(steps) if (max_frames is None or steps <= max_frames)
           else np.linspace(0, steps - 1, max_frames).round().astype(int))
     green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
-    rows = (("x < 0 (slow)", 0, True), ("x ≥ 0 (fast)", 1, False))
+    rows = ((low_name, 0, True), (high_name, 1, False))
     frames = []
     for t in ts:
         t = int(t)
         fig, ax = plt.subplots(2, 3, figsize=(15, 8), sharex=True, sharey=True)
-        for lbl, r, neg in rows:
-            tt, pp = wsel(tm, t, neg), wsel(pm, t, neg)
+        for lbl, r, low in rows:
+            tt, pp = wsel(tm, t, low), wsel(pm, t, low)
             for c in range(3):
                 ax[r, c].set_xlim(0, hi); ax[r, c].set_ylim(0, ymax)
             if tt.size: ax[r, 0].hist(tt, bins=edges, density=True, color=green, alpha=0.6)
@@ -1266,40 +1271,98 @@ def anim_action_by_state(true_acts, pred_acts, x, a_max, bins=55, max_frames=Non
             ax[r, 2].set_title(f"{lbl} · both", fontsize=10); ax[r, 2].legend(loc="upper right", fontsize=8)
         for c in range(3):
             ax[1, c].set_xlabel("|a|")
-        fig.suptitle(f"action-magnitude by x-sign  ·  t={t}/{steps - 1}"
+        fig.suptitle(f"action-magnitude by state ({low_name}/{high_name})  ·  t={t}/{steps - 1}"
                      + (f"  (±{window} pooled)" if window else ""), fontsize=13)
         fig.tight_layout(rect=(0, 0, 1, 0.94)); fig.set_dpi(dpi)
         frames.append(_fig_rgb(fig)); plt.close(fig)
     return np.stack(frames)
 
 
-def fig_action_by_state(act, x, a_max, sampler_name="", n_cols=4, window=0):
-    """Action-magnitude distribution split by the sign of ambient x (the state-dependence division): TOP row =
-    x<0 (slow half), BOTTOM row = x>=0 (fast half); columns are uniformly-spaced timesteps. Same column across
-    rows -> same timestep, so slow-vs-fast is directly comparable. Histograms are densities (comparable across
-    tiles despite differing counts). `act` (n_traj, steps, 2), `x` (n_traj, steps) ambient x. window>0 -> each
-    column pools timesteps [t-w, t+w] (~(2w+1)x more samples/tile)."""
+def fig_action_by_state(act, split, a_max, low_name="slow", high_name="fast", sampler_name="", n_cols=4, window=0):
+    """Action-magnitude distribution split by a meaningful state feature (see WorldEnv.action_dist_split,
+    environments/base.py): TOP row = low_name group, BOTTOM row = high_name group; columns are uniformly-spaced
+    timesteps. Same column across rows -> same timestep, so the two groups are directly comparable. Histograms
+    are densities (comparable across tiles despite differing counts). `act` (n_traj, steps, 2), `split`
+    (n_traj, steps) bool (True -> low_name group). window>0 -> each column pools timesteps [t-w, t+w]
+    (~(2w+1)x more samples/tile)."""
     a = np.asarray(act); n_traj = a.shape[0]
     mag = np.linalg.norm(a, axis=-1)                 # (n_traj, steps)
-    x = np.asarray(x)                                # (n_traj, steps)
+    split = np.asarray(split, dtype=bool)             # (n_traj, steps)
     steps = mag.shape[1]
     cols = [int(round(f * (steps - 1))) for f in np.linspace(0.05, 1.0, n_cols)]   # uniform timesteps
-    hi = min(float(a_max), float(mag.max()) * 1.15)
-    def wsel(t, neg):                                # samples in [t-w,t+w] on the requested x-half
+    data_hi = float(mag.max()) * 1.15
+    hi = data_hi if a_max is None else min(float(a_max), data_hi)   # a_max: torus-only x-limit knob; None -> data-derived
+    def wsel(t, low):                                # samples in [t-w,t+w] on the requested group
         lo, hiw = max(0, t - window), t + window + 1
-        mw, xw = mag[:, lo:hiw], x[:, lo:hiw]
-        return mw[(xw < 0.0) if neg else (xw >= 0.0)]
+        mw, sw = mag[:, lo:hiw], split[:, lo:hiw]
+        return mw[sw if low else ~sw]
     fig, axes = plt.subplots(2, n_cols, figsize=(4 * n_cols, 7), sharex=True, sharey=True)
-    for r, (lbl, neg) in enumerate((("x < 0 (slow)", True), ("x ≥ 0 (fast)", False))):
+    for r, (lbl, low) in enumerate(((low_name, True), (high_name, False))):
         for c, t in enumerate(cols):
-            m = wsel(t, neg)
+            m = wsel(t, low)
             ax = axes[r, c]
             ax.hist(m, bins=55, range=(0, hi), density=True, color="steelblue")
             ax.set_title(f"{lbl},  t={t}  (n={m.size})", fontsize=10)
             if r == 1:
                 ax.set_xlabel("|a|")
-    ttl = (f"action-magnitude distribution — top: x<0 (slow)  |  bottom: x≥0 (fast)  ·  "
+    ttl = (f"action-magnitude distribution — top: {low_name}  |  bottom: {high_name}  ·  "
            f"pooled over {n_traj} trajectories" + (f"  ·  sampler={sampler_name}" if sampler_name else ""))
     fig.suptitle(ttl, fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return fig
+
+
+def fig_action_marginals(true_a, pred_a, names=None, max_cols=4, discrete_max=10, q=(0.001, 0.999)):
+    """Per-dim action marginals: recorded (filled) vs head (outline) on SHARED bins, one panel per dim.
+    Dataset/env-agnostic (no a_max/state-split/geometry) — works for any action_dim, unlike the |a|-magnitude
+    products above which collapse all dims into one norm and get dominated by large-magnitude binary dims.
+
+    true_a/pred_a: (E, T, A) physical actions. names: list[str] | None -> 'a[i]'. Per-dim behaviour is decided
+    from the TRUE actions (so panels are comparable across runs/checkpoints):
+      - constant (n_unique<=1): a text tile ("a[i] constant @ <value>") — no faked histogram.
+      - discrete (n_unique<=discrete_max): grouped bar chart of value frequencies, true vs pred (pred values are
+        snapped to the nearest true value) — correct for e.g. a ±1 gripper/flag dim.
+      - continuous: shared bins over the TRUE dim's robust `q`-quantile range (padded ~5%); true filled + pred
+        step outline, both densities so they're comparable."""
+    true_a, pred_a = np.asarray(true_a), np.asarray(pred_a)
+    A = true_a.shape[-1]
+    names = list(names) if names and len(names) == A else [f"a[{i}]" for i in range(A)]
+    n_cols = max(1, min(max_cols, A))
+    n_rows = int(np.ceil(A / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.2 * n_rows))
+    axes = np.atleast_1d(axes).ravel()
+    green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
+    for i in range(A):
+        ax = axes[i]
+        t, p = true_a[..., i].reshape(-1), pred_a[..., i].reshape(-1)
+        uniq = np.unique(t)
+        if uniq.size <= 1:                                     # constant dim: don't fake a histogram
+            val = float(uniq[0]) if uniq.size else 0.0
+            ax.text(0.5, 0.5, f"{names[i]} constant @ {val:.3f}", ha="center", va="center", fontsize=11,
+                    transform=ax.transAxes)
+            ax.set_xticks([]); ax.set_yticks([])
+        elif uniq.size <= discrete_max:                        # discrete dim: grouped value-frequency bars
+            t_freq = np.array([(t == v).mean() for v in uniq])
+            nearest = np.abs(p[:, None] - uniq[None, :]).argmin(axis=1)   # snap pred to nearest true value
+            p_freq = np.bincount(nearest, minlength=uniq.size).astype(float) / max(p.size, 1)
+            xs = np.arange(uniq.size); w = 0.35
+            ax.bar(xs - w / 2, t_freq, w, color=green, alpha=0.7, label="true")
+            ax.bar(xs + w / 2, p_freq, w, color=red, alpha=0.7, label="pred")
+            ax.set_xticks(xs); ax.set_xticklabels([f"{v:.2g}" for v in uniq], fontsize=8)
+            ax.set_title(f"{names[i]}  (discrete, n={uniq.size})", fontsize=10)
+            ax.legend(loc="upper right", fontsize=8)
+        else:                                                  # continuous dim: shared bins from TRUE quantiles
+            lo, hi = np.quantile(t, q[0]), np.quantile(t, q[1])
+            pad = (hi - lo) * 0.05 or 1.0
+            lo, hi = lo - pad, hi + pad
+            edges = np.linspace(lo, hi, 41)
+            ax.hist(t, bins=edges, density=True, color=green, alpha=0.5, label="true")
+            ax.hist(p, bins=edges, density=True, histtype="step", color=red, linewidth=1.6, label="pred")
+            ax.set_xlim(lo, hi)
+            ax.set_title(f"{names[i]}  (continuous)", fontsize=10)
+            ax.legend(loc="upper right", fontsize=8)
+    for j in range(A, len(axes)):
+        axes[j].axis("off")
+    fig.suptitle("per-dim action marginals — recorded (filled/bars) vs head (outline/bars)", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     return fig
