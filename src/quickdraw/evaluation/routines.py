@@ -720,6 +720,10 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     frames = viz.anim_action_distribution(true_a, pred_a, a_max, window=win)
     writer.video("eval_action_distribution/animation_pooled", frames, fps, step)
     prog(85, "animation (pooled)")
+    # per-dim marginals VIDEO: the animated companion to the static marginals PNG (same styling + same `win`).
+    mframes = viz.anim_action_marginals(true_a, pred_a, names=action_names, window=win)
+    writer.video("eval_action_distribution/animation_marginals", mframes, fps, step)
+    prog(88, "animation (marginals)")
     if split_info is not None:                                   # by-state animation: TORUS-ONLY (item 3)
         frames_bx = viz.anim_action_by_state(true_a, pred_a, labels, a_max, low_name=low_name,
                                              high_name=high_name, window=win)

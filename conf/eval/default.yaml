@@ -1,3 +1,7 @@
+action_dist_window: 4      # +/-N timesteps pooled per frame/tile across ALL action-dist products (pooled-magnitude
+#                            animation, by-state, AND the per-dim marginals video) -> ~(2N+1)x samples/frame past the
+#                            #episodes ceiling; the dist changes slowly so bias is tiny. ONE knob for all of them (the
+#                            viz styling is shared too). 0 = no pooling (per-timestep). Change here -> changes both.
 action_dist_episodes: 64   # LOCKED (user, 2026-07-20): action-distribution eval uses 64 val episodes (the full
 #                            split) for DENSE histograms (~256/bin with window pooling). NEVER lower this — a
 #                            lower value made the plots look sparse (n~30). DO NOT CHANGE / do not override lower.

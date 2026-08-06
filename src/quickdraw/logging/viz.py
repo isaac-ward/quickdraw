@@ -1312,57 +1312,114 @@ def fig_action_by_state(act, split, a_max, low_name="slow", high_name="fast", sa
     return fig
 
 
-def fig_action_marginals(true_a, pred_a, names=None, max_cols=4, discrete_max=10, q=(0.001, 0.999)):
-    """Per-dim action marginals: recorded (filled) vs head (outline) on SHARED bins, one panel per dim.
-    Dataset/env-agnostic (no a_max/state-split/geometry) — works for any action_dim, unlike the |a|-magnitude
-    products above which collapse all dims into one norm and get dominated by large-magnitude binary dims.
+_AGREEN, _ARED = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)   # true=green, pred=red (shared by pooled anim + marginals)
 
-    true_a/pred_a: (E, T, A) physical actions. names: list[str] | None -> 'a[i]'. Per-dim behaviour is decided
-    from the TRUE actions (so panels are comparable across runs/checkpoints):
-      - constant (n_unique<=1): a text tile ("a[i] constant @ <value>") — no faked histogram.
-      - discrete (n_unique<=discrete_max): grouped bar chart of value frequencies, true vs pred (pred values are
-        snapped to the nearest true value) — correct for e.g. a ±1 gripper/flag dim.
-      - continuous: shared bins over the TRUE dim's robust `q`-quantile range (padded ~5%); true filled + pred
-        step outline, both densities so they're comparable."""
-    true_a, pred_a = np.asarray(true_a), np.asarray(pred_a)
-    A = true_a.shape[-1]
-    names = list(names) if names and len(names) == A else [f"a[{i}]" for i in range(A)]
-    n_cols = max(1, min(max_cols, A))
-    n_rows = int(np.ceil(A / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.2 * n_rows))
-    axes = np.atleast_1d(axes).ravel()
-    green, red = (0.20, 0.60, 0.25), (0.85, 0.20, 0.20)
+
+def _action_marginal_spec(true_a, discrete_max=10, q=(0.001, 0.999)):
+    """Per-dim classification + LOCKED bins/values computed once from the POOLED true actions, so the PNG and the
+    video frames are all directly comparable. Returns a list of {kind, ...} dicts, one per action dim."""
+    A = true_a.shape[-1]; spec = []
     for i in range(A):
-        ax = axes[i]
-        t, p = true_a[..., i].reshape(-1), pred_a[..., i].reshape(-1)
-        uniq = np.unique(t)
-        if uniq.size <= 1:                                     # constant dim: don't fake a histogram
-            val = float(uniq[0]) if uniq.size else 0.0
-            ax.text(0.5, 0.5, f"{names[i]} constant @ {val:.3f}", ha="center", va="center", fontsize=11,
-                    transform=ax.transAxes)
-            ax.set_xticks([]); ax.set_yticks([])
-        elif uniq.size <= discrete_max:                        # discrete dim: grouped value-frequency bars
-            t_freq = np.array([(t == v).mean() for v in uniq])
-            nearest = np.abs(p[:, None] - uniq[None, :]).argmin(axis=1)   # snap pred to nearest true value
-            p_freq = np.bincount(nearest, minlength=uniq.size).astype(float) / max(p.size, 1)
-            xs = np.arange(uniq.size); w = 0.35
-            ax.bar(xs - w / 2, t_freq, w, color=green, alpha=0.7, label="true")
-            ax.bar(xs + w / 2, p_freq, w, color=red, alpha=0.7, label="pred")
-            ax.set_xticks(xs); ax.set_xticklabels([f"{v:.2g}" for v in uniq], fontsize=8)
-            ax.set_title(f"{names[i]}  (discrete, n={uniq.size})", fontsize=10)
-            ax.legend(loc="upper right", fontsize=8)
-        else:                                                  # continuous dim: shared bins from TRUE quantiles
-            lo, hi = np.quantile(t, q[0]), np.quantile(t, q[1])
-            pad = (hi - lo) * 0.05 or 1.0
-            lo, hi = lo - pad, hi + pad
-            edges = np.linspace(lo, hi, 41)
-            ax.hist(t, bins=edges, density=True, color=green, alpha=0.5, label="true")
-            ax.hist(p, bins=edges, density=True, histtype="step", color=red, linewidth=1.6, label="pred")
-            ax.set_xlim(lo, hi)
-            ax.set_title(f"{names[i]}  (continuous)", fontsize=10)
-            ax.legend(loc="upper right", fontsize=8)
+        t = true_a[..., i].reshape(-1); uniq = np.unique(t)
+        if uniq.size <= 1:
+            spec.append({"kind": "constant", "val": float(uniq[0]) if uniq.size else 0.0})
+        elif uniq.size <= discrete_max:
+            spec.append({"kind": "discrete", "uniq": uniq})
+        else:
+            lo, hi = np.quantile(t, q[0]), np.quantile(t, q[1]); pad = (hi - lo) * 0.05 or 1.0
+            spec.append({"kind": "continuous", "edges": np.linspace(lo - pad, hi + pad, 41)})
+    return spec
+
+
+def _draw_action_marginal(ax, t, p, name, s, ylim=None):
+    """Draw ONE dim's panel from true samples `t` and pred samples `p` using the locked spec `s`. STYLING (shared by
+    the PNG and the video, matching anim_action_distribution): true GREEN + pred RED, both FILLED at alpha 0.5 and
+    OVERLAID — no step outline. `ylim` locks the y-axis (video frames); None -> autoscale (PNG)."""
+    if s["kind"] == "constant":                               # don't fake a histogram
+        ax.text(0.5, 0.5, f"{name} constant @ {s['val']:.3f}", ha="center", va="center", fontsize=11,
+                transform=ax.transAxes)
+        ax.set_xticks([]); ax.set_yticks([]); return
+    if s["kind"] == "discrete":                               # value-frequency bars, OVERLAID at the same x (alpha)
+        uniq = s["uniq"]; xs = np.arange(uniq.size)
+        t_freq = np.array([(t == v).mean() for v in uniq]) if t.size else np.zeros(uniq.size)
+        near = np.abs(p[:, None] - uniq[None, :]).argmin(axis=1) if p.size else np.array([], int)   # snap pred
+        p_freq = np.bincount(near, minlength=uniq.size).astype(float) / max(p.size, 1)
+        ax.bar(xs, t_freq, 0.8, color=_AGREEN, alpha=0.5, label="true")
+        ax.bar(xs, p_freq, 0.8, color=_ARED, alpha=0.5, label="pred")
+        ax.set_xticks(xs); ax.set_xticklabels([f"{v:.2g}" for v in uniq], fontsize=8)
+        ax.set_title(f"{name}  (discrete, n={uniq.size})", fontsize=10)
+    else:                                                     # continuous: shared bins, both FILLED + translucent
+        edges = s["edges"]
+        ax.hist(t, bins=edges, density=True, color=_AGREEN, alpha=0.5, label="true")
+        ax.hist(p, bins=edges, density=True, color=_ARED, alpha=0.5, label="pred")
+        ax.set_xlim(edges[0], edges[-1]); ax.set_title(f"{name}  (continuous)", fontsize=10)
+    if ylim:
+        ax.set_ylim(0, ylim)
+    ax.legend(loc="upper right", fontsize=8)
+
+
+def fig_action_marginals(true_a, pred_a, names=None, max_cols=4, discrete_max=10, q=(0.001, 0.999)):
+    """Per-dim action marginals (STATIC): recorded (green) vs head (red), both FILLED + translucent + OVERLAID on
+    SHARED bins, one panel per dim, pooling ALL timesteps for density. Dataset/env-agnostic. Per-dim behaviour
+    (from TRUE): constant -> text tile; discrete (<=discrete_max unique) -> overlaid value-freq bars; continuous ->
+    overlaid density histograms on the true dim's robust q-quantile range. Same styling as anim_action_marginals."""
+    true_a, pred_a = np.asarray(true_a), np.asarray(pred_a); A = true_a.shape[-1]
+    names = list(names) if names and len(names) == A else [f"a[{i}]" for i in range(A)]
+    spec = _action_marginal_spec(true_a, discrete_max, q)
+    n_cols = max(1, min(max_cols, A)); n_rows = int(np.ceil(A / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.2 * n_rows)); axes = np.atleast_1d(axes).ravel()
+    for i in range(A):
+        _draw_action_marginal(axes[i], true_a[..., i].reshape(-1), pred_a[..., i].reshape(-1), names[i], spec[i])
     for j in range(A, len(axes)):
         axes[j].axis("off")
-    fig.suptitle("per-dim action marginals — recorded (filled/bars) vs head (outline/bars)", fontsize=13)
+    fig.suptitle("per-dim action marginals — recorded (green) vs head (red), overlaid (pooled over all t)", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     return fig
+
+
+def anim_action_marginals(true_a, pred_a, names=None, window=0, max_frames=None, dpi=90, max_cols=4,
+                          discrete_max=10, q=(0.001, 0.999)):
+    """Per-dim marginals ANIMATED over timesteps — the per-dim analogue of anim_action_distribution, same styling
+    (green+red filled/overlaid) and the same `window` (each frame pools timesteps [t-w, t+w] to densify past the
+    #episodes ceiling). Bins/values are LOCKED from the pooled true (via _action_marginal_spec) and per-dim y-limits
+    are locked to the worst-case over all frames, so panels are comparable frame-to-frame. Returns (F,H,W,3)."""
+    true_a, pred_a = np.asarray(true_a), np.asarray(pred_a); A = true_a.shape[-1]; steps = true_a.shape[1]
+    names = list(names) if names and len(names) == A else [f"a[{i}]" for i in range(A)]
+    spec = _action_marginal_spec(true_a, discrete_max, q)
+
+    def win(a, i, t):                                          # dim i, timesteps [t-w, t+w] pooled over episodes
+        return a[:, max(0, t - window): t + window + 1, i].reshape(-1)
+
+    ylim = [None] * A                                         # lock each dim's y-axis = worst-case density over frames
+    for i in range(A):
+        if spec[i]["kind"] == "constant":
+            continue
+        m = 0.0
+        for t in range(steps):
+            tw, pw = win(true_a, i, t), win(pred_a, i, t)
+            if spec[i]["kind"] == "discrete":
+                uq = spec[i]["uniq"]
+                m = max(m, max((tw == v).mean() for v in uq) if tw.size else 0.0)
+                near = np.abs(pw[:, None] - uq[None, :]).argmin(axis=1) if pw.size else np.array([], int)
+                m = max(m, float((np.bincount(near, minlength=uq.size) / max(pw.size, 1)).max()) if pw.size else 0.0)
+            else:
+                e = spec[i]["edges"]
+                m = max(m, float(np.histogram(tw, bins=e, density=True)[0].max()) if tw.size else 0.0,
+                        float(np.histogram(pw, bins=e, density=True)[0].max()) if pw.size else 0.0)
+        ylim[i] = m * 1.08 or 1.0
+    ts = (range(steps) if (max_frames is None or steps <= max_frames)
+          else np.linspace(0, steps - 1, max_frames).round().astype(int))
+    n_cols = max(1, min(max_cols, A)); n_rows = int(np.ceil(A / n_cols))
+    frames = []
+    for t in ts:
+        t = int(t)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.2 * n_rows)); axes = np.atleast_1d(axes).ravel()
+        for i in range(A):
+            _draw_action_marginal(axes[i], win(true_a, i, t), win(pred_a, i, t), names[i], spec[i], ylim=ylim[i])
+        for j in range(A, len(axes)):
+            axes[j].axis("off")
+        fig.suptitle(f"per-dim action marginals  ·  t={t}/{steps - 1}" + (f"  (±{window} pooled)" if window else ""),
+                     fontsize=13)
+        fig.tight_layout(rect=(0, 0, 1, 0.93)); fig.set_dpi(dpi)
+        frames.append(_fig_rgb(fig)); plt.close(fig)
+    return np.stack(frames)
