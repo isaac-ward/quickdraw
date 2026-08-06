@@ -13,6 +13,9 @@ name: mm_flow
 #   FULL recipe (CLI overrides over these defaults): model.d=128 depth=4 heads=8 window=32 data.batch=32
 #   data.F=64 recon_frac=0.25 diffusion.shortcut=true p_tf_warmup_epochs=4 detach_every=16
 #   modalities.1.{num_tokens=8,encode_arch=vit,decode_arch=vit,decode_kind=mse}  action_head.enabled=false.
+#   UPDATE 2026-08-06: the CURRENT defaults below differ from the 2026-07-28 recipe — detach_every=32 (LOCKED, fixes
+#   the ~ep10 long-horizon control collapse) and action_head.enabled=true (UNLOCKED; longer BPTT rehabilitated the
+#   joint head). The recipe above is the historical det16/no-head best; the values below are what actually runs now.
 # =============================================================================================
 d: 32                     # backbone/token width (all modality tokens live at d)
 depth: 4
@@ -41,7 +44,11 @@ dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.
 recon_frac: 1.0            # fraction (0-1) of the F rollout frames to supervise the decode recon on (train only;
                            #   ALL output modalities, same random subset per step). 1.0=all. <1 saves ViT-AE decode compute.
-detach_every: 16
+detach_every: 32           # LOCKED 32 (2026-08-06): 16 under-penalized long-horizon error growth, so the one-step
+#                            map drifted non-contractive and control collapsed to NON-FINITE ~ep10 (killed a run).
+#                            detach_every=32 extends the penalized BPTT horizon -> control STABLE through ep30+
+#                            (no-head 4.5/5, head 4.25/5; det16 was dead at ep10). ~free: peak mem scales with F
+#                            not detach_every, and wall-time is neutral. DO NOT lower. See accelerations.md.
 grad_checkpoint: false     # wrap each rollout-step backbone forward in torch.utils.checkpoint -> AR memory ∝ detach_every not F; ~1.3x compute; default off
 compile_rollout: false     # true -> torch.compile the AR rollout STEP (~6x, accelerations.md Exp 9). Requires
 #                            head_dim (d/heads) >= 16 and is mutually exclusive with variations.contraction
@@ -64,10 +71,12 @@ diffusion:
 # prior used LATER as the MPPI proposal — its samples are NEVER fed back into the world model. Eyeballed via the
 # eval_action_distribution routine (true-vs-pred histograms + animation). enabled: false -> no head, bit-identical.
 action_head:
-  enabled: false            # LOCKED false (best-performance, 2026-07-28): the JOINT action head KILLS control
-  #                           (goals ~0 vs 3.88 baseline) AND destabilizes the WM over a long run (unetflow NaN'd
-  #                           ~ep31, vitmse collapsed to a frozen 11.1). Removing it recreated the baseline + control.
-  #                           If you want the MPPI action prior, train it POST-HOC on a FROZEN checkpoint, not jointly.
+  enabled: true             # DEFAULT ON (2026-08-06) — NOT locked, flip freely. Was LOCKED false in the det16 era
+  #                           (the joint head killed control ~0 + destabilized: unetflow NaN'd ~ep31, vitmse collapsed);
+  #                           detach_every=32 (now default) fixed that — head-on is stable and controls well. CURRENT
+  #                           bptt32 runs @ep30:  HEAD 4.25 goals/5, val 0.83   vs   NO-HEAD 4.50 goals/5, val 0.38 —
+  #                           no-head edges control + far lower val loss; head-on also trains the joint MPPI action
+  #                           prior. Set false for the leaner no-head baseline. (Post-hoc on a frozen ckpt still valid.)
   weight: 1.0               # weight of the action-flow loss in the total training loss
   shortcut: false           # PURE RECTIFIED FLOW for the action prior — NOT default-on like the dynamics
   #   (diffusion.shortcut) / decode shortcuts, because the action prior is fundamentally different from
