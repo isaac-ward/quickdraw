@@ -160,10 +160,12 @@ def autobatch_find(cfg, device, log=print) -> int:
     `autobatch_max`. The AR step is DISPATCH-bound (accelerations.md Exp 8), so bigger batch is nearly-free
     throughput until memory binds — pick the largest that fits with headroom. Builds a THROWAWAY model +
     SYNTHETIC batches (memory is shape- not value-dependent), probes real `rollout_train` fwd + decode + bwd,
-    then frees. Headroom covers the optimizer states, eval-phase spikes, and allocator reserve — raise
-    `data.autobatch_headroom` if an eval OOMs. Config: data.autobatch{,_headroom,_max,_base}."""
+    then frees. Probes the REAL training step (rollout_train -> recon + flow loss, backward, AND an AdamW
+    step so optimizer states count) — the earlier synthetic pow(2) proxy under-counted the loss graph +
+    optimizer by ~12 GB and picked batches that OOM'd. Headroom still covers eval-phase spikes + allocator
+    reserve — raise `data.autobatch_headroom` if an eval OOMs. Config: data.autobatch{,_headroom,_max,_base}."""
     import gc
-    headroom = float(cfg.data.get("autobatch_headroom", 0.15))
+    headroom = float(cfg.data.get("autobatch_headroom", 0.25))
     cap = int(cfg.data.get("autobatch_max", 512))
     base = int(cfg.data.get("autobatch_base", 16))
     total = torch.cuda.get_device_properties(device).total_memory
@@ -179,6 +181,11 @@ def autobatch_find(cfg, device, log=print) -> int:
     compiled_run = bool(cfg.model.get("compile_rollout", False))
     model.compile_rollout = False
 
+    # real optimizer so its Adam states (fp32 moments) count toward the probed peak — they allocate on the
+    # first .step(). lr=1e-12 so repeated probe steps don't drift the throwaway weights to NaN (which would
+    # break the value-sensitive loss path); states allocate regardless of lr.
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-12, weight_decay=0.0, fused=True)
+
     def synth(B):
         obs = {}
         for s in specs:
@@ -189,26 +196,48 @@ def autobatch_find(cfg, device, log=print) -> int:
             else:
                 obs[s.name] = torch.randn(B, L, int(getattr(s, "dim", 6)), device=device)
         act = torch.randn(B, L - 1, adim, device=device)
-        return {k: v[:, :P] for k, v in obs.items()}, act, {k: v[:, P:] for k, v in obs.items()}
+        return obs, act
 
-    def probe(B):   # peak bytes for one real AR step, or None on OOM
+    def _train_loss(obs, act):
+        # The REAL training loss at p_tf=0 (max-memory AR path), mirroring LitWorldModel._step minus logging +
+        # variations: rollout_train -> recon_losses (all-head ViT decode, recon_frac subset) + loss_terms (flow).
+        # This full graph is what the synthetic pow(2) proxy under-counted.
+        ctx = {k: v[:, :P] for k, v in obs.items()}
+        future = {k: v[:, P:] for k, v in obs.items()}
+        preds = model.rollout_train(ctx, act[:, : L - 1], future, 0.0, de)
+        recon_src = preds if getattr(model, "pred_obs_in_loss", True) else preds.detach()
+        if rf < 1.0:
+            Tf = recon_src.shape[1]; k = max(1, int(round(rf * Tf)))
+            idx = torch.randperm(Tf, device=device)[:k]
+            src, futr = recon_src[:, idx], {kk: v[:, idx] for kk, v in future.items()}
+        else:
+            src, futr = recon_src, future
+        recon = model.recon_losses(src, futr)
+        raw, w = model.loss_terms(preds, future, obs, 0.0, act)
+        wts = {mod.name: float(mod.weight) for mod in model.modalities.values()}
+        return sum(w[k] * raw[k] for k in raw) + sum(wts[k.split("/")[-1]] * recon[k] for k in recon)
+
+    def probe(B):   # peak bytes for a real training step (fwd loss + bwd + optimizer.step), or None on OOM
         torch.cuda.synchronize(device); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
         try:
-            ctx, act, fut = synth(B)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                preds = model.rollout_train(ctx, act, fut, 0.0, de)
-                loss = preds.float().pow(2).mean()
-                try:   # add the decode-backward footprint (recon_frac subset) — deterministic decoders only
-                    k = max(1, int(round(rf * preds.shape[1])))
-                    loss = loss + sum(v.float().pow(2).mean() for v in model.to_obs(preds[:, :k]).values())
-                except Exception:   # flow/other decoders that don't decode cleanly here — rollout-only estimate
-                    pass
-            loss.backward(); model.zero_grad(set_to_none=True)
+            obs, act = synth(B)
+            for _ in range(2):   # Adam states allocate on step 1 -> step 2's peak is the steady-state footprint
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    try:
+                        loss = _train_loss(obs, act)             # faithful full loss graph
+                    except Exception as e:                       # value-sensitive path choked on synthetic data
+                        if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower():
+                            raise                                # a real OOM -> batch too big; bubble out
+                        preds = model.rollout_train({k: v[:, :P] for k, v in obs.items()}, act[:, : L - 1],
+                                                    {k: v[:, P:] for k, v in obs.items()}, 0.0, de)
+                        loss = preds.float().pow(2).mean()       # fall back to the rollout-only estimate
+                loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
             return torch.cuda.max_memory_allocated(device)
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if not (isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower()):
                 raise
-            model.zero_grad(set_to_none=True); torch.cuda.empty_cache(); return None
+            model.zero_grad(set_to_none=True); opt.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache(); return None
 
     def fits(B):
         p = probe(B); return (p is not None and p <= budget), p

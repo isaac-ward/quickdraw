@@ -43,6 +43,9 @@ recon_frac: 1.0            # fraction (0-1) of the F rollout frames to supervise
                            #   ALL output modalities, same random subset per step). 1.0=all. <1 saves ViT-AE decode compute.
 detach_every: 16
 grad_checkpoint: false     # wrap each rollout-step backbone forward in torch.utils.checkpoint -> AR memory ∝ detach_every not F; ~1.3x compute; default off
+compile_rollout: false     # true -> torch.compile the AR rollout STEP (~6x, accelerations.md Exp 9). Requires
+#                            head_dim (d/heads) >= 16 and is mutually exclusive with variations.contraction
+#                            (its Jacobian power-iteration needs the eager graph). Declared so the bare override works.
 # Temporal KV-cache is ON by default for INFERENCE rollouts (imagine_eval / MPPI; MultiModalSequenceModel.
 # use_kv_cache, never used in training). It is the FAITHFUL sliding-window forward (cached == full-sequence
 # masked forward, ~8e-7). NOTE: it also (correctly) un-truncates deep-layer receptive fields that the legacy

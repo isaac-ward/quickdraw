@@ -456,3 +456,10 @@ dedicated H100 — only `compile_rollout` differs.
 - **head_dim trap found here.** The first attempt used the `mm_flow` **default d=32** (head_dim=4) and crashed 12 min
   in at the epoch-4 compile with the inductor NYI. Fixed by the build-time guard above; rerun at d=128 (head_dim=16)
   passed. Net: the isolation ~6.1× **does** survive the full training loop, on any config with head_dim ≥ 16.
+- **Full-run confirmation (2026-08-06).** A real 50-epoch no-head run (d=128, batch 64, full eval, torus image
+  data) crossed the eager→compiled boundary cleanly: **eager warmup epochs ~53 min (~4.3 s/batch) → compiled
+  steady epochs (p_tf=0) ~10 min (~0.81 s/batch) = ~5.3× per-epoch end-to-end** (and ≥6× vs a *true* eager p_tf=0,
+  which is slower than the p_tf=0.25 warmup this is measured against). No OOM, val descending. So the win holds on
+  the real training loop at scale. The only slow part is the eager warmup (~4 epochs, p_tf>0) — inherent, since
+  compile applies only to the steady p_tf=0 rollout. A second dataset (robocasa recorded, d=128/F=64/batch=32)
+  independently measured **3.90 → 0.67 s/batch (5.8×)**.
