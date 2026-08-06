@@ -13,9 +13,10 @@ name: mm_flow
 #   FULL recipe (CLI overrides over these defaults): model.d=128 depth=4 heads=8 window=32 data.batch=32
 #   data.F=64 recon_frac=0.25 diffusion.shortcut=true p_tf_warmup_epochs=4 detach_every=16
 #   modalities.1.{num_tokens=8,encode_arch=vit,decode_arch=vit,decode_kind=mse}  action_head.enabled=false.
-#   UPDATE 2026-08-06: the CURRENT defaults below differ from the 2026-07-28 recipe — detach_every=32 (LOCKED, fixes
-#   the ~ep10 long-horizon control collapse) and action_head.enabled=true (UNLOCKED; longer BPTT rehabilitated the
-#   joint head). The recipe above is the historical det16/no-head best; the values below are what actually runs now.
+#   UPDATE 2026-08-06: the CURRENT defaults below differ from the 2026-07-28 recipe — detach_every=0 (full-F BPTT:
+#   less detach fixes the ~ep10 long-horizon control collapse), action_head.enabled=true (UNLOCKED; longer BPTT
+#   rehabilitated the joint head), and IMAGE decode is now decode_kind=mse + decode_arch=unet (conv decoder, no patch
+#   grid — UNTESTED on metrics, see the image note below). Recipe above = historical det16/vit best.
 # =============================================================================================
 d: 32                     # backbone/token width (all modality tokens live at d)
 depth: 4
@@ -44,11 +45,13 @@ dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.
 recon_frac: 1.0            # fraction (0-1) of the F rollout frames to supervise the decode recon on (train only;
                            #   ALL output modalities, same random subset per step). 1.0=all. <1 saves ViT-AE decode compute.
-detach_every: 32           # LOCKED 32 (2026-08-06): 16 under-penalized long-horizon error growth, so the one-step
-#                            map drifted non-contractive and control collapsed to NON-FINITE ~ep10 (killed a run).
-#                            detach_every=32 extends the penalized BPTT horizon -> control STABLE through ep30+
-#                            (no-head 4.5/5, head 4.25/5; det16 was dead at ep10). ~free: peak mem scales with F
-#                            not detach_every, and wall-time is neutral. DO NOT lower. See accelerations.md.
+detach_every: 0            # DEFAULT 0 = FULL-F BPTT (never truncates the rollout gradient). LESS detach = longer
+#                            penalized horizon = BETTER LONG-HORIZON stability/control: at detach_every=16 the one-step
+#                            map drifted non-contractive and control collapsed to NON-FINITE ~ep10; 32 fixed it (stable
+#                            through ep30+); 0 maximizes the horizon (full F=64) for the most margin. ~free: peak mem
+#                            scales with F not detach_every. RAISE it only to cut backward compute, at the risk of the
+#                            long-horizon collapse returning. (32 is the validated point; 0 is the max-margin extrapolation
+#                            — full-F backward may be somewhat slower.) See accelerations.md.
 grad_checkpoint: false     # wrap each rollout-step backbone forward in torch.utils.checkpoint -> AR memory ∝ detach_every not F; ~1.3x compute; default off
 compile_rollout: false     # true -> torch.compile the AR rollout STEP (~6x, accelerations.md Exp 9). Requires
 #                            head_dim (d/heads) >= 16 and is mutually exclusive with variations.contraction
@@ -76,7 +79,9 @@ action_head:
   #                           detach_every=32 (now default) fixed that — head-on is stable and controls well. CURRENT
   #                           bptt32 runs @ep30:  HEAD 4.25 goals/5, val 0.83   vs   NO-HEAD 4.50 goals/5, val 0.38 —
   #                           no-head edges control + far lower val loss; head-on also trains the joint MPPI action
-  #                           prior. Set false for the leaner no-head baseline. (Post-hoc on a frozen ckpt still valid.)
+  #                           prior. DETACH: our head uses detach_gradient=false (NOT detached — the action gradient
+  #                           co-shapes the trunk; detachF beat detachT on every axis, see detach_gradient below).
+  #                           Set false for the leaner no-head baseline. (Post-hoc on a frozen ckpt still valid.)
   weight: 1.0               # weight of the action-flow loss in the total training loss
   shortcut: false           # PURE RECTIFIED FLOW for the action prior — NOT default-on like the dynamics
   #   (diffusion.shortcut) / decode shortcuts, because the action prior is fundamentally different from
@@ -110,6 +115,10 @@ modalities:
   # BEST-PERFORMANCE FINDING (2026-07-28, bimodal): for the IMAGE head, decode_kind=mse + decode_arch=vit (ViT-MSE,
   # the conditional-mean decoder) slightly BEAT decode_kind=flow + decode_arch=unet on every axis — val PSNR 18.9 vs
   # 18.3, OOD pointwise 0.24 vs 0.32, OOD PSNR 14.5 vs 12.6, control 4.12 vs 3.5. The image is a deterministic render,
-  # so the conditional mean IS the target -> MSE has no downside here. Prefer mse/vit for the image decode.
+  # so the conditional mean IS the target -> MSE has no downside here.
+  # UPDATE 2026-08-06: DEFAULT image decode is now mse + UNET (conv, not the linear-patch ViT). The ViT decoder tiles
+  # NON-OVERLAPPING patches -> a visible PATCH GRID at the seams; the conv U-Net has overlapping receptive fields ->
+  # smooth, no grid. CAVEAT: unet+MSE is UNTESTED on metrics (the finding above was unet+FLOW vs vit+MSE, never
+  # unet+mse) — expected to keep MSE's metrics AND kill the grid, but VALIDATE before trusting. encode stays ViT.
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
-  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: flow, decode_param: x0, encode_arch: vit, decode_arch: vit}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: vit, decode_arch: unet}
