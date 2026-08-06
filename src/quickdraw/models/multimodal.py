@@ -100,6 +100,11 @@ class MultiModalSequenceModel(nn.Module):
         dyn = getattr(self, "flow", None) or getattr(self, "predictor", None)
         lbl = "flow (rectified, per-token)" if hasattr(self, "flow") else "predictor (MLP residual)"
         rows.append((f"predict_next: {lbl}", f"(B,T,{self.n_state},{self.d}) -> same", npar(dyn)))
+        # OPTIONAL action-flow prior: learned p(next action | context h), trained jointly, used LATER as the MPPI
+        # proposal (never fed back into the WM). Only present when action_head.enabled -> show it so the head is visible.
+        if getattr(self, "action_head_enabled", False) and getattr(self, "action_flow", None) is not None:
+            rows.append(("action_flow (learned action prior)",
+                         f"context h -> (B,T,{self.act_enc[0].in_features}) action dist", npar(self.action_flow)))
         if getattr(self, "predictor_q", None) is not None:
             rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
         # decode heads (predicted tokens -> obs)
