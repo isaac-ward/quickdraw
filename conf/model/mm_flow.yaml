@@ -49,13 +49,16 @@ dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.
 recon_frac: 1.0            # fraction (0-1) of the F rollout frames to supervise the decode recon on (train only;
                            #   ALL output modalities, same random subset per step). 1.0=all. <1 saves ViT-AE decode compute.
-detach_every: 0            # DEFAULT 0 = FULL-F BPTT (never truncates the rollout gradient). LESS detach = longer
+detach_every: 32           # DEFAULT 32 = truncate the rollout BPTT graph every 32 steps. LESS detach = longer
 #                            penalized horizon = BETTER LONG-HORIZON stability/control: at detach_every=16 the one-step
 #                            map drifted non-contractive and control collapsed to NON-FINITE ~ep10; 32 fixed it (stable
-#                            through ep30+); 0 maximizes the horizon (full F=64) for the most margin. ~free: peak mem
-#                            scales with F not detach_every. RAISE it only to cut backward compute, at the risk of the
-#                            long-horizon collapse returning. (32 is the validated point; 0 is the max-margin extrapolation
-#                            — full-F backward may be somewhat slower.) See accelerations.md.
+#                            through ep30+). 32 is the VALIDATED point. detach_every=0 (full-F BPTT) is the max-margin
+#                            extrapolation but full-F backward is somewhat slower — reverted to 32 on 2026-08-06.
+#                            NOTE: detach_every does NOT change the memory footprint of the epoch-0 peak. Epochs 0-3 run
+#                            p_tf>0 (at epoch 0, p_tf=1 -> the PARALLEL forward: whole sequence in one pass), which never
+#                            uses detach_every; peak mem there scales with F (and recon_frac), NOT detach_every. So if you
+#                            OOM at epoch 0 (as small+F64+unet-decode did on 2026-08-06), lowering detach_every won't help
+#                            — drop the batch (autobatch does this), lower recon_frac (<1 decodes fewer frames), or cut F.
 grad_checkpoint: false     # wrap each rollout-step backbone forward in torch.utils.checkpoint -> AR memory ∝ detach_every not F; ~1.3x compute; default off
 compile_rollout: false     # true -> torch.compile the AR rollout STEP (~6x, accelerations.md Exp 9). Requires
 #                            head_dim (d/heads) >= 16 and is mutually exclusive with variations.contraction

@@ -241,8 +241,8 @@ def autobatch_find(cfg, device, log=print) -> int:
                 obs[s.name] = torch.rand(B, L, hw[0], hw[1], 3, device=device)
             else:
                 obs[s.name] = torch.randn(B, L, int(getattr(s, "dim", 6)), device=device)
-        act = torch.randn(B, L - 1, adim, device=device)
-        return obs, act
+        act = torch.randn(B, L, adim, device=device)   # act_seq is length L (P+F): _par_preds does act[:, :-1] -> L-1
+        return obs, act                                 #   (aligns with obs[:, :-1]); _seq_preds does act[:, :L-1]
 
     def _loss_from_preds(preds, obs, act):
         # recon_losses (recon_frac subset, all-head decode) + loss_terms (flow) — the memory-relevant loss graph,
@@ -306,17 +306,30 @@ def autobatch_find(cfg, device, log=print) -> int:
             if ok_:
                 log(f"[autobatch] compiled-confirm OK: batch {b} ({(p_ or 0)/1e9:.1f}/{budget/1e9:.0f}GB compiled)")
                 return b
-            if b - 8 < base:
-                log(f"[autobatch] compiled step over budget down to base {base}; using {base}")
-                return base
+            if b - 8 < 1:
+                log(f"[autobatch] compiled step over budget down to batch {b}; using {b}")
+                return b
             log(f"[autobatch] compiled step over budget at {b} — stepping down to {b - 8}")
             b -= 8
         return b
 
     ok, p = fits(base)
     if not ok:
-        log(f"[autobatch] base batch {base} already over budget ({(p or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — using {base}")
-        return done(base)
+        # base itself is over budget (or OOM'd while probing -> p is None). DON'T return base — that would launch a
+        # run doomed to OOM at epoch 0 (this is exactly what small+F64+unet-decode hit on 2026-08-06). Step DOWN,
+        # halving, until a batch fits; only then return it (compiled-confirmed).
+        log(f"[autobatch] base batch {base} over budget ({(p or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — searching below base")
+        b = base // 2
+        while b >= 1:
+            okb, pb = fits(b)
+            if okb:
+                log(f"[autobatch] fits below base: data.batch={b} ({(pb or 0)/1e9:.1f}/{budget/1e9:.0f}GB @ "
+                    f"{int(headroom*100)}% headroom)")
+                return done(confirm_compiled(b))
+            log(f"[autobatch] batch {b} over budget ({(pb or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — halving")
+            b //= 2
+        raise RuntimeError(f"[autobatch] even batch 1 exceeds the {budget/1e9:.0f}GB budget — this model+F+recon_frac "
+                           f"does not fit; lower model.size / data.F / recon_frac (or raise data.autobatch_headroom).")
     lo = hi = base
     while hi * 2 <= cap:                       # double to bracket [lo fits, hi over]
         ok, p = fits(hi * 2)
