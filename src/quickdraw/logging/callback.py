@@ -211,7 +211,15 @@ class LoggingCallback(L.Callback):
         t_eval = time.perf_counter()
         try:
             for name in self.routines:
-                REGISTRY[name](self.cfg, m, self.norm, self.ecfg, self.writer, pl_module.device, epoch)
+                try:
+                    REGISTRY[name](self.cfg, m, self.norm, self.ecfg, self.writer, pl_module.device, epoch)
+                except Exception as e:   # a DIAGNOSTIC eval must NEVER kill training — a diverged model can emit
+                    #                       non-finite renders (e.g. a NaN control-arrow direction -> pyvista
+                    #                       "matrix must have finite values"), OOM a viz, etc. Log loudly + go on.
+                    import traceback
+                    print(f"\n[eval:{name} @ep{epoch}] FAILED non-fatally ({type(e).__name__}: {e}); "
+                          f"skipping this routine, CONTINUING training.", flush=True)
+                    traceback.print_exc()
             bench = self._bench(pl_module)
             if bench:
                 self.writer.scalars(bench, step=epoch)   # inference-speed scalars (empty for multimodal)
