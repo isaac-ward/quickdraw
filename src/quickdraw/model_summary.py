@@ -13,11 +13,12 @@ from __future__ import annotations
 import hydra
 
 from .logging.callback import arch_summary_lines
-from .training.setup import build_model
+from .training.setup import apply_size_preset, build_model
 
 
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
 def main(cfg):
+    apply_size_preset(cfg)   # model.size=tiny|small -> the hidden capacity knobs (raise on knob clash)
     model = build_model(cfg)
     for line in arch_summary_lines(model):
         print(line)

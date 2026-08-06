@@ -69,6 +69,51 @@ def _modality_specs(cfg):
     return specs
 
 
+# Model-SIZE presets (mm_flow): model.size -> the hidden capacity knobs it sets. NOT tuned for every problem — a
+# starting point. d/heads = backbone width + attention heads (head_dim=d/heads must be a POWER OF 2 and >=16 for the
+# compiled FlexAttention -> small uses heads=12 so 192/12=16); num_tokens = image latent tokens; decode_base = U-Net
+# decoder width. Keys in _SIZE_MODEL_KEYS live at model level; the rest are set on the image modality.
+SIZE_PRESETS = {
+    "tiny":  {"d": 128, "num_tokens": 16, "decode_base": 32},                # heads=8 -> head_dim 16
+    "small": {"d": 192, "heads": 12, "num_tokens": 16, "decode_base": 48},   # heads=12 -> head_dim 16 (power of 2)
+}
+_SIZE_MODEL_KEYS = ("d", "heads", "depth")
+_SIZE_BASE = {"d": 32, "heads": 8, "depth": 4, "num_tokens": 8, "decode_base": 32}   # base defaults, to detect clashes
+
+
+def apply_size_preset(cfg):
+    """model.size=tiny|small -> set the preset's hidden capacity knobs (model.d/heads + the image modality's
+    num_tokens/decode_base) IN PLACE on cfg, so config.resolved records the real values. RAISES if you ALSO overrode
+    one of those knobs individually (size vs explicit-knob clash -> pick one). Image knobs apply only when an image
+    modality is present. No-op if model.size is unset. Call ONCE, early (before the resolved dump), NOT on resume."""
+    from omegaconf import open_dict
+    m = cfg.get("model", None)
+    size = None if m is None else m.get("size", None)
+    if not size:
+        return
+    if size not in SIZE_PRESETS:
+        raise ValueError(f"model.size={size!r} is unknown; options: {sorted(SIZE_PRESETS)}")
+    preset = SIZE_PRESETS[size]
+    img = next((md for md in (m.get("modalities") or []) if md.get("kind") == "image"), None)
+    clashes = []
+    for k, v in preset.items():
+        holder = m if k in _SIZE_MODEL_KEYS else img
+        if holder is None:                                    # image key but no image modality -> skip
+            continue
+        cur = holder.get(k, _SIZE_BASE.get(k))
+        if cur not in (_SIZE_BASE.get(k), v):
+            clashes.append(f"model.{'' if k in _SIZE_MODEL_KEYS else 'modalities.<image>.'}{k}={cur}")
+    if clashes:
+        raise ValueError(f"model.size={size} sets {sorted(preset)}, but you also overrode {clashes}. "
+                         f"Use model.size OR the individual knob(s), not both — remove one.")
+    for k, v in preset.items():
+        if k in _SIZE_MODEL_KEYS:
+            m[k] = v
+        elif img is not None:
+            with open_dict(img):
+                img[k] = v
+
+
 def build_model(cfg):
     """Dispatch on cfg.model.name: data-space (DSAR) or latent-space (LSAR + a collapse mechanism) or
     diffusion; if cfg.model.modalities is set, build the MULTIMODAL variant (token-bag spine)."""
@@ -95,11 +140,12 @@ def build_model(cfg):
             # no such floor (it runs the unfused fallback), so this only blocks compile_rollout. Fail fast here
             # at build time, not with a cryptic inductor error ~15 min in at the first p_tf==0 compile.
             head_dim = int(m.d) // int(m.heads)
-            if head_dim < 16:
+            if head_dim < 16 or (head_dim & (head_dim - 1)) != 0:   # compiled FlexAttention: power of 2 AND >= 16
                 raise ValueError(
-                    f"model.compile_rollout needs head_dim (d/heads) >= 16 for the compiled FlexAttention kernel, "
-                    f"but d={m.d}/heads={m.heads} -> head_dim={head_dim}. Raise d or lower heads so d/heads >= 16 "
-                    f"(e.g. d=128/heads=8), or disable compile_rollout (eager has no floor).")
+                    f"model.compile_rollout needs head_dim (d/heads) to be a POWER OF 2 and >= 16 for the compiled "
+                    f"FlexAttention kernel (head_dim=24 fails to compile), but d={m.d}/heads={m.heads} -> "
+                    f"head_dim={head_dim}. Pick d/heads giving head_dim in {{16,32,64}} (e.g. d=192/heads=12 -> 16), "
+                    f"or disable compile_rollout (eager has no such constraint).")
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
                       mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2),
                       grad_checkpoint=bool(m.get("grad_checkpoint", False)),
@@ -198,13 +244,10 @@ def autobatch_find(cfg, device, log=print) -> int:
         act = torch.randn(B, L - 1, adim, device=device)
         return obs, act
 
-    def _train_loss(obs, act):
-        # The REAL training loss at p_tf=0 (max-memory AR path), mirroring LitWorldModel._step minus logging +
-        # variations: rollout_train -> recon_losses (all-head ViT decode, recon_frac subset) + loss_terms (flow).
-        # This full graph is what the synthetic pow(2) proxy under-counted.
-        ctx = {k: v[:, :P] for k, v in obs.items()}
+    def _loss_from_preds(preds, obs, act):
+        # recon_losses (recon_frac subset, all-head decode) + loss_terms (flow) — the memory-relevant loss graph,
+        # SHARED by the sequential (p_tf=0 rollout) and parallel (p_tf=1) probes. Mirrors LitWorldModel._step.
         future = {k: v[:, P:] for k, v in obs.items()}
-        preds = model.rollout_train(ctx, act[:, : L - 1], future, 0.0, de)
         recon_src = preds if getattr(model, "pred_obs_in_loss", True) else preds.detach()
         if rf < 1.0:
             Tf = recon_src.shape[1]; k = max(1, int(round(rf * Tf)))
@@ -217,22 +260,30 @@ def autobatch_find(cfg, device, log=print) -> int:
         wts = {mod.name: float(mod.weight) for mod in model.modalities.values()}
         return sum(w[k] * raw[k] for k in raw) + sum(wts[k.split("/")[-1]] * recon[k] for k in recon)
 
-    def probe(B):   # peak bytes for a real training step (fwd loss + bwd + optimizer.step), or None on OOM
+    def _seq_preds(obs, act):   # p_tf=0 AUTOREGRESSIVE rollout (the in-rollout epochs)
+        return model.rollout_train({k: v[:, :P] for k, v in obs.items()}, act[:, : L - 1],
+                                   {k: v[:, P:] for k, v in obs.items()}, 0.0, de)
+
+    def _par_preds(obs, act):   # p_tf=1 PARALLEL forward (epoch-0 regime: whole sequence in ONE pass — often the
+        return model({k: v[:, :-1] for k, v in obs.items()}, act[:, :-1])[:, P - 1:]   # TRUE memory peak)
+
+    def _probe_path(obs, act, preds_fn):   # 2 iters (so Adam states allocate) of fwd-loss + bwd + step -> peak bytes
         torch.cuda.synchronize(device); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
-        try:
+        for _ in range(2):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                try:
+                    loss = _loss_from_preds(preds_fn(obs, act), obs, act)   # faithful full loss graph
+                except Exception as e:                                     # value-sensitive path choked on synth data
+                    if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower():
+                        raise
+                    loss = preds_fn(obs, act).float().pow(2).mean()        # fall back to a pred-only estimate
+            loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
+        return torch.cuda.max_memory_allocated(device)
+
+    def probe(B):   # peak = MAX(p_tf=0 rollout, p_tf=1 parallel forward). The old probe measured ONLY the rollout,
+        try:        #   missing the parallel-forward peak that epoch 0 hits -> under-sized -> OOM at epoch 0. None on OOM.
             obs, act = synth(B)
-            for _ in range(2):   # Adam states allocate on step 1 -> step 2's peak is the steady-state footprint
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    try:
-                        loss = _train_loss(obs, act)             # faithful full loss graph
-                    except Exception as e:                       # value-sensitive path choked on synthetic data
-                        if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower():
-                            raise                                # a real OOM -> batch too big; bubble out
-                        preds = model.rollout_train({k: v[:, :P] for k, v in obs.items()}, act[:, : L - 1],
-                                                    {k: v[:, P:] for k, v in obs.items()}, 0.0, de)
-                        loss = preds.float().pow(2).mean()       # fall back to the rollout-only estimate
-                loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
-            return torch.cuda.max_memory_allocated(device)
+            return max(_probe_path(obs, act, _seq_preds), _probe_path(obs, act, _par_preds))
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if not (isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower()):
                 raise

@@ -19,7 +19,8 @@ from .logging.callback import BestCkptMirror, LoggingCallback, ProgressPrinter
 from .logging.writer import make_writer
 from .utils.logging import make_run_dir
 from .training.lit import LitWorldModel
-from .training.setup import autobatch_find, build_model, data_exists, env_cfg, normalizer, window_loaders
+from .training.setup import (apply_size_preset, autobatch_find, build_model, data_exists, env_cfg, normalizer,
+                             window_loaders)
 
 
 _SUMMARY_FIELDS = [("problem", "Problem we are facing"), ("tried", "What we have tried"),
@@ -95,6 +96,8 @@ def main(cfg):
     resume = cfg.get("resume", None)   # +resume=<ckpt> -> CONTINUE that checkpoint's own run (see run_dir below)
     if resume:
         resume = os.path.expanduser(str(resume))
+    if not resume:                     # resume's config.resolved already has the preset baked (d/num_tokens/decode_base)
+        apply_size_preset(cfg)         # model.size=tiny|small -> set the hidden capacity knobs (raise on knob clash)
     summary_text = _run_summary_text(cfg)   # fail if the run note is missing (present on resume via the
     if not resume:                          # resolved config). A resume is a CONTINUATION, so skip the unique
         _assert_summary_unique(summary_text, cfg)   # run-note gate + the config.resolved.yaml re-write below.

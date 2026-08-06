@@ -108,13 +108,18 @@ Walk each choice, suggest the default, and **quote the learning** (exact numbers
 - **Teacher forcing** — keep **`p_tf_end=0.0` (in-rollout)**, `p_tf_warmup_epochs=4`. This is the
   anti-collapse lever: full teacher forcing (p_tf never drops) → autoregressive **mean-collapse** at
   rollout. Diffusion Forcing is NOT a substitute (it made collapse *worse* at scale 0.25/1.0) — keep DF off.
-- **Size** — ask for a **target total parameter count** (or a tier: small ~0.5M / base ~3M / large).
-  Back out `d` / `depth` / `heads` / `window` / `num_tokens` to hit it. **Constraint: `head_dim = d/heads`
-  must be a power of 2** (FlexAttention) — e.g. d=128,heads=8 → 16 ✓. Then **report the exact shape** with
-  **`python -m quickdraw.model_summary model=<...> <your overrides>`** — CPU, no data/env, it prints the
-  same `[train]` (total params) + `[arch]` (per-component: each modality's encode/decode head, the
-  space-time backbone, the dynamics flow head, the action head) table that training writes at the top of
-  `progress.log`. Iterate `d`/`depth`/`num_tokens` against its output to hit the target param count.
+- **Size** — for `mm_flow`, prefer the **`model.size` presets** (one knob; each sets the hidden capacity levers).
+  These are **basic starting points, NOT tuned for every problem.** Present them by *what they change*, not a param
+  guess:
+    - `model.size=tiny`  → d=128, image latent tokens=16, U-Net decoder width=32
+    - `model.size=small` → d=192 (heads=12), image latent tokens=16, U-Net decoder width=48
+  Ask which fits their compute/quality target, pass `model.size=<choice>`. **Do NOT also override
+  `d`/`heads`/`num_tokens`/`decode_base` individually — it RAISES a clash** (use the preset OR the knobs, not both).
+  For a custom size, set those knobs directly instead — **constraint with `compile_rollout`: `head_dim = d/heads`
+  a POWER OF 2 and ≥ 16** (e.g. d=128,heads=8 → 16 ✓; head_dim=24 fails to compile). For the **exact** shape +
+  param count, run **`python -m quickdraw.model_summary model=<...> <overrides>`** — CPU, no data/env; it prints the
+  `[train]` total params + `[arch]` per-component table (each modality's encode/decode head, the space-time
+  backbone, the dynamics flow head, the action head), the same table training writes atop `progress.log`.
 - **Modalities** — `proprio` dim = data `obs_dim`; one `image` modality per chosen camera
   (`img_size=[H,W]` per that camera, `patch=16`, `num_tokens=8`, `encode_arch=vit`). Multiple cameras =
   multiple `image` entries (trunks).

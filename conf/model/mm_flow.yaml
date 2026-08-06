@@ -18,6 +18,10 @@ name: mm_flow
 #   rehabilitated the joint head), and IMAGE decode is now decode_kind=mse + decode_arch=unet (conv decoder, no patch
 #   grid — UNTESTED on metrics, see the image note below). Recipe above = historical det16/vit best.
 # =============================================================================================
+size: null                # null | tiny | small — ONE knob that sets the capacity levers below (d, image
+#                           num_tokens, image decode_base) from setup.SIZE_PRESETS. Applied onto cfg before the
+#                           resolved dump, so config.resolved records the real values. RAISES if you also override
+#                           one of those knobs individually (use size OR the knobs, not both). Basic starting points.
 d: 32                     # backbone/token width (all modality tokens live at d)
 depth: 4
 heads: 8                   # head_dim = 4 (d/heads; power of 2 for FlexAttention)
