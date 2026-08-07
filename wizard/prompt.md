@@ -122,7 +122,8 @@ Walk each choice, suggest the default, and **quote the learning** (exact numbers
   `[train]` total params + `[arch]` per-component table (each modality's encode/decode head, the space-time
   backbone, the dynamics flow head, the action head), the same table training writes atop `progress.log`.
 - **Teacher-forcing warmup** (`model.p_tf_warmup_epochs`, default **1**) — p_tf anneals 1.0→0.0 over this many
-  epochs (ramped batch-by-batch via `p_tf_batch_granular=true`). Scale it to dataset SIZE, not a fixed count:
+  epochs (a per-epoch step — `p_tf_batch_granular` is LOCKED false; the batch-granular ramp is ~10x slower
+  because any 0<p_tf<1 uses the eager sequential rollout for the whole warmup). Scale warmup to dataset SIZE:
   a **decently-sized set (~4h+ of trajectories)** has enough steps that **1 epoch** is plenty to anneal;
   a **toy set (~30 min, e.g. torus)** has few steps/epoch, so use **~4** so the ramp isn't too abrupt.
 - **Modalities** — `proprio` dim = data `obs_dim`; one `image` modality per chosen camera

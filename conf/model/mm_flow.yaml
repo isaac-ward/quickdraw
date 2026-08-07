@@ -50,9 +50,15 @@ p_tf_end: 0.0
 p_tf_warmup_epochs: 1    # DEFAULT 1 (2026-08-07): with a decently-sized dataset (~4h+) one epoch is plenty of
 #                          steps to anneal teacher forcing; the old default 4 suited the ~30-min toy torus set.
 #                          Raise to ~4 for small datasets (fewer steps/epoch -> the ramp needs more epochs).
-p_tf_batch_granular: true  # true -> ramp p_tf over a FRACTIONAL epoch (current_epoch + batch_idx/num_batches) so
-#                            it's smooth ACROSS batches; false -> legacy per-epoch step. With warmup=1 the
-#                            per-epoch step would jump 1.0->0.0 in one shot, so batch-granular matters here.
+p_tf_batch_granular: false  # LOCKED false (2026-08-07). true = smooth p_tf ramp over a fractional epoch
+#                            (current_epoch + batch_idx/num_batches); false = per-epoch step. LOCKED false because
+#                            batch-granular is ~10x SLOWER during warmup: the step has three regimes — p_tf==1.0
+#                            uses the fast PARALLEL forward, p_tf==0.0 uses the COMPILED rollout, and any
+#                            0<p_tf<1 falls into the slow EAGER SEQUENTIAL AR rollout (F per-step dispatches, no
+#                            compile). A smooth ramp sits in that slow zone for the ENTIRE warmup, so epoch 0 on
+#                            a big dataset crawled (owm-iss: >5.6h and not even 25% vs ~30min at p_tf=1). Per-epoch
+#                            keeps warmup epochs at p_tf=1.0 (fast parallel), then hard-switches to p_tf=0.0
+#                            (compiled) — the hard 1->0 jump is a feature, not a bug, given the regime cost.
 dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding the DYNAMICS (flow/latent) loss:
 #                           the dynamics gradient can't reshape the encoder (trained then only by decode/recon).
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.
