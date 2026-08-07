@@ -17,6 +17,10 @@ name: mm_flow
 #   point: less detach than det16 fixes the ~ep10 long-horizon control collapse), action_head.enabled=true (UNLOCKED; longer BPTT
 #   rehabilitated the joint head), and IMAGE decode is now decode_kind=mse + decode_arch=unet (conv decoder, no patch
 #   grid — UNTESTED on metrics, see the image note below). Recipe above = historical det16/vit best.
+#   UPDATE 2026-08-07: IMAGE encode_arch is now CONV (was vit). The db16 encoder A/B (mini, decode_base=16,
+#   runs 4mzoqi54 vit vs as92t39l conv) had conv edge vit on ~every image+dynamics metric at ep10/11 — val PSNR
+#   17.4 vs 17.0, ckpt manifold_dist_err 0.086 vs 0.095, OOD PSNR 15.5 vs 14.3, OOD pointwise 0.222 vs 0.297 —
+#   with a more stable latent-flow loss (vit's total val loss crept from the flow terms, not image recon).
 # =============================================================================================
 size: null                # null | tiny | small — ONE knob that sets the capacity levers below (d, image
 #                           num_tokens, image decode_base) from setup.SIZE_PRESETS. Applied onto cfg before the
@@ -128,4 +132,4 @@ modalities:
   # smooth, no grid. CAVEAT: unet+MSE is UNTESTED on metrics (the finding above was unet+FLOW vs vit+MSE, never
   # unet+mse) — expected to keep MSE's metrics AND kill the grid, but VALIDATE before trusting. encode stays ViT.
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
-  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: vit, decode_arch: unet}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet}
