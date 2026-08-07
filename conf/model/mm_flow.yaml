@@ -47,7 +47,12 @@ lambda_consistency: 1.0
 #   p_tf_end=0.0 (in-rollout), keep DF scale=0.0 (off). The anti-collapse lever is in-rollout, not DF.
 p_tf_start: 1.0
 p_tf_end: 0.0
-p_tf_warmup_epochs: 4
+p_tf_warmup_epochs: 1    # DEFAULT 1 (2026-08-07): with a decently-sized dataset (~4h+) one epoch is plenty of
+#                          steps to anneal teacher forcing; the old default 4 suited the ~30-min toy torus set.
+#                          Raise to ~4 for small datasets (fewer steps/epoch -> the ramp needs more epochs).
+p_tf_batch_granular: true  # true -> ramp p_tf over a FRACTIONAL epoch (current_epoch + batch_idx/num_batches) so
+#                            it's smooth ACROSS batches; false -> legacy per-epoch step. With warmup=1 the
+#                            per-epoch step would jump 1.0->0.0 in one shot, so batch-granular matters here.
 dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding the DYNAMICS (flow/latent) loss:
 #                           the dynamics gradient can't reshape the encoder (trained then only by decode/recon).
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.

@@ -28,7 +28,7 @@ class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
                  lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0,
-                 recon_frac: float = 1.0, lr_warmup_steps: int = 0, env=None):
+                 recon_frac: float = 1.0, lr_warmup_steps: int = 0, env=None, p_tf_batch_granular: bool = True):
         super().__init__()
         self.model = model
         self.norm = normalizer
@@ -37,6 +37,7 @@ class LitWorldModel(L.LightningModule):
         self.dt = dt
         self.recon_frac = float(recon_frac)   # <1 -> supervise the decode recon on a random subset of F frames (ALL heads)
         self.p_tf_start, self.p_tf_end, self.p_tf_warmup = p_tf_start, p_tf_end, p_tf_warmup
+        self.p_tf_batch_granular = bool(p_tf_batch_granular)   # True -> ramp p_tf across batches (fractional epoch)
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
         self.lr_warmup_steps = int(lr_warmup_steps)
         # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
@@ -66,12 +67,16 @@ class LitWorldModel(L.LightningModule):
 
     def _cur_p_tf(self) -> float:
         # curriculum: ramp p_tf_start (e.g. 1.0, full teacher forcing) -> p_tf_end over p_tf_warmup epochs.
-        # Use a FRACTIONAL epoch (current_epoch + how far through this epoch's batches we are) so the ramp is
-        # smooth ACROSS batches, not a per-epoch step. Critical for short warmups on large datasets: a
-        # per-epoch schedule with warmup=1 would sit at 1.0 for all of epoch 0 then hard-jump to 0.0.
-        nb = getattr(self.trainer, "num_training_batches", 0) or 0
-        frac = (getattr(self, "_batch_idx", 0) / nb) if (nb and nb != float("inf")) else 0.0
-        return linear_schedule(self.p_tf_start, self.p_tf_end, self.p_tf_warmup, self.current_epoch + frac)
+        # p_tf_batch_granular=True (default) uses a FRACTIONAL epoch (current_epoch + how far through this
+        # epoch's batches we are) so the ramp is smooth ACROSS batches, not a per-epoch step — critical for
+        # short warmups on large datasets (warmup=1 per-epoch would sit at 1.0 all epoch 0 then hard-jump to 0).
+        # False -> the legacy per-epoch step (only changes at epoch boundaries).
+        epoch = float(self.current_epoch)
+        if self.p_tf_batch_granular:
+            nb = getattr(self.trainer, "num_training_batches", 0) or 0
+            if nb and nb != float("inf"):
+                epoch += getattr(self, "_batch_idx", 0) / nb
+        return linear_schedule(self.p_tf_start, self.p_tf_end, self.p_tf_warmup, epoch)
 
     def _physical_ramp(self) -> float:
         # physical-loss weight multiplier: 0 -> 1 over physical_warmup epochs (no ramp if warmup<=0)
