@@ -336,14 +336,23 @@ class MultiModalSequenceModel(nn.Module):
 
     @torch.no_grad()
     def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None,
-                     use_cache: bool | None = None) -> dict[str, Tensor]:
+                     use_cache: bool | None = None, decode_chunk: int | None = None) -> dict[str, Tensor]:
         """`heads` limits which modalities are decoded (e.g. ['proprio'] for cheap long-horizon rollouts —
         the full latent bag, including image tokens, still rolls forward; we just skip decoding images).
-        use_cache: temporal KV-cache (default self.use_kv_cache; pass False for the parity A/B)."""
+        use_cache: temporal KV-cache (default self.use_kv_cache; pass False for the parity A/B).
+        decode_chunk: if set, decode the rolled-out latent bag in chunks of this many timesteps. The rollout
+        is cheap latents; the image decode is the memory PEAK, so this bounds the decoder to
+        batch x decode_chunk frames instead of batch x horizon -> long-horizon image eval doesn't OOM
+        (PR #8 bug 2). None -> decode the whole bag at once (unchanged)."""
         uc = self.use_kv_cache if use_cache is None else use_cache
         with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
             bag = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=uc)
-            out = self.to_obs(bag, heads=heads)
+            if decode_chunk and bag.ndim >= 2 and bag.shape[1] > decode_chunk:   # chunk decode over the time axis
+                parts = [self.to_obs(bag[:, s:s + decode_chunk], heads=heads)
+                         for s in range(0, bag.shape[1], decode_chunk)]
+                out = {k: torch.cat([p[k] for p in parts], dim=1) for k in parts[0]}
+            else:
+                out = self.to_obs(bag, heads=heads)
         return {k: v.float() for k, v in out.items()}
 
     @torch.no_grad()

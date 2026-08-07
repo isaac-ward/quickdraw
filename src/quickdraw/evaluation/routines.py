@@ -101,7 +101,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     for h in img_heads:
         ctx[h] = torch.stack([torch.from_numpy(im[:P]) for _, _, im in eps]).float().div(255.0).to(device)
     acts = torch.stack([norm.norm_act(torch.from_numpy(a[:P + H - 1])) for _, a, _ in eps]).float().to(device)  # normalized (as trained)
-    out = m.imagine_eval(ctx, acts, H, heads=["proprio"] + img_heads)
+    dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None                  # chunk image decode over horizon (PR #8 bug 2)
+    out = m.imagine_eval(ctx, acts, H, heads=["proprio"] + img_heads, decode_chunk=dc)
     prog(30, "rollout done")
 
     n_plot = min(4, n_ep)                                                    # per-episode visuals for the first few

@@ -167,6 +167,7 @@ class LoggingCallback(L.Callback):
         self._t_fit = self._t_epoch = self._t_b0 = None
         self._eval_cum = 0.0
         self._compile_s = None
+        self._skipped = []   # (epoch, name) of every non-fatally-skipped eval, for the run-end summary
 
     def _eval_due(self, epoch: int) -> bool:
         # UNION of the every-N cadence (20, 40, 60, ...) and the explicit at_epochs list (extra one-off
@@ -217,8 +218,13 @@ class LoggingCallback(L.Callback):
                     #                       non-finite renders (e.g. a NaN control-arrow direction -> pyvista
                     #                       "matrix must have finite values"), OOM a viz, etc. Log loudly + go on.
                     import traceback
-                    print(f"\n[eval:{name} @ep{epoch}] FAILED non-fatally ({type(e).__name__}: {e}); "
-                          f"skipping this routine, CONTINUING training.", flush=True)
+                    from ..controller.run import _plog   # house helper -> the failure line reaches progress.log,
+                    #                                       not just stdout (a docker-exec session loses stdout).
+                    _plog(self.writer, f"[eval:{name} @ep{epoch}] FAILED non-fatally ({type(e).__name__}: {e}); "
+                          f"skipping this routine, CONTINUING training.")
+                    self._skipped.append((epoch, name))
+                    self.writer.scalar(f"eval/skipped/{name}", 1.0, step=epoch)  # logged -> a skipped eval is
+                    #                       now distinguishable from a metric that was never enabled.
                     traceback.print_exc()
             bench = self._bench(pl_module)
             if bench:
@@ -268,6 +274,10 @@ class LoggingCallback(L.Callback):
         self.writer.scalars(metrics, step=epoch)
 
     def on_fit_end(self, trainer, pl_module):
+        if self._skipped:   # run-end summary so silently-skipped diagnostics are visible in progress.log
+            from ..controller.run import _plog
+            items = ", ".join(f"{n}@ep{e}" for e, n in self._skipped)
+            _plog(self.writer, f"[eval] {len(self._skipped)} eval(s) SKIPPED non-fatally this run: {items}")
         self.writer.finalize()
 
 

@@ -6,6 +6,11 @@ import os
 import shutil
 import time
 
+# Bound CUDA-allocator fragmentation before torch initializes its allocator: eval_ood_horizon's U-Net image
+# decode makes a large allocation at long horizons, and expandable_segments lets the allocator reuse fragmented
+# reserved memory instead of OOMing (PR #8 bug 2). setdefault -> a launch-script -e override still wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import hydra
 import lightning as L
 import torch
