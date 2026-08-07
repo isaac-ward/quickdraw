@@ -65,8 +65,13 @@ class LitWorldModel(L.LightningModule):
             warnings.warn(msg)
 
     def _cur_p_tf(self) -> float:
-        # curriculum: ramp from p_tf_start (e.g. 1.0, full teacher forcing) down to p_tf_end over warmup
-        return linear_schedule(self.p_tf_start, self.p_tf_end, self.p_tf_warmup, self.current_epoch)
+        # curriculum: ramp p_tf_start (e.g. 1.0, full teacher forcing) -> p_tf_end over p_tf_warmup epochs.
+        # Use a FRACTIONAL epoch (current_epoch + how far through this epoch's batches we are) so the ramp is
+        # smooth ACROSS batches, not a per-epoch step. Critical for short warmups on large datasets: a
+        # per-epoch schedule with warmup=1 would sit at 1.0 for all of epoch 0 then hard-jump to 0.0.
+        nb = getattr(self.trainer, "num_training_batches", 0) or 0
+        frac = (getattr(self, "_batch_idx", 0) / nb) if (nb and nb != float("inf")) else 0.0
+        return linear_schedule(self.p_tf_start, self.p_tf_end, self.p_tf_warmup, self.current_epoch + frac)
 
     def _physical_ramp(self) -> float:
         # physical-loss weight multiplier: 0 -> 1 over physical_warmup epochs (no ramp if warmup<=0)
@@ -227,7 +232,8 @@ class LitWorldModel(L.LightningModule):
         for key, sq in module_sq.items():
             self.log(f"grad/norm/{key}", sq.sqrt(), reduce_fx="max")   # worst-step per-module norm
 
-    def training_step(self, batch, _):
+    def training_step(self, batch, batch_idx):
+        self._batch_idx = batch_idx   # for _cur_p_tf's fractional-epoch (batch-granular) teacher-forcing ramp
         return self._step(batch, "train")
 
     def on_train_batch_end(self, *_):
