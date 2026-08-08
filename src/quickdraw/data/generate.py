@@ -109,6 +109,7 @@ def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
                 f[key] = frames[t]
             ds.add_frame(f)
         ds.save_episode()
+    ds.finalize()
     return ds
 
 
