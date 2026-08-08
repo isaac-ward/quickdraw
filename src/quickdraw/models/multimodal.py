@@ -78,7 +78,9 @@ class MultiModalSequenceModel(nn.Module):
         """Rows (component, shape transform, #params) describing the token-bag dataflow — printed at the top
         of progress.log. Shows how each modality becomes token(s), how the bag is fused by the backbone
         (spatial within-step + temporal across-step), and the per-token prediction head."""
-        def npar(mod): return sum(p.numel() for p in mod.parameters()) if mod is not None else 0
+        # `mod is not None` is not enough: the PRETRAINED image modality's `.ae` is an _AEHolder, a plain
+        # non-Module shim that only carries `.cfg` (it has no `.parameters()` by design). Guard on the method.
+        def npar(mod): return sum(p.numel() for p in mod.parameters()) if hasattr(mod, "parameters") else 0
 
         rows = []
         # encoders (obs -> tokens) + the action encoder
@@ -87,7 +89,11 @@ class MultiModalSequenceModel(nn.Module):
             is_img = hasattr(mod, "ae")
             ins = f"(B,T,{mod.ae.cfg.img_size},{mod.ae.cfg.img_size},3)" if is_img else f"(B,T,{mod.dim})"
             enc = mod.ae if is_img else mod.enc     # image AE (encoder-only when decode_kind=flow); proprio enc MLP
+            if is_img and hasattr(mod, "down_adapter"):   # pretrained: .ae is the param-less shim -> count the
+                enc = mod.down_adapter                    # REAL encode path (frozen TAESD reported separately)
             earch = getattr(mod, "encode_arch", "vit") if is_img else "mlp"   # vit|conv for image; mlp for vector
+            if is_img and hasattr(mod, "taesd"):
+                earch = f"taesd{'-frozen' if getattr(mod, 'taesd_frozen', False) else ''}+adapter"
             rows.append((f"{name} encoder ({earch})", f"{ins} -> (B,T,{ntok},{self.d})", npar(enc)))
         rows.append(("action_enc", f"(B,T,{self.act_enc[0].in_features}) -> (B,T,1,{self.d})", npar(self.act_enc)))
         # backbone: fuse the token bag over space (within-step) + time (causal)
