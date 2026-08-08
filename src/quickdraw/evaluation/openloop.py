@@ -9,6 +9,44 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+def _ssim(a, b):
+    """Windowed SSIM over (N,H,W,3) images in [0,1] (uniform 7x7 window via avg_pool — pooling, not a
+    learned conv). Returns mean SSIM scalar."""
+    import torch.nn.functional as F
+    a, b = a.permute(0, 3, 1, 2), b.permute(0, 3, 1, 2)
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    mu_a, mu_b = F.avg_pool2d(a, 7, 1), F.avg_pool2d(b, 7, 1)
+    va = F.avg_pool2d(a * a, 7, 1) - mu_a ** 2
+    vb = F.avg_pool2d(b * b, 7, 1) - mu_b ** 2
+    cab = F.avg_pool2d(a * b, 7, 1) - mu_a * mu_b
+    s = ((2 * mu_a * mu_b + C1) * (2 * cab + C2)) / ((mu_a ** 2 + mu_b ** 2 + C1) * (va + vb + C2))
+    return float(s.mean())
+
+
+def image_curves(pred, true):
+    """Per-timestep IMAGE reconstruction metrics -> {psnr, ssim, mse, l1}, each a (H,) numpy array. pred/true:
+    (N, H, s, s, 3) in [0,1] (caller clamps pred). SHARED by eval_ood_horizon (rollout preds) and eval_ae_floor
+    (encode->decode recon) — the arithmetic is bit-for-bit the same in both, so it lives here once."""
+    H = pred.shape[1]
+    psnr_s, ssim_s, mse_s, l1_s = [], [], [], []
+    for t in range(H):
+        mse = float(torch.mean((pred[:, t] - true[:, t]) ** 2)); mse_s.append(mse)
+        l1_s.append(float(torch.mean((pred[:, t] - true[:, t]).abs())))
+        psnr_s.append(-10.0 * np.log10(max(mse, 1e-12)))
+        ssim_s.append(max(0.0, min(1.0, _ssim(pred[:, t], true[:, t]))))   # clamp SSIM to [0,1]
+    return {"psnr": np.array(psnr_s), "ssim": np.array(ssim_s), "mse": np.array(mse_s), "l1": np.array(l1_s)}
+
+
+def emit_horizon_readouts(writer, routine, head, icurves, H, step):
+    """Quarter-horizon `@+x` scalar readouts of a head's per-step curves (x in {q, 2q, 3q, H}, q=floor(0.25H)):
+    one scalar per (stat, x) at `{routine}/{head}/{stat}/@+{x}` so the accuracy decay vs depth is trackable in
+    wandb without the curve. SHARED by eval_ood_horizon + eval_ae_floor (identical readout)."""
+    q = max(1, int(0.25 * H))
+    for x in sorted({q, 2 * q, 3 * q, H}):
+        for stat, arr in icurves.items():
+            writer.scalar(f"{routine}/{head}/{stat}/@+{x}", float(arr[min(x, H) - 1]), step)
+
+
 def proprio_curves(preds_norm, true_norm, p_hat, p_true, env):
     """The open-loop proprio per-step metrics (each (N,H)), shared by eval_batched (vector spine) and
     eval_ood_horizon (multimodal spine) so the metric definitions live in ONE place. preds_norm/true_norm

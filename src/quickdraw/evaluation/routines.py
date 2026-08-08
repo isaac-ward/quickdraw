@@ -20,7 +20,7 @@ from ..logging import viz
 from ..training.setup import eval_episodes, resolve_data_root
 import torch
 
-from .openloop import eval_batched, proprio_curves
+from .openloop import emit_horizon_readouts, eval_batched, image_curves, proprio_curves
 from .products import emit_openloop
 
 
@@ -151,23 +151,11 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     for head in img_heads:
         ipred = out[head].clamp(0, 1)                                        # (n_ep,H,s,s,3)
         itrue = torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
-        psnr_s, ssim_s, mse_s, l1_s = [], [], [], []
-        for t in range(H):
-            mse = float(torch.mean((ipred[:, t] - itrue[:, t]) ** 2)); mse_s.append(mse)
-            l1_s.append(float(torch.mean((ipred[:, t] - itrue[:, t]).abs())))
-            psnr_s.append(-10.0 * _np.log10(max(mse, 1e-12)))
-            ssim_s.append(max(0.0, min(1.0, _ssim(ipred[:, t], itrue[:, t]))))   # clamp SSIM to [0,1]
-        images[head] = {"icurves": {"psnr": _np.array(psnr_s), "ssim": _np.array(ssim_s),
-                                    "mse": _np.array(mse_s), "l1": _np.array(l1_s)},
+        images[head] = {"icurves": image_curves(ipred, itrue),               # shared per-step psnr/ssim/mse/l1
                         "full_true": _np.stack([eps[i][2][:P + H].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                         "ipred": ipred[:n_plot].cpu().numpy()}
-        # per-step future-accuracy scalars: each stat read out at quarter-horizon steps into the future (+ the
-        # full horizon), one scalar apiece, so the accuracy DECAY vs rollout depth is trackable in wandb without
-        # the curve. Tag `eval_ood_horizon/<head>/<stat>/@+<x>` (x = steps ahead). q = floor(0.25*H) increments.
-        q = max(1, int(0.25 * H))
-        for x in sorted({q, 2 * q, 3 * q, H}):
-            for stat, arr in images[head]["icurves"].items():
-                writer.scalar(f"eval_ood_horizon/{head}/{stat}/@+{x}", float(arr[min(x, H) - 1]), step)
+        # per-step future-accuracy scalars at quarter-horizon steps -> eval_ood_horizon/<head>/<stat>/@+<x>
+        emit_horizon_readouts(writer, "eval_ood_horizon", head, images[head]["icurves"], H, step)
     prog(45, f"averaged curves (proprio + {len(img_heads)} image head(s))")
 
     # ---- everything (curves + per-episode trajectory/image visuals) via the shared open-loop emitter ----
@@ -190,6 +178,95 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         m.train()
     prog(100, f"done in {time.perf_counter() - t0:.1f}s")
     return {"eval_ood_horizon": float(curves["pointwise_error"].mean())}
+
+
+@torch.no_grad()
+def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
+    """eval_ae_floor — the encode->decode CEILING (issue #12 §4). NO dynamics, NO rollout: encode each REAL
+    val frame and decode it straight back, per modality (proprio + each image head). Every downstream image
+    metric is bounded by this floor, so it separates "what the tokenizer can represent" from "what the
+    dynamics gets wrong". Products MIRROR eval_ood_horizon (same names/layout via emit_openloop) under
+    eval_ae_floor/: per image <head> a filmstrip_i (GT vs recon) + rollout_i(=recon) mp4 +
+    error_vs_step_avg_{linear,log} + {psnr,ssim,mse,l1}_mean; proprio/{pointwise_error,obs_error}_mean. The
+    error-vs-step curve is DELIBERATELY FLAT (each frame independent) — on ood_horizon's axes it reads as the
+    ceiling vs the compounding rollout. Env-agnostic (no geometry). With a frozen pretrained AE this is a
+    constant across epochs (a cheap "is something training that shouldn't be" detector — #12 §4)."""
+    import numpy as _np
+
+    from ..data.dataset import load_split_episodes_mm
+    m = getattr(model, "_orig_mod", model)
+    img_heads = [n for n, _ in m.layout if n != "proprio"]
+    was = m.training
+    m.eval()
+    t0 = time.perf_counter()
+    P, fps = cfg.data.P, round(1.0 / ecfg.dt)
+    dev = device if isinstance(device, str) else device.type
+
+    def prog(pct, what):
+        _plog(writer, f"[eval_ae_floor @ep{step}] {pct:3d}% — {what}")
+
+    img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    n_ep = min(int(cfg.eval.get("ae_floor_episodes", 2) or 2), len(eps))
+    eps = eps[:n_ep]
+    H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
+    prog(0, f"start: {n_ep} eps, H={H}, heads={['proprio'] + img_heads} (encode->decode, NO dynamics)")
+
+    pro_full = torch.stack([norm.norm_obs(torch.from_numpy(o[:P + H])) for o, _, _ in eps]).float().to(device)
+    obs_full = {"proprio": pro_full}
+    for h in img_heads:
+        obs_full[h] = torch.stack([torch.from_numpy(im[:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
+
+    # per-frame encode->decode (encode_state is per-frame; chunk over time so image decode memory stays bounded)
+    chunk = int(cfg.eval.get("decode_chunk", 64) or 64)
+    rec_acc = {}
+    for s in range(0, P + H, chunk):
+        sub = {k: v[:, s:s + chunk] for k, v in obs_full.items()}
+        with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
+            rec = m.to_obs(m.encode_state(sub), heads=["proprio"] + img_heads)
+        for k, v in rec.items():
+            rec_acc.setdefault(k, []).append(v.float())
+    recon = {k: torch.cat(v, dim=1) for k, v in rec_acc.items()}
+    prog(30, "encode->decode done")
+
+    n_plot = min(4, n_ep)
+    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
+    pred = recon["proprio"][:, P:P + H]                              # reconstructed proprio (normalized)
+    p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
+    p_true = torch.stack([torch.from_numpy(o[P:P + H]) for o, _, _ in eps]).float().to(device)
+    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, env)
+    curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}   # flat over time (per-frame independent)
+
+    images = {}
+    for head in img_heads:
+        ipred = recon[head][:, P:P + H].clamp(0, 1)
+        itrue = obs_full[head][:, P:P + H]
+        images[head] = {"icurves": image_curves(ipred, itrue),               # shared per-step psnr/ssim/mse/l1
+                        "full_true": _np.stack([eps[i][2][:P + H].astype(_np.float32) / 255.0 for i in range(n_plot)]),
+                        "ipred": ipred[:n_plot].cpu().numpy()}
+        emit_horizon_readouts(writer, "eval_ae_floor", head, images[head]["icurves"], H, step)
+    prog(45, "curves + metrics")
+
+    desc = ("Encode->decode ceiling (NO dynamics): each frame reconstructed independently. The error-vs-step "
+            "curve is flat by construction — the floor every rollout image metric is bounded by.")
+    ctx_obs = norm.denorm_obs(pro_full[:n_plot, :P]).cpu().numpy()
+    pos = _pos_idx(cfg, env=env)
+    emit_openloop(writer, "eval_ae_floor", step, env=env, R=getattr(ecfg, "R", None), r=getattr(ecfg, "r", None),
+                  coloring="hsv", fps=fps, P=P, smooth_window=int(cfg.data.action_smooth_window), description=desc,
+                  ctx_xyz=ctx_obs[:, :, pos],
+                  p_true_xyz=p_true[:n_plot][:, :, pos].cpu().numpy(), p_hat_xyz=p_hat[:n_plot][:, :, pos].cpu().numpy(),
+                  actions=[eps[i][1][:P + H].astype(_np.float32) for i in range(n_plot)],
+                  curves=curves, n_plot=n_plot, images=(images or None),
+                  obs_true=_np.concatenate([ctx_obs, p_true[:n_plot].cpu().numpy()], axis=1),
+                  obs_pred=p_hat[:n_plot].cpu().numpy(),
+                  title_fn=lambda i: f"eval_ae_floor #{i} (encode->decode ceiling)", log=lambda msg: prog(50, msg))
+    if was:
+        m.train()
+    prog(100, f"done in {time.perf_counter() - t0:.1f}s")
+    summary = {"eval_ae_floor/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
+    summary.update({f"eval_ae_floor/{h}/psnr": float(images[h]["icurves"]["psnr"].mean()) for h in img_heads})
+    return summary
 
 
 def _ood_axis(cfg, model, norm, ecfg, writer, device, step, split):
@@ -221,20 +298,6 @@ def eval_control(cfg, model, norm, ecfg, writer, device, step=0):
     """Dual MPPI control (oracle vs learned) through a random sequence of 8 goals. Multimodal models plan
     with an FPV context rendered in the loop (run_and_log_control handles it)."""
     return {"control": run_and_log_control(cfg, model, norm, ecfg, writer, device, step)}
-
-
-def _ssim(a, b):
-    """Windowed SSIM over (N,H,W,3) images in [0,1] (uniform 7x7 window via avg_pool — pooling, not a
-    learned conv). Returns mean SSIM scalar."""
-    import torch.nn.functional as F
-    a, b = a.permute(0, 3, 1, 2), b.permute(0, 3, 1, 2)
-    C1, C2 = 0.01 ** 2, 0.03 ** 2
-    mu_a, mu_b = F.avg_pool2d(a, 7, 1), F.avg_pool2d(b, 7, 1)
-    va = F.avg_pool2d(a * a, 7, 1) - mu_a ** 2
-    vb = F.avg_pool2d(b * b, 7, 1) - mu_b ** 2
-    cab = F.avg_pool2d(a * b, 7, 1) - mu_a * mu_b
-    s = ((2 * mu_a * mu_b + C1) * (2 * cab + C2)) / ((mu_a ** 2 + mu_b ** 2 + C1) * (va + vb + C2))
-    return float(s.mean())
 
 
 @torch.no_grad()
@@ -882,7 +945,7 @@ REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
             "control": eval_control, "denoising_multistep": eval_denoising_multistep,
             "denoising_aggregate": eval_denoising_aggregate, "denoising_filmstrip": eval_denoising_filmstrip,
-            "manifold": eval_manifold,
+            "ae_floor": eval_ae_floor, "manifold": eval_manifold,
             "interpret": eval_interpret, "action_distribution": eval_action_distribution}
 
 
