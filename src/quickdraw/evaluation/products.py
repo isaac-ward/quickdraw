@@ -73,8 +73,8 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
                   obs_true=None, obs_pred=None, title_fn=None, log=None):
     """The ONE open-loop product orchestrator, shared by eval_ood_horizon (multimodal) and _openloop_split
     (vector). Given a COMPLETED rollout's per-episode positions + aggregate curves, it emits everything:
-    proprio `error_vs_step_avg` + each head's image `error_vs_step_avg`, then per-episode `trajectory_{plot,
-    video}_i` (+scene) and each head's `rollout_i`/`filmstrip_i`. The rollout itself stays modality-specific
+    per-head nested under `<routine>/<head>/`: `proprio/error_vs_step_avg` + `proprio/trajectory_{plot,video}_i`
+    (+scene) and each image head's `<head>/error_vs_step_avg` + `<head>/rollout_i`/`filmstrip_i`. The rollout itself stays modality-specific
     (dict-obs image decode vs vector tensor) — only the emission is unified here.
       env: the WorldEnv the rollout lives in. The per-episode scene video goes through
       `env.render_diagnostics` when the env offers it (torus: byte-identical to the legacy direct viz call);
@@ -85,7 +85,7 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
       "ipred": (N,H,s,s,3)}}; obs_true (N,P+H,obs_dim)/obs_pred (N,H,obs_dim) full observation vectors
       (only the fallback reads them). title_fn(i) -> a plot title (default '<routine> #i')."""
     title_fn = title_fn or (lambda i: f"{routine} #{i}")
-    log_error_curves(writer, routine, curves, step)                        # proprio averaged curves + scalars
+    log_error_curves(writer, routine, curves, step, head="proprio")        # proprio averaged curves + scalars
     for head, d in (images or {}).items():                                 # per image head, mirrored (PSNR split top)
         log_error_curves(writer, routine, d["icurves"], step, head=head, split_top={"psnr"}, colors={"psnr": "red"})
     rich = wants_diagnostics(env)
@@ -148,12 +148,12 @@ def log_torus_paths(writer, routine, i, *, env, R, r, coloring, ctx_xyz, true_xy
                  {"xyz": pred_xyz, "color": "dimgray", "start_sphere": False, "end_sphere": True}]
         fp = viz.fig_torus_atlas(R, r, trajs=trajs, coloring=coloring, title=title,
                                  view_pad=viz.EVAL_VIEW_PAD, torus_opacity=viz.TORUS_OPACITY)
-        writer.figure(product_tag(routine, "trajectory_plot", i=i), fp, step); plt.close(fp)
+        writer.figure(product_tag(routine, "trajectory_plot", i=i, head="proprio"), fp, step); plt.close(fp)
     for view, frames in vids.items():   # "scene" keeps the canonical tag; extra views get suffixed
         writer.video(product_tag(routine, "trajectory_video" if view == "scene" else f"trajectory_video_{view}",
-                                 i=i), frames, fps, step)
+                                 i=i, head="proprio"), frames, fps, step)
     if is_torus:
-        writer.scene(product_tag(routine, "trajectory_video", i=i),
+        writer.scene(product_tag(routine, "trajectory_video", i=i, head="proprio"),
                      torus_scene(R, r, description=description, true_path_xyz=true_full,
                                  predicted_path_xyz=pred_full, fork_step_index=int(P),
                                  action_arrow_per_step={"origins_xyz": true_full[:len(avec)],

@@ -99,10 +99,11 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
 def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     """The ONE open-loop long-horizon eval for every model (OOD: horizon >> trained). One rollout over
     held-out val episodes decodes proprio (always) + any image head; proprio and image outputs MIRROR each
-    other and the code generalizes over arbitrary trunks. All under eval_ood_horizon/:
-      - AVERAGED (over episodes, not per-instance) error_vs_step_avg_{linear,log} curves + *_mean scalars, one
-        block per head: proprio (obs_error/manifold/pointwise/tangent) and each image <head>/ (psnr/ssim/mse/l1).
-      - per-episode visuals for the first n_plot(=4) episodes: proprio trajectory_plot_{i}/video_{i}/scene_{i},
+    other and the code generalizes over arbitrary trunks. All under eval_ood_horizon/, one block per head
+    nested under <head>/:
+      - AVERAGED (over episodes, not per-instance) error_vs_step_avg_{linear,log} curves + *_mean scalars:
+        proprio/ (obs_error/manifold/pointwise/tangent) and each image <head>/ (psnr/ssim/mse/l1).
+      - per-episode visuals for the first n_plot(=4) episodes: proprio/trajectory_plot_{i}/video_{i}/scene_{i},
         and each image <head>/filmstrip_{i} + <head>/rollout_{i}.
     Image decode is the cost, so n_ep=8 when an image head is present (else eval.n_episodes)."""
     import numpy as _np
@@ -177,7 +178,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     if was:
         m.train()
     prog(100, f"done in {time.perf_counter() - t0:.1f}s")
-    return {"eval_ood_horizon": float(curves["pointwise_error"].mean())}
+    return {"eval_ood_horizon/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
 
 
 @torch.no_grad()
