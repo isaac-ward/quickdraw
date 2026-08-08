@@ -37,11 +37,15 @@ def _pos_idx(cfg, env=None):
     (torus/pendulum declare [0,1,2] in code; RecordedEnv omits it) > [0,1,2] with a ONE-TIME warning. Config
     wins so a recorded dataset whose position triple isn't the first 3 dims (e.g. robocasa EEF = [7,8,9]) can
     set it — all recorded datasets share the generic RecordedEnv and can't carry it in code. See #11 +
-    WorldEnv.position_indices. `env` (if given) is queried for the hook; else one is built cheaply on CPU."""
+    WorldEnv.position_indices. `env` (if given) is queried for the hook; else one is built cheaply on CPU.
+    Returns (pos, explicit): `explicit` is True when pos came from the config or the env hook, False when it
+    fell back to the [0,1,2] GUESS (warned). Callers slice proprio pointwise_error to `pos` ONLY when explicit
+    (see proprio_curves) — and since pointwise_error is the recorded env's checkpoint_metric, an explicit
+    position_idx makes best.ckpt select on POSITION error (intended; e.g. docking)."""
     envcfg = cfg.get("environments", {}) if hasattr(cfg, "get") else {}
     cfg_idx = envcfg.get("position_idx", None)
     if cfg_idx is not None:
-        return [int(i) for i in cfg_idx]                       # explicit config override wins
+        return [int(i) for i in cfg_idx], True                 # explicit config override wins
     if env is None:                                            # lazily build a cheap env to read its hook
         try:
             env = make_env(envcfg.get("name", "torus_world"), cfg.environments, 1, "cpu")
@@ -50,13 +54,13 @@ def _pos_idx(cfg, env=None):
     fn = getattr(env, "position_indices", None)
     hook = fn() if callable(fn) else None
     if hook is not None:
-        return [int(i) for i in hook]
+        return [int(i) for i in hook], True                    # explicit env hook
     if not _POS_IDX_WARNED[0]:
         print("[eval] WARNING: no position_indices (env hook or environments.position_idx set); defaulting "
               "world-xyz viz to obs dims [0,1,2]. Set environments.position_idx if this dataset's position "
               "triple differs (see issue #11).", flush=True)
         _POS_IDX_WARNED[0] = True
-    return [0, 1, 2]
+    return [0, 1, 2], False    # NOT explicit -> a GUESS; callers do NOT slice pointwise_error to it
 
 
 def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, prefix, step, coloring="rainbow", fps=60):
@@ -142,10 +146,12 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     # ---- AVERAGED error-vs-step curves, one block per head (proprio + each image), mirrored. Averaged over
     #      episodes (NOT per-instance) — same policy as proprio: no per-episode curves. ----
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
+    pos, pos_explicit = _pos_idx(cfg, env=env)                              # world-xyz obs dims (#11; env hook / config)
     pred = out["proprio"]
     p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
     p_true = torch.stack([torch.from_numpy(o[P:P + H]) for o, _, _ in eps]).float().to(device)
-    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, env)
+    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, env,
+                              pos_slice=(pos if pos_explicit else None))    # position-L2 pointwise iff explicit
     curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}        # mean over episodes -> (H,)
 
     images = {}                                                              # per image head: curves + frames for the emitter
@@ -162,8 +168,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     # ---- everything (curves + per-episode trajectory/image visuals) via the shared open-loop emitter ----
     desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
             "the model's PREDICTED path, sharing the context then diverging at the fork.")
-    ctx_obs = norm.denorm_obs(pro[:n_plot]).cpu().numpy()
-    pos = _pos_idx(cfg, env=env)                                             # world-xyz obs dims (#11; env hook / config)
+    ctx_obs = norm.denorm_obs(pro[:n_plot]).cpu().numpy()                    # pos/pos_explicit computed above
     emit_openloop(writer, "eval_ood_horizon", step, env=env, R=getattr(ecfg, "R", None),  # R/r only read by the
                   r=getattr(ecfg, "r", None), coloring="hsv", fps=fps, P=P,               # rich (torus) scene path
                   smooth_window=int(cfg.data.action_smooth_window), description=desc,
@@ -233,10 +238,12 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
 
     n_plot = min(4, n_ep)
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
+    pos, pos_explicit = _pos_idx(cfg, env=env)                       # world-xyz obs dims (#11; env hook / config)
     pred = recon["proprio"][:, P:P + H]                              # reconstructed proprio (normalized)
     p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
     p_true = torch.stack([torch.from_numpy(o[P:P + H]) for o, _, _ in eps]).float().to(device)
-    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, env)
+    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, env,
+                              pos_slice=(pos if pos_explicit else None))   # position-L2 pointwise iff explicit
     curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}   # flat over time (per-frame independent)
 
     images = {}
@@ -251,8 +258,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
 
     desc = ("Encode->decode ceiling (NO dynamics): each frame reconstructed independently. The error-vs-step "
             "curve is flat by construction — the floor every rollout image metric is bounded by.")
-    ctx_obs = norm.denorm_obs(pro_full[:n_plot, :P]).cpu().numpy()
-    pos = _pos_idx(cfg, env=env)
+    ctx_obs = norm.denorm_obs(pro_full[:n_plot, :P]).cpu().numpy()   # pos/pos_explicit computed above
     emit_openloop(writer, "eval_ae_floor", step, env=env, R=getattr(ecfg, "R", None), r=getattr(ecfg, "r", None),
                   coloring="hsv", fps=fps, P=P, smooth_window=int(cfg.data.action_smooth_window), description=desc,
                   ctx_xyz=ctx_obs[:, :, pos],
@@ -384,7 +390,7 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
         z = m.encode_state(obs)                                     # (1, Tlen, n_state, d)
 
-    pos = _pos_idx(cfg)                                             # world-xyz obs dims (#11; default [0,1,2])
+    pos, _ = _pos_idx(cfg)                                          # world-xyz obs dims (#11; default [0,1,2])
 
     def decode_xyz(z_t, x):                                          # proprio residual x -> physical position (committed = endpoint)
         return norm.denorm_obs(dec.decode(_ln(z_t + x)[:, None, :].float()))[..., pos]
@@ -478,7 +484,7 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     R, r = getattr(ecfg, "R", None), getattr(ecfg, "r", None)
     has_geom = str(cfg.environments.get("name", "torus_world")) == "torus_world"   # torus mesh render is torus-ONLY
     #                                       (RecordedConfig has inert R/r=1.0, so R-is-not-None can't gate this; #11)
-    K, P, pos = m.sampling_steps, cfg.data.P, _pos_idx(cfg)
+    pos, _ = _pos_idx(cfg); K, P = m.sampling_steps, cfg.data.P
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                     cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))

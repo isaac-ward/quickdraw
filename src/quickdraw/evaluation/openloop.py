@@ -47,17 +47,25 @@ def emit_horizon_readouts(writer, routine, head, icurves, H, step):
             writer.scalar(f"{routine}/{head}/{stat}/@+{x}", float(arr[min(x, H) - 1]), step)
 
 
-def proprio_curves(preds_norm, true_norm, p_hat, p_true, env):
+def proprio_curves(preds_norm, true_norm, p_hat, p_true, env, pos_slice=None):
     """The open-loop proprio per-step metrics (each (N,H)), shared by eval_batched (vector spine) and
     eval_ood_horizon (multimodal spine) so the metric definitions live in ONE place. preds_norm/true_norm
     are normalized (obs_error == the training loss); p_hat/p_true are denormalized physical positions.
     The physical metrics are env-polymorphic (`env.rollout_metrics`, elementwise over leading dims ->
     (N,H)): torus returns its manifold/pointwise/tangent errors (same functions, same arguments as the
-    old hardcoded calls — byte-identical); a generic env returns the default pointwise_error."""
-    return {
-        "obs_error": ((preds_norm - true_norm) ** 2).mean(-1),          # normalized 6-vec MSE (== the loss)
+    old hardcoded calls — byte-identical); a generic env returns the default pointwise_error.
+    `pos_slice`: None (default) -> pointwise_error is the env's FULL-observation error (unchanged). A list of
+    obs dims -> pointwise_error is the POSITION L2 over just those dims (used when position_idx is EXPLICIT;
+    e.g. docking cares about position, not the full state). `obs_error` stays the FULL-vector error in BOTH
+    cases. NOTE: pointwise_error is the recorded env's checkpoint_metric, so an explicit position_idx makes
+    best.ckpt select on POSITION error."""
+    out = {
+        "obs_error": ((preds_norm - true_norm) ** 2).mean(-1),          # normalized full-vec MSE (== the loss)
         **env.rollout_metrics(p_hat, p_true),
     }
+    if pos_slice is not None:                                           # explicit position_idx -> position-only L2
+        out["pointwise_error"] = (p_hat[..., pos_slice] - p_true[..., pos_slice]).norm(dim=-1)
+    return out
 
 
 @torch.no_grad()

@@ -5,3 +5,7 @@ dt: 0.0333333     # FALLBACK ONLY. env_cfg auto-reads the dataset's own fps (sum
                   # value is used only if the dataset has no fps, with a loud warning. 30 Hz = starling default.
 position_idx: [0, 1, 2]  # obs dims that are ambient world xyz for flow/manifold viz. DATASET-SPECIFIC: set to the
 #                          real position triple (e.g. robocasa 16-D EEF = [7,8,9]; xarm7 28-D right-arm = [0,1,2]).
+#                          EXPLICITLY setting this ALSO makes eval pointwise_error the POSITION-only L2 over these
+#                          dims — and pointwise_error is the recorded checkpoint_metric, so best.ckpt then selects on
+#                          POSITION error (intended for e.g. docking). Leave UNSET -> full-observation L2 (a [0,1,2]
+#                          guess is NOT applied to pointwise_error), warned once. obs_error is always the full vector.
