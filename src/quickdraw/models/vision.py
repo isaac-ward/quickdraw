@@ -149,6 +149,59 @@ class ImageAutoencoder(nn.Module):
         return self.decode(z), z
 
 
+# ---- pretrained-AE (TAESD) grid<->token adapters (issue #12 §2): bridge a spatial latent GRID and the token
+# BAG so the dynamics still sees num_tokens tokens (never a 16x16=256-token grid). Same Perceiver pattern as
+# ImageAutoencoder (learned queries cross-attend), reused here on the frozen pretrained-AE latent. ----
+class GridToTokens(nn.Module):
+    """down-adapter: latent GRID (B, C, gh, gw) -> token LIST (B, num_tokens, d). Flatten the grid to gh*gw
+    spatial tokens of width C, Linear(C->d) + learned pos-embed, `depth` ViT refine blocks, then num_tokens
+    learned queries cross-attend (Perceiver bottleneck — same as ImageAutoencoder.encode)."""
+
+    def __init__(self, lat_ch: int, grid_hw: tuple[int, int], num_tokens: int, d: int, heads: int, depth: int):
+        super().__init__()
+        gh, gw = grid_hw
+        self.proj = nn.Linear(lat_ch, d)
+        self.pos = nn.Parameter(torch.zeros(1, gh * gw, d))
+        self.blocks = nn.ModuleList([ViTBlock(d, heads, 4.0) for _ in range(depth)])
+        self.latent_q = nn.Parameter(torch.zeros(1, num_tokens, d))
+        self.to_latent = CrossAttn(d, heads)
+        self.norm = nn.LayerNorm(d)
+        for p in (self.pos, self.latent_q):
+            nn.init.trunc_normal_(p, std=0.02)
+
+    def forward(self, grid):                                     # (B, C, gh, gw) -> (B, num_tokens, d)
+        B, C, gh, gw = grid.shape
+        x = self.proj(grid.permute(0, 2, 3, 1).reshape(B, gh * gw, C)) + self.pos
+        for blk in self.blocks:
+            x = blk(x)
+        return self.norm(self.to_latent(self.latent_q.expand(B, -1, -1), x))
+
+
+class TokensToGrid(nn.Module):
+    """up-adapter: token LIST (B, num_tokens, d) -> latent GRID (B, C, gh, gw). Mirror of GridToTokens: gh*gw
+    learned output-position queries cross-attend the num_tokens tokens, `depth` ViT refine blocks, Linear(d->C),
+    reshape back to the grid."""
+
+    def __init__(self, lat_ch: int, grid_hw: tuple[int, int], num_tokens: int, d: int, heads: int, depth: int):
+        super().__init__()
+        gh, gw = grid_hw
+        self.gh, self.gw, self.lat_ch = gh, gw, lat_ch
+        self.out_pos = nn.Parameter(torch.zeros(1, gh * gw, d))
+        self.from_latent = CrossAttn(d, heads)
+        self.blocks = nn.ModuleList([ViTBlock(d, heads, 4.0) for _ in range(depth)])
+        self.norm = nn.LayerNorm(d)
+        self.to_grid = nn.Linear(d, lat_ch)
+        nn.init.trunc_normal_(self.out_pos, std=0.02)
+
+    def forward(self, tokens):                                   # (B, num_tokens, d) -> (B, C, gh, gw)
+        B = tokens.shape[0]
+        x = self.from_latent(self.out_pos.expand(B, -1, -1), tokens)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.to_grid(self.norm(x))                           # (B, gh*gw, C)
+        return x.transpose(1, 2).reshape(B, self.lat_ch, self.gh, self.gw)
+
+
 class _FiLMResBlock(nn.Module):
     """Conv residual block with FiLM (per-channel scale+shift) from a global conditioning vector `g`."""
 

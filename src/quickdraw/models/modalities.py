@@ -17,8 +17,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .flow import FlowField, ImageFlowHead, ImageUNetFlowHead
-from .vision import ConvImageEncoder, ImageAutoencoder, VisionAEConfig
+from .flow import FlowField, ImageFlowHead, ImageUNetFlowHead, TransportHead
+from .vision import (ConvImageEncoder, GridToTokens, ImageAutoencoder, TokensToGrid, VisionAEConfig, img_hw)
 
 
 def _mlp(i: int, o: int, h: int) -> nn.Sequential:
@@ -56,6 +56,12 @@ class ModalitySpec:
     num_tokens: int = 8
     ae_depth: int = 4
     channels: int = 3
+    # pretrained image AE (TAESD) — issue #12. pretrained=false -> the bespoke AE above (BIT-IDENTICAL default).
+    pretrained: bool = False                     # master on/off for the pretrained-AE image trunk
+    pretrained_name: str = "madebyollin/taesd"   # HF repo id, loaded via diffusers.AutoencoderTiny
+    pretrained_init: bool = True                 # true=load HF weights; false=random-init SAME arch (prior-vs-arch ablation)
+    freeze: bool = True                          # freeze the AE weights (Perceiver adapters still train); false=fine-tune
+    adapter: dict | None = None                  # Perceiver down/up-adapter config, e.g. {depth: 2} (default depth 2)
 
 
 class Modality(nn.Module):
@@ -156,11 +162,94 @@ class ImageModality(Modality):
         return flat_tok
 
 
+class _AEHolder:
+    """Plain (non-Module) holder exposing `.cfg` so eval routines that read `mod.ae.cfg.img_size` work for the
+    pretrained modality too (the pretrained AE is TAESD, not an ImageAutoencoder). No params — not registered."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+
+class PretrainedImageHead(TransportHead):
+    """decode_head for the pretrained-AE image modality (issue #12 §3): the DETERMINISTIC (no_noise=mse) net
+    whose forward is `up-adapter -> frozen TAESD decoder`. Keeping it a TransportHead means decode()/decode_loss()
+    /recon_frac/eval_ae_floor all compose UNCHANGED — the pretrained decoder is just another 'net' behind the
+    unified head. TAESD is held by a NON-registered ref (registered once on the modality, not double-counted)."""
+
+    def __init__(self, *, taesd, up_adapter, img_size, channels, decode_pm1: bool = True):
+        super().__init__(param="x0", shortcut=False, event_dims=3, no_noise=True)
+        self._taesd = (taesd,)                     # tuple -> NOT a registered submodule (no double-count)
+        self.up_adapter = up_adapter
+        self.img_size, self.channels, self._pm1 = img_size, channels, decode_pm1
+
+    def velocity(self, x, temb, cond, demb=None):  # no_noise: x is zeros; cond = latent tokens (M, num_tokens, d)
+        grid = self.up_adapter(cond)               # (M, C, gh, gw) — back to TAESD latent-grid space
+        img = self._taesd[0].decode(grid).sample   # (M, 3, H, W) in TAESD range
+        if self._pm1:
+            img = (img + 1) / 2                    # [-1,1] -> [0,1] (probe-confirmed TAESD convention)
+        return img.permute(0, 2, 3, 1)             # (M, H, W, 3) in [0,1] — obs space
+
+    def sample(self, cond, *, steps, deterministic, eps=None, record_path=False):
+        H, W = img_hw(self.img_size)
+        return self._sample(cond, event_shape=(H, W, self.channels), lead=cond.shape[:-2],
+                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
+
+
+class PretrainedImageModality(Modality):
+    """Image stream backed by a PRETRAINED AE (TAESD) bridged to the token bag by learned Perceiver adapters
+    (issue #12). encode: TAESD.encode -> down-adapter -> (num_tokens, d). decode (unified no_noise head):
+    up-adapter -> TAESD.decode -> image. The AE may be frozen (adapters + dynamics still train)."""
+    _obs_ndim = 3
+
+    def __init__(self, spec: ModalitySpec, d: int):
+        super().__init__()
+        from diffusers import AutoencoderTiny
+        self.name, self.n_tokens, self.weight = spec.name, spec.num_tokens, spec.weight
+        self.noise_std = float(spec.noise_std)
+        self.decode_kind = "mse"                   # pretrained path = the deterministic no_noise decode
+        self.decode_steps = 1
+        H, W = img_hw(spec.img_size)
+        if spec.pretrained_init:                   # load the HF weights (the pretrained pixel prior)
+            taesd = AutoencoderTiny.from_pretrained(spec.pretrained_name)
+        else:                                      # random-init the SAME arch (ablation: prior vs architecture)
+            taesd = AutoencoderTiny.from_config(AutoencoderTiny.load_config(spec.pretrained_name))
+        self.taesd = taesd                         # registered ONCE here (the head holds a non-registered ref)
+        self.taesd_frozen = bool(spec.freeze)
+        if self.taesd_frozen:                      # freeze weights; keep permanently in eval (see train() below)
+            for p in self.taesd.parameters():
+                p.requires_grad_(False)
+            self.taesd.eval()
+        with torch.no_grad():                      # derive the true latent grid shape (robust to downsample/channels)
+            lat = self.taesd.encode(torch.zeros(1, spec.channels, H, W)).latents
+        lat_ch, gh, gw = int(lat.shape[1]), int(lat.shape[2]), int(lat.shape[3])
+        heads = max(1, d // 16)
+        depth = int((dict(spec.adapter) if spec.adapter else {}).get("depth", 2))
+        self.down_adapter = GridToTokens(lat_ch, (gh, gw), spec.num_tokens, d, heads, depth)
+        up = TokensToGrid(lat_ch, (gh, gw), spec.num_tokens, d, heads, depth)
+        self.decode_head = PretrainedImageHead(taesd=self.taesd, up_adapter=up, img_size=spec.img_size,
+                                               channels=spec.channels)
+        self.ae = _AEHolder(VisionAEConfig(img_size=spec.img_size, patch=spec.patch, d=d,
+                                           num_tokens=spec.num_tokens, channels=spec.channels, build_decoder=False))
+
+    def _encode(self, obs):                        # (M,H,W,C)[0,1] -> (M, num_tokens, d)
+        grid = self.taesd.encode(obs.permute(0, 3, 1, 2) * 2 - 1).latents   # [0,1]->[-1,1]-> latent grid
+        return self.down_adapter(grid)
+
+    def _decode_cond(self, flat_tok):              # (M, num_tokens, d) -> tokens (head decodes via up-adapter+TAESD)
+        return flat_tok
+
+    def train(self, mode: bool = True):            # keep a frozen TAESD in eval permanently (Lightning can't flip it)
+        super().train(mode)
+        if getattr(self, "taesd_frozen", False):
+            self.taesd.eval()
+        return self
+
+
 def make_modality(spec: ModalitySpec, d: int) -> Modality:
     if spec.kind == "vector":
         return VectorModality(spec, d)
     if spec.kind == "image":
-        return ImageModality(spec, d)
+        return PretrainedImageModality(spec, d) if getattr(spec, "pretrained", False) else ImageModality(spec, d)
     raise ValueError(f"unknown modality kind: {spec.kind!r}")
 
 

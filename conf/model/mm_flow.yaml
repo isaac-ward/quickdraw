@@ -143,4 +143,11 @@ modalities:
   # smooth, no grid. CAVEAT: unet+MSE is UNTESTED on metrics (the finding above was unet+FLOW vs vit+MSE, never
   # unet+mse) — expected to keep MSE's metrics AND kill the grid, but VALIDATE before trusting. encode stays ViT.
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
-  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet}
+  - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet,
+     pretrained: false, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2}}
+  # PRETRAINED IMAGE AE (issue #12): pretrained=false (default) -> the bespoke conv/unet AE above, BIT-IDENTICAL.
+  #   pretrained=true -> TAESD (diffusers.AutoencoderTiny) encode/decode bridged to the num_tokens x d token bag by
+  #   learned Perceiver adapters (encode_arch/decode_arch/decode_base then ignored). Gate (raw TAESD, no training):
+  #   31 dB @128 vs the bespoke AE's pinned ~14.3 dB at the SAME 1024-float budget. pretrained_init=false random-inits
+  #   the same arch (isolates prior vs architecture); freeze=true freezes TAESD (adapters+dynamics still train, and
+  #   the AE is excluded from AdamW); adapter.depth = Perceiver refine blocks per adapter.

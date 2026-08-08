@@ -17,6 +17,9 @@ def adamw_with_warmup(params, lr: float, weight_decay: float, warmup_steps: int 
     running away). Warmup lets them settle. `interval="step"` counts batches so it finishes early in epoch 0.
     NOT fused: Lightning's gradient_clip_val is incompatible with a fused optimizer (negligible speedup at
     this size anyway). Shared by LitFlow (WM) and LitActionModel (action head) — one warmup, no duplication."""
+    params = [p for p in params if p.requires_grad]   # exclude FROZEN params (e.g. a frozen pretrained AE, #12)
+    #                                                   so AdamW allocates NO moments for them. No-op when nothing
+    #                                                   is frozen (all requires_grad=True) -> bit-identical.
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     if warmup_steps and warmup_steps > 0:
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warmup_steps))
