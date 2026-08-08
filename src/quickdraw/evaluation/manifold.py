@@ -25,8 +25,8 @@ def _sample_contexts(ds, *, P, n_points, stride, seed):
 @torch.no_grad()
 def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
     """Multimodal analogue of manifold_predictions. Committed next-state token bag over many contexts via
-    the shared forward(); returns (data6d (N,6) decoded PROPRIO physical, latents (N, n_state*d) = the
-    flattened carried token bag, speed (N,), n_avail). mm_eps: list of (obs (T,6), act (T,2), img (T,H,W,3))."""
+    the shared forward(); returns (data_phys (N, obs_dim) decoded PROPRIO physical, latents (N, n_state*d) =
+    the flattened carried token bag, n_avail). mm_eps: list of (obs (T, obs_dim), act (T, action_dim), img (T,H,W,3))."""
     n_ep = len(mm_eps)
     rng = np.random.RandomState(seed)
     slices = [(ei, t) for ei in range(n_ep) for t in range(P, len(mm_eps[ei][0]) - 1, stride)]
@@ -36,7 +36,7 @@ def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
     for ei, t in slices[:n_points]:
         by_ep[ei].append(t)
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)   # single FPV feed's head name
-    data6d, latents = [], []
+    data_phys, latents = [], []
     for ei, ts in by_ep.items():
         o, a, im = mm_eps[ei]
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device),
@@ -45,10 +45,9 @@ def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
         pred = m(obs, act)                                   # (1,T,n_state,d)
         sel = pred[0, np.array(sorted(ts))]                  # (nt,n_state,d)
         latents.extend(sel.reshape(sel.shape[0], -1).cpu().numpy())            # flatten bag -> (n_state*d,)
-        data6d.extend(norm.denorm_obs(m.to_obs(sel)["proprio"]).cpu().numpy())  # decoded proprio 6-vec
-    data6d, latents = np.stack(data6d), np.stack(latents)
-    speed = np.linalg.norm(data6d[:, 3:], axis=1)
-    return data6d, latents, speed, n_avail
+        data_phys.extend(norm.denorm_obs(m.to_obs(sel)["proprio"]).cpu().numpy())  # decoded proprio vector
+    data_phys, latents = np.stack(data_phys), np.stack(latents)
+    return data_phys, latents, n_avail
 
 
 def reduce_dims(pts, method, *, n_components, seed=0, return_reducer=False, y=None, target_weight=0.0):
@@ -118,8 +117,8 @@ def pad_lims(e, frac=0.05):
 @torch.no_grad()
 def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device):
     """Diffusion-SPECIFIC (token-bag spine): one uniform-hypercube noise per context, denoised through the
-    per-token flow to the committed next PROPRIO token, keeping the WHOLE ODE path. Returns (paths6d
-    (N, K+1, 6) physical proprio, speed (N,), latents (N, d) = committed proprio token, n_avail). Feeds
+    per-token flow to the committed next PROPRIO token, keeping the WHOLE ODE path. Returns (paths_phys
+    (N, K+1, obs_dim) physical proprio, latents (N, d) = committed proprio token, n_avail). Feeds
     eval_flow's `denoising_aggregate` (the swarm collapsing from noise onto the recovered manifold)."""
     import torch.nn.functional as F
     _ln = lambda x: F.layer_norm(x, (x.shape[-1],))
@@ -133,7 +132,7 @@ def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device)
     for ei, t in slices[:n_points]:
         by_ep[ei].append(t)
     dec = m.modalities["proprio"]
-    paths6d, latents = [], []
+    paths_phys, latents = [], []
     for ei, ts in by_ep.items():
         o, a, im = mm_eps[ei]
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device)}
@@ -148,8 +147,7 @@ def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device)
         _, path = m.flow.sample(h_pro, steps=K, deterministic=False, eps=eps, record_path=True)
         decs = np.stack([norm.denorm_obs(dec.decode(_ln(zt_pro + x)[:, None, :].float())).float().cpu().numpy()
                          for x in path])                           # (K+1, nt, 6): decoded proprio along the ODE
-        paths6d.extend(np.transpose(decs, (1, 0, 2)))              # list of (K+1, 6)
+        paths_phys.extend(np.transpose(decs, (1, 0, 2)))              # list of (K+1, obs_dim)
         latents.extend(_ln(zt_pro + path[-1]).float().cpu().numpy())   # committed proprio token, (d,)
-    paths6d, latents = np.stack(paths6d), np.stack(latents)
-    speed = np.linalg.norm(paths6d[:, -1, 3:], axis=1)             # |predicted next velocity|
-    return paths6d, speed, latents, n_avail
+    paths_phys, latents = np.stack(paths_phys), np.stack(latents)
+    return paths_phys, latents, n_avail

@@ -67,9 +67,11 @@ Ask: **"What are you bringing?"** One of three (this mirrors `docs/byo.md`):
 
 **(3) Full custom env** — you want every eval on your own dynamics.
 - Help them implement a `WorldEnv`: walk `docs/byo.md` §"Full implementation" + the contract in `base.py`,
-  using `environments/examples/pendulum.py` as the copyable full example (all 7 optional hooks). Each hook
+  using `environments/examples/pendulum.py` as the copyable full example (all optional hooks). Each hook
   unlocks one eval (rollout_metrics, checkpoint_metric, render_diagnostics, control_goals, physical_loss,
-  POLICIES, fork).
+  POLICIES, fork, position_indices). `position_indices` returns the obs dims that are ambient world xyz and
+  unlocks the flow/manifold world-space viz (`eval_flow`, `ood_horizon` paths); recorded datasets set it via
+  `environments.position_idx` instead (config overrides the hook; default `[0,1,2]` + a one-time warning).
 
 **Where the data comes from depends on the path:**
 - **Recorded data** → there IS a dataset; you inspected it, so process it (`data.processors`) and point

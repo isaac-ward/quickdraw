@@ -28,6 +28,37 @@ def _is_mm(model):
     return hasattr(getattr(model, "_orig_mod", model), "layout")
 
 
+_POS_IDX_WARNED = [False]
+
+
+def _pos_idx(cfg, env=None):
+    """The obs dims that are ambient world xyz, for the flow/manifold world-space viz. LAYERED resolution:
+    explicit `environments.position_idx` CONFIG override > the env's optional `position_indices()` HOOK
+    (torus/pendulum declare [0,1,2] in code; RecordedEnv omits it) > [0,1,2] with a ONE-TIME warning. Config
+    wins so a recorded dataset whose position triple isn't the first 3 dims (e.g. robocasa EEF = [7,8,9]) can
+    set it — all recorded datasets share the generic RecordedEnv and can't carry it in code. See #11 +
+    WorldEnv.position_indices. `env` (if given) is queried for the hook; else one is built cheaply on CPU."""
+    envcfg = cfg.get("environments", {}) if hasattr(cfg, "get") else {}
+    cfg_idx = envcfg.get("position_idx", None)
+    if cfg_idx is not None:
+        return [int(i) for i in cfg_idx]                       # explicit config override wins
+    if env is None:                                            # lazily build a cheap env to read its hook
+        try:
+            env = make_env(envcfg.get("name", "torus_world"), cfg.environments, 1, "cpu")
+        except Exception:
+            env = None
+    fn = getattr(env, "position_indices", None)
+    hook = fn() if callable(fn) else None
+    if hook is not None:
+        return [int(i) for i in hook]
+    if not _POS_IDX_WARNED[0]:
+        print("[eval] WARNING: no position_indices (env hook or environments.position_idx set); defaulting "
+              "world-xyz viz to obs dims [0,1,2]. Set environments.position_idx if this dataset's position "
+              "triple differs (see issue #11).", flush=True)
+        _POS_IDX_WARNED[0] = True
+    return [0, 1, 2]
+
+
 def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, prefix, step, coloring="rainbow", fps=60):
     if _is_mm(model):                      # multimodal open-loop is eval_ood_horizon (dict obs); this vector-tensor
         return {}                          # OOD-split path (ood_visual/geometric/dynamics) is a pending MM port
@@ -143,11 +174,12 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
             "the model's PREDICTED path, sharing the context then diverging at the fork.")
     ctx_obs = norm.denorm_obs(pro[:n_plot]).cpu().numpy()
+    pos = _pos_idx(cfg, env=env)                                             # world-xyz obs dims (#11; env hook / config)
     emit_openloop(writer, "eval_ood_horizon", step, env=env, R=getattr(ecfg, "R", None),  # R/r only read by the
                   r=getattr(ecfg, "r", None), coloring="hsv", fps=fps, P=P,               # rich (torus) scene path
                   smooth_window=int(cfg.data.action_smooth_window), description=desc,
-                  ctx_xyz=ctx_obs[:, :, :3],
-                  p_true_xyz=p_true[:n_plot, :, :3].cpu().numpy(), p_hat_xyz=p_hat[:n_plot, :, :3].cpu().numpy(),
+                  ctx_xyz=ctx_obs[:, :, pos],
+                  p_true_xyz=p_true[:n_plot][:, :, pos].cpu().numpy(), p_hat_xyz=p_hat[:n_plot][:, :, pos].cpu().numpy(),
                   actions=[eps[i][1][:P + H].astype(_np.float32) for i in range(n_plot)],
                   curves=curves, n_plot=n_plot, images=(images or None),
                   obs_true=_np.concatenate([ctx_obs, p_true[:n_plot].cpu().numpy()], axis=1),
@@ -221,8 +253,8 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                     cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
-    _, latents, _, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
-                                                  stride=1, seed=0, device=device)
+    _, latents, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
+                                                stride=1, seed=0, device=device)
     sub = (f"each point = one committed 1-step next-state prediction from a real val context "
            f"({latents.shape[0]:,} points over {n_avail:,} contexts)")   # model-agnostic; teacher-forced, not a rollout
     label = f"latent space (full {latents.shape[1]}D z)"
@@ -262,7 +294,10 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     m.eval()
     t0 = time.perf_counter()
     R, r = getattr(ecfg, "R", None), getattr(ecfg, "r", None)
-    has_geom = R is not None and r is not None   # torus render needs geometry; the flow scalar below does NOT
+    # the torus ATLAS render is torus-ONLY. Gate on the env NAME, NOT on R/r being set: RecordedConfig ships
+    # inert R=r=1.0 placeholders (train reads them unconditionally), so "R is not None" is True on recorded too
+    # -> would wrongly pick the torus mesh render. Non-torus -> geometry-free plain 3D world-space render (#11).
+    has_geom = str(cfg.environments.get("name", "torus_world")) == "torus_world"
     dev = device if isinstance(device, str) else device.type
     P, W, d, K, n_swarm = cfg.data.P, m.window, m.d, m.sampling_steps, 16
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
@@ -285,8 +320,10 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
         z = m.encode_state(obs)                                     # (1, Tlen, n_state, d)
 
-    def decode_xyz(z_t, x):                                          # proprio residual x -> physical xyz (committed = endpoint)
-        return norm.denorm_obs(dec.decode(_ln(z_t + x)[:, None, :].float()))[..., :3]
+    pos = _pos_idx(cfg)                                             # world-xyz obs dims (#11; default [0,1,2])
+
+    def decode_xyz(z_t, x):                                          # proprio residual x -> physical position (committed = endpoint)
+        return norm.denorm_obs(dec.decode(_ln(z_t + x)[:, None, :].float()))[..., pos]
 
     def step_data(t):                                               # per-step swarm geometry for the quiver
         w = min(W, t + 1)
@@ -308,9 +345,9 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     ms_t0 = int(rng.integers(lo, hi)) if hi > lo else lo
     cap = int(cfg.eval.get("denoising_max_steps", None) or 128)     # cap the slow multistep render (default full 128)
     n_ms = min(cap, Tlen - 2 - ms_t0)
-    ms_cur = o[ms_t0, :3]
-    ms_tail = o[max(0, ms_t0 - 60):ms_t0 + 1, :3]
-    ms_future = o[ms_t0:ms_t0 + n_ms + 1, :3]                       # fixed black future line spanning the N steps
+    ms_cur = o[ms_t0, pos]
+    ms_tail = o[max(0, ms_t0 - 60):ms_t0 + 1, pos]
+    ms_future = o[ms_t0:ms_t0 + n_ms + 1, pos]                       # fixed black future line spanning the N steps
     ms_act = viz.action_ambient(ms_cur, a[ms_t0], R, r) if has_geom else None
     _plog(writer, f"[denoising_multistep @ep{step}] seed={seed} {n_ms} steps from t0={ms_t0}, K={K} swarm={n_swarm}")
     ms_steps, spreads, sample_times = [], [], []
@@ -319,27 +356,35 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
         spreads.append(float(_np.linalg.norm(_np.stack(dd["ends"]).std(axis=0))))    # swarm final-position spread
         sample_times.append(dd["sample_s"])
         ms_steps.append({"per_frame": _quiver_round_data(dd["swarm"], grow=10, collapse=5),
-                         "true_next": o[ms_t0 + i + 1, :3]})
+                         "true_next": o[ms_t0 + i + 1, pos]})
         if (i + 1) % max(1, n_ms // 5) == 0:
             _plog(writer, f"[denoising_multistep @ep{step}] sampling {int(100 * (i + 1) / n_ms):3d}% "
                           f"({i + 1}/{n_ms} swarms) | elapsed {time.perf_counter() - t0:.0f}s")
-    if has_geom:
+    n_frames = sum(len(s["per_frame"]) for s in ms_steps)
+    if has_geom:                                                   # torus: rich atlas render (unchanged)
         _plog(writer, f"[denoising_multistep @ep{step}] swarm sampling done in {time.perf_counter() - t0:.0f}s; "
-                      f"rendering {sum(len(s['per_frame']) for s in ms_steps)} frames (torus atlas, GPU/EGL)...")
+                      f"rendering {n_frames} frames (torus atlas, GPU/EGL)...")
         ms_frames = viz.diffusion_quiver_sequential_frames(R, r, "rainbow", ms_cur, ms_act, ms_tail, ms_future,
                                                            ms_steps, title="denoising multistep",
                                                            log=lambda mm: _plog(writer, f"[denoising_multistep @ep{step}] render {mm}"))
-        writer.video("eval_flow/denoising_multistep", ms_frames, 60, step)
-        writer.scene("eval_flow/denoising_multistep", {
-            "description": "Sequential swarms at a FIXED agent: each swarm denoises, then its tails collapse onto the "
-                           "convergence point along the (fixed) black future line, before the next swarm; agent, history "
-                           "and future do not move.",
-            "coordinate_system": "world xyz, same space as the torus",
-            "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
-            "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,
-            "swarm_target_per_step_xyz": [s["true_next"] for s in ms_steps]}, step)
-    else:   # geometry-free flow scalars still logged below; only the torus render is skipped (option 2)
-        _plog(writer, f"[denoising_multistep @ep{step}] no env geometry (R/r); logging flow scalars only, no torus render")
+    else:                                                          # #11: geometry-free plain 3D world-space render
+        _plog(writer, f"[denoising_multistep @ep{step}] swarm sampling done in {time.perf_counter() - t0:.0f}s; "
+                      f"rendering {n_frames} frames (plain 3D world space, autoscaled — no torus mesh)...")
+        ms_frames = viz.diffusion_swarm_plain_frames(ms_cur, ms_tail, ms_future, ms_steps,
+                                                     title="denoising multistep (world space)",
+                                                     log=lambda mm: _plog(writer, f"[denoising_multistep @ep{step}] render {mm}"))
+    writer.video("eval_flow/denoising_multistep", ms_frames, 60, step)
+    scene = {"description": "Sequential swarms at a FIXED agent: each swarm denoises, then its tails collapse onto the "
+                            "convergence point along the (fixed) black future line, before the next swarm; agent, history "
+                            "and future do not move.",
+             "current_position_xyz": ms_cur, "history_tail_xyz": ms_tail, "future_path_xyz": ms_future,
+             "swarm_target_per_step_xyz": [s["true_next"] for s in ms_steps]}
+    if has_geom:
+        scene["coordinate_system"] = "world xyz, same space as the torus"
+        scene["torus"] = {"major_radius_R": float(R), "tube_radius_r": float(r)}
+    else:
+        scene["coordinate_system"] = f"world xyz from obs dims {pos} (autoscaled)"
+    writer.scene("eval_flow/denoising_multistep", scene, step)
     writer.scalars({"eval_flow/std_of_samples": float(_np.mean(spreads)),      # predicted uncertainty
                     "eval_flow/time/sample_s": float(_np.mean(sample_times)),
                     "eval_flow/time/sample_ms_per_euler_step": float(1000.0 * _np.mean(sample_times) / max(1, K))}, step)
@@ -361,34 +406,130 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     from ..models.multimodal import MultiModalFlow
     from .manifold import manifold_clouds
     m = getattr(model, "_orig_mod", model)
-    if not isinstance(m, MultiModalFlow) or getattr(ecfg, "R", None) is None:
-        return {}   # pure torus render (no geometry-free product) -> self-skip on non-torus envs
+    if not isinstance(m, MultiModalFlow):
+        return {}   # flow-in-dynamics is the ONLY precondition now (#11); non-torus renders in plain 3D world space
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    R, r, K, P = ecfg.R, ecfg.r, m.sampling_steps, cfg.data.P
+    R, r = getattr(ecfg, "R", None), getattr(ecfg, "r", None)
+    has_geom = str(cfg.environments.get("name", "torus_world")) == "torus_world"   # torus mesh render is torus-ONLY
+    #                                       (RecordedConfig has inert R/r=1.0, so R-is-not-None can't gate this; #11)
+    K, P, pos = m.sampling_steps, cfg.data.P, _pos_idx(cfg)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                     cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
     _plog(writer, f"[denoising_aggregate @ep{step}] seed={seed} pooling val contexts, K={K}...")
-    paths6d, _, _, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=5000, cube=3.0, stride=1, seed=seed, device=device)
-    Lm, Zm = (R + r) * 1.05, r * 1.6
-    sub = f"{paths6d.shape[0]:,} next-states (of {n_avail:,} val contexts), K={K}"
-    _plog(writer, f"[denoising_aggregate @ep{step}] pooled {paths6d.shape[0]} paths in {time.perf_counter() - t0:.0f}s; rendering 480 frames...")
-    mframes = viz.points_collapse_frames(paths6d[..., :3], lims=((-Lm, Lm), (-Lm, Lm), (-Zm, Zm)), n_frames=480,
+    paths_phys, _, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=5000, cube=3.0, stride=1, seed=seed, device=device)
+    paths_xyz = paths_phys[..., pos]                                     # (N, K+1, 3) world positions
+    if has_geom:
+        Lm, Zm = (R + r) * 1.05, r * 1.6
+        lims = ((-Lm, Lm), (-Lm, Lm), (-Zm, Zm))                         # torus-derived box (unchanged)
+    else:
+        lims = viz._pad3(paths_xyz.reshape(-1, 3))                       # #11: autoscaled from the data
+    sub = f"{paths_xyz.shape[0]:,} next-states (of {n_avail:,} val contexts), K={K}"
+    _plog(writer, f"[denoising_aggregate @ep{step}] pooled {paths_xyz.shape[0]} paths in {time.perf_counter() - t0:.0f}s; rendering 480 frames...")
+    mframes = viz.points_collapse_frames(paths_xyz, lims=lims, n_frames=480,
                                          point_size=2.0, title=f"denoising aggregate — noise -> manifold\n{sub}",
                                          log=lambda mm: _plog(writer, f"[denoising_aggregate @ep{step}] render {mm}"))   # 480 @ 60fps = 8s (0.5x speed)
     writer.video("eval_flow/denoising_aggregate", mframes, 60, step)
-    writer.scene("eval_flow/denoising_aggregate", {
-        "description": "Denoising ODE paths pooled over many val contexts: a swarm of predicted next-states "
-                       "collapsing from noise onto the recovered torus manifold over the K flow steps.",
-        "coordinate_system": "world xyz, same space as the torus",
-        "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)},
-        "denoising_paths_xyz": paths6d[:200, :, :3]}, step)         # 200-path subset (full set is large)
+    scene = {"description": "Denoising ODE paths pooled over many val contexts: a swarm of predicted next-states "
+                            "collapsing from noise onto the recovered manifold over the K flow steps.",
+             "denoising_paths_xyz": paths_xyz[:200]}         # 200-path subset (full set is large)
+    if has_geom:
+        scene["coordinate_system"] = "world xyz, same space as the torus"
+        scene["torus"] = {"major_radius_R": float(R), "tube_radius_r": float(r)}
+    else:
+        scene["coordinate_system"] = f"world xyz from obs dims {pos} (autoscaled)"
+    writer.scene("eval_flow/denoising_aggregate", scene, step)
     if was:
         m.train()
-    _plog(writer, f"[denoising_aggregate @ep{step}] done in {time.perf_counter() - t0:.1f}s ({paths6d.shape[0]} paths)")
+    _plog(writer, f"[denoising_aggregate @ep{step}] done in {time.perf_counter() - t0:.1f}s ({paths_xyz.shape[0]} paths)")
+    return {}
+
+
+@torch.no_grad()
+def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
+    """denoising_filmstrip (diffusion ONLY; opt-in): watch the predicted next FRAME resolve over diffusion time.
+    Variant (b) — dynamics-side: the predict_next dynamics head is ALWAYS a flow, so it denoises the next
+    IMAGE tokens; decode each element of that latent ODE path through the (default MSE) image decoder. Emits
+    `denoising_filmstrip_<i>` — one FILE per image (`denoising_filmstrip_images`, each a DIFFERENT (episode,
+    step) frame); within each file rows = eps-noise seeds (`denoising_filmstrip_seeds`), cols = [GT | noise |
+    denoise step 1..K]. ENV-AGNOSTIC (no geometry/goals) -> the first eval_flow product usable on a recorded
+    dataset (#10). K is set LOCALLY (cfg.eval.denoising_filmstrip_steps) so a K=1 (shortcut) training config
+    still shows a real trajectory; eps ~ N(0,1) (not the eps=0 committed path) so the 'noise' panel is real noise."""
+    import numpy as _np
+    import torch.nn.functional as F
+
+    from ..data.dataset import load_split_episodes_mm
+    from ..models.multimodal import MultiModalFlow
+    m = getattr(model, "_orig_mod", model)
+    img_head = next((n for n, _ in m.layout if n != "proprio"), None)
+    if not isinstance(m, MultiModalFlow) or img_head is None:
+        return {}   # needs the flow dynamics + an image head to decode
+    was = m.training
+    m.eval()
+    t0 = time.perf_counter()
+    dev = device if isinstance(device, str) else device.type
+    off = 0                                                          # bag offset of the image tokens
+    for name, n in m.layout:
+        if name == img_head:
+            n_img = n; break
+        off += n
+    P, K = cfg.data.P, int(cfg.eval.get("denoising_filmstrip_steps", 8) or 8)   # LOCAL K (not the training value)
+    n_seeds = int(cfg.eval.get("denoising_filmstrip_seeds", 4) or 4)
+    img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+                                    cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
+    n_images = int(cfg.eval.get("denoising_filmstrip_images", 4) or 4)   # separate FILES, each a different frame
+    rng = _np.random.default_rng(seed)
+    _ln = lambda x: F.layer_norm(x, (x.shape[-1],))
+    _plog(writer, f"[denoising_filmstrip @ep{step}] seed={seed} images={n_images} K={K} seeds={n_seeds} img={img_head}")
+    for i in range(n_images):
+        o, a, im = eps_ds[int(rng.integers(len(eps_ds)))]           # a DIFFERENT (episode, step) per image
+        Tlen = len(o)
+        t_ctx = int(rng.integers(max(P, 1), max(P + 1, Tlen - 2)))  # a real context step; predict frame t_ctx+1
+        obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device),
+               img_head: torch.from_numpy(im).float().div(255.0)[None].to(device)}
+        act = norm.norm_act(torch.from_numpy(a)).float()[None].to(device)
+        g = torch.Generator(device=device).manual_seed(seed + i)   # reproducible eps rows, distinct per image
+        with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
+            z = m.encode_state(obs)                                 # (1, Tlen, n_state, d)
+            w = min(m.window, t_ctx + 1)
+            h = m.backbone(m._to_input(z[:, t_ctx - w + 1:t_ctx + 1], act[:, t_ctx - w + 1:t_ctx + 1]))[:, -1]  # (1,n_input,d)
+        z_bag = z[0, t_ctx].float()                                 # (n_state, d) carried tokens
+        h_img = h[0, off:off + n_img, :].float()                    # (n_img, d) conditioning for the image tokens
+        z_img = z_bag[off:off + n_img]
+
+        def decode_step(x):                                         # image-token residual -> (H,W,3) float in [0,1]
+            bag = z_bag.clone()[None, None]                        # (1,1,n_state,d)
+            bag[0, 0, off:off + n_img] = _ln(z_img + x)
+            return m.to_obs(bag, heads=[img_head])[img_head][0, 0].clamp(0, 1).float().cpu().numpy()
+
+        gt = (im[t_ctx + 1].astype(_np.float32) / 255.0)           # GT next frame
+        rows = []
+        for s in range(n_seeds):
+            e = torch.randn(n_img, m.d, generator=g, device=device)
+            _, path = m.flow.sample(h_img, steps=K, deterministic=False, eps=e, record_path=True)  # K+1 latent states
+            rows.append([gt] + [decode_step(x) for x in path])     # [GT, noise(path0), step1..K]
+        col_titles = ["GT", "noise"] + [f"k{k}" for k in range(1, len(rows[0]) - 1)]
+        ncol = len(rows[0])
+        fig, axes = plt.subplots(n_seeds, ncol, figsize=(1.7 * ncol, 1.7 * n_seeds), squeeze=False)
+        for ri, row in enumerate(rows):
+            for ci, img_np in enumerate(row):
+                ax = axes[ri][ci]; ax.imshow(_np.clip(img_np, 0, 1)); ax.set_xticks([]); ax.set_yticks([])
+                if ri == 0:
+                    ax.set_title(col_titles[ci], fontsize=9)
+            axes[ri][0].set_ylabel(f"eps {ri}", fontsize=8)
+        fig.suptitle(f"denoising filmstrip {i} — predicted next frame resolving over K={K} dynamics-flow steps "
+                     f"(t={t_ctx}, {img_head})", fontsize=10)
+        fig.supxlabel("diffusion time →", fontsize=9)   # cols GT | noise | k1..kK read left-to-right as diffusion time
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        writer.figure(f"eval_flow/denoising_filmstrip_{i}", fig, step); plt.close(fig)
+    if was:
+        m.train()
+    _plog(writer, f"[denoising_filmstrip @ep{step}] done in {time.perf_counter() - t0:.1f}s ({n_images} images)")
     return {}
 
 
@@ -740,7 +881,8 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
 REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
             "control": eval_control, "denoising_multistep": eval_denoising_multistep,
-            "denoising_aggregate": eval_denoising_aggregate, "manifold": eval_manifold,
+            "denoising_aggregate": eval_denoising_aggregate, "denoising_filmstrip": eval_denoising_filmstrip,
+            "manifold": eval_manifold,
             "interpret": eval_interpret, "action_distribution": eval_action_distribution}
 
 

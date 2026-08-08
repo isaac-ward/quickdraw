@@ -780,6 +780,71 @@ def diffusion_quiver_sequential_frames(R, r, coloring, current, action_amb, agen
     return np.stack(frames)
 
 
+def _pad3(P, frac=0.05):
+    """Per-axis padded (lo,hi) for an (N,3) cloud -> ((xlo,xhi),(ylo,yhi),(zlo,zhi)). Autoscaled box for the
+    geometry-free 3D renderers (no torus R/r to derive limits from)."""
+    P = np.asarray(P, float).reshape(-1, 3)
+    lo, hi = P.min(0), P.max(0); pad = frac * (hi - lo + 1e-6)
+    return tuple((float(lo[i] - pad[i]), float(hi[i] + pad[i])) for i in range(3))
+
+
+def diffusion_swarm_plain_frames(current, agent_tail, future_path, steps, title="", lims=None,
+                                 size=6.0, dpi=VIDEO_DPI, log=None):
+    """Geometry-FREE fallback for diffusion_quiver_sequential_frames: the SAME N-sequential-swarm denoising
+    animation (static agent dot + black history tail + black future line; each step's swarm denoises to its
+    target, tails growing then collapsing) but in plain matplotlib 3D with axes AUTOSCALED from the data and
+    NO torus surface mesh. Used when the env supplies no geometry (recorded datasets). `steps`/`current`/
+    `agent_tail`/`future_path` are the SAME structures the torus renderer consumes."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
+    cur = np.asarray(current, float).reshape(3)
+    tail = np.asarray(agent_tail, float).reshape(-1, 3)
+    fut = np.asarray(future_path, float).reshape(-1, 3)
+    if lims is None:                                        # autoscale over EVERY point ever drawn
+        allpts = [cur[None], tail, fut]
+        for s in steps:
+            allpts.append(np.asarray(s["true_next"], float).reshape(1, 3))
+            for fr in s["per_frame"]:
+                for pcl in fr["swarm"]:
+                    allpts.append(np.asarray(pcl["trail"], float).reshape(-1, 3))
+        lims = _pad3(np.concatenate([a for a in allpts if len(a)], axis=0))
+    (xl, yl, zl) = lims
+    total = sum(len(s["per_frame"]) for s in steps) or 1
+    every = max(1, total // 10); t0 = time.perf_counter(); done = 0; frames = []
+
+    def draw(swarm, target):
+        fig = plt.figure(figsize=(size, size))
+        ax = fig.add_subplot(111, projection="3d"); ax.set_proj_type("ortho")
+        ax.set_xlim(xl); ax.set_ylim(yl); ax.set_zlim(zl)
+        ax.set_box_aspect((xl[1] - xl[0], yl[1] - yl[0], zl[1] - zl[0]))
+        if len(fut) > 1:
+            ax.plot(fut[:, 0], fut[:, 1], fut[:, 2], color="0.6", lw=1.2)          # static future line
+        if len(tail) > 1:
+            ax.plot(tail[:, 0], tail[:, 1], tail[:, 2], color="black", lw=1.4)     # static history tail
+        ax.scatter([cur[0]], [cur[1]], [cur[2]], s=60, c="black", depthshade=False)
+        if target is not None:
+            ax.scatter([target[0]], [target[1]], [target[2]], s=45, c="black", depthshade=False)
+        for pcl in (swarm or []):
+            tr = np.asarray(pcl["trail"], float).reshape(-1, 3)
+            if len(tr) > 1:
+                ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color="0.5", lw=0.6, alpha=0.7)   # denoising trail
+            p = np.asarray(pcl["particle"], float).reshape(3)
+            ax.scatter([p[0]], [p[1]], [p[2]], s=8, c="tab:blue", depthshade=False)     # swarm particle
+        ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+        ax.set_title(title, fontsize=10)
+        fig.set_dpi(dpi); rgb = _fig_rgb(fig); plt.close(fig)
+        return rgb
+
+    for s in steps:
+        tgt = np.asarray(s["true_next"], float).reshape(3)
+        for fr in s["per_frame"]:
+            if log is not None and done % every == 0:
+                log(_eta_str(t0, done, total))
+            frames.append(draw(fr["swarm"], tgt)); done += 1
+    if steps:                                              # 0.5s hold on the clean scene (last swarm gone)
+        frames.extend([draw([], np.asarray(steps[-1]["true_next"], float).reshape(3))] * 30)
+    return np.stack(frames) if frames else np.zeros((1, int(size * dpi), int(size * dpi), 3), np.uint8)
+
+
 # ------------------------- diffusion: recovered-manifold point clouds (matplotlib 3D) -------------------------
 _POINT_PURPLE = "#8E44AD"   # flat fill when no scalar `color` is given (color everything purple)
 

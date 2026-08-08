@@ -11,6 +11,13 @@ decode_chunk: 64           # eval_ood_horizon decodes the rolled-out latents to 
 #                            timesteps so the U-Net decoder peak is bounded (batch x chunk), NOT batch x horizon
 #                            -> long-horizon image eval doesn't OOM (PR #8 bug 2). null/0 -> decode whole rollout.
 n_plot: 1                  # per-episode trajectory plots+videos+error curves per eval split (just _0)
+denoising_filmstrip_steps: 8   # K Euler steps for the denoising_filmstrip eval — set LOCALLY (not inherited from
+#                                diffusion.sampling_steps/shortcut) so a K=1 (shortcut) training config still shows a
+#                                multi-panel trajectory. Columns of each strip = [GT, noise, step 1..K].
+# Two AXES for the filmstrip: `images` = how many DIFFERENT frames, each emitted as its OWN file
+# eval_flow/denoising_filmstrip_<i>; `seeds` = eps-noise ROWS within each file (the generative spread on one frame).
+denoising_filmstrip_images: 4  # number of different (episode, step) frames -> 4 separate files _0.._3
+denoising_filmstrip_seeds: 4   # number of eps-noise seeds = rows within each file -> shows the generative spread
 
 # denoising eval (diffusion only): which trajectory + swarm angle it shows, and the multistep render cost
 denoising_seed: null       # null -> use the epoch step (a DIFFERENT trajectory/angle each eval); set an int to pin one
@@ -32,7 +39,14 @@ during_train:
     control: true          # dual MPPI control (oracle vs learned) through 8 goals (eval_control)
     denoising_multistep: true  # diffusion ONLY: fixed-agent sequential-swarm flow-field video (self-skips for other models)
     denoising_aggregate: true  # diffusion ONLY: pooled next-states collapsing from noise onto the manifold (self-skips)
-    manifold: true         # ANY method: recovered-manifold UMAPs (data + latent space, 2D + 3D)
+    denoising_filmstrip: true  # AUTO-ON for flow dynamics: per-eps rows of [GT | noise | denoise step 1..K] image panels
+    #                            showing the predicted next FRAME resolve over diffusion time. SELF-SKIPS unless the model
+    #                            is MultiModalFlow with an image head, so true = on whenever the dynamics is flow, silently
+    #                            skipped otherwise. Env-agnostic (no geometry) -> the first eval_flow product usable on a
+    #                            recorded dataset. See knobs below.
+    manifold: true         # ANY method + ANY obs_dim: recovered-manifold UMAPs of the flattened LATENT bag (2D+3D).
+    #                        Dimension-agnostic — uses only latents (width n_state*d), no ecfg/geometry — so it's
+    #                        SAFE on any recorded dataset (torus or not); don't disable it for non-torus data (#9).
     interpret: false       # OFF in the train loop (user, 2026-08-05). VLM-labeled latent manifolds; needs
     #                        OPENAI_API_KEY + conf/interpret/<env>.yaml and ~20-30 min + OpenAI $ per eval epoch.
     #                        Run POST-HOC standalone: python -m quickdraw.eval_interpret checkpoint=<run>.

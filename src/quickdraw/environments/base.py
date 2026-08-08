@@ -78,6 +78,8 @@ class WorldEnv(Protocol):
       action_dist_split    -- obs -> (labels, low_name,     -> unlocks the by-state action-distribution
                               high_name) split by a             products (fallback: pooled-only panels).
                               MEANINGFUL state feature
+      position_indices     -- obs dims that are world xyz   -> unlocks the flow/manifold WORLD-SPACE viz
+                              (fallback: environments.position_idx config, else [0,1,2]).
       POLICIES             -- name -> factory(env, device)  -> unlocks env-shipped datagen behavior policies
                               (see environments/policies.make_policy; 'random' always available)."""
     action_dim: int
@@ -128,6 +130,14 @@ class WorldEnv(Protocol):
     # skip those products entirely (pooled-only panels). Envs without a meaningful split (e.g. RecordedEnv,
     # PendulumEnv) omit it.
     def action_dist_split(self, obs) -> tuple[np.ndarray, str, str] | None: ...
+
+    # OPTIONAL — the obs dims that are ambient WORLD xyz, for the flow/manifold WORLD-SPACE viz (eval_flow
+    # denoising_multistep/aggregate + the eval_ood_horizon paths). Return a length-3 list, or None. Torus &
+    # pendulum return [0,1,2] (their first three obs channels ARE the ambient position). RecordedEnv omits it
+    # (it can't know its dataset's layout) -> the dims come from the `environments.position_idx` CONFIG instead
+    # (e.g. robocasa EEF = [7,8,9]). Resolution order (evaluation.routines._pos_idx): explicit config override
+    # > this hook > [0,1,2] + a one-time warning. Unlocks the geometry-free 3D flow/manifold viz on any env.
+    def position_indices(self) -> list[int] | None: ...
 
 
 def default_rollout_metrics(pred_obs: Tensor, true_obs: Tensor) -> dict[str, Tensor]:

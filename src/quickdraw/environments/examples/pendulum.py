@@ -127,6 +127,10 @@ class PendulumEnv:
         self._torque = torch.zeros(batch, device=self.device)   # last applied torque (for the reward term)
 
     # ---- WorldEnv contract: REQUIRED (reset / step / reward / render_obs) --------------------------
+    def position_indices(self) -> list[int]:
+        """WorldEnv hook (#11): obs dims used as ambient world xyz for the flow/manifold viz (default triple)."""
+        return [0, 1, 2]
+
     def reset(self, generator: torch.Generator | None = None) -> Tensor:
         """Random start: theta ~ U[-pi, pi], theta_dot ~ U[-1, 1] (gym Pendulum-v1 init)."""
         rand = lambda: torch.rand(self.batch, device=self.device, generator=generator)

@@ -158,6 +158,10 @@ class TorusEnv:
             out["continuity"] = (v_hat[:, 1:-1] - sec) / vs
         return out
 
+    def position_indices(self) -> list[int]:
+        """WorldEnv hook (#11): obs dims that are ambient world xyz — torus proprio is [pos(3), vel(3)]."""
+        return [0, 1, 2]
+
     def render_diagnostics(self, overlay, views) -> dict:
         """OPTIONAL rich diagnostic renderer (WorldEnv protocol; design/gym_refactor.md Phase 5): draw the
         overlay's labelled world-space paths/markers on the torus. ONE view is offered — "scene", the

@@ -17,7 +17,7 @@ path demands of you, and what it unlocks (**✓** works · **✗** unavailable /
 | `reset` / `step` | ✗ | ✓ | ✓ |
 | `reward` | ✗ *(zeros)* | ✓ | ✓ |
 | `render_obs` | ✗ *(frames from data)* | ✓ | ✓ |
-| the 7 optional hooks ¹ | ✗ | ✗ | ✓ |
+| the 8 optional hooks ¹ | ✗ | ✗ | ✓ |
 | **You get** | | | |
 | WM training + validation | ✓ | ✓ | ✓ |
 | pointwise rollout metrics (`ood_horizon`) | ✓ | ✓ | ✓ |
@@ -31,7 +31,10 @@ path demands of you, and what it unlocks (**✓** works · **✗** unavailable /
 | scripted play policies | ✗ | ✗ | ✓ |
 
 ¹ `rollout_metrics`, `checkpoint_metric`, `render_diagnostics`, `control_goals`, `physical_loss`,
-`POLICIES`, `fork` — each independent, each with a graceful fallback (the ✗ rows above).
+`POLICIES`, `fork`, `position_indices` — each independent, each with a graceful fallback (the ✗ rows above).
+`position_indices` (obs dims that are ambient world xyz) unlocks the flow/manifold **world-space viz**
+(`eval_flow` denoising + `ood_horizon` paths); recorded datasets that don't ship an env set it via
+`environments.position_idx` instead (config overrides the hook). Fallback `[0,1,2]` with a one-time warning.
 ² interpret + the reward head use only the frozen WM + data + a VLM — **no env stepping** — so recorded
 (no-simulator) data can do them (they need a `conf/interpret/<env>.yaml` + a VLM). Only the **control** row
 needs a steppable env: the goal race *and* language steering both execute plans in the env.
@@ -156,6 +159,7 @@ eval you want. This is the extra-in → extra-out:
 | `physical_loss` | off-circle + energy-drift + continuity residuals | physics-informed training term | variation unavailable |
 | `POLICIES` | `swingup` (bang-bang) + `sinusoid` | scripted play policies (`data.action_sampler=swingup`) | `random` only |
 | `fork` | copy `θ`/`θ̇`/torque into a `k`-batch clone | the **oracle** rollout baseline in control | control skips the oracle |
+| `position_indices` | `return [0, 1, 2]` (first 3 obs = xyz) | flow/manifold **world-space viz** (`eval_flow`, `ood_horizon` paths) | `environments.position_idx` config, else `[0,1,2]` + warning |
 
 Implement all seven and pendulum runs the **entire** pipeline.
 
