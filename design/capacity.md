@@ -115,9 +115,14 @@ Two consequences worth testing, neither measured yet:
   lost. This predicts a lower LN homework figure at the same `num_tokens`, and is cheap to test:
   the floor gate needs no training.
 
-Alternative layouts, in increasing distance from the current one: 2D tiles (square-ish patches,
-fixes anisotropy), channel-major (token = one latent channel), strided interleave (every token
-global). All are pure index rearrangements — no parameters, no capacity change, EXACT preserved.
+Alternative layouts: channel-major (token = one latent channel) and strided/polyphase interleave
+(token k takes every `num_tokens`-th grid cell, so every token samples the whole grid). Both are
+pure index rearrangements — no parameters, no capacity change, EXACT preserved.
+
+2D square tiles are the obvious third option and are **rejected**: they bake in an image prior
+(locality + isotropy) that the rest of this model deliberately does not assume — the bag is a token
+set, not a spatial grid. The interleave argument above is not an image prior; it is about what
+LayerNorm removes.
 
 ---
 

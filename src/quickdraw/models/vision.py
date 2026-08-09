@@ -230,7 +230,15 @@ class GridToTokens(nn.Module):
         x = flat.reshape(B, self.T, self.per)                     # (B,T,per) — each token a contiguous patch
         if self.dense:
             return self.proj(x)
-        return F.pad(x, (0, self.d - self.per))                   # widen to d with zeros
+        # Widen to d with zeros. THIS IS NOT FREE, AND NOT MERELY IDLE WIDTH. Zero-pad + strip is a bijection,
+        # so the ADAPTER round-trip stays an exact identity -- but the model runs encode -> LayerNorm -> decode
+        # and _ln is PER TOKEN, not per element: it takes the mean and std over all d entries of the token,
+        # INCLUDING these zeros, and normalizes the `per` real floats by them. The pad therefore sits inside the
+        # statistic the signal is divided by, and stripping it afterwards cannot undo a scale that was already
+        # applied. Measured (robocasa 128px + frozen TAESD, 2026-08-09): bag 32x128 (75% pad) floors at 16.03 dB
+        # vs 20.41 dB for the EXACT 8x128 bag -- -4.4 dB, a bigger loss than ANY num_tokens choice. Keep
+        # num_tokens*d == the latent size (EXACT); see design/capacity.md and conf/model/mm_flow.yaml.
+        return F.pad(x, (0, self.d - self.per))
 
     def forward(self, grid):
         b = self.base(grid)
