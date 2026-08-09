@@ -61,7 +61,14 @@ class ModalitySpec:
     pretrained_name: str = "madebyollin/taesd"   # HF repo id, loaded via diffusers.AutoencoderTiny
     pretrained_init: bool = True                 # true=load HF weights; false=random-init SAME arch (prior-vs-arch ablation)
     freeze: bool = True                          # freeze the AE weights (Perceiver adapters still train); false=fine-tune
-    adapter: dict | None = None                  # Perceiver down/up-adapter config, e.g. {depth: 2} (default depth 2)
+    adapter: dict | None = None                  # down/up-adapter config: {depth: N, dense: bool}. The BASE path is a
+    #                              parameter-free index rearrangement (exactly invertible) + a zero-init residual, so
+    #                              the round-trip is the IDENTITY at step 0 whenever num_tokens*d >= latent floats
+    #                              (mode EXACT or PADDED). dense=true swaps the pad for a learned per->d projection
+    #                              (mode PROJECTED: dense tokens, no idle decode width, but NO identity guarantee).
+    latent_loss_weight: float = 1.0              # weight of the adapter ROUND-TRIP loss ||up(down(g))-g||^2 (#12).
+    #                              The ONLY term that supervises the adapter pair directly; decode_loss only ever
+    #                              trains up() on the dynamics' predicted bag. 0 -> off.
 
 
 class Modality(nn.Module):
@@ -223,9 +230,13 @@ class PretrainedImageModality(Modality):
             lat = self.taesd.encode(torch.zeros(1, spec.channels, H, W)).latents
         lat_ch, gh, gw = int(lat.shape[1]), int(lat.shape[2]), int(lat.shape[3])
         heads = max(1, d // 16)
-        depth = int((dict(spec.adapter) if spec.adapter else {}).get("depth", 2))
-        self.down_adapter = GridToTokens(lat_ch, (gh, gw), spec.num_tokens, d, heads, depth)
-        up = TokensToGrid(lat_ch, (gh, gw), spec.num_tokens, d, heads, depth)
+        _ad = dict(spec.adapter) if spec.adapter else {}
+        depth = int(_ad.get("depth", 2))
+        dense = bool(_ad.get("dense", False))      # PROJECTED (dense tokens, no identity) vs PADDED (identity)
+        self.down_adapter = GridToTokens(lat_ch, (gh, gw), spec.num_tokens, d, heads, depth, dense)
+        up = TokensToGrid(lat_ch, (gh, gw), spec.num_tokens, d, heads, depth, dense)
+        self.adapter_info = self.down_adapter.info          # mode/L/M/per/identity_at_init — reported at build
+        self.latent_loss_weight = float(getattr(spec, "latent_loss_weight", 1.0))
         self.decode_head = PretrainedImageHead(taesd=self.taesd, up_adapter=up, img_size=spec.img_size,
                                                channels=spec.channels)
         self.ae = _AEHolder(VisionAEConfig(img_size=spec.img_size, patch=spec.patch, d=d,
@@ -237,6 +248,18 @@ class PretrainedImageModality(Modality):
 
     def _decode_cond(self, flat_tok):              # (M, num_tokens, d) -> tokens (head decodes via up-adapter+TAESD)
         return flat_tok
+
+    def roundtrip_loss(self, obs: Tensor) -> Tensor:
+        """ROUND-TRIP latent loss (#12): ||up(down(g)) - g||^2 against the FROZEN TAESD latent g. This is the
+        only thing that directly supervises the adapter pair — decode_loss trains up() on the dynamics'
+        PREDICTED bag against pixels, and nothing there ever asks the pair to compose to the identity (that
+        omission is why the learned-Perceiver adapter collapsed to ~10.5 dB). Cheap: no TAESD DECODE forward.
+        obs (B,[T,]H,W,C) in [0,1]."""
+        flat = obs.reshape(-1, *obs.shape[obs.ndim - self._obs_ndim:])
+        with torch.no_grad():                      # the target is the frozen encoder's grid
+            g = self.taesd.encode(flat.permute(0, 3, 1, 2) * 2 - 1).latents
+        g_hat = self.decode_head.up_adapter(self.down_adapter(g))
+        return F.mse_loss(g_hat, g)
 
     def train(self, mode: bool = True):            # keep a frozen TAESD in eval permanently (Lightning can't flip it)
         super().train(mode)

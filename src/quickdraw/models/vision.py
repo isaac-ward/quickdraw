@@ -152,54 +152,113 @@ class ImageAutoencoder(nn.Module):
 # ---- pretrained-AE (TAESD) grid<->token adapters (issue #12 §2): bridge a spatial latent GRID and the token
 # BAG so the dynamics still sees num_tokens tokens (never a 16x16=256-token grid). Same Perceiver pattern as
 # ImageAutoencoder (learned queries cross-attend), reused here on the frozen pretrained-AE latent. ----
+def adapter_mode(lat_ch: int, grid_hw: tuple[int, int], num_tokens: int, d: int, dense: bool = False) -> dict:
+    """Decide (and DESCRIBE) how a pretrained-AE latent grid maps onto the num_tokens x d token bag.
+
+    L = lat_ch*gh*gw floats in the grid; M = num_tokens*d floats in the bag. The base path is a fixed
+    index rearrangement (NO parameters, exactly invertible); a learned residual refines on top.
+
+      EXACT     M == L            reshape only, no padding, no wasted decode width  -> identity at init
+      PADDED    M >  L, !dense    reshape + zero-pad each token to d, strip on the inverse -> identity at init
+      PROJECTED M >  L,  dense    learned per->d projection (dense tokens, no idle width) -> NOT identity
+      LOSSY     M <  L            impossible without discarding latent floats -> caller must raise
+
+    `per` = ceil(L/num_tokens) real floats per token; per <= d is guaranteed whenever M >= L (if per > d then
+    L > num_tokens*d = M, contradicting M >= L)."""
+    gh, gw = grid_hw
+    L, M = lat_ch * gh * gw, num_tokens * d
+    per = -(-L // num_tokens)                                    # ceil
+    if M < L:
+        mode = "LOSSY"
+    elif M == L:
+        mode = "EXACT"
+    else:
+        mode = "PROJECTED" if dense else "PADDED"
+    return {"mode": mode, "L": L, "M": M, "per": per, "pad_per_token": max(0, d - per),
+            "identity_at_init": mode in ("EXACT", "PADDED"),
+            "grid": (lat_ch, gh, gw), "bag": (num_tokens, d)}
+
+
+def _zero_init_last(module: nn.Module) -> nn.Module:
+    """Zero the LAST Linear's weight+bias so the module outputs exactly 0 -> a residual branch that starts as
+    a no-op (ControlNet / DiT adaLN-zero trick). This is what makes the round-trip an EXACT identity at init
+    rather than a well-initialised approximation."""
+    last = [m for m in module.modules() if isinstance(m, nn.Linear)][-1]
+    nn.init.zeros_(last.weight)
+    if last.bias is not None:
+        nn.init.zeros_(last.bias)
+    return module
+
+
 class GridToTokens(nn.Module):
-    """down-adapter: latent GRID (B, C, gh, gw) -> token LIST (B, num_tokens, d). Flatten the grid to gh*gw
-    spatial tokens of width C, Linear(C->d) + learned pos-embed, `depth` ViT refine blocks, then num_tokens
-    learned queries cross-attend (Perceiver bottleneck — same as ImageAutoencoder.encode)."""
+    """down-adapter: latent GRID (B, C, gh, gw) -> token LIST (B, num_tokens, d).
 
-    def __init__(self, lat_ch: int, grid_hw: tuple[int, int], num_tokens: int, d: int, heads: int, depth: int):
+    BASE PATH = a fixed index rearrangement, no parameters, exactly invertible by TokensToGrid. The grid is
+    permuted to (H, W, C) BEFORE flattening so each token is a contiguous SPATIAL PATCH carrying all channels
+    (ViT-patch-like), rather than a channel-major slab. Nothing is destroyed — the bag holds the same floats,
+    and the backbone's spatial attention re-mixes across tokens anyway.
+    REFINE = a zero-initialised residual, so at step 0 the adapter is EXACTLY the rearrangement."""
+
+    def __init__(self, lat_ch: int, grid_hw: tuple[int, int], num_tokens: int, d: int, heads: int, depth: int,
+                 dense: bool = False):
         super().__init__()
-        gh, gw = grid_hw
-        self.proj = nn.Linear(lat_ch, d)
-        self.pos = nn.Parameter(torch.zeros(1, gh * gw, d))
-        self.blocks = nn.ModuleList([ViTBlock(d, heads, 4.0) for _ in range(depth)])
-        self.latent_q = nn.Parameter(torch.zeros(1, num_tokens, d))
-        self.to_latent = CrossAttn(d, heads)
-        self.norm = nn.LayerNorm(d)
-        for p in (self.pos, self.latent_q):
-            nn.init.trunc_normal_(p, std=0.02)
+        self.info = adapter_mode(lat_ch, grid_hw, num_tokens, d, dense)
+        if self.info["mode"] == "LOSSY":
+            raise ValueError(
+                f"pretrained-AE adapter is LOSSY: latent {self.info['grid']} = {self.info['L']} floats does not "
+                f"fit the token bag {self.info['bag']} = {self.info['M']} floats. Raise model.modalities."
+                f"<image>.num_tokens or model.d so that num_tokens*d >= {self.info['L']}.")
+        self.lat_ch, (self.gh, self.gw) = lat_ch, grid_hw
+        self.T, self.d, self.per = num_tokens, d, self.info["per"]
+        self.dense = self.info["mode"] == "PROJECTED"
+        if self.dense:                                            # learned per->d (no identity guarantee)
+            self.proj = nn.Linear(self.per, d)
+        self.refine = _zero_init_last(nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 4 * d), nn.GELU(),
+                                                    nn.Linear(4 * d, d)))
 
-    def forward(self, grid):                                     # (B, C, gh, gw) -> (B, num_tokens, d)
-        B, C, gh, gw = grid.shape
-        x = self.proj(grid.permute(0, 2, 3, 1).reshape(B, gh * gw, C)) + self.pos
-        for blk in self.blocks:
-            x = blk(x)
-        return self.norm(self.to_latent(self.latent_q.expand(B, -1, -1), x))
+    def base(self, grid):                                        # (B,C,gh,gw) -> (B,T,d), parameter-free
+        B = grid.shape[0]
+        flat = grid.permute(0, 2, 3, 1).reshape(B, -1)            # (B, gh*gw*C) — spatial-major, channels inner
+        need = self.T * self.per
+        if flat.shape[1] < need:                                  # pad the FLAT vector so the split is even
+            flat = F.pad(flat, (0, need - flat.shape[1]))
+        x = flat.reshape(B, self.T, self.per)                     # (B,T,per) — each token a contiguous patch
+        if self.dense:
+            return self.proj(x)
+        return F.pad(x, (0, self.d - self.per))                   # widen to d with zeros
+
+    def forward(self, grid):
+        b = self.base(grid)
+        return b + self.refine(b)
 
 
 class TokensToGrid(nn.Module):
-    """up-adapter: token LIST (B, num_tokens, d) -> latent GRID (B, C, gh, gw). Mirror of GridToTokens: gh*gw
-    learned output-position queries cross-attend the num_tokens tokens, `depth` ViT refine blocks, Linear(d->C),
-    reshape back to the grid."""
+    """up-adapter: token LIST (B, num_tokens, d) -> latent GRID (B, C, gh, gw). EXACT inverse of
+    GridToTokens.base (strip the pad, unflatten, un-permute) + a zero-initialised residual, so
+    up(down(g)) == g exactly at init whenever the mode is EXACT or PADDED."""
 
-    def __init__(self, lat_ch: int, grid_hw: tuple[int, int], num_tokens: int, d: int, heads: int, depth: int):
+    def __init__(self, lat_ch: int, grid_hw: tuple[int, int], num_tokens: int, d: int, heads: int, depth: int,
+                 dense: bool = False):
         super().__init__()
-        gh, gw = grid_hw
-        self.gh, self.gw, self.lat_ch = gh, gw, lat_ch
-        self.out_pos = nn.Parameter(torch.zeros(1, gh * gw, d))
-        self.from_latent = CrossAttn(d, heads)
-        self.blocks = nn.ModuleList([ViTBlock(d, heads, 4.0) for _ in range(depth)])
-        self.norm = nn.LayerNorm(d)
-        self.to_grid = nn.Linear(d, lat_ch)
-        nn.init.trunc_normal_(self.out_pos, std=0.02)
+        self.info = adapter_mode(lat_ch, grid_hw, num_tokens, d, dense)
+        self.lat_ch, (self.gh, self.gw) = lat_ch, grid_hw
+        self.T, self.d, self.per = num_tokens, d, self.info["per"]
+        self.dense = self.info["mode"] == "PROJECTED"
+        if self.dense:
+            self.unproj = nn.Linear(d, self.per)
+        self.refine = _zero_init_last(nn.Sequential(nn.LayerNorm(lat_ch), nn.Linear(lat_ch, 4 * lat_ch),
+                                                    nn.GELU(), nn.Linear(4 * lat_ch, lat_ch)))
 
-    def forward(self, tokens):                                   # (B, num_tokens, d) -> (B, C, gh, gw)
+    def base(self, tokens):                                      # (B,T,d) -> (B,C,gh,gw), parameter-free
         B = tokens.shape[0]
-        x = self.from_latent(self.out_pos.expand(B, -1, -1), tokens)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.to_grid(self.norm(x))                           # (B, gh*gw, C)
-        return x.transpose(1, 2).reshape(B, self.lat_ch, self.gh, self.gw)
+        x = self.unproj(tokens) if self.dense else tokens[..., :self.per]      # (B,T,per)
+        flat = x.reshape(B, -1)[:, :self.lat_ch * self.gh * self.gw]           # strip the flat-vector pad
+        return flat.reshape(B, self.gh, self.gw, self.lat_ch).permute(0, 3, 1, 2)   # un-permute to (B,C,gh,gw)
+
+    def forward(self, tokens):
+        g = self.base(tokens)                                    # (B,C,gh,gw)
+        r = self.refine(g.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)   # refine over the CHANNEL dim
+        return g + r
 
 
 class _FiLMResBlock(nn.Module):

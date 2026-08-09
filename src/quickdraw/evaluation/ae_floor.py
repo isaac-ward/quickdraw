@@ -86,3 +86,57 @@ def _af(cfg):
         return cfg.get("ae_floor", {}) or {}
     except Exception:
         return {}
+
+
+def assert_identity_floor(cfg, model, log=print, n_frames=8, tol_db=0.1):
+    """EPOCH-0 GATE (#12 §4). For every pretrained-AE image trunk, round-trip REAL val frames through
+    encode->decode and compare against the SAME (frozen) AE used raw, with no adapter in the path.
+
+    When the adapter mode is EXACT/PADDED the base path is a parameter-free index rearrangement and the
+    residual is zero-initialised, so the round-trip is the IDENTITY at step 0 and the two PSNRs must agree to
+    float noise -> ASSERT. When the mode is PROJECTED there is a learned per->d map with no such guarantee, so
+    the delta is REPORTED and left to the round-trip loss to close. This turns "the tokenizer is faithful" from
+    a hope into a precondition, which is what the 10.5 dB learned-Perceiver collapse cost us the first time."""
+    import numpy as _np
+    import torch as _t
+
+    from ..data.dataset import load_fpv_frames
+    from ..training.setup import resolve_data_root
+    m = getattr(model, "_orig_mod", model)
+    mods = [(n, md) for n, md in getattr(m, "modalities", {}).items() if getattr(md, "adapter_info", None)]
+    if not mods:
+        return {}
+    root, cam = resolve_data_root(cfg), cfg.data.get("cam", "fpv")
+    out = {}
+    for name, mod in mods:
+        info = mod.adapter_info
+        sz = mod.ae.cfg.img_size
+        dev = next(mod.parameters()).device
+        frames = load_fpv_frames(root, "val", size=sz, cam=cam, max_frames=n_frames, cache=False)
+        gt = _t.from_numpy(_np.asarray(frames)).float().div(255.0).to(dev)
+        was = mod.training
+        mod.eval()
+        with _t.no_grad():
+            rec = mod.decode(mod.encode(gt)).clamp(0, 1)                       # through the ADAPTERS
+            x = gt.permute(0, 3, 1, 2) * 2 - 1                                  # raw AE, no adapter
+            raw = ((mod.taesd.decode(mod.taesd.encode(x).latents).sample + 1) / 2).permute(0, 2, 3, 1).clamp(0, 1)
+        if was:
+            mod.train()
+        p_ad = float(-10.0 * _np.log10(max(float(((rec - gt) ** 2).mean()), 1e-12)))
+        p_raw = float(-10.0 * _np.log10(max(float(((raw - gt) ** 2).mean()), 1e-12)))
+        delta = p_ad - p_raw
+        out[name] = {"adapter_db": p_ad, "raw_db": p_raw, "delta_db": delta, "mode": info["mode"]}
+        if info["identity_at_init"]:
+            ok = abs(delta) < tol_db
+            log(f"[ae_floor @ep0] {name}: adapter {p_ad:.2f} dB | raw AE {p_raw:.2f} dB | delta {delta:+.3f} dB "
+                f"| {info['mode']} -> {'OK' if ok else 'MISMATCH'}")
+            if not ok:
+                raise AssertionError(
+                    f"pretrained-AE adapter '{name}' is mode {info['mode']}, which GUARANTEES an identity "
+                    f"round-trip at init, but the epoch-0 floor is {p_ad:.2f} dB vs the raw AE's {p_raw:.2f} dB "
+                    f"(delta {delta:+.3f} dB > {tol_db}). The pad/strip indexing or the zero-init residual is "
+                    f"wrong — fix that rather than training through it.")
+        else:
+            log(f"[ae_floor @ep0] {name}: adapter {p_ad:.2f} dB | raw AE {p_raw:.2f} dB | delta {delta:+.3f} dB "
+                f"| {info['mode']} -> no identity guarantee, round-trip must be LEARNED (watch this climb)")
+    return out

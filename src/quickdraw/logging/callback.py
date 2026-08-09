@@ -29,6 +29,24 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
     if device is not None:
         head += f" | device={device}"
     lines = [head]
+    # PRETRAINED-AE adapter mode (#12). The token bag either holds the AE's latent EXACTLY (a parameter-free
+    # index rearrangement -> identity round-trip at init) or it does not, and that distinction decides whether
+    # the epoch-0 ae_floor is an assertable guarantee or merely a number to watch. Say which, out loud.
+    for _nm, _mod in getattr(m, "modalities", {}).items():
+        info = getattr(_mod, "adapter_info", None)
+        if not info:
+            continue
+        c, gh, gw = info["grid"]
+        T, dd = info["bag"]
+        detail = ("bijective reshape, no pad, no idle decode width" if info["mode"] == "EXACT" else
+                  f"{info['per']} real floats/token + {info['pad_per_token']} pad "
+                  f"({100 * info['per'] / dd:.0f}% of width read back at init)" if info["mode"] == "PADDED" else
+                  f"learned {info['per']}->{dd} projection (dense tokens)")
+        guarantee = ("identity-at-init GUARANTEED" if info["identity_at_init"]
+                     else "identity NOT guaranteed — round-trip must be LEARNED")
+        lines.append(f"[adapter] {_nm}: AE latent ({c},{gh},{gw})={info['L']} floats -> bag {T}x{dd}={info['M']}"
+                     f" | {info['mode']}: {detail} | {guarantee}"
+                     f" | roundtrip_loss w={getattr(_mod, 'latent_loss_weight', 0.0):g}")
     if hasattr(m, "arch_table"):   # token-bag dataflow (component | shape transform | params)
         lines.append(f"[arch] d={m.d} window={m.window} | per-step bag = {m.n_state} state token(s) + 1 action = {m.n_input} tokens")
         for comp, shape, params in m.arch_table():
@@ -184,6 +202,23 @@ class LoggingCallback(L.Callback):
         self._t_fit = time.perf_counter()
         n_params = sum(p.numel() for p in pl_module.model.parameters())   # constant -> log ONCE, not per epoch
         self.writer.scalars({"model/params": float(n_params), "model/params_millions": n_params / 1e6}, step=0)
+        # EPOCH-0 pretrained-AE gate (#12 §4), BEFORE any training. In an identity-guaranteed adapter mode the
+        # round-trip must already equal the raw AE; a mismatch is an indexing/zero-init bug that would otherwise
+        # masquerade as a bad model for the whole run (which is exactly what the ~10.5 dB Perceiver collapse did).
+        # No-op unless a pretrained-AE trunk is present.
+        try:
+            from ..controller.run import _plog
+            from ..evaluation.ae_floor import assert_identity_floor
+            res = assert_identity_floor(self.cfg, pl_module.model, log=lambda s: _plog(self.writer, s))
+            for nm, r in (res or {}).items():
+                self.writer.scalars({f"eval_ae_floor/{nm}/init_adapter_psnr": r["adapter_db"],
+                                     f"eval_ae_floor/{nm}/init_raw_ae_psnr": r["raw_db"],
+                                     f"eval_ae_floor/{nm}/init_delta_db": r["delta_db"]}, step=0)
+        except AssertionError:
+            raise                                  # a broken identity is fatal — do NOT train through it
+        except Exception as e:                     # a missing AE/dataset must not kill a run over a diagnostic
+            from ..controller.run import _plog
+            _plog(self.writer, f"[ae_floor @ep0] skipped ({type(e).__name__}: {e})")
 
     def on_train_epoch_start(self, trainer, pl_module):
         self._t_epoch = time.perf_counter()

@@ -153,6 +153,11 @@ class MultiModalSequenceModel(nn.Module):
                     out[f"shortcut/{name}"] = sc
             else:
                 out[name] = main
+            # ADAPTER ROUND-TRIP loss (#12): pretrained-AE trunks only. decode_loss above trains up() on the
+            # dynamics' PREDICTED bag; NOTHING there asks the adapter pair to compose to the identity, which is
+            # exactly how the learned-Perceiver adapter ended up at ~10.5 dB. This term supervises it directly.
+            if getattr(mod, "latent_loss_weight", 0.0) > 0 and hasattr(mod, "roundtrip_loss"):
+                out[f"roundtrip/{name}"] = mod.roundtrip_loss(targets[name]) * mod.latent_loss_weight
             off += n
         return out
 
