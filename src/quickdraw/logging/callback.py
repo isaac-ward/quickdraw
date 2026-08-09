@@ -202,12 +202,14 @@ class LoggingCallback(L.Callback):
         self._skipped = []   # (epoch, name) of every non-fatally-skipped eval, for the run-end summary
 
     def _eval_due(self, epoch: int) -> bool:
-        # UNION of the every-N cadence (20, 40, 60, ...) and the explicit at_epochs list (extra one-off
-        # epochs, e.g. an early [10] read). at_epochs ADDS to the cadence (not override), so
-        # `every=20, at_epochs=[10]` -> 10, 20, 40, 60, 80, ...  (SKIP epoch 0). every=0 disables the cadence.
+        # Cadence uses Lightning's (epoch+1)%N phase — SAME phase as validation (check_val_every_n_epoch) and
+        # the checkpoint — so the eval cadence COINCIDES with a val + fresh checkpoint (e.g. every=2 -> {1,3,5}
+        # 0-indexed, the epochs val runs). Eval still fires from on_train_epoch_end (every epoch, self-gated),
+        # NOT the val hook, so it never gets silently dropped when the eval cadence != val cadence. Epoch 0
+        # (untrained) is skipped. at_epochs is a UNION of explicit one-off epoch INDICES (literal, not phase-shifted).
         if epoch <= 0:
             return False
-        cadence = self.every > 0 and epoch % self.every == 0
+        cadence = self.every > 0 and (epoch + 1) % self.every == 0
         extra = self.at_epochs is not None and epoch in self.at_epochs
         return cadence or extra
 
@@ -251,6 +253,14 @@ class LoggingCallback(L.Callback):
         # epochs) and an even eval cadence (10, 20, 40, ...) they NEVER coincided and no eval ran. Running them
         # here (every train-epoch end) means the eval cadence is honored regardless of the val cadence. The
         # model is put in eval mode for the routines, then restored (validation, which follows, sets its own).
+        if trainer.current_epoch == 0 and self.routines and not trainer.sanity_checking:
+            # state the epoch-0 skip in progress.log (for eval AND val): the untrained baseline has nothing
+            # meaningful to evaluate/validate, so both intentionally skip epoch 0. Only logged here (once).
+            from ..controller.run import _plog
+            cv = int(getattr(trainer, "check_val_every_n_epoch", 1) or 1)
+            who = "eval" + (" + val" if cv > 1 else "")
+            _plog(self.writer, f"[{who} @ep0] SKIPPED — epoch-0 baseline not evaluated (barely trained); "
+                               f"cadence begins at ep1.")
         if trainer.sanity_checking or not (self.routines and self._eval_due(trainer.current_epoch)):
             return
         from ..evaluation.routines import REGISTRY
