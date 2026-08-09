@@ -101,24 +101,27 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
 
 @torch.no_grad()
 def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
-    """The ONE open-loop long-horizon eval for every model (OOD: horizon >> trained). One rollout over
-    held-out val episodes decodes proprio (always) + any image head; proprio and image outputs MIRROR each
-    other and the code generalizes over arbitrary trunks. All under eval_ood_horizon/, one block per head
-    nested under <head>/:
-      - AVERAGED (over episodes, not per-instance) error_vs_step_avg_{linear,log} curves + *_mean scalars:
-        proprio/ (obs_error/manifold/pointwise/tangent) and each image <head>/ (psnr/ssim/mse/l1).
-      - per-episode visuals for the first n_plot(=4) episodes: proprio/trajectory_plot_{i}/video_{i}/scene_{i},
-        and each image <head>/filmstrip_{i} + <head>/rollout_{i}.
-    Image decode is the cost, so n_ep=8 when an image head is present (else eval.n_episodes)."""
+    """The ONE long-horizon eval for every model (OOD: horizon >> trained). Held-out val episodes, decoding
+    proprio (always) + any image head; the code generalizes over arbitrary trunks. Products are nested under
+    a MODE sub-path, one full product set per mode:
+      - eval_ood_horizon/open_loop/*                — pure open-loop rollout (context = the first P frames).
+      - eval_ood_horizon/closed_loop_{X}_steps/*    — re-inject the GROUND-TRUTH observation as context every X
+        steps (one sub-tree per X in eval.closed_loop_steps, default [1, 16]). open_loop IS re-grounding with
+        every=H (one segment) — so all modes share ONE rollout fn + ONE emit fn.
+    Within each mode, one block per head under <head>/: AVERAGED error_vs_step_avg_{linear,log} + *_mean scalars
+    (proprio/ obs_error/manifold/pointwise/tangent, each image <head>/ psnr/ssim/mse/l1) + per-episode visuals
+    (proprio/trajectory_*, image <head>/filmstrip_i + rollout_i). n_ep=8 with an image head (decode cost)."""
     import numpy as _np
 
     from ..data.dataset import load_split_episodes_mm
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
+    heads = ["proprio"] + img_heads
     was = m.training
     m.eval()
     t0 = time.perf_counter()
     P, fps = cfg.data.P, round(1.0 / ecfg.dt)
+    dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None                  # chunk image decode over horizon (PR #8 bug 2)
 
     def prog(pct, what):
         _plog(writer, f"[eval_ood_horizon @ep{step}] {pct:3d}% — {what}")
@@ -129,61 +132,102 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     n_ep = min(8 if img_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(eps))
     eps = eps[:n_ep]
     H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
-    prog(0, f"start: {n_ep} eps, H={H}, heads={['proprio'] + img_heads}")
-
-    # ---- one rollout (proprio always; decode image heads too when present) ----
-    pro = torch.stack([norm.norm_obs(torch.from_numpy(o[:P])) for o, _, _ in eps]).float().to(device)
-    ctx = {"proprio": pro}
-    for h in img_heads:
-        ctx[h] = torch.stack([torch.from_numpy(im[:P]) for _, _, im in eps]).float().div(255.0).to(device)
-    acts = torch.stack([norm.norm_act(torch.from_numpy(a[:P + H - 1])) for _, a, _ in eps]).float().to(device)  # normalized (as trained)
-    dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None                  # chunk image decode over horizon (PR #8 bug 2)
-    out = m.imagine_eval(ctx, acts, H, heads=["proprio"] + img_heads, decode_chunk=dc)
-    prog(30, "rollout done")
-
-    n_plot = min(4, n_ep)                                                    # per-episode visuals for the first few
-
-    # ---- AVERAGED error-vs-step curves, one block per head (proprio + each image), mirrored. Averaged over
-    #      episodes (NOT per-instance) — same policy as proprio: no per-episode curves. ----
+    n_plot = min(4, n_ep)
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
     pos, pos_explicit = _pos_idx(cfg, env=env)                              # world-xyz obs dims (#11; env hook / config)
-    pred = out["proprio"]
-    p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
+    # GT context (first P frames, normalized) — the emit's ctx_xyz + the fallback obs_true, mode-independent.
+    pro0 = torch.stack([norm.norm_obs(torch.from_numpy(o[:P])) for o, _, _ in eps]).float().to(device)
+    ctx_obs = norm.denorm_obs(pro0[:n_plot]).cpu().numpy()
     p_true = torch.stack([torch.from_numpy(o[P:P + H]) for o, _, _ in eps]).float().to(device)
-    per_step = proprio_curves(pred, norm.norm_obs(p_true), p_hat, p_true, env,
-                              pos_slice=(pos if pos_explicit else None))    # position-L2 pointwise iff explicit
-    curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}        # mean over episodes -> (H,)
+    itrue = {h: torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
+             for h in img_heads}
 
-    images = {}                                                              # per image head: curves + frames for the emitter
-    for head in img_heads:
-        ipred = out[head].clamp(0, 1)                                        # (n_ep,H,s,s,3)
-        itrue = torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
-        images[head] = {"icurves": image_curves(ipred, itrue),               # shared per-step psnr/ssim/mse/l1
-                        "full_true": _np.stack([eps[i][2][:P + H].astype(_np.float32) / 255.0 for i in range(n_plot)]),
-                        "ipred": ipred[:n_plot].cpu().numpy()}
-        # per-step future-accuracy scalars at quarter-horizon steps -> eval_ood_horizon/<head>/<stat>/@+<x>
-        emit_horizon_readouts(writer, "eval_ood_horizon", head, images[head]["icurves"], H, step)
-    prog(45, f"averaged curves (proprio + {len(img_heads)} image head(s))")
+    def rollout_regrounded(every, Hm):
+        """Hm-step predicted obs (dict per head, (n_ep,Hm,...)), re-grounding on GT every `every` steps. Segment
+        the horizon into ceil(Hm/every) chunks; segment s uses GT context obs[s*every:s*every+P] and actions
+        a[s*every:s*every+P+every-1], rolls `every` steps via imagine_eval, keeps min(every, Hm-s*every), then
+        concatenates the segments in time. Segments are batched over (episode, segment); the batch is chunked
+        (context encode is NOT decode_chunk'd) so cl_1 doesn't OOM. every=Hm -> ONE segment == pure open-loop.
+        Hm = this mode's horizon (open_loop uses the full H; closed-loop uses min(H, eval.closed_loop_horizon))."""
+        every = min(int(every), Hm)
+        n_seg = -(-Hm // every)                                             # ceil(Hm/every)
+        C = {"proprio": []}
+        C.update({h: [] for h in img_heads})
+        A = []
+        for o, a, im in eps:                                                # (episode, segment) row order
+            for s in range(n_seg):
+                st = s * every
+                C["proprio"].append(norm.norm_obs(torch.from_numpy(o[st:st + P])))
+                for h in img_heads:
+                    C[h].append(torch.from_numpy(im[st:st + P]))
+                idx = _np.clip(_np.arange(st, st + P + every - 1), 0, len(a) - 1)   # last seg: pad+clamp (tail discarded)
+                A.append(norm.norm_act(torch.from_numpy(a[idx])))
+        ctx = {"proprio": torch.stack(C["proprio"]).float().to(device)}
+        for h in img_heads:
+            ctx[h] = torch.stack(C[h]).float().div(255.0).to(device)
+        acts = torch.stack(A).float().to(device)                           # (n_ep*n_seg, P+every-1, act_dim)
+        rows = n_ep * n_seg
+        cap = max(n_ep, 64)                                                 # per-call batch cap (open_loop: rows=n_ep -> ONE call)
+        segs = {h: [] for h in heads}
+        for r0 in range(0, rows, cap):
+            sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
+            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc)
+            for h in heads:
+                segs[h].append(o_c[h])
+        out = {}
+        for h in heads:
+            v = torch.cat(segs[h], 0)                                       # (n_ep*n_seg, every, ...)
+            v = v.reshape(n_ep, n_seg, *v.shape[1:])
+            out[h] = torch.cat([v[:, s, :min(every, Hm - s * every)] for s in range(n_seg)], dim=1)  # (n_ep,Hm,...)
+        return out
 
-    # ---- everything (curves + per-episode trajectory/image visuals) via the shared open-loop emitter ----
-    desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
-            "the model's PREDICTED path, sharing the context then diverging at the fork.")
-    ctx_obs = norm.denorm_obs(pro[:n_plot]).cpu().numpy()                    # pos/pos_explicit computed above
-    emit_openloop(writer, "eval_ood_horizon", step, env=env, R=getattr(ecfg, "R", None),  # R/r only read by the
-                  r=getattr(ecfg, "r", None), coloring="hsv", fps=fps, P=P,               # rich (torus) scene path
-                  smooth_window=int(cfg.data.action_smooth_window), description=desc,
-                  ctx_xyz=ctx_obs[:, :, pos],
-                  p_true_xyz=p_true[:n_plot][:, :, pos].cpu().numpy(), p_hat_xyz=p_hat[:n_plot][:, :, pos].cpu().numpy(),
-                  actions=[eps[i][1][:P + H].astype(_np.float32) for i in range(n_plot)],
-                  curves=curves, n_plot=n_plot, images=(images or None),
-                  obs_true=_np.concatenate([ctx_obs, p_true[:n_plot].cpu().numpy()], axis=1),
-                  obs_pred=p_hat[:n_plot].cpu().numpy(),
-                  title_fn=lambda i: f"eval_ood_horizon #{i} H={H}", log=lambda msg: prog(50, msg))
+    def score_and_emit(out, subroutine, desc, Hm):
+        """Score (image_curves per head + proprio_curves) + emit (emit_openloop) a completed rollout under the
+        `subroutine` tag (e.g. eval_ood_horizon/open_loop). Head nesting rides under it via product_tag. `Hm`
+        is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H)."""
+        pred = out["proprio"]
+        p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
+        pt = p_true[:, :Hm]                                                    # GT future sliced to this mode's horizon
+        per_step = proprio_curves(pred, norm.norm_obs(pt), p_hat, pt, env,
+                                  pos_slice=(pos if pos_explicit else None))    # position-L2 pointwise iff explicit
+        curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}
+        images = {}
+        for head in img_heads:
+            ipred = out[head].clamp(0, 1)
+            images[head] = {"icurves": image_curves(ipred, itrue[head][:, :Hm]),
+                            "full_true": _np.stack([eps[i][2][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
+                            "ipred": ipred[:n_plot].cpu().numpy()}
+            emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
+        emit_openloop(writer, subroutine, step, env=env, R=getattr(ecfg, "R", None), r=getattr(ecfg, "r", None),
+                      coloring="hsv", fps=fps, P=P, smooth_window=int(cfg.data.action_smooth_window), description=desc,
+                      ctx_xyz=ctx_obs[:, :, pos],
+                      p_true_xyz=pt[:n_plot][:, :, pos].cpu().numpy(), p_hat_xyz=p_hat[:n_plot][:, :, pos].cpu().numpy(),
+                      actions=[eps[i][1][:P + Hm].astype(_np.float32) for i in range(n_plot)],
+                      curves=curves, n_plot=n_plot, images=(images or None),
+                      obs_true=_np.concatenate([ctx_obs, pt[:n_plot].cpu().numpy()], axis=1),
+                      obs_pred=p_hat[:n_plot].cpu().numpy(),
+                      title_fn=lambda i: f"{subroutine} #{i} H={Hm}", log=lambda msg: prog(50, msg))
+        return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
+
+    cl_steps = [int(x) for x in cfg.eval.get("closed_loop_steps", [1, 16])]
+    cl_h = min(H, int(cfg.eval.get("closed_loop_horizon", 256) or H))       # closed-loop modes roll only this many steps
+    modes = [("open_loop", H, H)] + [(f"closed_loop_{x}_steps", x, cl_h) for x in cl_steps]   # (name, every, horizon)
+    prog(0, f"start: {n_ep} eps, H={H} (closed-loop H={cl_h}), heads={heads}, modes={[mn for mn, _, _ in modes]}")
+    summary = {}
+    for k, (name, every, Hm) in enumerate(modes):
+        prog(int(5 + 90 * k / len(modes)), f"mode {name} (re-ground every {every} steps, H={Hm})"
+             if every < Hm else f"mode {name} (open-loop, no re-grounding, H={Hm})")
+        out = rollout_regrounded(every, Hm)
+        desc = (f"Open-loop long-horizon rollout: a BLACK agent on the TRUE path and a GREY agent on the model's "
+                f"PREDICTED path, sharing the context then diverging at the fork." if every >= Hm else
+                f"Closed-loop rollout: the GROUND-TRUTH observation is re-injected as context every {every} steps "
+                f"(over a {Hm}-step horizon), so error resets each re-grounding instead of compounding.")
+        summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm))
 
     if was:
         m.train()
     prog(100, f"done in {time.perf_counter() - t0:.1f}s")
-    return {"eval_ood_horizon/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
+    return summary
 
 
 @torch.no_grad()

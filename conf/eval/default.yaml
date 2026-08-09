@@ -6,6 +6,13 @@ action_dist_episodes: 64   # LOCKED (user, 2026-07-20): action-distribution eval
 #                            split) for DENSE histograms (~256/bin with window pooling). NEVER lower this — a
 #                            lower value made the plots look sparse (n~30). DO NOT CHANGE / do not override lower.
 horizon: 2048              # long-horizon / ood rollout length (capped by episode length); image heads roll it too
+closed_loop_steps: [1, 16] # eval_ood_horizon extra modes: re-inject the GROUND-TRUTH obs as context every X steps
+#                            (X in this list) -> products under eval_ood_horizon/closed_loop_<X>_steps/ alongside
+#                            eval_ood_horizon/open_loop/. Env-agnostic.
+closed_loop_horizon: 256   # caps the rollout horizon for the CLOSED-LOOP modes ONLY (open_loop keeps the full
+#                            `horizon`). The closed-loop error-vs-step signal is stationary/periodic (it resets every
+#                            X steps), so a shorter horizon captures it; and cl_1 at full H is n_ep*H context-encodes
+#                            = slow. Set null/0 to use the full `horizon` for closed-loop too.
 n_episodes: 64             # episodes averaged per OOD open-loop eval (proprio-only; image heads use 8, decode cost)
 ae_floor_episodes: 2       # val trajectories for eval_ae_floor (the encode->decode ceiling; #12). Cheap -> keep small.
 decode_chunk: 64           # eval_ood_horizon decodes the rolled-out latents to images in chunks of this many
