@@ -160,6 +160,11 @@ def adapter_mode(lat_ch: int, grid_hw: tuple[int, int], num_tokens: int, d: int,
 
       EXACT     M == L            reshape only, no padding, no wasted decode width  -> identity at init
       PADDED    M >  L, !dense    reshape + zero-pad each token to d, strip on the inverse -> identity at init
+                                  BUT: `identity_at_init` is an ADAPTER-ONLY property. The model runs
+                                  encode -> LayerNorm -> decode, and LN is PER TOKEN, so the pad floats join
+                                  the mean/std the real floats are normalized by. PADDED is therefore NOT
+                                  identity end-to-end and is measurably WORSE than any EXACT split: 16.03 dB
+                                  vs 20.41 dB on robocasa 128px + frozen TAESD (2026-08-09). Prefer EXACT.
       PROJECTED M >  L,  dense    learned per->d projection (dense tokens, no idle width) -> NOT identity
       LOSSY     M <  L            impossible without discarding latent floats -> caller must raise
 

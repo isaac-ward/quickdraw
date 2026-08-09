@@ -156,6 +156,17 @@ modalities:
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
   - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet,
      pretrained: false, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2}}
+  # TOKEN BUDGET RULE (measured 2026-08-09, robocasa 128px + frozen TAESD): keep num_tokens * d EXACTLY equal to
+  #   the AE latent size (TAESD @128px -> 4*16*16 = 1024 floats; @256px -> 4096). NEVER pad.
+  #   Padding is NOT idle capacity -- LayerNorm is PER TOKEN, so pad floats enter the mean/std the real floats are
+  #   normalized BY and actively distort them: bag 32x128 (75% pad) floors at 16.03 dB vs 20.41 dB for EXACT 8x128,
+  #   a 4.4 dB loss, worse than any num_tokens choice. The startup [adapter] line reports the mode and the fix.
+  #   At a FIXED budget num_tokens and d see-saw, and both sides cost something (init floor, before the adapter
+  #   residual trains -- these are NOT converged numbers):
+  #     4x256 20.79 dB | 8x128 20.41 (default) | 16x64 20.01 | 32x32 19.72 | 64x16 18.68
+  #   More tokens = finer spatial addressing for the dynamics (a token is a raster stripe of the latent grid;
+  #   8 tokens = 2 rows each) but a smaller backbone (params ~ d^2) and more LayerNorm to undo (LN drops 2 scalars
+  #   per token). Fewer tokens = the reverse. See design/capacity.md.
   # PRETRAINED IMAGE AE (issue #12): pretrained=false (default) -> the bespoke conv/unet AE above, BIT-IDENTICAL.
   #   pretrained=true -> TAESD (diffusers.AutoencoderTiny) encode/decode bridged to the num_tokens x d token bag by
   #   learned Perceiver adapters (encode_arch/decode_arch/decode_base then ignored). Gate (raw TAESD, no training):

@@ -53,9 +53,11 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
                      f" | {info['mode']}: {detail} | {guarantee}"
                      f" | roundtrip_loss w={getattr(_mod, 'latent_loss_weight', 0.0):g}")
         if info["mode"] in ("PADDED", "PROJECTED"):
-            # M > L is NOT free. The bag carries M floats but only L of them are real, so every step pays
-            # attention + backbone compute on num_tokens tokens while the decode path reads back only `per`
-            # dims each. Say the waste out loud, with the exact resize that makes it EXACT.
+            # M > L is NOT free, and it is NOT merely idle capacity. LayerNorm is PER TOKEN, so the pad floats
+            # are included in the mean/std the real floats are normalized BY -- they actively distort the signal
+            # rather than sitting inert. MEASURED (robocasa 128px + frozen TAESD, 2026-08-09): bag 32x128 (75%
+            # pad) floors at 16.03 dB vs 20.41 dB for the EXACT 8x128 bag -- padding costs 4.4 dB, a bigger hit
+            # than any num_tokens choice. Say that out loud, with the exact resize that makes it EXACT.
             waste = 100.0 * (1.0 - info["L"] / info["M"])
             fixes = []
             if info["L"] % T == 0:
@@ -63,9 +65,13 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
             if info["L"] % dd == 0:
                 fixes.append(f"num_tokens={info['L'] // dd}")
             hint = " or ".join(fixes) if fixes else f"any num_tokens*d == {info['L']}"
+            damage = (" and it is NOT just idle width: LayerNorm is per-token, so those floats enter the "
+                      "mean/std the real ones are divided by and ACTIVELY DEGRADE reconstruction "
+                      "(measured -4.4 dB on robocasa/TAESD: 16.03 dB padded vs 20.41 dB EXACT)") if _ln_on else ""
             lines.append(f"[adapter] {_nm}: WASTING {waste:.0f}% of the bag ({info['M'] - info['L']} of "
                          f"{info['M']} floats carry no latent) — {T} tokens are attended every step but only "
-                         f"{info['per']}/{dd} dims per token feed the decoder at init. For EXACT set {hint}.")
+                         f"{info['per']}/{dd} dims per token feed the decoder at init{damage}. "
+                         f"For EXACT set {hint}.")
     if hasattr(m, "arch_table"):   # token-bag dataflow (component | shape transform | params)
         lines.append(f"[arch] d={m.d} window={m.window} | per-step bag = {m.n_state} state token(s) + 1 action = {m.n_input} tokens")
         for comp, shape, params in m.arch_table():
