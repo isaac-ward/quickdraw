@@ -132,7 +132,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     n_ep = min(8 if img_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(eps))
     eps = eps[:n_ep]
     H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
-    n_plot = min(4, n_ep)
+    n_plot = min(int(cfg.eval.get("n_plot", 2) or 2), n_ep)   # per-episode visuals; SAME episode indices (0..n_plot-1) across all modes
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
     pos, pos_explicit = _pos_idx(cfg, env=env)                              # world-xyz obs dims (#11; env hook / config)
     # GT context (first P frames, normalized) — the emit's ctx_xyz + the fallback obs_true, mode-independent.
@@ -280,7 +280,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
     recon = {k: torch.cat(v, dim=1) for k, v in rec_acc.items()}
     prog(30, "encode->decode done")
 
-    n_plot = min(4, n_ep)
+    n_plot = min(int(cfg.eval.get("n_plot", 2) or 2), n_ep)   # per-episode visuals; SAME episode indices (0..n_plot-1) across all modes
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
     pos, pos_explicit = _pos_idx(cfg, env=env)                       # world-xyz obs dims (#11; env hook / config)
     pred = recon["proprio"][:, P:P + H]                              # reconstructed proprio (normalized)

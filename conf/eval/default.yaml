@@ -18,7 +18,8 @@ ae_floor_episodes: 2       # val trajectories for eval_ae_floor (the encode->dec
 decode_chunk: 64           # eval_ood_horizon decodes the rolled-out latents to images in chunks of this many
 #                            timesteps so the U-Net decoder peak is bounded (batch x chunk), NOT batch x horizon
 #                            -> long-horizon image eval doesn't OOM (PR #8 bug 2). null/0 -> decode whole rollout.
-n_plot: 1                  # per-episode trajectory plots+videos+error curves per eval split (just _0)
+n_plot: 2                  # per-episode trajectory plots+videos+filmstrips per eval routine (_0.._{n-1}); SAME
+#                            episode indices across eval_ood_horizon's open_loop + every closed_loop_X mode.
 denoising_filmstrip_steps: 8   # K Euler steps for the denoising_filmstrip eval — set LOCALLY (not inherited from
 #                                diffusion.sampling_steps/shortcut) so a K=1 (shortcut) training config still shows a
 #                                multi-panel trajectory. Columns of each strip = [GT, noise, step 1..K].
