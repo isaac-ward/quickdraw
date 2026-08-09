@@ -47,6 +47,20 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
         lines.append(f"[adapter] {_nm}: AE latent ({c},{gh},{gw})={info['L']} floats -> bag {T}x{dd}={info['M']}"
                      f" | {info['mode']}: {detail} | {guarantee}"
                      f" | roundtrip_loss w={getattr(_mod, 'latent_loss_weight', 0.0):g}")
+        if info["mode"] in ("PADDED", "PROJECTED"):
+            # M > L is NOT free. The bag carries M floats but only L of them are real, so every step pays
+            # attention + backbone compute on num_tokens tokens while the decode path reads back only `per`
+            # dims each. Say the waste out loud, with the exact resize that makes it EXACT.
+            waste = 100.0 * (1.0 - info["L"] / info["M"])
+            fixes = []
+            if info["L"] % T == 0:
+                fixes.append(f"model.d={info['L'] // T}")
+            if info["L"] % dd == 0:
+                fixes.append(f"num_tokens={info['L'] // dd}")
+            hint = " or ".join(fixes) if fixes else f"any num_tokens*d == {info['L']}"
+            lines.append(f"[adapter] {_nm}: WASTING {waste:.0f}% of the bag ({info['M'] - info['L']} of "
+                         f"{info['M']} floats carry no latent) — {T} tokens are attended every step but only "
+                         f"{info['per']}/{dd} dims per token feed the decoder at init. For EXACT set {hint}.")
     if hasattr(m, "arch_table"):   # token-bag dataflow (component | shape transform | params)
         lines.append(f"[arch] d={m.d} window={m.window} | per-step bag = {m.n_state} state token(s) + 1 action = {m.n_input} tokens")
         for comp, shape, params in m.arch_table():
