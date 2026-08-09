@@ -53,7 +53,7 @@ class MultiModalSequenceModel(nn.Module):
 
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
                  mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
-                 compile_rollout: bool = False):
+                 compile_rollout: bool = False, latent_norm: bool = True):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)
@@ -72,7 +72,11 @@ class MultiModalSequenceModel(nn.Module):
         self.act_enc = _mlp(action_dim, d, d)                 # action -> 1 token
         self.backbone = SpaceTimeTransformer(d, depth, heads, window, mlp_ratio,
                                              n_slots=self.n_input, rope_theta=rope_theta)
-        self.latent_norm = True   # LN the carried token bag (scale-free); LSAR turns it OFF for variance-based regs
+        # LN the carried token bag (scale-free). MUST be honoured at EVERY point the bag is produced —
+        # encode_state AND predict_next AND the DF noised context — or the encoder and the dynamics emit bags in
+        # two different spaces and the flag is silently unusable (bug, 2026-08-09: predict_next LN'd
+        # unconditionally). LSAR turns it OFF for variance-based regs (var/cov fight LN).
+        self.latent_norm = bool(latent_norm)
 
     def arch_table(self) -> list[tuple[str, str, int]]:
         """Rows (component, shape transform, #params) describing the token-bag dataflow — printed at the top
@@ -416,12 +420,12 @@ class MultiModalLSAR(MultiModalSequenceModel):
     pred_latent = MSE to the encoded true-next bag (Reconstruction collapse: obs heads ground the encoder)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 grad_checkpoint: bool = False, compile_rollout: bool = False,
+                 grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True,
                  pred_hidden: int = 0, lambda_pred_latent: float = 1.0,
                  collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
-                         compile_rollout=compile_rollout)
+                         compile_rollout=compile_rollout, latent_norm=latent_norm)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
@@ -431,7 +435,7 @@ class MultiModalLSAR(MultiModalSequenceModel):
         # POLICY object here: MM keeps its own multi-encoder EMA/encode mechanics but reads the strategy's
         # flags + reg_loss + pred_metric. Reconstruction (obs grounds the encoder) is the default.
         self.collapse = collapse or Reconstruction()
-        self.latent_norm = not self.collapse.has_reg           # OFF for vicreg/sigreg (var/cov fight LN)
+        self.latent_norm = latent_norm and not self.collapse.has_reg   # OFF for vicreg/sigreg (var/cov fight LN)
         self.pred_obs_in_loss = self.collapse.obs_grounds_encoder
         self.predictor_q = None                                # BYOL online-only predictor q (asymmetry)
         if self.collapse.needs_predictor:
@@ -503,7 +507,7 @@ class MultiModalFlow(MultiModalSequenceModel):
     (deterministic ε=0 at eval unless stochastic_eval — the committed prediction)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 grad_checkpoint: bool = False, compile_rollout: bool = False,
+                 grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True,
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = False, time_sampling: str = "uniform", flow_hidden: int = 0,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
@@ -513,7 +517,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  dynamics_detach_encoder: bool = False):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
-                         compile_rollout=compile_rollout)
+                         compile_rollout=compile_rollout, latent_norm=latent_norm)
         assert predict in ("residual", "absolute")
         self.predict_residual = predict == "residual"
         self.sampling_steps = int(sampling_steps)
@@ -565,7 +569,8 @@ class MultiModalFlow(MultiModalSequenceModel):
     def predict_next(self, h_state: Tensor, prev_bag: Tensor) -> Tensor:
         det = (not self.training) and (not self.stochastic_eval)
         out = self.flow.sample(h_state, steps=self.sampling_steps, deterministic=det)   # per-token over the bag
-        return _ln(prev_bag + out) if self.predict_residual else _ln(out)
+        out = prev_bag + out if self.predict_residual else out
+        return _ln(out) if self.latent_norm else out
 
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
         """Teacher-forced rectified-flow loss over the bag (mirrors models/diffusion.py)."""
@@ -580,7 +585,9 @@ class MultiModalFlow(MultiModalSequenceModel):
             levels = torch.rand(s.shape[:-2] + (1,), device=s.device, dtype=s.dtype) * self.df_scale  # (B,L-1,1)
             eps = torch.randn_like(s)
             lv = levels.unsqueeze(-2)                            # (B,L-1,1,1) broadcast over n_state,d
-            s = _ln((1.0 - lv) * s + lv * eps)                  # noised context (renormalized on the sphere)
+            s = (1.0 - lv) * s + lv * eps                        # noised context
+            if self.latent_norm:
+                s = _ln(s)                                       # renormalized back onto the sphere
         h = self.backbone(self._to_input(s, act_seq[:, :L - 1], levels=levels))
         h_state = h[..., : self.n_state, :]                     # (B,L-1,n_state,d)
         target = (z[:, 1:] - z[:, :-1]).detach() if self.predict_residual else z[:, 1:].detach()  # target off CLEAN z
