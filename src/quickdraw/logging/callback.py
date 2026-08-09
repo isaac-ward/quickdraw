@@ -42,8 +42,13 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
                   f"{info['per']} real floats/token + {info['pad_per_token']} pad "
                   f"({100 * info['per'] / dd:.0f}% of width read back at init)" if info["mode"] == "PADDED" else
                   f"learned {info['per']}->{dd} projection (dense tokens)")
-        guarantee = ("identity-at-init GUARANTEED" if info["identity_at_init"]
-                     else "identity NOT guaranteed — round-trip must be LEARNED")
+        # The guarantee is a property of the ADAPTER ALONE. encode_state LayerNorms the bag when
+        # model.latent_norm is on, and non-affine LN discards each token's mean+std, so the END-TO-END
+        # round-trip is legitimately below the adapter-only one. Do not claim otherwise (the earlier line did).
+        _ln_on = bool(getattr(m, "latent_norm", False))
+        guarantee = ("exactly invertible" if info["identity_at_init"] else "LEARNED (lossy) grid<->token map")
+        if _ln_on:
+            guarantee += "; bag is LayerNormed before the dynamics, so the real floor is lower — see [ae_floor @ep0]"
         lines.append(f"[adapter] {_nm}: AE latent ({c},{gh},{gw})={info['L']} floats -> bag {T}x{dd}={info['M']}"
                      f" | {info['mode']}: {detail} | {guarantee}"
                      f" | roundtrip_loss w={getattr(_mod, 'latent_loss_weight', 0.0):g}")

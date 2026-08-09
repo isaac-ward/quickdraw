@@ -89,14 +89,23 @@ def _af(cfg):
 
 
 def assert_identity_floor(cfg, model, log=print, n_frames=8, tol_db=0.1):
-    """EPOCH-0 GATE (#12 §4). For every pretrained-AE image trunk, round-trip REAL val frames through
-    encode->decode and compare against the SAME (frozen) AE used raw, with no adapter in the path.
+    """EPOCH-0 GATE (#12 sec 4). Reports TWO numbers per pretrained-AE trunk and asserts only the one that is
+    actually guaranteed:
 
-    When the adapter mode is EXACT/PADDED the base path is a parameter-free index rearrangement and the
-    residual is zero-initialised, so the round-trip is the IDENTITY at step 0 and the two PSNRs must agree to
-    float noise -> ASSERT. When the mode is PROJECTED there is a learned per->d map with no such guarantee, so
-    the delta is REPORTED and left to the round-trip loss to close. This turns "the tokenizer is faithful" from
-    a hope into a precondition, which is what the 10.5 dB learned-Perceiver collapse cost us the first time."""
+      adapter-only   up(down(g))                    -- a property of the adapter ALONE. When the mode is
+                                                      EXACT/PADDED this is a parameter-free rearrangement plus
+                                                      a zero-init residual, so it MUST equal the raw AE at init.
+                                                      ASSERTED: a mismatch is an indexing/zero-init bug.
+      model path     to_obs(encode_state(frames))   -- what the dynamics actually consumes. When
+                                                      model.latent_norm is on, encode_state LayerNorms the bag,
+                                                      which DISCARDS each token's mean and std, so this is
+                                                      legitimately BELOW the adapter-only number. REPORTED, not
+                                                      asserted -- LN is a deliberate design choice (it keeps the
+                                                      carried bag scale-free and the dynamics better
+                                                      conditioned), not a bug to assert away.
+
+    The earlier version measured only the adapter path and called it the floor, certifying 23.92 dB while the
+    model actually ran at 20.41 dB."""
     import numpy as _np
     import torch as _t
 
@@ -107,6 +116,7 @@ def assert_identity_floor(cfg, model, log=print, n_frames=8, tol_db=0.1):
     if not mods:
         return {}
     root, cam = resolve_data_root(cfg), cfg.data.get("cam", "fpv")
+    ln_on = bool(getattr(m, "latent_norm", False))
     out = {}
     for name, mod in mods:
         info = mod.adapter_info
@@ -114,29 +124,33 @@ def assert_identity_floor(cfg, model, log=print, n_frames=8, tol_db=0.1):
         dev = next(mod.parameters()).device
         frames = load_fpv_frames(root, "val", size=sz, cam=cam, max_frames=n_frames, cache=False)
         gt = _t.from_numpy(_np.asarray(frames)).float().div(255.0).to(dev)
-        was = mod.training
-        mod.eval()
+        was = m.training
+        m.eval()
         with _t.no_grad():
-            rec = mod.decode(mod.encode(gt)).clamp(0, 1)                       # through the ADAPTERS
-            x = gt.permute(0, 3, 1, 2) * 2 - 1                                  # raw AE, no adapter
+            rec_ad = mod.decode(mod.encode(gt)).clamp(0, 1)                     # adapter only, no LN
+            x = gt.permute(0, 3, 1, 2) * 2 - 1
             raw = ((mod.taesd.decode(mod.taesd.encode(x).latents).sample + 1) / 2).permute(0, 2, 3, 1).clamp(0, 1)
+            obs = {}                                                            # encode_state needs EVERY trunk
+            for nm2, _n2 in m.layout:
+                obs[nm2] = gt if nm2 == name else _t.zeros(len(gt), getattr(m.modalities[nm2], "dim", 1), device=dev)
+            rec_model = m.to_obs(m.encode_state(obs), heads=[name])[name].clamp(0, 1)
         if was:
-            mod.train()
-        p_ad = float(-10.0 * _np.log10(max(float(((rec - gt) ** 2).mean()), 1e-12)))
-        p_raw = float(-10.0 * _np.log10(max(float(((raw - gt) ** 2).mean()), 1e-12)))
+            m.train()
+        db = lambda a: float(-10.0 * _np.log10(max(float(((a - gt) ** 2).mean()), 1e-12)))
+        p_ad, p_raw, p_model = db(rec_ad), db(raw), db(rec_model)
         delta = p_ad - p_raw
-        out[name] = {"adapter_db": p_ad, "raw_db": p_raw, "delta_db": delta, "mode": info["mode"]}
+        out[name] = {"adapter_db": p_ad, "raw_db": p_raw, "delta_db": delta, "model_db": p_model,
+                     "mode": info["mode"], "latent_norm": ln_on}
+        # ONE line, the number that matters: what the dynamics actually gets. The adapter-only round-trip is
+        # not reported -- the model never runs it; it survives only as the silent assert below.
+        log(f"[ae_floor @ep0] {name}: floor {p_model:.2f} dB (encode_state->to_obs) vs raw AE {p_raw:.2f} dB"
+            + (f" — LayerNorm costs {p_ad - p_model:.2f} dB by discarding per-token mean/std; the adapter "
+               f"residual has to learn that back" if ln_on else "") + f" | {info['mode']}")
         if info["identity_at_init"]:
-            ok = abs(delta) < tol_db
-            log(f"[ae_floor @ep0] {name}: adapter {p_ad:.2f} dB | raw AE {p_raw:.2f} dB | delta {delta:+.3f} dB "
-                f"| {info['mode']} -> {'OK' if ok else 'MISMATCH'}")
-            if not ok:
+            if abs(delta) >= tol_db:
                 raise AssertionError(
                     f"pretrained-AE adapter '{name}' is mode {info['mode']}, which GUARANTEES an identity "
-                    f"round-trip at init, but the epoch-0 floor is {p_ad:.2f} dB vs the raw AE's {p_raw:.2f} dB "
+                    f"round-trip at init, but adapter-only is {p_ad:.2f} dB vs the raw AE's {p_raw:.2f} dB "
                     f"(delta {delta:+.3f} dB > {tol_db}). The pad/strip indexing or the zero-init residual is "
-                    f"wrong — fix that rather than training through it.")
-        else:
-            log(f"[ae_floor @ep0] {name}: adapter {p_ad:.2f} dB | raw AE {p_raw:.2f} dB | delta {delta:+.3f} dB "
-                f"| {info['mode']} -> no identity guarantee, round-trip must be LEARNED (watch this climb)")
+                    f"wrong -- fix that rather than training through it.")
     return out

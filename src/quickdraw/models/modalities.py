@@ -249,17 +249,6 @@ class PretrainedImageModality(Modality):
     def _decode_cond(self, flat_tok):              # (M, num_tokens, d) -> tokens (head decodes via up-adapter+TAESD)
         return flat_tok
 
-    def roundtrip_loss(self, obs: Tensor) -> Tensor:
-        """ROUND-TRIP latent loss (#12): ||up(down(g)) - g||^2 against the FROZEN TAESD latent g. This is the
-        only thing that directly supervises the adapter pair — decode_loss trains up() on the dynamics'
-        PREDICTED bag against pixels, and nothing there ever asks the pair to compose to the identity (that
-        omission is why the learned-Perceiver adapter collapsed to ~10.5 dB). Cheap: no TAESD DECODE forward.
-        obs (B,[T,]H,W,C) in [0,1]."""
-        flat = obs.reshape(-1, *obs.shape[obs.ndim - self._obs_ndim:])
-        with torch.no_grad():                      # the target is the frozen encoder's grid
-            g = self.taesd.encode(flat.permute(0, 3, 1, 2) * 2 - 1).latents
-        g_hat = self.decode_head.up_adapter(self.down_adapter(g))
-        return F.mse_loss(g_hat, g)
 
     def train(self, mode: bool = True):            # keep a frozen TAESD in eval permanently (Lightning can't flip it)
         super().train(mode)

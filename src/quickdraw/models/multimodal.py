@@ -153,13 +153,27 @@ class MultiModalSequenceModel(nn.Module):
                     out[f"shortcut/{name}"] = sc
             else:
                 out[name] = main
-            # ADAPTER ROUND-TRIP loss (#12): pretrained-AE trunks only. decode_loss above trains up() on the
-            # dynamics' PREDICTED bag; NOTHING there asks the adapter pair to compose to the identity, which is
-            # exactly how the learned-Perceiver adapter ended up at ~10.5 dB. This term supervises it directly.
-            if getattr(mod, "latent_loss_weight", 0.0) > 0 and hasattr(mod, "roundtrip_loss"):
-                out[f"roundtrip/{name}"] = mod.roundtrip_loss(targets[name]) * mod.latent_loss_weight
             off += n
+        out.update(self.roundtrip_losses(targets))
         return out
+
+    def roundtrip_losses(self, targets: dict[str, Tensor]) -> dict[str, Tensor]:
+        """ENCODE->DECODE round-trip loss for pretrained-AE trunks (#12), through THE MODEL'S OWN path.
+
+        Deliberately uses encode_state()/to_obs() rather than the modality's encode/decode: whatever the
+        dynamics actually consumes — LayerNormed bag or not (see self.latent_norm) — is what gets supervised,
+        with no duplicated normalisation logic to drift. The earlier modality-level version measured
+        up(down(g)) with NO LayerNorm and so reported a perfect 2.5e-5 while the real path was 3.5 dB worse.
+
+        Note decode_loss only ever trains the decoder on the dynamics' PREDICTED bag; nothing else asks the
+        encode->decode path to reconstruct, which is how the first adapter reached only ~10.5 dB."""
+        wts = {n: getattr(self.modalities[n], "latent_loss_weight", 0.0) for n, _ in self.layout}
+        heads = [n for n, w in wts.items() if w > 0 and hasattr(self.modalities[n], "taesd")]
+        if not heads:
+            return {}
+        bag = self.encode_state(targets)                 # the REAL encode (LN included when latent_norm)
+        rec = self.to_obs(bag, heads=heads)              # the REAL decode
+        return {f"roundtrip/{n}": F.mse_loss(rec[n], targets[n]) * wts[n] for n in heads}
 
     def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
         """Diffusion-forcing hook: add a per-state-token noise-LEVEL embedding to the bag before fusion.

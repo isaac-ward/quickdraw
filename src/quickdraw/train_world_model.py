@@ -203,9 +203,18 @@ def main(cfg):
     # default: the generic pointwise_error) — must be a key of env.rollout_metrics.
     ckpt_cb = ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
                               monitor=f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}",
-                              mode="min", save_top_k=cfg.trainer.save_top_k, save_last=True)
+                              mode="min", save_top_k=cfg.trainer.save_top_k, save_last=False)
+    # save_last on the monitored callback only writes last.ckpt when Lightning ALSO saves a top-k file, so
+    # once the monitored metric stops improving the newest weights stop being written — a collapsed run then
+    # leaves NOTHING from after the collapse and the failure cannot be inspected (observed 2026-08-09: a run
+    # that collapsed at epoch 5 had best/last/epoch=4 all identical at epoch 4). This monitor-free callback
+    # saves every epoch unconditionally so post-collapse state always exists. It writes the SAME last.ckpt
+    # name (ckpt_cb's save_last is off), so there is exactly one "newest weights" file, not two.
+    latest_cb = ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"), filename="last",
+                                save_top_k=1, every_n_epochs=1, monitor=None, save_last=False)
     callbacks = [
         ckpt_cb,
+        latest_cb,
         LoggingCallback(writer, cfg, norm, e, cfg.eval.during_train.every_epochs,
                         [name for name, on in cfg.eval.during_train.evals.items() if on],
                         at_epochs=cfg.eval.during_train.get("at_epochs", None)),
