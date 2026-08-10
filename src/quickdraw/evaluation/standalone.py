@@ -32,6 +32,21 @@ def run_standalone(cfg, routines, label: str | None = None):
         saved = OmegaConf.create(json.load(open(cfgj)))
         OmegaConf.set_struct(cfg, False)
         cfg.model = saved.model                                  # adopt the trained model config (arch + modalities)
+        # ...but adopting it WHOLESALE silently discarded any `model.*` the caller passed on the CLI, so
+        # `model.diffusion.stochastic_eval=true` (evaluate a trained checkpoint under stochastic sampling
+        # instead of the committed mean) looked like it applied and did nothing. Re-apply CLI model overrides
+        # ON TOP of the saved arch: the saved config still wins for everything the caller did not name.
+        try:
+            from hydra.core.hydra_config import HydraConfig
+            for ov in HydraConfig.get().overrides.task:
+                key, _, val = str(ov).lstrip("+~").partition("=")
+                if key.startswith("model.") and val != "":
+                    # PARSE the value as YAML -- OmegaConf.create({"v": val}) would keep the raw STRING, and
+                    # bool("false") is True, so a `...=false` override would silently arrive as True.
+                    OmegaConf.update(cfg, key, OmegaConf.create(f"v: {val}").v, merge=False)
+                    print(f"[standalone] re-applied CLI override after adopting the saved model cfg: {key}={val}")
+        except Exception as e:
+            print(f"[standalone] could not re-apply CLI model overrides ({type(e).__name__}: {e})")
     model = build_model(cfg).to(device)
     load_checkpoint(model, cfg.checkpoint)  # .ckpt file or train run dir (-> best.ckpt)
     model.eval()
