@@ -293,6 +293,59 @@ class LoggingCallback(L.Callback):
         if self._compile_s is None and self._t_b0 is not None:
             self._compile_s = time.perf_counter() - self._t_b0  # ~ one-time compile
 
+    @torch.no_grad()
+    def _log_normalization(self, pl_module, step):
+        """EVERY EPOCH under normalization/. The affine PARAMETERS are frozen after calibration, so what is
+        worth tracking is the STATISTIC the normalizer acts on: the per-token mean/std of the encoded bag
+        BEFORE normalization, measured on a FIXED set of val frames so epochs are comparable.
+
+        Why it matters under layernorm: _ln divides by each token's own std. If the encoder (or, in rollout,
+        the dynamics) drifts toward emitting near-constant tokens, that std falls and LN amplifies whatever
+        is left by up to 1/sqrt(eps) ~ 316x. A falling pre_norm_std is therefore an EARLY WARNING of exactly
+        the positive feedback suspected behind the epoch-5 collapse -- visible here before the loss moves."""
+        m = getattr(pl_module.model, "_orig_mod", pl_module.model)
+        nt = getattr(m, "latent_norm_type", "layernorm")
+        out = {"normalization/is_layernorm": float(nt == "layernorm"),
+               "normalization/is_affine": float(nt == "affine"),
+               "normalization/is_invertible": float(nt in ("affine", "none"))}
+        try:
+            frames = self._norm_probe_frames(m)
+            was = m.training
+            m.eval()
+            for name, mod in m.modalities.items():
+                if not hasattr(mod, "taesd"):
+                    continue
+                tok = mod.encode(frames.to(next(mod.parameters()).device))    # pre-bag, pre-_ln
+                sd, mu = tok.std(dim=-1), tok.mean(dim=-1)                    # per token
+                out[f"normalization/{name}/pre_norm_std_mean"] = float(sd.mean())
+                out[f"normalization/{name}/pre_norm_std_min"] = float(sd.min())
+                out[f"normalization/{name}/pre_norm_absmean_mean"] = float(mu.abs().mean())
+                if getattr(mod, "latent_affine", False):                      # frozen, but re-logged so the
+                    for i, v in enumerate(mod.lat_mean.flatten().tolist()):   # folder is self-contained per epoch
+                        out[f"normalization/{name}/mean_c{i}"] = v
+                    for i, v in enumerate(mod.lat_std.flatten().tolist()):
+                        out[f"normalization/{name}/std_c{i}"] = v
+            if was:
+                m.train()
+        except Exception as e:                     # telemetry must never take a run down -- but it must not
+            if not getattr(self, "_norm_warned", False):   # fail SILENTLY either (a swallowed AttributeError
+                self._norm_warned = True                   # hid this diagnostic for a full cycle once)
+                from ..controller.run import _plog
+                _plog(self.writer, f"[latent_norm] per-epoch probe disabled ({type(e).__name__}: {e})")
+        self.writer.scalars(out, step=step)
+
+    def _norm_probe_frames(self, m):
+        """8 FIXED val frames, loaded once and cached — the point is comparability across epochs."""
+        if getattr(self, "_norm_frames", None) is None:
+            import numpy as _np, torch as _t
+            from ..data.dataset import load_fpv_frames
+            from ..training.setup import resolve_data_root
+            sz = next(md.ae.cfg.img_size for md in m.modalities.values() if hasattr(md, "taesd"))
+            fr = load_fpv_frames(resolve_data_root(self.cfg), "val", size=sz,
+                                 cam=self.cfg.data.get("cam", "fpv"), max_frames=8, cache=False)
+            self._norm_frames = _t.from_numpy(_np.asarray(fr)).float().div(255.0)
+        return self._norm_frames
+
     def on_train_epoch_end(self, trainer, pl_module):
         # Eval routines fire on the eval CADENCE, decoupled from the validation cadence. They used to live in
         # on_validation_epoch_end, which only fires on val epochs — so with check_val_every_n_epoch=2 (odd val
@@ -361,6 +414,7 @@ class LoggingCallback(L.Callback):
         epoch = trainer.current_epoch
         # forward every aggregated scalar metric (train/* and val/*) through the one writer
         self.writer.scalars({k: v.item() for k, v in trainer.callback_metrics.items()}, step=epoch)
+        self._log_normalization(pl_module, epoch)
 
         metrics = {}                                  # eval routines now run in on_train_epoch_end (decoupled from val cadence)
 

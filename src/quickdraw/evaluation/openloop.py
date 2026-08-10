@@ -23,18 +23,49 @@ def _ssim(a, b):
     return float(s.mean())
 
 
+_LPIPS_CACHE: dict = {}
+
+
+def _lpips_net(device):
+    """Cached LPIPS (SqueezeNet backbone — the cheapest of the three; ~0.1 GFLOP/frame at 128px, negligible
+    beside the rollout that produced the frames). Returns None if the weights can't be fetched, so a missing
+    download degrades the metric rather than killing an eval."""
+    key = str(device)
+    if key not in _LPIPS_CACHE:
+        try:
+            from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+            net = LearnedPerceptualImagePatchSimilarity(net_type="squeeze", normalize=True).to(device).eval()
+            for prm in net.parameters():
+                prm.requires_grad_(False)
+            _LPIPS_CACHE[key] = net
+        except Exception:
+            _LPIPS_CACHE[key] = None
+    return _LPIPS_CACHE[key]
+
+
 def image_curves(pred, true):
     """Per-timestep IMAGE reconstruction metrics -> {psnr, ssim, mse, l1}, each a (H,) numpy array. pred/true:
     (N, H, s, s, 3) in [0,1] (caller clamps pred). SHARED by eval_ood_horizon (rollout preds) and eval_ae_floor
     (encode->decode recon) — the arithmetic is bit-for-bit the same in both, so it lives here once."""
     H = pred.shape[1]
-    psnr_s, ssim_s, mse_s, l1_s = [], [], [], []
+    psnr_s, ssim_s, mse_s, l1_s, lp_s = [], [], [], [], []
+    lp = _lpips_net(pred.device)
     for t in range(H):
         mse = float(torch.mean((pred[:, t] - true[:, t]) ** 2)); mse_s.append(mse)
         l1_s.append(float(torch.mean((pred[:, t] - true[:, t]).abs())))
         psnr_s.append(-10.0 * np.log10(max(mse, 1e-12)))
         ssim_s.append(max(0.0, min(1.0, _ssim(pred[:, t], true[:, t]))))   # clamp SSIM to [0,1]
-    return {"psnr": np.array(psnr_s), "ssim": np.array(ssim_s), "mse": np.array(mse_s), "l1": np.array(l1_s)}
+        if lp is not None:
+            # PSNR/SSIM/MSE/L1 are all pixelwise: a blurred prediction and a sharp-but-displaced one can score
+            # the same. LPIPS is the DISCRIMINATOR -- perceptual distance rises with blur even when MSE does
+            # not, which is what separates "hedging toward the mean frame" from "confidently wrong".
+            with torch.no_grad():
+                lp_s.append(float(lp(pred[:, t].permute(0, 3, 1, 2).clamp(0, 1).float(),
+                                     true[:, t].permute(0, 3, 1, 2).clamp(0, 1).float())))
+    out = {"psnr": np.array(psnr_s), "ssim": np.array(ssim_s), "mse": np.array(mse_s), "l1": np.array(l1_s)}
+    if lp_s:
+        out["lpips"] = np.array(lp_s)          # LOWER is better (unlike psnr/ssim)
+    return out
 
 
 def emit_horizon_readouts(writer, routine, head, icurves, H, step):
