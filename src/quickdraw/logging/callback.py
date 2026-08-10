@@ -183,6 +183,8 @@ class ProgressPrinter(L.Callback):
 
 
 class LoggingCallback(L.Callback):
+    EVAL_FAIL_LIMIT = 2   # consecutive failures of ONE routine before it is treated as deterministic -> fatal
+
     def __init__(self, writer, cfg, normalizer, ecfg, every_epochs: int, routines: list[str],
                  at_epochs=None):
         self.writer = writer
@@ -196,6 +198,7 @@ class LoggingCallback(L.Callback):
         self._eval_cum = 0.0
         self._compile_s = None
         self._skipped = []   # (epoch, name) of every non-fatally-skipped eval, for the run-end summary
+        self._fail_streak: dict = {}   # routine -> CONSECUTIVE failures; EVAL_FAIL_LIMIT in a row is fatal
 
     def _eval_due(self, epoch: int) -> bool:
         # Cadence uses Lightning's (epoch+1)%N phase — SAME phase as validation (check_val_every_n_epoch) and
@@ -381,6 +384,22 @@ class LoggingCallback(L.Callback):
                     self.writer.scalar(f"eval/skipped/{name}", 1.0, step=epoch)  # logged -> a skipped eval is
                     #                       now distinguishable from a metric that was never enabled.
                     traceback.print_exc()
+                    # ESCALATE A PERSISTENT failure (user, 2026-08-10). "Never kill training" is right for a
+                    # TRANSIENT failure (one bad render, one OOM viz) but catastrophic for a DETERMINISTIC one:
+                    # a 30-epoch run whose whole purpose is the eval metrics lost every single eval to the same
+                    # TypeError and would have burned 46 GPU-hours producing nothing, reporting it only as a
+                    # non-fatal line nobody was watching. N consecutive failures of the SAME routine is not a
+                    # blip -- it will not fix itself, so fail loudly NOW instead of at the end.
+                    self._fail_streak[name] = self._fail_streak.get(name, 0) + 1
+                    if self._fail_streak[name] >= self.EVAL_FAIL_LIMIT:
+                        raise RuntimeError(
+                            f"eval routine {name!r} failed {self._fail_streak[name]} times IN A ROW "
+                            f"(last: {type(e).__name__}: {e}). This is deterministic, not transient -- the rest "
+                            f"of this run would produce no {name} metrics at all. Fix the routine and restart "
+                            f"(or disable eval.during_train.evals.{name}) rather than training on blind."
+                        ) from e
+                else:
+                    self._fail_streak[name] = 0                     # a success clears the streak
         finally:
             m.train(was_training)
         self._eval_cum += time.perf_counter() - t_eval
