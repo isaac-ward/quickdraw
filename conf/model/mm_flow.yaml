@@ -106,7 +106,17 @@ diffusion:
   shortcut: false          # true -> K=1 sampling via self-consistency
   sampling_steps: 6
   predict: residual
-  stochastic_eval: false   # false -> eps=0 committed prediction at eval
+  stochastic_eval: true    # TRAIN/EVAL MUST AGREE (user, 2026-08-10). predict_next uses
+#                            det = (not training) and (not stochastic_eval), so TRAINING always rolls on
+#                            SAMPLED predictions. With this false, every validation / eval routine / video
+#                            instead rolled on the eps=0 committed MEAN — the model was trained under one
+#                            rollout distribution and judged under another. true removes that mismatch.
+#                            EVAL-ONLY: during training `not self.training` is already False, so this flag
+#                            cannot change the training path.
+#                            MEASURED cost of flipping it (ep4 taesd_exact, open_loop @128): psnr
+#                            14.6227 -> 14.5502, lpips 0.5030 -> 0.5009, ssim 0.4206 -> 0.4145. Nothing
+#                            moves, because the flow has learned a near-DETERMINISTIC map — which is itself
+#                            the finding: the blur is in what the flow learned, not in how it is sampled.
   time_sampling: uniform
   flow_hidden: 0           # 0 -> mirror d
   flow_arch: mlp           # mlp | transformer — how the velocity net sees the OTHER tokens being denoised.

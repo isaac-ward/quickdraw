@@ -538,7 +538,7 @@ class MultiModalFlow(MultiModalSequenceModel):
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
                  grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True,
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
-                 stochastic_eval: bool = False, time_sampling: str = "uniform", flow_hidden: int = 0,
+                 stochastic_eval: bool = True, time_sampling: str = "uniform", flow_hidden: int = 0,
                  flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
                  df_scale: float = 0.0, df_granularity: str = "timestep",

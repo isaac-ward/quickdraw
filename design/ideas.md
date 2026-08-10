@@ -76,3 +76,25 @@ eval_ood_horizon/<mod>/lpips_mean beside psnr_mean over the same rollouts. Diver
 (PSNR flat, LPIPS rising) says blur; both falling together says wrong-but-sharp.
 
 Cheap: one perceptual net over frames already rendered by the existing eval. Deferred only for focus.
+
+## Position is never injected anywhere (noted 2026-08-10)
+
+Perceiver-IO's latent array is structure-free, but position is injected at BOTH boundaries: Fourier features
+(sinusoids of the (x,y) coordinates, concatenated to each input element) going IN, and positional QUERIES
+(one query per output location, cross-attending into the latent array) coming OUT. TiTok does the output
+half differently but does it: its decoder rebuilds an H/f x W/f grid of mask tokens with positional
+embeddings.
+
+We do NEITHER:
+  - IN:  the backbone adds a LEARNED PER-SLOT embedding — one vector per slot index. That is a learned
+         absolute PE over ~10 slots, not sinusoidal features over 2D coordinates. The model is never told
+         where in the image a token's contents came from, only which slot it is. (Temporally we DO use RoPE,
+         which is sinusoidal + relative, so we are close to Perceiver in time and not at all in space.)
+  - OUT: to_obs is a fixed index rearrangement back to the latent grid, then TAESD's conv decoder. No
+         cross-attention, no positional queries. We get a WEAK version of "the decoder re-imposes 2D" for
+         free — once tokens are back on the grid, TAESD's convolutions supply locality — but nothing in our
+         own code re-injects position.
+
+Cheap thing to try: 2D Fourier features of each latent cell's (h,w), folded into the adapter's residual
+branch. Costs no tokens and no capacity, keeps EXACT, and would tell us whether "the model does not know
+where anything is" is a real handicap or a non-issue at 8 tokens.
