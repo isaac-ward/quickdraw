@@ -402,20 +402,34 @@ def fig_torus_atlas(R, r, trajs=(), targets=None, arrows=(), coloring="hsv", tit
 
 
 def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | None = None, vlines=None,
-                      yscale: str = "log", split_top=None, caption: str | None = None, linestyles=None, markers=None):
-    """Curves vs rollout step. If `split_top` (a set of keys) is given AND there are other keys, those go in
-    a TOP panel and the rest in a BOTTOM panel sharing ONE long x-axis (e.g. PSNR in dB on top; ssim/mse/l1
-    in [0,1] below), instead of squashing incompatible scales together. Captions (per-curve CAPTIONS, plus a
-    free-form `caption` — e.g. the reward-trace failure-decomposition legend) render below the axes."""
+                      yscale: str = "log", split_top=None, split_bottom=None, caption: str | None = None,
+                      linestyles=None, markers=None):
+    """Curves vs rollout step, split into up to THREE stacked panels sharing ONE long x-axis, so metrics with
+    incompatible ranges are not squashed together:
+
+      TOP     `split_top`     unbounded, own units          (psnr, dB)
+      MIDDLE  everything else bounded [0,1]                 (ssim, mse, l1)  -> ylim pinned to [0,1] on linear
+      BOTTOM  `split_bottom`  unbounded, DIFFERENT direction (lpips, lower-is-better) -> floors at 0, grows
+
+    LPIPS gets its own panel rather than sharing the bounded one: it is unbounded above (it exceeds 1 exactly
+    on the badly-wrong predictions worth seeing, which a [0,1] axis would clip) and it runs the OPPOSITE
+    direction to ssim, so overlaying them invites misreading. Any empty group is dropped. Captions (per-curve
+    CAPTIONS, plus a free-form `caption`) render below the axes."""
     top = set(split_top or ()) & set(errors)
+    bot = (set(split_bottom or ()) & set(errors)) - top
     top_keys = [k for k in errors if k in top]
-    bot_keys = [k for k in errors if k not in top]
-    if top_keys and bot_keys:                                    # two EQUAL-height stacked panels, shared x
-        fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True, gridspec_kw={"height_ratios": [1, 1]})
-        panels = [(axes[0], top_keys), (axes[1], bot_keys)]
+    bot_keys = [k for k in errors if k in bot]
+    mid_keys = [k for k in errors if k not in top and k not in bot]
+    groups = [(g, ks) for g, ks in (("top", top_keys), ("mid", mid_keys), ("bottom", bot_keys)) if ks]
+    if len(groups) > 1:                                          # EQUAL-height stacked panels, shared x
+        fig, axes = plt.subplots(len(groups), 1, figsize=(11, 3.5 * len(groups)), sharex=True,
+                                 gridspec_kw={"height_ratios": [1] * len(groups)})
+        panels = [(axes[i], ks) for i, (_, ks) in enumerate(groups)]
+        kinds = [g for g, _ in groups]
     else:                                                        # single panel
         fig, ax = plt.subplots(figsize=(11, 6))
         panels = [(ax, list(errors))]
+        kinds = ["mid" if not groups else groups[0][0]]
     for ax_, keys in panels:
         marked = False
         for name in keys:
@@ -435,12 +449,13 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
                                   markerfacecolor="none", label="replanning step"))
         ax_.legend(handles=handles, loc="best")
     ax_bottom = panels[-1][0]
-    if len(panels) == 2 and yscale == "linear":                  # image bottom panel (ssim/mse/l1/lpips)
-        # [0,1] is the natural range for ssim/mse/l1, but LPIPS is unbounded above and DOES exceed 1 on badly
-        # wrong predictions -- a hard ylim(0,1) would clip exactly the failures worth seeing. Keep the floor at
-        # 0 and let the top grow only when something needs it.
-        _hi = max([float(np.nanmax(errors[k])) for k in panels[-1][1] if len(errors[k])] or [1.0])
-        ax_bottom.set_ylim(0, max(1.0, _hi * 1.05))
+    if yscale == "linear":
+        for (ax_, keys), kind in zip(panels, kinds):
+            if kind == "mid" and len(panels) > 1:                # ssim/mse/l1 are genuinely bounded -> pin [0,1]
+                ax_.set_ylim(0, 1)
+            elif kind == "bottom":                               # lpips: floor at 0, grow only if a curve needs it
+                _hi = max([float(np.nanmax(errors[k])) for k in keys if len(errors[k])] or [1.0])
+                ax_.set_ylim(0, max(1.0, _hi * 1.05))
     # vlines: {color: [step indices]} -> dotted verticals marking events (e.g. goal switches), on the bottom panel
     for color, steps in (vlines or {}).items():
         for s in steps:

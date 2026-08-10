@@ -36,12 +36,13 @@ def torus_scene(R: float, r: float, *, description: str, **fields) -> dict:
             "torus": {"major_radius_R": float(R), "tube_radius_r": float(r)}, **fields}
 
 
-def log_error_curves(writer, routine, curves, step, *, head=None, split_top=None, colors=None,
-                     yscales=("linear", "log"), name="error_vs_step_avg", scalars=True):
+def log_error_curves(writer, routine, curves, step, *, head=None, split_top=None, split_bottom=None,
+                     colors=None, yscales=("linear", "log"), name="error_vs_step_avg", scalars=True):
     """Emit `fig_error_vs_step` at each y-scale + `<metric>_mean` scalars, under the head prefix if given.
     curves: {metric_name: (H,) array}. Mirrors proprio and image heads with identical structure."""
     for ys in yscales:
-        f = viz.fig_error_vs_step(curves, yscale=ys, split_top=split_top, colors=colors)
+        f = viz.fig_error_vs_step(curves, yscale=ys, split_top=split_top, split_bottom=split_bottom,
+                                  colors=colors)
         writer.figure(product_tag(routine, f"{name}_{ys}", head=head), f, step)
         plt.close(f)
     if scalars:
@@ -87,7 +88,8 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
     title_fn = title_fn or (lambda i: f"{routine} #{i}")
     log_error_curves(writer, routine, curves, step, head="proprio")        # proprio averaged curves + scalars
     for head, d in (images or {}).items():                                 # per image head, mirrored (PSNR split top)
-        log_error_curves(writer, routine, d["icurves"], step, head=head, split_top={"psnr"}, colors={"psnr": "red"})
+        log_error_curves(writer, routine, d["icurves"], step, head=head, split_top={"psnr"},
+                         split_bottom={"lpips"}, colors={"psnr": "red", "lpips": "purple"})
     rich = wants_diagnostics(env)
     for i in range(n_plot):
         if log is not None:
