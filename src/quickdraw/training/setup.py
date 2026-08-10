@@ -260,10 +260,9 @@ def autobatch_find(cfg, device, log=print) -> int:
             src, futr = recon_src[:, idx], {kk: v[:, idx] for kk, v in future.items()}
         else:
             src, futr = recon_src, future
-        recon = model.recon_losses(src, futr)
+        recon, rw = model.recon_losses(src, futr)
         raw, w = model.loss_terms(preds, future, obs, 0.0, act)
-        wts = {mod.name: float(mod.weight) for mod in model.modalities.values()}
-        return sum(w[k] * raw[k] for k in raw) + sum(wts[k.split("/")[-1]] * recon[k] for k in recon)
+        return sum(w[k] * raw[k] for k in raw) + sum(rw[k] * recon[k] for k in recon)
 
     def _seq_preds(obs, act):   # p_tf=0 AUTOREGRESSIVE rollout (the in-rollout epochs)
         return model.rollout_train({k: v[:, :P] for k, v in obs.items()}, act[:, : L - 1],

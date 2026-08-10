@@ -127,18 +127,16 @@ class LitWorldModel(L.LightningModule):
             src, fut = recon_src[:, idx], {kk: v[:, idx] for kk, v in future.items()}
         else:
             src, fut = recon_src, future
-        recon = m.recon_losses(src, fut)                      # per-head decode LOSS: {name} (mse) or {flow/name,shortcut/name}
+        recon, rw = m.recon_losses(src, fut)                  # decode/<name>[_shortcut] + codec/roundtrip_<name>
         # NOTE: do NOT decode here (to_obs) in train — recon_losses is the decode loss, and for flow decoders
         # to_obs would SAMPLE the ViT decoder every step (with grad) for nothing -> huge wasted memory (OOM). The
         # decoded sample is only needed for val metrics; computed there under no_grad.
         raw, w = m.loss_terms(preds, future, obs, p_tf, act)
-        # `roundtrip/<mod>` rides in the recon dict for logging, but it is NOT a decode loss and must NOT be
-        # scaled by the modality's decode weight: roundtrip_losses already applied the modality's
-        # latent_loss_weight internally, so weighting again here made the two INSEPARABLE -- setting
-        # modalities.<i>.weight=0 to ablate a head's decode recon silently also deleted its adapter's ONLY
-        # supervision (2026-08-10). Decode weight = mod.weight; roundtrip weight = latent_loss_weight.
-        rw = lambda k: 1.0 if k.startswith("roundtrip/") else wts[k.split("/")[-1]]
-        loss = sum(w[k] * raw[k] for k in raw) + sum(rw(k) * recon[k] for k in recon)
+        # recon_losses returns its OWN weights (same contract as loss_terms). It used to be reconstructed here
+        # by parsing the key -- wts[k.split("/")[-1]] -- which mapped "roundtrip/image" to the IMAGE DECODE
+        # weight, so ablating a head's decode recon with modalities.<i>.weight=0 silently also deleted that
+        # head's adapter supervision. Weights now travel WITH the losses; nothing infers them from a name.
+        loss = sum(w[k] * raw[k] for k in raw) + sum(rw[k] * recon[k] for k in recon)
 
         # train-time shaping variations (per-stream input noise applied inline above; here the LOSS terms:
         # physical_loss on the proprio decode, contraction on the one-step token-bag map). Routed through the
@@ -296,9 +294,9 @@ class LitActionModel(L.LightningModule):
         a_target = act[:, 1:L_ - 1].detach()                  # a[1..L-2] — same alignment as loss_terms
         l_flow, l_cons = m.action_flow.loss(cond, a_target, time_sampling=m.time_sampling)
         loss = l_flow if l_cons is None else l_flow + l_cons
-        self.log(f"{tag}/loss/flow/action", l_flow)
+        self.log(f"{tag}/loss/action/flow", l_flow)
         if l_cons is not None:
-            self.log(f"{tag}/loss/shortcut/action", l_cons)
+            self.log(f"{tag}/loss/action/shortcut", l_cons)
         self.log(f"{tag}/loss/total", loss, prog_bar=(tag == "train"))
         return loss
 

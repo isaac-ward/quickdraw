@@ -175,19 +175,17 @@ class MultiModalSequenceModel(nn.Module):
         """Per-modality DECODE loss of the predicted token bag vs clean target obs. Keys: `<name>` for mse
         decoders (bit-identical to before) or `flow/<name>` (+ `shortcut/<name>`) for flow decoders. The
         per-key weight is the modality weight (key.split('/')[-1] -> name)."""
-        out, off = {}, 0
+        out, wts, off = {}, {}, 0
         for name, n in self.layout:
             mod = self.modalities[name]
             main, sc = mod.decode_loss(bag[..., off:off + n, :], targets[name])
-            if mod.decode_kind == "flow":
-                out[f"flow/{name}"] = main
-                if sc is not None:
-                    out[f"shortcut/{name}"] = sc
-            else:
-                out[name] = main
+            out[f"decode/{name}"], wts[f"decode/{name}"] = main, float(mod.weight)
+            if sc is not None:                                  # flow decoders only
+                out[f"decode/{name}_shortcut"], wts[f"decode/{name}_shortcut"] = sc, float(mod.weight)
             off += n
-        out.update(self.roundtrip_losses(targets))
-        return out
+        for k, v in self.roundtrip_losses(targets).items():     # codec/roundtrip_<name>
+            out[k], wts[k] = v, 1.0                             # already scaled by latent_loss_weight inside
+        return out, wts
 
     def roundtrip_losses(self, targets: dict[str, Tensor]) -> dict[str, Tensor]:
         """ENCODE->DECODE round-trip loss for pretrained-AE trunks (#12), through THE MODEL'S OWN path.
@@ -205,7 +203,7 @@ class MultiModalSequenceModel(nn.Module):
             return {}
         bag = self.encode_state(targets)                 # the REAL encode (LN included when latent_norm)
         rec = self.to_obs(bag, heads=heads)              # the REAL decode
-        return {f"roundtrip/{n}": F.mse_loss(rec[n], targets[n]) * wts[n] for n in heads}
+        return {f"codec/roundtrip_{n}": F.mse_loss(rec[n], targets[n]) * wts[n] for n in heads}
 
     def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
         """Diffusion-forcing hook: add a per-state-token noise-LEVEL embedding to the bag before fusion.
@@ -625,9 +623,9 @@ class MultiModalFlow(MultiModalSequenceModel):
         h_state = h[..., : self.n_state, :]                     # (B,L-1,n_state,d)
         target = (z[:, 1:] - z[:, :-1]).detach() if self.predict_residual else z[:, 1:].detach()  # target off CLEAN z
         l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
-        raw, w = {"flow/latent": l_flow}, {"flow/latent": self.lambda_flow}   # dynamics flow (was "flow")
+        raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function
         if l_cons is not None:
-            raw["shortcut/latent"], w["shortcut/latent"] = l_cons, self.lambda_consistency   # was "flow_consistency"
+            raw["dynamics/latent_shortcut"], w["dynamics/latent_shortcut"] = l_cons, self.lambda_consistency
         if self.action_head_enabled and L >= 3:
             # action-flow PRIOR: predict a[t] from the PREVIOUS-step pooled context h[t-1] (leak-free — h[t-1]
             # never attended to a[t]). Pool the backbone context over the bag's tokens -> one vector per step.
@@ -638,9 +636,9 @@ class MultiModalFlow(MultiModalSequenceModel):
                 cond = cond.detach()
             a_target = act_seq[:, 1:L - 1].detach()             # normalized a[1..L-2] (never the a[t] in cond)
             l_aflow, l_acons = self.action_flow.loss(cond, a_target, time_sampling=self.time_sampling)
-            raw["flow/action"], w["flow/action"] = l_aflow, self.action_head_weight
+            raw["action/flow"], w["action/flow"] = l_aflow, self.action_head_weight
             if l_acons is not None:
-                raw["shortcut/action"], w["shortcut/action"] = l_acons, self.action_head_weight
+                raw["action/shortcut"], w["action/shortcut"] = l_acons, self.action_head_weight
         return raw, w
 
     def action_context(self, obs, act_seq) -> Tensor:

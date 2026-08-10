@@ -37,16 +37,24 @@ def main():
     pf = m(obs, act)
     check("forward bag (B,L,n_state,d)", pf.shape == (B, L, 9, d), str(tuple(pf.shape)))
     raw, w = m.loss_terms(pf.detach(), {k: v[:, P:] for k, v in obs.items()}, obs, 1.0, act)
-    check("flow loss present + finite", "flow/latent" in raw and torch.isfinite(raw["flow/latent"]).all())
+    check("flow loss present + finite", "dynamics/latent" in raw and torch.isfinite(raw["dynamics/latent"]).all())
 
-    # DETERMINISTIC committed prediction: eval + eps=0 -> byte-identical across two calls
+    # eps=0 committed prediction -> byte-identical across two calls. stochastic_eval DEFAULTS TRUE since
+    # 2026-08-10 (train and eval must roll on the same distribution), so pin it off for this check: the
+    # property under test is that the DETERMINISTIC path is deterministic, not what the default is.
     m.eval()
+    _se, m.stochastic_eval = m.stochastic_eval, False
     s = m.encode_state(obs)
     h = m.backbone(m._to_input(s, act))
     with torch.no_grad():
         r1 = m.readout(h, s)
         r2 = m.readout(h, s)
     check("deterministic (eps=0) readout byte-identical", torch.equal(r1, r2))
+    m.stochastic_eval = True                      # and the DEFAULT path must actually sample
+    with torch.no_grad():
+        r3, r4 = m.readout(h, s), m.readout(h, s)
+    check("stochastic_eval=true readout DIFFERS across calls", not torch.equal(r3, r4))
+    m.stochastic_eval = _se
     m.train()
 
     # rollout + imagine_eval
@@ -69,7 +77,7 @@ def main():
         rl = {k: F.mse_loss(dec[k], future[k]) for k in future}
         raw, w = m.loss_terms(preds, future, obs, 1.0, act)
         (sum(rl.values()) + sum(w[k] * raw[k] for k in raw)).backward(); opt.step()
-        flow_hist.append(float(raw["flow/latent"])); pro_hist.append(float(rl["proprio"])); img_hist.append(float(rl["image"]))
+        flow_hist.append(float(raw["dynamics/latent"])); pro_hist.append(float(rl["proprio"])); img_hist.append(float(rl["image"]))
     mean = lambda xs: sum(xs) / len(xs)
     f0, f1 = mean(flow_hist[:15]), mean(flow_hist[-15:])
     check("flow loss drops (windowed mean)", f1 < f0, f"{f0:.4f}->{f1:.4f}")

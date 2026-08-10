@@ -25,6 +25,30 @@ caption = equation + one sentence (the definitions in `environment.md`):
 - `…/rollout_video` — the same animated on the torus surface (video)
 - `…/obs_image_video` — predicted vs ground-truth ego frames (image stage)
 
+## Loss keys (renamed 2026-08-10)
+
+ROLE first; the decode PARAMETERIZATION never appears in a name. Under `train/loss/` and `val/loss/`:
+
+| key | was | what it is |
+|---|---|---|
+| `dynamics/latent` | `flow/latent` | the transition function (teacher-forced rectified-flow term) |
+| `dynamics/latent_shortcut` | `shortcut/latent` | its self-consistency term (`diffusion.shortcut`) |
+| `decode/<mod>` | `<mod>` (mse) or `flow/<mod>` (flow) | that modality's decode recon |
+| `decode/<mod>_shortcut` | `shortcut/<mod>` | flow decoders' self-consistency |
+| `codec/roundtrip_<mod>` | `roundtrip/<mod>` | adapter encode->decode identity; NOT a decode loss |
+| `action/flow`, `action/shortcut` | `flow/action`, `shortcut/action` | action-head prior |
+
+The old scheme emitted `image` but `flow/proprio` for the SAME role, and grouped `flow/latent` (the
+dynamics) with `flow/proprio` (a decoder) under one `flow/` panel. The three groups now correspond to the
+three things that actually compete in the objective: dynamics vs decode vs codec.
+
+`recon_losses` returns `(losses, weights)` -- the same contract as `loss_terms` -- so no caller infers a
+weight by parsing a key. That parsing was a live bug: `wts[k.split("/")[-1]]` mapped `roundtrip/image` to the
+IMAGE DECODE weight, so ablating a head's decode recon also silently deleted its adapter supervision.
+
+NOTE this forks every series: runs before 2026-08-10 log `flow/latent`, after log `dynamics/latent`. Charts
+spanning the rename split silently rather than erroring.
+
 ## Chart families
 
 - **`train/`** = rollout report on one window (`P=32→F=32`) each epoch, plus `train/loss_total`,
