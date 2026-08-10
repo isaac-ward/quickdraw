@@ -151,7 +151,7 @@ def build_model(cfg):
                       mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2),
                       grad_checkpoint=bool(m.get("grad_checkpoint", False)),
                       compile_rollout=compile_rollout,
-                      latent_norm=bool(m.get("latent_norm", True)))
+                      latent_norm=m.get("latent_norm", "layernorm"))
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}

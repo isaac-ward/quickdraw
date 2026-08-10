@@ -50,17 +50,25 @@ p_tf_end: 0.0
 p_tf_warmup_epochs: 1    # DEFAULT 1 (2026-08-07): with a decently-sized dataset (~4h+) one epoch is plenty of
 #                          steps to anneal teacher forcing; the old default 4 suited the ~30-min toy torus set.
 #                          Raise to ~4 for small datasets (fewer steps/epoch -> the ramp needs more epochs).
-latent_norm: true    # LOCKED true (user, 2026-08-09): WE WANT THE DYNAMICS TO RECEIVE NORMALIZED TOKENS. The
-#                      carried token bag is LayerNormed (non-affine, per token) everywhere it is produced —
-#                      encode_state, predict_next, and the diffusion-forcing noised context — so the encoder and
-#                      the dynamics emit bags in the SAME space and rollouts cannot drift in scale. That scale-
-#                      free latent is what makes multi-step prediction stable; it is the whole point.
-#                      COST, measured on robocasa + frozen TAESD: LN discards each token's mean and std (2 of
-#                      every 128 floats) and that costs 3.51 dB of reconstruction ceiling (23.92 -> 20.41 dB,
-#                      see [ae_floor @ep0]). The adapter residual is expected to learn those moments back; the
-#                      loss/roundtrip/<mod> term supervises exactly that, so watch it fall rather than lowering
-#                      this flag. Setting false is a research escape hatch ONLY (it was silently broken until
-#                      2026-08-09: predict_next LN'd unconditionally regardless of the flag).
+# NOTE (user, 2026-08-10): "affine is clearly right for a frozen AE where the latent scale is a fixed property
+# of the data. For the bespoke learned AE the encoder can drift its own scale during training, and LN may be
+# doing real work there. So the default probably needs to be per-modality, not global."
+latent_norm: layernorm   # layernorm | affine | none. HOW the latent is made scale-free for the dynamics.
+#                          WE WANT THE DYNAMICS TO RECEIVE NORMALIZED TOKENS -- that requirement is LOCKED; only
+#                          the MECHANISM is a choice. `none` is a research escape hatch, not a default.
+#   layernorm  (default, and bit-identical to every run before 2026-08-10) per-token non-affine LayerNorm on the
+#              carried bag, applied everywhere the bag is produced: encode_state, predict_next, and the
+#              diffusion-forcing noised context. Scale-free and stable, but NOT invertible -- it discards each
+#              token's mean and std (2 scalars per token), measured at -3.51 dB of reconstruction ceiling
+#              (23.92 -> 20.41) on robocasa 128px + frozen TAESD. The adapter residual must learn those moments
+#              back; loss/roundtrip/<mod> supervises exactly that.
+#   affine     fixed per-CHANNEL scale+shift on the AE LATENT, calibrated once from the training set at fit
+#              start and inverted EXACTLY before decode. The dynamics still sees ~unit-variance inputs, but the
+#              round trip is lossless, so it costs 0 dB. This is Stable Diffusion's `scaling_factor` (literally
+#              the latent std) generalized per channel; modern video VAEs store latents_mean/latents_std the
+#              same way. The bag itself is then left alone -- which also removes the padding hazard below and
+#              makes the token layout irrelevant to reconstruction.
+#   Active type + its parameters are logged to wandb under normalization/ and to progress.log as [latent_norm].
 p_tf_batch_granular: false  # LOCKED false (2026-08-07). true = smooth p_tf ramp over a fractional epoch
 #                            (current_epoch + batch_idx/num_batches); false = per-epoch step. LOCKED false because
 #                            batch-granular is ~10x SLOWER during warmup: the step has three regimes — p_tf==1.0

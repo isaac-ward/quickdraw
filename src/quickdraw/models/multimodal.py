@@ -24,9 +24,31 @@ from .transformer import pad_block_mask
 from .collapse import CollapseStrategy, Reconstruction
 
 
+LATENT_NORMS = ("layernorm", "affine", "none")
+
+
 def _ln(x: Tensor) -> Tensor:
     """Per-token (last-dim) non-affine LayerNorm — scale-invariant carried-token normalization."""
     return F.layer_norm(x, (x.shape[-1],))
+
+
+def resolve_latent_norm(v) -> str:
+    """`model.latent_norm` -> one of LATENT_NORMS. Accepts the legacy bool (true -> layernorm, false -> none).
+
+      layernorm  per-token non-affine LN on the BAG, at encode and after every dynamics step. Scale-free and
+                 stable, but NOT invertible: it discards each token's mean+std (2 scalars/token), measured at
+                 -3.51 dB of reconstruction ceiling on robocasa 128px + frozen TAESD.
+      affine     fixed per-CHANNEL scale+shift on the AE LATENT (calibrated once from the training set), with
+                 the exact inverse before decode. Same unit-variance input for the dynamics, INVERTIBLE, so it
+                 costs 0 dB. The bag itself is then left alone. This is the Stable-Diffusion `scaling_factor`
+                 idea (a latent std) generalized per channel.
+      none       no normalization anywhere (research escape hatch; LSAR's variance regularizers force this)."""
+    if isinstance(v, bool):
+        return "layernorm" if v else "none"
+    s = str(v).strip().lower()
+    if s not in LATENT_NORMS:
+        raise ValueError(f"model.latent_norm must be one of {LATENT_NORMS} (or a bool for the legacy form), got {v!r}")
+    return s
 
 
 def _mlp(i: int, o: int, h: int) -> nn.Sequential:
@@ -53,7 +75,7 @@ class MultiModalSequenceModel(nn.Module):
 
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
                  mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
-                 compile_rollout: bool = False, latent_norm: bool = True):
+                 compile_rollout: bool = False, latent_norm: str | bool = "layernorm"):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)
@@ -72,11 +94,17 @@ class MultiModalSequenceModel(nn.Module):
         self.act_enc = _mlp(action_dim, d, d)                 # action -> 1 token
         self.backbone = SpaceTimeTransformer(d, depth, heads, window, mlp_ratio,
                                              n_slots=self.n_input, rope_theta=rope_theta)
-        # LN the carried token bag (scale-free). MUST be honoured at EVERY point the bag is produced —
-        # encode_state AND predict_next AND the DF noised context — or the encoder and the dynamics emit bags in
-        # two different spaces and the flag is silently unusable (bug, 2026-08-09: predict_next LN'd
-        # unconditionally). LSAR turns it OFF for variance-based regs (var/cov fight LN).
-        self.latent_norm = bool(latent_norm)
+        # How the latent is made scale-free for the dynamics — see resolve_latent_norm for the three options.
+        # `self.latent_norm` stays a BOOL meaning "LN the carried bag", because that is what the five bag-level
+        # _ln sites gate on. It MUST be honoured at EVERY point the bag is produced — encode_state AND
+        # predict_next AND the DF noised context — or the encoder and the dynamics emit bags in two different
+        # spaces (bug, 2026-08-09: predict_next LN'd unconditionally).
+        self.latent_norm_type = resolve_latent_norm(latent_norm)
+        self.latent_norm = self.latent_norm_type == "layernorm"
+        if self.latent_norm_type == "affine":       # normalization moves OFF the bag and ONTO the AE latent
+            for _md in self.modalities.values():
+                if hasattr(_md, "enable_latent_affine"):
+                    _md.enable_latent_affine()
 
     def arch_table(self) -> list[tuple[str, str, int]]:
         """Rows (component, shape transform, #params) describing the token-bag dataflow — printed at the top
@@ -435,7 +463,8 @@ class MultiModalLSAR(MultiModalSequenceModel):
         # POLICY object here: MM keeps its own multi-encoder EMA/encode mechanics but reads the strategy's
         # flags + reg_loss + pred_metric. Reconstruction (obs grounds the encoder) is the default.
         self.collapse = collapse or Reconstruction()
-        self.latent_norm = latent_norm and not self.collapse.has_reg   # OFF for vicreg/sigreg (var/cov fight LN)
+        if self.collapse.has_reg:                                # vicreg/sigreg: var/cov terms fight any norm
+            self.latent_norm, self.latent_norm_type = False, "none"
         self.pred_obs_in_loss = self.collapse.obs_grounds_encoder
         self.predictor_q = None                                # BYOL online-only predictor q (asymmetry)
         if self.collapse.needs_predictor:

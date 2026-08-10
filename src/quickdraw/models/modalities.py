@@ -191,6 +191,9 @@ class PretrainedImageHead(TransportHead):
 
     def velocity(self, x, temb, cond, demb=None):  # no_noise: x is zeros; cond = latent tokens (M, num_tokens, d)
         grid = self.up_adapter(cond)               # (M, C, gh, gw) — back to TAESD latent-grid space
+        own = getattr(self, "_owner", None)        # latent_norm=affine: EXACT inverse of the encode-side affine
+        if own is not None and own[0].latent_affine:
+            grid = grid * own[0].lat_std + own[0].lat_mean
         img = self._taesd[0].decode(grid).sample   # (M, 3, H, W) in TAESD range
         if self._pm1:
             img = (img + 1) / 2                    # [-1,1] -> [0,1] (probe-confirmed TAESD convention)
@@ -239,12 +242,25 @@ class PretrainedImageModality(Modality):
         self.latent_loss_weight = float(getattr(spec, "latent_loss_weight", 1.0))
         self.decode_head = PretrainedImageHead(taesd=self.taesd, up_adapter=up, img_size=spec.img_size,
                                                channels=spec.channels)
+        self.decode_head._owner = (self,)          # tuple -> NOT a registered submodule (no cycle in state_dict)
+        # latent_norm=affine: fixed per-CHANNEL scale+shift on the AE latent, calibrated once from the training
+        # set (calibrate_latent_affine) and inverted exactly before decode. Unit-variance input for the dynamics
+        # at ZERO reconstruction cost, unlike the per-token LN on the bag. Identity until calibrated.
+        self.latent_affine = False
+        self.register_buffer("lat_mean", torch.zeros(1, lat_ch, 1, 1))
+        self.register_buffer("lat_std", torch.ones(1, lat_ch, 1, 1))
+        self.register_buffer("lat_calibrated", torch.zeros((), dtype=torch.bool))
         self.ae = _AEHolder(VisionAEConfig(img_size=spec.img_size, patch=spec.patch, d=d,
                                            num_tokens=spec.num_tokens, channels=spec.channels, build_decoder=False))
 
     def _encode(self, obs):                        # (M,H,W,C)[0,1] -> (M, num_tokens, d)
         grid = self.taesd.encode(obs.permute(0, 3, 1, 2) * 2 - 1).latents   # [0,1]->[-1,1]-> latent grid
+        if self.latent_affine:                     # invertible; PretrainedImageHead.velocity undoes it
+            grid = (grid - self.lat_mean) / self.lat_std
         return self.down_adapter(grid)
+
+    def enable_latent_affine(self):
+        self.latent_affine = True
 
     def _decode_cond(self, flat_tok):              # (M, num_tokens, d) -> tokens (head decodes via up-adapter+TAESD)
         return flat_tok
@@ -255,6 +271,29 @@ class PretrainedImageModality(Modality):
         if getattr(self, "taesd_frozen", False):
             self.taesd.eval()
         return self
+
+
+@torch.no_grad()
+def calibrate_latent_affine(model, frames) -> dict:
+    """Fill lat_mean/lat_std for every affine-normalized pretrained trunk from real TRAINING frames.
+
+    Per CHANNEL over (N,H,W) -- the same statistic Stable Diffusion bakes into `scaling_factor` (a single latent
+    std) and that modern video VAEs store as latents_mean/latents_std. Runs ONCE at fit start, before the AE
+    floor gate, so the reported floor already reflects the normalization the run will actually use."""
+    stats = {}
+    for name, mod in getattr(model, "modalities", {}).items():
+        if not getattr(mod, "latent_affine", False) or bool(mod.lat_calibrated):
+            continue
+        dev = next(mod.parameters()).device
+        x = frames.to(dev).permute(0, 3, 1, 2) * 2 - 1
+        lat = torch.cat([mod.taesd.encode(x[i:i + 32]).latents for i in range(0, len(x), 32)])
+        mu = lat.mean(dim=(0, 2, 3), keepdim=True)
+        sd = lat.std(dim=(0, 2, 3), keepdim=True).clamp_min(1e-6)
+        mod.lat_mean.copy_(mu.to(mod.lat_mean.dtype))
+        mod.lat_std.copy_(sd.to(mod.lat_std.dtype))
+        mod.lat_calibrated.fill_(True)
+        stats[name] = {"mean": mu.flatten().tolist(), "std": sd.flatten().tolist(), "n_frames": int(len(x))}
+    return stats
 
 
 def make_modality(spec: ModalitySpec, d: int) -> Modality:

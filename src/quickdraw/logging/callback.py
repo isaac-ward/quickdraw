@@ -72,6 +72,13 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
                          f"{info['M']} floats carry no latent) — {T} tokens are attended every step but only "
                          f"{info['per']}/{dd} dims per token feed the decoder at init{damage}. "
                          f"For EXACT set {hint}.")
+    _nt = getattr(m, "latent_norm_type", "layernorm")
+    _why = {"layernorm": "per-token non-affine LN on the bag at encode + after every dynamics step — scale-free "
+                         "but NOT invertible (drops 2 scalars/token; -3.51 dB measured on robocasa/TAESD)",
+            "affine": "fixed per-channel scale+shift on the AE latent, exactly inverted before decode — "
+                      "invertible, 0 dB cost; the bag itself is left alone",
+            "none": "no latent normalization anywhere"}.get(_nt, "")
+    lines.append(f"[latent_norm] {_nt}: {_why}")
     if hasattr(m, "arch_table"):   # token-bag dataflow (component | shape transform | params)
         lines.append(f"[arch] d={m.d} window={m.window} | per-step bag = {m.n_state} state token(s) + 1 action = {m.n_input} tokens")
         for comp, shape, params in m.arch_table():
@@ -236,6 +243,7 @@ class LoggingCallback(L.Callback):
         try:
             from ..controller.run import _plog
             from ..evaluation.ae_floor import assert_identity_floor
+            self._calibrate_latent_affine(pl_module)   # MUST precede the gate: it changes what the floor is
             res = assert_identity_floor(self.cfg, pl_module.model, log=lambda s: _plog(self.writer, s))
             for nm, r in (res or {}).items():
                 self.writer.scalars({f"eval_ae_floor/{nm}/init_adapter_psnr": r["adapter_db"],
@@ -246,6 +254,33 @@ class LoggingCallback(L.Callback):
         except Exception as e:                     # a missing AE/dataset must not kill a run over a diagnostic
             from ..controller.run import _plog
             _plog(self.writer, f"[ae_floor @ep0] skipped ({type(e).__name__}: {e})")
+
+    def _calibrate_latent_affine(self, pl_module):
+        """latent_norm=affine: fit the per-channel latent stats from TRAIN frames, once, before anything runs.
+        Also publishes the active normalization + its parameters under wandb `normalization/`."""
+        from ..controller.run import _plog
+        from ..models.modalities import calibrate_latent_affine
+        m = getattr(pl_module.model, "_orig_mod", pl_module.model)
+        nt = getattr(m, "latent_norm_type", "layernorm")
+        self.writer.scalars({"normalization/is_layernorm": float(nt == "layernorm"),
+                             "normalization/is_affine": float(nt == "affine"),
+                             "normalization/is_invertible": float(nt in ("affine", "none"))}, step=0)
+        if nt != "affine":
+            return
+        from ..data.dataset import load_fpv_frames
+        from ..training.setup import resolve_data_root
+        import numpy as _np, torch as _t
+        n = int(self.cfg.get("eval", {}).get("latent_affine_frames", 256))
+        sz = next(md.ae.cfg.img_size for md in m.modalities.values() if hasattr(md, "latent_affine"))
+        fr = load_fpv_frames(resolve_data_root(self.cfg), "train", size=sz,
+                             cam=self.cfg.data.get("cam", "fpv"), max_frames=n, cache=False)
+        stats = calibrate_latent_affine(m, _t.from_numpy(_np.asarray(fr)).float().div(255.0))
+        for nm, st in stats.items():
+            self.writer.scalars({f"normalization/{nm}/mean_c{i}": v for i, v in enumerate(st["mean"])}, step=0)
+            self.writer.scalars({f"normalization/{nm}/std_c{i}": v for i, v in enumerate(st["std"])}, step=0)
+            self.writer.scalars({f"normalization/{nm}/n_frames": float(st["n_frames"])}, step=0)
+            _plog(self.writer, f"[latent_norm] {nm}: affine calibrated on {st['n_frames']} train frames | "
+                               f"mean={[round(v, 4) for v in st['mean']]} std={[round(v, 4) for v in st['std']]}")
 
     def on_train_epoch_start(self, trainer, pl_module):
         self._t_epoch = time.perf_counter()

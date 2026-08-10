@@ -62,3 +62,17 @@ Is it an odd thing that causes errors? No — mild, and benign-directional:
 - It won't produce qualitative failures (nothing like the 0,0,0 collapse) — it's a quantitative long-horizon nudge.
 
 If you ever want zero mismatch: either train teacher-forced (matches the cache, but we left TF deliberately for drift-robustness), or apply the O(T²) in-rollout fix from before. My call: accept it, note it (done, in config + memory).
+
+## LPIPS alongside PSNR for long-horizon (deferred 2026-08-10)
+
+PSNR cannot distinguish "blurry hedge" from "sharp but wrong", and those need different fixes. The long-horizon
+plateau on robocasa (single-step 18.39 dB, 64+ step rollout stuck at ~12.3 dB, rollouts looking like a mean
+frame) is currently unattributable between the two.
+
+NOTE this dataset is DETERMINISTIC (replayed trajectories, actions given), so unlike a stochastic env the
+blur cannot be excused as correct hedging over possible futures — PSNR is a legitimate target here and the
+plateau is a real failure. LPIPS is wanted as a DISCRIMINATOR, not as a replacement metric: add
+eval_ood_horizon/<mod>/lpips_mean beside psnr_mean over the same rollouts. Divergence between the two curves
+(PSNR flat, LPIPS rising) says blur; both falling together says wrong-but-sharp.
+
+Cheap: one perceptual net over frames already rendered by the existing eval. Deferred only for focus.
