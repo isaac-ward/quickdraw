@@ -132,7 +132,13 @@ class LitWorldModel(L.LightningModule):
         # to_obs would SAMPLE the ViT decoder every step (with grad) for nothing -> huge wasted memory (OOM). The
         # decoded sample is only needed for val metrics; computed there under no_grad.
         raw, w = m.loss_terms(preds, future, obs, p_tf, act)
-        loss = sum(w[k] * raw[k] for k in raw) + sum(wts[k.split("/")[-1]] * recon[k] for k in recon)
+        # `roundtrip/<mod>` rides in the recon dict for logging, but it is NOT a decode loss and must NOT be
+        # scaled by the modality's decode weight: roundtrip_losses already applied the modality's
+        # latent_loss_weight internally, so weighting again here made the two INSEPARABLE -- setting
+        # modalities.<i>.weight=0 to ablate a head's decode recon silently also deleted its adapter's ONLY
+        # supervision (2026-08-10). Decode weight = mod.weight; roundtrip weight = latent_loss_weight.
+        rw = lambda k: 1.0 if k.startswith("roundtrip/") else wts[k.split("/")[-1]]
+        loss = sum(w[k] * raw[k] for k in raw) + sum(rw(k) * recon[k] for k in recon)
 
         # train-time shaping variations (per-stream input noise applied inline above; here the LOSS terms:
         # physical_loss on the proprio decode, contraction on the one-step token-bag map). Routed through the
