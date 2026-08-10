@@ -75,7 +75,7 @@ class MultiModalSequenceModel(nn.Module):
 
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
                  mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
-                 compile_rollout: bool = False, latent_norm: str | bool = "layernorm"):
+                 compile_rollout: bool = False, latent_norm: str | bool = "affine"):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)

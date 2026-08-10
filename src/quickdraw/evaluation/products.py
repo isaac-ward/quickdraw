@@ -88,8 +88,12 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
     title_fn = title_fn or (lambda i: f"{routine} #{i}")
     log_error_curves(writer, routine, curves, step, head="proprio")        # proprio averaged curves + scalars
     for head, d in (images or {}).items():                                 # per image head, mirrored (PSNR split top)
-        log_error_curves(writer, routine, d["icurves"], step, head=head, split_top={"psnr"},
-                         split_bottom={"lpips"}, colors={"psnr": "red", "lpips": "purple"})
+        # psnr_frozen shares the TOP panel with psnr (same dB units) so "do we beat a frozen scene?" is one
+        # glance. lpips + motion_ratio share the BOTTOM panel (neither is bounded [0,1] nor higher-is-better).
+        log_error_curves(writer, routine, d["icurves"], step, head=head,
+                         split_top={"psnr", "psnr_frozen"}, split_bottom={"lpips", "motion_ratio"},
+                         colors={"psnr": "red", "psnr_frozen": "grey", "lpips": "purple",
+                                 "motion_ratio": "green"})
     rich = wants_diagnostics(env)
     for i in range(n_plot):
         if log is not None:

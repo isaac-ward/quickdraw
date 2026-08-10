@@ -46,9 +46,21 @@ def _lpips_net(device):
 
 
 def image_curves(pred, true):
-    """Per-timestep IMAGE reconstruction metrics -> {psnr, ssim, mse, l1}, each a (H,) numpy array. pred/true:
-    (N, H, s, s, 3) in [0,1] (caller clamps pred). SHARED by eval_ood_horizon (rollout preds) and eval_ae_floor
-    (encode->decode recon) — the arithmetic is bit-for-bit the same in both, so it lives here once."""
+    """Per-timestep IMAGE metrics -> {psnr, ssim, mse, l1, lpips, psnr_frozen, motion_ratio}, each a (H,) numpy
+    array. pred/true: (N, H, s, s, 3) in [0,1] (caller clamps pred). SHARED by eval_ood_horizon (rollout preds)
+    and eval_ae_floor (encode->decode recon) -- the arithmetic is bit-for-bit the same in both.
+
+    psnr/ssim/mse/l1 are all PIXELWISE similarities, so a model that predicted "next frame = current frame"
+    would score respectably while modelling nothing at all. The last three keys exist to catch that:
+      lpips        perceptual distance (LOWER better). Rises with blur even when MSE does not, separating
+                   "hedging toward the mean frame" from "confidently wrong".
+      psnr_frozen  PSNR of holding frame 0 for the whole rollout -- the do-nothing baseline. psnr must stay
+                   ABOVE it or no change is being predicted. Also reads as difficulty: a static scene has a
+                   high psnr_frozen, so beating it is the real bar.
+      motion_ratio ||pred_t - pred_{t-1}|| / ||true_t - true_{t-1}||. 1 = right amount of motion, <1 =
+                   under-predicting it (drifting toward a frozen scene), >1 = jitter. This is the one metric
+                   that separates "blurry but moving" from "sharp but static"; the others conflate them.
+    """
     H = pred.shape[1]
     psnr_s, ssim_s, mse_s, l1_s, lp_s = [], [], [], [], []
     lp = _lpips_net(pred.device)
@@ -58,20 +70,28 @@ def image_curves(pred, true):
         psnr_s.append(-10.0 * np.log10(max(mse, 1e-12)))
         ssim_s.append(max(0.0, min(1.0, _ssim(pred[:, t], true[:, t]))))   # clamp SSIM to [0,1]
         if lp is not None:
-            # PSNR/SSIM/MSE/L1 are all pixelwise: a blurred prediction and a sharp-but-displaced one can score
-            # the same. LPIPS is the DISCRIMINATOR -- perceptual distance rises with blur even when MSE does
-            # not, which is what separates "hedging toward the mean frame" from "confidently wrong".
             with torch.no_grad():
                 lp_s.append(float(lp(pred[:, t].permute(0, 3, 1, 2).clamp(0, 1).float(),
                                      true[:, t].permute(0, 3, 1, 2).clamp(0, 1).float())))
     if lp is not None:
-        # LearnedPerceptualImagePatchSimilarity is a stateful Metric: EVERY __call__ appends to .all_scores.
-        # image_curves runs once per timestep (H up to 2048) per head per mode per eval, and the net is cached
-        # for the process, so without this the state grows without bound on the eval device.
+        # LearnedPerceptualImagePatchSimilarity is a stateful Metric: EVERY __call__ appends to .all_scores, and
+        # the net is cached for the process, so without this the state grows without bound on the eval device.
         lp.reset()
-    out = {"psnr": np.array(psnr_s), "ssim": np.array(ssim_s), "mse": np.array(mse_s), "l1": np.array(l1_s)}
+
+    frozen = true[:, :1].expand_as(true)                                   # the do-nothing prediction
+    fz = [float(torch.mean((frozen[:, t] - true[:, t]) ** 2)) for t in range(H)]
+    frozen_s = np.array([-10.0 * np.log10(max(m, 1e-12)) for m in fz])
+    dp = [float(torch.mean((pred[:, t] - pred[:, t - 1]) ** 2)) ** 0.5 for t in range(1, H)]
+    dt_ = [float(torch.mean((true[:, t] - true[:, t - 1]) ** 2)) ** 0.5 for t in range(1, H)]
+    ratio = np.array([p / max(q, 1e-12) for p, q in zip(dp, dt_)])
+    ratio = np.concatenate([ratio[:1], ratio]) if len(ratio) else np.ones(H)   # t=0 has no delta -> repeat t=1
+
+    out = {"psnr": np.array(psnr_s), "ssim": np.array(ssim_s), "mse": np.array(mse_s), "l1": np.array(l1_s),
+           "psnr_frozen": frozen_s, "motion_ratio": ratio}
     if lp_s:
         out["lpips"] = np.array(lp_s)          # LOWER is better (unlike psnr/ssim)
+    assert all(len(v) == H for v in out.values()), \
+        f"image_curves must return length-H arrays; got { {k: len(v) for k, v in out.items()} } for H={H}"
     return out
 
 
@@ -79,8 +99,12 @@ def emit_horizon_readouts(writer, routine, head, icurves, H, step):
     """Quarter-horizon `@+x` scalar readouts of a head's per-step curves (x in {q, 2q, 3q, H}, q=floor(0.25H)):
     one scalar per (stat, x) at `{routine}/{head}/{stat}/@+{x}` so the accuracy decay vs depth is trackable in
     wandb without the curve. SHARED by eval_ood_horizon + eval_ae_floor (identical readout)."""
+    # Quarters of H, UNIONED with fixed early steps. Quarters alone are useless when H is large: at H=791
+    # they give @+197/394/591/791 and there is NO number at step 32 or 64 -- the regime that actually matters
+    # for a model trained on F=64 rollouts. (2026-08-10: every headline figure was a mean over 791 steps, ~12x
+    # past the horizon we care about, which distorted the whole DF investigation.)
     q = max(1, int(0.25 * H))
-    for x in sorted({q, 2 * q, 3 * q, H}):
+    for x in sorted({1, 8, 16, 32, 64, q, 2 * q, 3 * q, H} & set(range(1, H + 1))):
         for stat, arr in icurves.items():
             writer.scalar(f"{routine}/{head}/{stat}/@+{x}", float(arr[min(x, H) - 1]), step)
 

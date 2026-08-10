@@ -53,7 +53,27 @@ p_tf_warmup_epochs: 1    # DEFAULT 1 (2026-08-07): with a decently-sized dataset
 # NOTE (user, 2026-08-10): "affine is clearly right for a frozen AE where the latent scale is a fixed property
 # of the data. For the bespoke learned AE the encoder can drift its own scale during training, and LN may be
 # doing real work there. So the default probably needs to be per-modality, not global."
-latent_norm: layernorm   # layernorm | affine | none. HOW the latent is made scale-free for the dynamics.
+latent_norm: affine      # layernorm | affine | none. HOW the latent is made scale-free for the dynamics.
+#                          LOCKED affine (user, 2026-08-10). DEFINITIVE TEST: tf_ln vs tf_affine, identical in
+#                          every respect except this flag (transformer denoiser, 8x128 EXACT bag, frozen TAESD
+#                          @128px, batch 32, stochastic eval) -- logs/robocasa-tfaff/*_19_36_25_tf_{ln,affine}.
+#                          At epoch 0 affine won on EVERY axis:
+#                            one-step PSNR      14.48  vs   8.78   (+5.7 dB)
+#                            dynamics/latent   0.1977  vs  0.3935   (HALF the loss; every prior run sat ~0.29)
+#                            codec/roundtrip   0.0034  vs  0.0058
+#                            val loss total    0.5518  vs  1.3365
+#                            motion_ratio       0.822  vs   2.060   (calibrated vs 2x jitter)
+#                            ae_floor (codec)   24.92  vs  22.89
+#                          The ae_floor number is the mechanism, not just a score: under affine the codec
+#                          IMPROVES past its own 23.92 dB raw-AE floor (the adapter residual learns to
+#                          pre-distort the latent so TAESD's decoder reconstructs better), whereas under
+#                          layernorm it ERODES -- df_off went 23.52 -> 21.63 over four epochs with
+#                          closed_loop_1_steps tracking it down 22.45 -> 21.13, i.e. one-step prediction was
+#                          pinned to a ceiling training was destroying. Cause: the 3.51 dB LayerNorm tax is the
+#                          ONLY reason the adapter residual must learn anything, and it shares its 0.134M
+#                          params with the dynamics, which wins the tug-of-war. Remove the tax, remove the war.
+#                          CAVEAT ON THE EVIDENCE: epoch 0 only, and epoch 0 is the p_tf=1.0 teacher-forced
+#                          epoch. Strong and mechanistically explained, but not yet confirmed post-rollout.
 #                          WE WANT THE DYNAMICS TO RECEIVE NORMALIZED TOKENS -- that requirement is LOCKED; only
 #                          the MECHANISM is a choice. `none` is a research escape hatch, not a default.
 #   layernorm  (default, and bit-identical to every run before 2026-08-10) per-token non-affine LayerNorm on the
