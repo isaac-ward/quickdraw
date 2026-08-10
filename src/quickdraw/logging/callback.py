@@ -92,28 +92,6 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
 
 
 @torch.no_grad()
-def _bench_rollout(model, P, F, obs_dim, act_dim, device, B, warmup=1, iters=3):
-    """Mean wall-clock seconds for ONE full F-step autoregressive rollout at batch B. Warmup +
-    cuda-sync so the number reflects real compute, not async launch overhead or first-call compile."""
-    was_training = model.training
-    model.eval()
-    ctx = torch.randn(B, P, obs_dim, device=device)
-    act = torch.randn(B, P + F - 1, act_dim, device=device)
-    cuda = device.type == "cuda"
-    for _ in range(warmup):
-        model.imagine_eval(ctx, act, F)
-    if cuda:
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        model.imagine_eval(ctx, act, F)
-    if cuda:
-        torch.cuda.synchronize()
-    dt = (time.perf_counter() - t0) / iters
-    if was_training:
-        model.train()
-    return dt
-
 
 def _fmt_secs(s: float) -> str:
     s = int(s)
@@ -402,29 +380,9 @@ class LoggingCallback(L.Callback):
                     self.writer.scalar(f"eval/skipped/{name}", 1.0, step=epoch)  # logged -> a skipped eval is
                     #                       now distinguishable from a metric that was never enabled.
                     traceback.print_exc()
-            bench = self._bench(pl_module)
-            if bench:
-                self.writer.scalars(bench, step=epoch)   # inference-speed scalars (empty for multimodal)
         finally:
             m.train(was_training)
         self._eval_cum += time.perf_counter() - t_eval
-
-    def _bench(self, pl_module):
-        """time/ms/* + time/hz/* from a controlled rollout micro-benchmark (batch B and batch 1)."""
-        m, dev = pl_module.model, pl_module.device
-        if hasattr(getattr(m, "_orig_mod", m), "layout"):   # multimodal (dict obs) — skip the vector benchmark
-            return {}
-        P, F, B = self.cfg.data.P, self.cfg.data.F, int(self.cfg.data.batch)
-        od, ad = m.cfg.obs_dim, m.cfg.action_dim
-        roll_b = _bench_rollout(m, P, F, od, ad, dev, B)   # full rollout, whole batch
-        roll_1 = _bench_rollout(m, P, F, od, ad, dev, 1)   # full rollout, single sample (true latency)
-        secs = {"step_batch": roll_b / F, "step_sample_amortized": roll_b / F / B, "step_sample_true": roll_1 / F,
-                "rollout_batch": roll_b, "rollout_sample_amortized": roll_b / B, "rollout_sample_true": roll_1}
-        out = {}
-        for k, s in secs.items():
-            out[f"time/ms/{k}"] = s * 1000.0
-            out[f"time/hz/{k}"] = (1.0 / s) if s > 0 else 0.0
-        return out
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:

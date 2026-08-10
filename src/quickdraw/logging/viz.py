@@ -62,6 +62,10 @@ CAPTIONS = {
         "mse  ·  MSE = mean_pixels((x̂ − x)²),  x,x̂ ∈ [0,1]  ·  per-pixel L2 (= the image training loss)  ·  lower = closer  ·  [0, 1]",
     "l1":
         "l1  ·  L1 = mean_pixels(|x̂ − x|),  x,x̂ ∈ [0,1]  ·  per-pixel L1, less outlier-sensitive than MSE  ·  lower = closer  ·  [0, 1]",
+    "lpips":
+        "lpips  ·  LPIPS = Σ_layers ‖w_l ⊙ (φ_l(x̂) − φ_l(x))‖² over a SqueezeNet feature stack φ  ·  PERCEPTUAL "
+        "distance: unlike psnr/ssim/mse/l1 (all pixelwise) it separates a prediction BLURRED toward the dataset "
+        "mean from one that is sharp but wrong  ·  LOWER = closer (opposite direction to psnr/ssim)  ·  [0, ~1+]",
 }
 _AXIAL_VIEWS = [("x", "y", "z"), ("y", "x", "z"), ("z", "x", "y")]  # (view axis, xlabel, ylabel)
 
@@ -431,8 +435,12 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
                                   markerfacecolor="none", label="replanning step"))
         ax_.legend(handles=handles, loc="best")
     ax_bottom = panels[-1][0]
-    if len(panels) == 2 and yscale == "linear":                  # image bottom panel (ssim/mse/l1) -> fixed [0,1] axis
-        ax_bottom.set_ylim(0, 1)
+    if len(panels) == 2 and yscale == "linear":                  # image bottom panel (ssim/mse/l1/lpips)
+        # [0,1] is the natural range for ssim/mse/l1, but LPIPS is unbounded above and DOES exceed 1 on badly
+        # wrong predictions -- a hard ylim(0,1) would clip exactly the failures worth seeing. Keep the floor at
+        # 0 and let the top grow only when something needs it.
+        _hi = max([float(np.nanmax(errors[k])) for k in panels[-1][1] if len(errors[k])] or [1.0])
+        ax_bottom.set_ylim(0, max(1.0, _hi * 1.05))
     # vlines: {color: [step indices]} -> dotted verticals marking events (e.g. goal switches), on the bottom panel
     for color, steps in (vlines or {}).items():
         for s in steps:
