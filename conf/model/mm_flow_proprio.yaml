@@ -20,7 +20,7 @@ diffusion:
   shortcut: false
   sampling_steps: 6
   predict: residual
-  stochastic_eval: false
+  stochastic_eval: true    # train and eval roll on the same distribution (2026-08-10)
   time_sampling: uniform
   flow_hidden: 0
 modalities:

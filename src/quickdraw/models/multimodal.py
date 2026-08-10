@@ -172,9 +172,12 @@ class MultiModalSequenceModel(nn.Module):
         return out
 
     def recon_losses(self, bag: Tensor, targets: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Per-modality DECODE loss of the predicted token bag vs clean target obs. Keys: `<name>` for mse
-        decoders (bit-identical to before) or `flow/<name>` (+ `shortcut/<name>`) for flow decoders. The
-        per-key weight is the modality weight (key.split('/')[-1] -> name)."""
+        """Per-modality DECODE loss of the predicted token bag vs clean target obs.
+
+        Returns (losses, weights) -- the SAME contract as loss_terms, so no caller infers a weight by parsing
+        a key. Keys are ROLE-first and never encode the decode parameterization: `decode/<name>` for every
+        modality (mse or flow), `decode/<name>_shortcut` for flow decoders with self-consistency, and
+        `codec/roundtrip_<name>` from roundtrip_losses. All values are RAW; weights are applied at the sum."""
         out, wts, off = {}, {}, 0
         for name, n in self.layout:
             mod = self.modalities[name]
@@ -183,8 +186,8 @@ class MultiModalSequenceModel(nn.Module):
             if sc is not None:                                  # flow decoders only
                 out[f"decode/{name}_shortcut"], wts[f"decode/{name}_shortcut"] = sc, float(mod.weight)
             off += n
-        for k, v in self.roundtrip_losses(targets).items():     # codec/roundtrip_<name>
-            out[k], wts[k] = v, 1.0                             # already scaled by latent_loss_weight inside
+        rt, rtw = self.roundtrip_losses(targets)                # codec/roundtrip_<name>
+        out.update(rt); wts.update(rtw)
         return out, wts
 
     def roundtrip_losses(self, targets: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -203,7 +206,11 @@ class MultiModalSequenceModel(nn.Module):
             return {}
         bag = self.encode_state(targets)                 # the REAL encode (LN included when latent_norm)
         rec = self.to_obs(bag, heads=heads)              # the REAL decode
-        return {f"codec/roundtrip_{n}": F.mse_loss(rec[n], targets[n]) * wts[n] for n in heads}
+        # RAW mse + its weight, so the logged series is comparable across runs that sweep latent_loss_weight
+        # (every sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec
+        # panel rescale while the decode panels did not.
+        return ({f"codec/roundtrip_{n}": F.mse_loss(rec[n], targets[n]) for n in heads},
+                {f"codec/roundtrip_{n}": wts[n] for n in heads})
 
     def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
         """Diffusion-forcing hook: add a per-state-token noise-LEVEL embedding to the bag before fusion.
@@ -418,6 +425,12 @@ class MultiModalSequenceModel(nn.Module):
         import time
         dev = actions.device
         sync = (lambda: torch.cuda.synchronize()) if dev.type == "cuda" else (lambda: None)
+        # The divergence number below is a CORRECTNESS signal (cached rollout == uncached rollout), which is
+        # only defined for a deterministic readout. stochastic_eval defaults TRUE since 2026-08-10, so without
+        # this pin the two rollouts draw different eps and the metric reads ~4 on every run -- indistinguishable
+        # from a genuinely broken cache. Restored in the finally below.
+        _se = getattr(self, "stochastic_eval", False)
+        self.stochastic_eval = False
 
         def timed(uc):
             self.imagine_eval(ctx_obs, actions, horizon, heads=heads, use_cache=uc)     # warmup (compile/alloc)
@@ -425,10 +438,13 @@ class MultiModalSequenceModel(nn.Module):
             self.imagine_eval(ctx_obs, actions, horizon, heads=heads, use_cache=uc)
             sync(); return time.perf_counter() - t0
 
-        t_cached, t_uncached = timed(True), timed(False)
-        with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
-            bc = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=True)
-            bu = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=False)
+        try:
+            t_cached, t_uncached = timed(True), timed(False)
+            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
+                bc = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=True)
+                bu = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=False)
+        finally:
+            self.stochastic_eval = _se
         return {"kvcache/speedup": t_uncached / max(t_cached, 1e-9),
                 "kvcache/ms_cached": t_cached * 1e3, "kvcache/ms_uncached": t_uncached * 1e3,
                 "kvcache/horizon": float(horizon),

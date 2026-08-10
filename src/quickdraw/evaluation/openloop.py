@@ -38,8 +38,10 @@ def _lpips_net(device):
             for prm in net.parameters():
                 prm.requires_grad_(False)
             _LPIPS_CACHE[key] = net
-        except Exception:
-            _LPIPS_CACHE[key] = None
+        except Exception as e:                     # LOUD, once: a silent None disables lpips for the whole
+            _LPIPS_CACHE[key] = None               # run (design/logging.md: fail-soft but NOT silent)
+            print(f"[lpips] DISABLED for this process ({type(e).__name__}: {e}) — "
+                  f"image_curves will omit the lpips key")
     return _LPIPS_CACHE[key]
 
 
@@ -62,6 +64,11 @@ def image_curves(pred, true):
             with torch.no_grad():
                 lp_s.append(float(lp(pred[:, t].permute(0, 3, 1, 2).clamp(0, 1).float(),
                                      true[:, t].permute(0, 3, 1, 2).clamp(0, 1).float())))
+    if lp is not None:
+        # LearnedPerceptualImagePatchSimilarity is a stateful Metric: EVERY __call__ appends to .all_scores.
+        # image_curves runs once per timestep (H up to 2048) per head per mode per eval, and the net is cached
+        # for the process, so without this the state grows without bound on the eval device.
+        lp.reset()
     out = {"psnr": np.array(psnr_s), "ssim": np.array(ssim_s), "mse": np.array(mse_s), "l1": np.array(l1_s)}
     if lp_s:
         out["lpips"] = np.array(lp_s)          # LOWER is better (unlike psnr/ssim)

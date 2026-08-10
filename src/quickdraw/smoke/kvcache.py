@@ -21,7 +21,11 @@ def _model(window):
              ModalitySpec(name="image", kind="image", num_tokens=4, img_size=32, patch=8, ae_depth=2,
                           decode_kind="flow", decode_param="x0")]
     m = MultiModalFlow(specs, d=32, depth=2, heads=4, window=window, mlp_ratio=4.0, rope_theta=10000.0,
-                       action_dim=2, sampling_steps=4).to(DEV).eval()
+                       action_dim=2, sampling_steps=4,
+                       # PIN: stochastic_eval defaults TRUE since 2026-08-10 (train and eval must roll on the
+                       # same distribution). Cached-vs-uncached PARITY is only defined for a deterministic
+                       # readout -- with sampling each rollout draws fresh eps and |delta| is ~4, not ~1e-6.
+                       stochastic_eval=False).to(DEV).eval()
     return m
 
 

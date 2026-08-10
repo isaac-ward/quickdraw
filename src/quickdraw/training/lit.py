@@ -115,7 +115,6 @@ class LitWorldModel(L.LightningModule):
         future = {k: v[:, P:] for k, v in obs.items()}         # CLEAN targets
         # EMA/JEPA heads: obs recon is a decoder-only probe (detach preds so it doesn't shape the encoder).
         recon_src = preds if getattr(m, "pred_obs_in_loss", True) else preds.detach()
-        wts = {mod.name: float(mod.weight) for mod in m.modalities.values()}
         # recon on a RANDOM subset of the F rollout frames when recon_frac<1 (train only), the SAME subset across
         # ALL output modalities. The ViT-AE decode is F x per-step, so fewer frames = less compute; random (not a
         # fixed stride) -> every frame gets recon gradient over an epoch (unbiased). The DYNAMICS loss (flow /

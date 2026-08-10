@@ -186,7 +186,10 @@ def build_model(cfg):
             ahg = (lambda k, v: ah.get(k, v)) if hasattr(ah, "get") else (lambda k, v: getattr(ah, k, v))
             return MultiModalFlow(**common, sampling_steps=int(dfg("sampling_steps", 6)),
                                        shortcut=bool(dfg("shortcut", False)), predict=str(dfg("predict", "residual")),
-                                       stochastic_eval=bool(dfg("stochastic_eval", False)),
+                                       stochastic_eval=bool(dfg("stochastic_eval", True)),   # matches the
+                                       #   class default + conf/model/mm_flow.yaml: train and eval roll on the
+                                       #   same distribution. A config MISSING the key (e.g. an older run's
+                                       #   saved config adopted by run_standalone) must not silently differ.
                                        time_sampling=str(dfg("time_sampling", "uniform")),
                                        flow_hidden=int(dfg("flow_hidden", 0)),
                                        flow_arch=str(dfg("flow_arch", "mlp")),

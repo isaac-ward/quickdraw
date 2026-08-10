@@ -15,7 +15,7 @@ So a floor of 20.41 dB does **not** mean "this configuration reconstructs at 20.
 "before any training, the LayerNorm has removed 3.51 dB that the adapter residual now has to learn
 back". It is the size of the job, not the outcome of the job.
 
-What supervises that job is `loss/roundtrip/<mod>`, which routes through `encode_state -> to_obs`
+What supervises that job is `loss/codec/roundtrip_<mod>`, which routes through `encode_state -> to_obs`
 (the real path, LayerNorm included). Prior to 2026-08-09 that term measured the modality's own
 norm-free `up(down(g))`, read `0.0` at every epoch of every run, and produced no gradient at all —
 so **no run to date has actually trained the adapter to invert LayerNorm.** The only evidence it
@@ -153,7 +153,7 @@ scoping the claim in `vision.adapter_mode`'s docstring and making the `[adapter]
 
 - Root cause of the epoch-5 collapse. No post-collapse weights existed at the time; `last.ckpt` is
   now written unconditionally every epoch, so the next one is inspectable.
-- Whether the adapter residual actually recovers the LayerNorm homework once `loss/roundtrip` has a
+- Whether the adapter residual actually recovers the LayerNorm homework once `loss/codec/roundtrip_<mod>` has a
   real gradient. First run to test it is in flight.
 - Whether spatial addressing (§4) or dynamics capacity (§3) drives the long-horizon plateau.
 - The `F=64` trained vs 2048 evaluated horizon gap (§2).

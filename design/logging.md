@@ -90,7 +90,7 @@ numbers are comparable across epochs (a moving probe set would make a trend mean
 | `normalization/<mod>/mean_c{i}`, `std_c{i}` | `affine` ONLY: the calibrated per-channel parameters (frozen after fit start; re-logged each epoch so the folder is self-contained) |
 | `normalization/<mod>/n_frames` | frames the affine calibration used |
 
-**Read `pre_norm_std_mean` as a collapse tripwire.** Under `layernorm`, `_ln` divides every token by its own
+**Read `ln_gain_max` as a collapse tripwire.** Under `layernorm`, `_ln` divides every token by its own
 std. If the encoder — or, in rollout, the dynamics — drifts toward emitting near-constant tokens, that std
 falls and LayerNorm amplifies whatever remains by up to `1/sqrt(eps)` ~ 316x. That is a positive feedback
 loop, and it is the leading suspect for the un-diagnosed epoch-5 collapse of `taesd_exact` (val PSNR

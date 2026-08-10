@@ -236,6 +236,10 @@ class LoggingCallback(L.Callback):
         self._t_fit = time.perf_counter()
         n_params = sum(p.numel() for p in pl_module.model.parameters())   # constant -> log ONCE, not per epoch
         self.writer.scalars({"model/params": float(n_params), "model/params_millions": n_params / 1e6}, step=0)
+        # Calibration is FUNCTIONAL, not diagnostic: it must run BEFORE the gate (it changes what the floor
+        # is) and it must NOT share the gate's except, which would let a latent_norm=affine run train with
+        # identity stats (silently == latent_norm:none) reported only as "[ae_floor @ep0] skipped".
+        self._calibrate_latent_affine(pl_module)
         # EPOCH-0 pretrained-AE gate (#12 §4), BEFORE any training. In an identity-guaranteed adapter mode the
         # round-trip must already equal the raw AE; a mismatch is an indexing/zero-init bug that would otherwise
         # masquerade as a bad model for the whole run (which is exactly what the ~10.5 dB Perceiver collapse did).
@@ -243,7 +247,7 @@ class LoggingCallback(L.Callback):
         try:
             from ..controller.run import _plog
             from ..evaluation.ae_floor import assert_identity_floor
-            self._calibrate_latent_affine(pl_module)   # MUST precede the gate: it changes what the floor is
+            pass                                       # (calibration moved OUT of this try — see above)
             res = assert_identity_floor(self.cfg, pl_module.model, log=lambda s: _plog(self.writer, s))
             for nm, r in (res or {}).items():
                 self.writer.scalars({f"eval_ae_floor/{nm}/init_adapter_psnr": r["adapter_db"],
@@ -267,6 +271,10 @@ class LoggingCallback(L.Callback):
                              "normalization/is_invertible": float(nt in ("affine", "none"))}, step=0)
         if nt != "affine":
             return
+        if not any(hasattr(md, "taesd") for md in m.modalities.values()):
+            return                                 # no pretrained trunk -> nothing to calibrate. NOT an error:
+            #                                        this used to raise StopIteration and log a scary empty
+            #                                        "probe disabled ()" line on every proprio-only run.
         from ..data.dataset import load_fpv_frames
         from ..training.setup import resolve_data_root
         import numpy as _np, torch as _t
@@ -299,40 +307,50 @@ class LoggingCallback(L.Callback):
         worth tracking is the STATISTIC the normalizer acts on: the per-token mean/std of the encoded bag
         BEFORE normalization, measured on a FIXED set of val frames so epochs are comparable.
 
-        Why it matters under layernorm: _ln divides by each token's own std. If the encoder (or, in rollout,
-        the dynamics) drifts toward emitting near-constant tokens, that std falls and LN amplifies whatever
-        is left by up to 1/sqrt(eps) ~ 316x. A falling pre_norm_std is therefore an EARLY WARNING of exactly
-        the positive feedback suspected behind the epoch-5 collapse -- visible here before the loss moves."""
+        Why it matters under layernorm: _ln divides by each token's own std, so a shrinking std means LN
+        amplifies whatever is left, by up to 1/sqrt(eps) ~ 316x. ln_gain_{mean,max} report that gain directly.
+
+        SCOPE -- this probes the ENCODER path only (mod.encode on clean frames). The feedback loop suspected
+        behind the epoch-5 collapse lives in the ROLLOUT: _ln runs again after every predict_next, on the
+        model's own drifting predictions. With a frozen TAESD and the parameter-free EXACT adapter, the
+        encode-side statistic is nearly inert by construction (only the zero-init refine MLP can move it), so
+        a flat series here is NOT evidence the rollout is healthy. Probing the rollout side is a TODO."""
         m = getattr(pl_module.model, "_orig_mod", pl_module.model)
         nt = getattr(m, "latent_norm_type", "layernorm")
         out = {"normalization/is_layernorm": float(nt == "layernorm"),
                "normalization/is_affine": float(nt == "affine"),
                "normalization/is_invertible": float(nt in ("affine", "none"))}
+        probe = [(n, md) for n, md in m.modalities.items() if hasattr(md, "taesd")]
+        if not probe:                              # no pretrained trunk -> nothing to probe. NOT an error:
+            self.writer.scalars(out, step=step)    # this used to raise StopIteration and log a scary empty
+            return                                 # "probe disabled ()" on every proprio-only run.
+        was = m.training
         try:
             frames = self._norm_probe_frames(m)
-            was = m.training
             m.eval()
-            for name, mod in m.modalities.items():
-                if not hasattr(mod, "taesd"):
-                    continue
+            for name, mod in probe:
                 tok = mod.encode(frames.to(next(mod.parameters()).device))    # pre-bag, pre-_ln
                 sd, mu = tok.std(dim=-1), tok.mean(dim=-1)                    # per token
                 out[f"normalization/{name}/pre_norm_std_mean"] = float(sd.mean())
                 out[f"normalization/{name}/pre_norm_std_min"] = float(sd.min())
+                # The GAIN _ln actually applies, 1/sqrt(var+eps) -- directly readable against the 1/sqrt(eps)
+                # ~= 316x ceiling, unlike the raw std. This is the number to alarm on.
+                out[f"normalization/{name}/ln_gain_mean"] = float((1.0 / (sd ** 2 + 1e-5).sqrt()).mean())
+                out[f"normalization/{name}/ln_gain_max"] = float((1.0 / (sd ** 2 + 1e-5).sqrt()).max())
                 out[f"normalization/{name}/pre_norm_absmean_mean"] = float(mu.abs().mean())
                 if getattr(mod, "latent_affine", False):                      # frozen, but re-logged so the
                     for i, v in enumerate(mod.lat_mean.flatten().tolist()):   # folder is self-contained per epoch
                         out[f"normalization/{name}/mean_c{i}"] = v
                     for i, v in enumerate(mod.lat_std.flatten().tolist()):
                         out[f"normalization/{name}/std_c{i}"] = v
-            if was:
-                m.train()
         except Exception as e:                     # telemetry must never take a run down -- but it must not
             if not getattr(self, "_norm_warned", False):   # fail SILENTLY either (a swallowed AttributeError
                 self._norm_warned = True                   # hid this diagnostic for a full cycle once)
                 from ..controller.run import _plog
                 _plog(self.writer, f"[latent_norm] per-epoch probe disabled ({type(e).__name__}: {e})")
-        self.writer.scalars(out, step=step)
+        finally:
+            m.train(was)                           # restore even if the probe threw (the eval-routine runner
+        self.writer.scalars(out, step=step)        # already does this; this brings the probe up to it)
 
     def _norm_probe_frames(self, m):
         """8 FIXED val frames, loaded once and cached — the point is comparability across epochs."""
