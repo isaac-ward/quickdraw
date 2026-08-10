@@ -539,6 +539,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True,
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = False, time_sampling: str = "uniform", flow_hidden: int = 0,
+                 flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
@@ -553,7 +554,10 @@ class MultiModalFlow(MultiModalSequenceModel):
         self.stochastic_eval = bool(stochastic_eval)
         self.time_sampling = time_sampling
         self.lambda_flow, self.lambda_consistency = lambda_flow, lambda_consistency
-        self.flow = FlowField(d, h_dim=d, hidden=(flow_hidden or d), cond="concat", shortcut=shortcut)
+        # flow_arch="transformer" makes the denoiser token-mixing -> a JOINT over the bag instead of a product
+        # of per-token marginals. n_state (NOT n_input) is the token axis predict_next denoises.
+        self.flow = FlowField(d, h_dim=d, hidden=(flow_hidden or d), cond="concat", shortcut=shortcut,
+                              arch=flow_arch, n_tokens=self.n_state, depth=flow_arch_depth, heads=flow_arch_heads)
         self.pred_obs_in_loss = True
         self.lambda_pred_obs = 1.0
         # ---- diffusion forcing (opt-in; df_scale=0 -> everything below is inert / bit-identical) ----

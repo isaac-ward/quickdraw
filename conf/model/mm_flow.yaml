@@ -109,6 +109,24 @@ diffusion:
   stochastic_eval: false   # false -> eps=0 committed prediction at eval
   time_sampling: uniform
   flow_hidden: 0           # 0 -> mirror d
+  flow_arch: mlp           # mlp | transformer — how the velocity net sees the OTHER tokens being denoised.
+#                            mlp (DEFAULT, bit-identical to every run before 2026-08-10): a per-token MLP, so
+#                              token k's velocity depends only on its own x_k and h_k. The K sampling steps
+#                              therefore draw from PROD_k p(z_k | h_k) -- a FACTORIZED model. h is frozen for
+#                              the whole denoising trajectory and cannot repair this: a product of correct
+#                              marginals is not the correct joint. It is HARMLESS while eval is deterministic
+#                              (stochastic_eval=false), because the mean of the factorized model equals the
+#                              true marginal means -- what you get is blur, not incoherence.
+#                            transformer: every denoising step attends across the n_state bag tokens, sampling
+#                              a proper JOINT. This is the PREREQUISITE for stochastic_eval=true to buy
+#                              sharpness instead of incoherent bags (token 3 committing to one future while
+#                              token 5 commits to another). Uses plain SDPA, so compile_rollout's
+#                              head_dim>=16-power-of-2 rule does not apply. Attention is over ~10 tokens, so
+#                              the cost is params (~0.07M -> ~0.27M at d=128), not compute.
+#                            The ACTION head always stays mlp: its lead axes are (B,T), so token-mixing there
+#                            would mix over TIME.
+  flow_arch_depth: 2       # transformer only: token-mixing blocks
+  flow_arch_heads: 4       # transformer only: heads (head_dim = flow_hidden/heads; 9-10 tokens needs few)
 # action-distribution head (design/models/flow_heads.md — the action-flow prior). A FlowField that predicts
 # the NEXT action's distribution from the PREVIOUS-step backbone context h[t-1] (leak-free: it never sees the
 # action a[t] it predicts, only history). Trained JOINTLY as an extra flow loss; it is a learned behavior/play

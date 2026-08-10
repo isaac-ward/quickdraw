@@ -49,6 +49,50 @@ cases, summary scalars added, losses dropped.
 Shoot-out: tag each run and group runs in W&B; the shared `eval/*/manifold_distance_error@*`
 scalars drive automatic comparison across runs × cases.
 
+## `normalization/` — how the latent is made scale-free, and whether it is drifting
+
+One folder describing the ACTIVE latent-normalization mechanism (`model.latent_norm`) and the statistic it
+acts on. Logged at fit start AND **every validation epoch**, probed on a FIXED set of 8 val frames so the
+numbers are comparable across epochs (a moving probe set would make a trend meaningless).
+
+| key | meaning |
+|---|---|
+| `normalization/is_layernorm` | 1.0 when `latent_norm: layernorm` — per-token non-affine LN on the carried bag |
+| `normalization/is_affine` | 1.0 when `latent_norm: affine` — fixed per-channel scale+shift on the AE latent |
+| `normalization/is_invertible` | 1.0 for `affine`/`none`. `layernorm` is 0: it DISCARDS 2 scalars per token |
+| `normalization/<mod>/pre_norm_std_mean` | mean per-token std of the encoded bag BEFORE normalization |
+| `normalization/<mod>/pre_norm_std_min` | the smallest such std — the first token to degenerate |
+| `normalization/<mod>/pre_norm_absmean_mean` | mean \|per-token mean\| before normalization |
+| `normalization/<mod>/mean_c{i}`, `std_c{i}` | `affine` ONLY: the calibrated per-channel parameters (frozen after fit start; re-logged each epoch so the folder is self-contained) |
+| `normalization/<mod>/n_frames` | frames the affine calibration used |
+
+**Read `pre_norm_std_mean` as a collapse tripwire.** Under `layernorm`, `_ln` divides every token by its own
+std. If the encoder — or, in rollout, the dynamics — drifts toward emitting near-constant tokens, that std
+falls and LayerNorm amplifies whatever remains by up to `1/sqrt(eps)` ~ 316x. That is a positive feedback
+loop, and it is the leading suspect for the un-diagnosed epoch-5 collapse of `taesd_exact` (val PSNR
+18.39 -> 11.63 in one epoch, never recovered). A falling `pre_norm_std_mean` should be visible BEFORE the
+loss moves. Under `affine` the mechanism does not exist, so the series is informational only.
+
+The probe is fail-soft but NOT silent: if it raises, it logs `[latent_norm] per-epoch probe disabled (...)`
+once to progress.log. A bare `except: pass` here previously hid a real bug for a full verify cycle.
+
+`progress.log` additionally carries a one-line `[latent_norm] <type>: <what it costs>` at startup.
+
+## Image metrics: LPIPS sits alongside psnr/ssim/mse/l1
+
+`evaluation/openloop.image_curves` returns `{psnr, ssim, mse, l1, lpips}` per timestep, and EVERY consumer
+picks the new key up automatically (`emit_horizon_readouts` iterates the dict; `products.log_error_curves`
+plots it) — so it appears in both `eval_ood_horizon/` and `eval_ae_floor/` with no per-call-site change.
+
+**LOWER lpips is better**, unlike psnr/ssim. It exists because every other image metric here is pixelwise
+and therefore cannot distinguish a prediction blurred toward the dataset mean from one that is sharp but
+wrong — the two failures need opposite fixes, and long-horizon rollouts on this repo look like the former.
+Measured separation on synthetic inputs: heavy blur 0.7635 vs sharp-but-noisy 0.0159.
+
+Backbone is SqueezeNet (cheapest of the three LPIPS variants, ~0.1 GFLOP/frame at 128px — negligible beside
+the rollout that produced the frames), cached per device, and fail-soft: if the weights cannot be fetched
+the key is simply absent rather than the eval dying.
+
 ## Collapse diagnostics (latent models only)
 
 A `collapse/` panel describing **this run's** latent health (one model — not a cross-model view).
