@@ -21,7 +21,10 @@ def check(name, cond, extra=""):
 def build(specs, d=256, depth=2, shortcut=False):
     torch.manual_seed(0)
     return MultiModalFlow(specs, d=d, depth=depth, heads=4, window=16, mlp_ratio=4.0,
-                               rope_theta=10000.0, action_dim=2, sampling_steps=4, shortcut=shortcut).to(DEV)
+                               rope_theta=10000.0, action_dim=2, sampling_steps=4,
+                       # EXPLICIT: these specs use the BESPOKE image trunk, and latent_norm=affine (the
+                       # default) needs a PRETRAINED one. No fallback exists by design -- name the norm.
+                       latent_norm="layernorm", shortcut=shortcut).to(DEV)
 
 
 def main():

@@ -209,6 +209,472 @@ entirely, so actions reached a prediction ONLY via attention onto 1 of 10 slots.
 state token; `model.action_fourier_freqs` and `modalities.<i>.fourier_freqs` (both default 0/off) add sin/cos
 bands. NOT bit-identical to these runs — they predate it.
 
+## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
+
+These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
+
+### from `wizard/scripts/handoff-eval-action-dist.md`
+
+# Handoff: 4 fixes in the action-distribution eval + one config declaration
+
+Context: running `mm_flow` on a **recorded, no-simulator** dataset with a **12-dim** action space
+(`isaac-ronald-ward/robocasa-scene4-4h`, `environments=recorded`). Line numbers are against the commit
+`2c1ea51`. Items 1–3 are bugs; item 4 is a feature request with a design.
+
+Motivating measurement — the 12 action dims over all 259,299 train frames. Note how degenerate a real
+robot action space is, which is what makes the current magnitude-only products uninformative:
+
+| dim | std | n_unique | reading |
+|---|---|---|---|
+| 0,1,2 | 0.23 / 0.21 / 0.19 | ~550–700 | EEF delta position |
+| **3** | **0.000** | **1** | exactly constant — dead |
+| **4** | 0.71 | **2** | binary flag (~85% at −1) |
+| 5,6,7 | 0.31 / 0.24 / 0.30 | ~700 | rotation deltas |
+| 8,9,10 | 0.081 / 0.086 / 0.072 | ~710 | near-dead (mobile base, unused in this scene) |
+| **11** | 0.97 | **2** | binary — gripper |
+
+---
+
+## 1. `model.compile_rollout` is undeclared, so the bare override is rejected
+
+`src/quickdraw/training/setup.py:81` reads it with `bool(m.get("compile_rollout", False))`, but
+`conf/model/mm_flow.yaml` never declares the key. So:
+
+```
+model.compile_rollout=true    -> ERROR: "Key 'compile_rollout' is not in struct"
++model.compile_rollout=true   -> works
+```
+
+This is the same trap class as the old `trainer.fast_dev_run` (read but undeclared ⇒ needs `+`). It is
+easy to hit because every *other* model knob in that file takes the bare form.
+
+**Fix:** declare it in `conf/model/mm_flow.yaml` next to `grad_checkpoint`, defaulting off, with the
+guard conditions in the comment:
+
+```yaml
+compile_rollout: false   # true -> torch.compile the AR rollout STEP (~6x, accelerations.md Exp 9).
+#                          Requires head_dim (d/heads) >= 16 and is mutually exclusive with
+#                          variations.contraction (its Jacobian power-iteration needs the eager graph).
+```
+
+Measured on this dataset for reference: **3.90 s/batch eager → 0.67 s/batch compiled** at
+`d=128 depth=4 F=64 batch=32` (5.8x), and 1.07 s/batch at `d=256 depth=6`.
+
+---
+
+## 2. CRASH: bare `ecfg.a_max` in `eval_action_distribution` (3 sites)
+
+`src/quickdraw/evaluation/routines.py` lines **679, 690, 694**:
+
+```python
+fig = viz.fig_action_by_state(arr, x, ecfg.a_max, ...)              # 679
+frames = viz.anim_action_distribution(true_a, pred_a, ecfg.a_max, ...)   # 690
+frames_bx = viz.anim_action_by_state(true_a, pred_a, x, ecfg.a_max, ...) # 694
+```
+
+`a_max` is a **torus-only** knob (`conf/environments/torus.yaml:7`, `a_max: 4.0`).
+`conf/environments/recorded.yaml` has no such key ⇒ `AttributeError` the moment this eval runs on any
+recorded/non-torus env. This is the identical bare-attribute pattern already fixed at `_ood_axis`
+(line 166), just further down the same file.
+
+`a_max` is only ever used as a histogram **x-limit** — `viz.py:1197`, `1287`:
+`hi = min(float(a_max), <data max> * 1.05)`. So it has a natural data-driven fallback.
+
+**Fix:** pass `getattr(ecfg, "a_max", None)` and make the three viz functions treat `None` as "use the
+data range":
+
+```python
+a_max = getattr(ecfg, "a_max", None)   # torus-only knob; None -> derive the limit from the data
+```
+and in `viz.py` (`fig_action_distribution:1160`, `anim_action_distribution:1185`,
+`anim_action_by_state:1225`, `fig_action_by_state:1276`):
+```python
+data_hi = max(float(tm.max()), float(pm.max())) * 1.05
+hi = data_hi if a_max is None else min(float(a_max), data_hi)
+```
+
+### 2b. Same bug, one line up, still live: `ecfg.init_speed`
+
+`routines.py:168` — inside the function whose `R`/`r` default you *just* made lazy on line 166:
+
+```python
+se.get("init_speed", ecfg.init_speed),   # <-- bare attribute, evaluated EAGERLY
+```
+
+`se.get(k, default)` always evaluates `default`, so this raises on any env without `init_speed` —
+`recorded.yaml` has none — even when the dataset card supplies `init_speed`. Line 166 was fixed with
+`or {...getattr...}`; line 168 was missed.
+
+**Fix:** `se.get("init_speed", getattr(ecfg, "init_speed", None))`, and confirm `_openloop_split`
+tolerates `None` (it is reached only by the `ood_visual/geometric/dynamics` axes, so this is latent
+rather than blocking — but it is the same footgun).
+
+---
+
+## 3. The by-state ("by-x") products must be torus-only
+
+`routines.py:663`:
+
+```python
+x = np.stack([o[1:L, 0] for o, _, _ in eps]).astype(np.float32)   # ambient x at each action's state
+```
+
+This hardcodes **observation dim 0** and the two by-state products then split rows on `x<0` / `x>=0`,
+captioned as the torus's *slow basin / fast basin* (`viz.py:1226`: "TOP x<0 slow, BOTTOM x>=0 fast").
+
+On any other env, obs dim 0 is an unrelated quantity — for this robocasa state it is a joint value with
+mean 2.86, std 1.16, so `x<0` selects almost nothing and the split is silently meaningless. It does not
+crash, which is worse: the panels render and look authoritative.
+
+**Minimal fix** — gate both by-state products on geometry, exactly like the denoising routines now do:
+
+```python
+has_geom = getattr(ecfg, "R", None) is not None      # by-x split is torus semantics
+...
+if has_geom:
+    for name, arr in (("true", true_a), ("pred", pred_a)):
+        fig = viz.fig_action_by_state(...)           # 678-681
+    frames_bx = viz.anim_action_by_state(...)        # 694-695
+```
+
+**Preferred fix** — make it an *optional env hook*, matching the 7-hook contract in `docs/byo.md` so
+each hook independently unlocks one product with a graceful fallback. Add to the `WorldEnv` protocol in
+`src/quickdraw/environments/base.py`:
+
+```python
+def action_dist_split(self, obs):        # OPTIONAL
+    """-> (labels: bool array over obs rows, low_name: str, high_name: str) | None.
+    Splits action-distribution panels by a MEANINGFUL state feature. None -> panels are pooled only."""
+```
+
+`TorusEnv` returns `(obs[..., 0] < 0, "slow", "fast")`; every other env inherits `None` and the by-state
+products self-skip. That also deletes the hardcoded `o[..., 0]` and lets the panel captions come from the
+env instead of being baked into `viz.py`.
+
+---
+
+## 4. FEATURE: per-dim action marginals (dataset/env-agnostic)
+
+**Why the current products are not enough.** Every existing action plot reduces to a **magnitude**:
+`np.linalg.norm(..., axis=-1)` at `viz.py:1192-1193`, `1231-1232`, `1283`. That is dimension-agnostic (so
+12-D does *not* crash once item 2 is fixed) but for a real action space it is dominated by whichever dims
+happen to have the largest scale. Here |a| is driven by the two **binary** dims (std 0.97 and 0.71),
+while the six dims that actually carry continuous control have std 0.07–0.31. So the headline plot mostly
+shows the gripper toggling, and a head could match |a| well while getting every continuous dim wrong.
+
+Likewise `true_pred_w1` (`routines.py:684`) is a single scalar on pooled |a| — it cannot say *which* dim
+is wrong.
+
+### 4a. New viz function
+
+In `src/quickdraw/logging/viz.py`, beside the existing action functions (~1160–1320):
+
+```python
+def fig_action_marginals(true_a, pred_a, names=None, max_cols=4, discrete_max=10, q=(0.001, 0.999)):
+    """Per-dim action marginals: recorded (filled) vs head (outline) on SHARED bins, one panel per dim.
+    true_a/pred_a: (E, T, A) physical actions. names: list[str] | None -> 'a[i]'.
+    Dimension-agnostic and env-agnostic: no a_max, no state split, no geometry."""
+```
+
+Per-dim behaviour, decided from the **true** actions so panels stay comparable across runs:
+
+- **constant** (`n_unique <= 1`): don't fake a histogram — render a text tile `"a[3] constant @ 0.000"`.
+  Keeps the grid aligned and makes degeneracy *visible* instead of hidden.
+- **discrete** (`n_unique <= discrete_max`): grouped bar chart of value frequencies, true vs pred.
+  A 60-bin histogram of a ±1 flag is unreadable; this is the correct rendering for dims 4 and 11.
+- **continuous**: shared bins over `[lo, hi]` = the `q` quantiles of the true dim, padded ~5%. Overlay
+  true (filled, alpha) and pred (step outline). Robust quantiles, not min/max, so one outlier can't
+  flatten the panel.
+
+Shared bins between true and pred are the important detail — separately-binned histograms are not
+visually comparable.
+
+### 4b. Per-dim quantitative metric
+
+Reuse the existing quantile-difference Wasserstein already at `routines.py:683-684` (same `q` grid),
+applied per dim instead of to pooled magnitude:
+
+```python
+q = np.linspace(0.0, 1.0, 512)
+w1_per_dim = [float(np.mean(np.abs(np.quantile(true_a[..., i], q) - np.quantile(pred_a[..., i], q))))
+              for i in range(true_a.shape[-1])]
+live = [i for i in range(true_a.shape[-1]) if true_a[..., i].std() > 1e-6]   # skip dead dims
+writer.scalars({f"eval_action_distribution/w1/dim_{i}": w for i, w in enumerate(w1_per_dim)}, step)
+writer.scalar("eval_action_distribution/w1_mean", float(np.mean([w1_per_dim[i] for i in live])), step)
+```
+
+**`live` matters:** a constant dim has W1 ≈ 0 by construction. Averaging it in would flatter the head —
+on this dataset 4 of 12 dims are dead or near-dead, so a naive mean is diluted by a third. Keep the
+existing pooled-magnitude `true_pred_w1` unchanged for continuity with prior runs.
+
+`writer.scalars(dict, step)` already exists (`logging/writer.py:135`).
+
+### 4c. Dim names, from the dataset (not the env)
+
+lerobot carries them: `<root>/train/meta/info.json` → `features.action.names`. It is `null` for this
+dataset, so the fallback must be graceful — but wiring it now means a dataset that *does* label its
+actions gets readable panels for free. Read once in the routine (root via `resolve_data_root(cfg)`,
+already imported at `routines.py:20`), fall back to `None` ⇒ `a[i]`.
+
+### 4d. Call site
+
+In `eval_action_distribution`, right after `true_a` / `pred_a` are built (`routines.py:671-672`) and
+**unconditionally** — it needs no geometry, no `a_max`, no state split, so it works for torus (2-D),
+pendulum (1-D) and robocasa (12-D) alike:
+
+```python
+fig = viz.fig_action_marginals(true_a, pred_a, names=action_names)
+writer.figure("eval_action_distribution/marginals", fig, step); plt.close(fig)
+```
+
+This should become the **primary** product of the eval; the magnitude animations stay as secondary
+views, and the by-state ones become torus-only per item 3.
+
+---
+
+## Acceptance criteria
+
+1. `python -m quickdraw.eval_action_distribution checkpoint=<run> data.root=<root> data.repo_id=robocasa-scene4-4h data.cam=robot0_agentview_left environments=recorded environments.obs_dim=16 environments.action_dim=12` completes with **no `AttributeError`**.
+2. `eval_action_distribution/marginals` shows **12 panels**: histograms for dims 0,1,2,5,6,7,8,9,10; bar
+   charts for dims 4 and 11; a "constant" tile for dim 3.
+3. No `by_state_*` / `animation_byx` products are emitted for `environments=recorded`; they still are for torus.
+4. `w1_mean` excludes dim 3, and per-dim `w1/dim_*` scalars exist for all 12.
+5. Torus runs are **unchanged** — same products, same `true_pred_w1`, `a_max` still respected as the limit.
+
+Note this eval requires an action head, which is trained **post-hoc** on a frozen WM via
+`train_action_model` (joint training is locked off — it killed control and destabilised the WM). So
+reproducing needs a `train_action_model` run first; there is no action prior in a stock WM checkpoint.
+
+### from `wizard/scripts/robocasa-scene4-4h.md`
+
+# Wizard record — `isaac-ronald-ward/robocasa-scene4-4h`
+
+Script: `wizard/scripts/robocasa-scene4-4h.sh` (both gitignored). Dataset inspected 2026-08-04;
+**experiment revised 2026-08-05** from a decode-objective A/B to a **capacity sweep** at the user's
+direction ("do the vit mse on both, a smaller 3.3M on one and a larger one on the other… 128x128 on both").
+
+## Part A — what the dataset actually is
+
+**Inspected before asking anything.** The key finding: this repo is **not a raw robocasa dump** — it is
+already a **processed quickdraw recording**, pushed via `push_to_hub` from
+`logs/recording_2026_08_04_06_54_40_robocasa-scene4-4h`. It has `train/` + `val/` split dirs each with
+`meta/info.json`, `data/chunk-000/`, `videos/observation.images.<cam>/`, plus top-level `summary.json`,
+`dataset_card.json`, `normalization_stats.json`, `progress.log`, and a `media/` dir of per-episode mp4s.
+
+**So there is no `data_generation` stage and no `data/processors.py` stage.** Those are already done. (The
+raw source was `madang6/quickdraw-robocasa-scene4-4h`, which the `robocasa` processor reads.)
+
+| property | value | source |
+|---|---|---|
+| `obs_dim` | **16** | `train/meta/info.json` → `observation_vector.shape` |
+| `action_dim` | **12** | `train/meta/info.json` → `action.shape` |
+| `dt` / fps | **0.05 / 20** | `summary.json`, `dataset_card.json` |
+| camera key | **`robot0_agentview_left`** — the ONLY one | `videos/observation.images.robot0_agentview_left` |
+| image | **256×256×3**, av1 / yuv420p | `info.json` video info |
+| train | 235 eps · 259,299 frames · **3.60 h** · len 615/1103/1749 | `summary.json` + `check_dataset` |
+| val | 26 eps · 29,294 frames · **0.41 h** · len 644/1126/2066 | `summary.json` + `check_dataset` |
+| windows @ P=8 F=64 | **242,614 train / 27,448 val** | `check_dataset` |
+| robot_type | `null` | `info.json` |
+
+**Column of `docs/byo.md`: 1 — recorded data, no simulator.** Confirmed by the run's own contract report:
+
+```
+[env-contract] recorded | obs_dim=16 action_dim=12 | reset ✗ no-sim | step ✗ no-sim | reward ✗ no-control |
+render_obs ✗ dataset-images-only | rollout_metrics ✗ default(pointwise) | render_diagnostics ✗ filmstrip |
+control_goals ✗ reward-only | physical_loss ✗ off | checkpoint_metric=pointwise_error | policies=-
+```
+
+- **Available:** WM training + validation, the `ood_horizon` pointwise metric, the `pred`/GT image
+  filmstrip, and (deferred, not in this script) `eval_interpret` + `train_reward_model`, which need only the
+  frozen WM + data + a VLM.
+- **Unavailable:** MPPI control — both the goal race *and* language steering — plus the oracle baseline.
+  All three must *step* the env. Hence `eval.during_train.evals.control=false`.
+
+**Only one camera**, so the multi-trunk (one `image` modality per camera) question is moot. Multiple
+cameras would mean re-running the processor against the source repo with `+source.camera=<leaf>`; the
+`robocasa` docstring notes the source has 3 cameras.
+
+## The user's choices
+
+| topic | chosen | notes |
+|---|---|---|
+| image decode | **ViT-MSE on BOTH arms** | `decode_kind=mse`, `decode_arch=vit` — the header's winner |
+| image resolution | **128×128 on both** (from 256) | the resolution the recipe's numbers were measured at |
+| action head | **off on both** | WM only; no `train_action_model` |
+| model size | **arm A ~3.2M / arm B ~14.2M** | the sweep axis |
+| pipeline scope | **`train_world_model` only** | interpret + reward head deferred to the winning arm |
+| GPUs | **both — one arm each** | GPU 0 = base, GPU 1 = large, otherwise byte-identical |
+
+## The experiment: capacity, with everything else held fixed
+
+The single independent variable is `d`/`depth`/`heads`. Everything else — data, schedule, decode objective,
+teacher forcing, epochs — is identical between arms, so a difference in outcome is attributable to capacity
+alone.
+
+| arm | `d` | `depth` | `heads` | `head_dim` | params | GPU |
+|---|---|---|---|---|---|---|
+| base | 128 | 4 | 8 | 16 ✓ | **3.22M** | 0 |
+| large | 256 | 6 | 16 | 16 ✓ | **14.21M** | 1 |
+
+`head_dim = d/heads` must be a power of 2 for FlexAttention — both arms land on 16. (`d=192, heads=8`
+would give 24 ✗; `d=256, heads=16` was chosen over `d=192, heads=12` for a cleaner 4.4× scale-up.)
+
+`model_summary` for the large arm — the growth is almost entirely backbone, since `num_tokens=8` fixes the
+per-frame token budget and the ViT heads scale only with `d`:
+
+```
+[train] MultiModalFlow 14.21M params
+[arch] d=256 window=32 | per-step bag = 9 state token(s) + 1 action = 10 tokens
+```
+
+Base arm, per component (the 3.22M reference):
+
+```
+  proprio encoder (mlp)              (B,T,16) -> (B,T,1,128)                              0.009M
+  image encoder (vit)                (B,T,128,128,3) -> (B,T,8,128)                       0.968M
+  action_enc                         (B,T,12) -> (B,T,1,128)                              0.018M
+  space-time backbone                (B,T,10,128) -> same [spatial 10 tok/step + causal]   1.060M
+  predict_next: flow (rectified, per-token) (B,T,9,128) -> same                            0.072M
+  proprio decode (mlp flow)          (B,T,1,128) -> (B,T,16)                              0.019M
+  image decode (vit mse/no-noise)    (B,T,8,128) -> (B,T,128,128,3)                       1.072M
+```
+
+**Why 128×128 and not native 256.** At 256 the same config is 3.27M (encoder 0.992M / decode 1.097M) —
+parameters barely move, but `patch=16` means **256 patches/frame vs 64**, ~4× the ViT encode+decode work
+across the F=64 rollout, and the GPU-resident frame store grows 12.75 GB → 51 GB. The cost is compute and
+memory, not parameters. 128 also matches the resolution every quoted metric was measured at.
+
+## Learnings applied (quoted from `conf/model/mm_flow.yaml`)
+
+- **`decode_kind=mse` + `decode_arch=vit`** — "ViT-MSE image decode (decode_kind=mse, decode_arch=vit)
+  slightly BEAT U-Net/flow on EVERY axis here": val PSNR **18.9 vs 18.3**, OOD pointwise **0.24 vs 0.32**,
+  OOD PSNR **14.5 vs 12.6**, control **4.12 vs 3.5**. The image is a deterministic render, so "the
+  conditional mean IS the target."
+- **`action_head.enabled=false`** — "the JOINT action head KILLS control (goals ~0 vs 3.88 baseline) AND
+  destabilizes the WM (unetflow NaN'd ~ep31, vitmse collapsed to a frozen 11.1)." The control half of that
+  doesn't even apply here (no steppable env); the destabilization half does.
+- **`p_tf_end=0.0` (in-rollout), `p_tf_warmup_epochs=4`, Diffusion Forcing OFF** — full teacher forcing
+  causes "autoregressive MEAN-COLLAPSE (proprio→origin, images→one frozen frame)"; in-rollout took "val
+  0.81→0.32, pointwise 0.61." DF "at scale 0.25/1.0 it made collapse WORSE" — "The anti-collapse lever is
+  in-rollout, not DF."
+- **`diffusion.shortcut=true`** — K=1 sampling via self-consistency, safe because next-state dynamics are
+  near-deterministic (a straight noise→target field, so "1×(2d) == 2×(d)").
+- **`recon_frac=0.25`, `detach_every=16`, `num_tokens=8`, `encode_arch=vit`** — from the FULL recipe line;
+  the header also forbids "NO conv encoder, NO num_tokens>8, NO grad-accum, NO window_stride>1".
+- **`lr_warmup_steps=300`, `weight_decay=1e-4`** — already the defaults in `conf/optim/adamw.yaml`, so no
+  override was added. Warmup exists because "flow heads regress a clean target from near-pure noise →
+  high-variance early gradients."
+- **Forbidden levers left alone:** `trainer.accumulate_grad_batches` (LOCKED at 1 — Lightning SUMS
+  micro-batch grads → ~N× effective LR → mean-collapse) and `data.window_stride` (LOCKED at 1).
+- **`trainer.max_epochs=20`** — the header's metrics are "@ep10-15" and it records collapse past ep20
+  (NaN ~ep31, frozen 11.1), so 20 is the informative budget. Config default is 50; raise it only to study
+  the collapse itself.
+
+## Repo gotchas found while wiring this up
+
+These are the reason the script looks the way it does. **None required a code change.**
+
+1. **`data.root`, not `data.hf_repo`.** Training resolves either (`resolve_data_root`), but every eval
+   routine reads `cfg.data.root` **directly** — `evaluation/routines.py:89,163,218,264,361,414,636,639`.
+   With `hf_repo` alone, `data.root` stays `null` and `ood_horizon` would die at the first eval epoch (5).
+   The script resolves the snapshot path itself and passes `data.root`.
+2. **Frame-cache race.** `load_fpv_frames` writes `<root>/<split>/<cam>_128.npy` with a non-atomic
+   `np.save` (`data/dataset.py:69,108`). Two simultaneous cold starts would both decode 288k frames and
+   could tear the file. Stage 0 warms it serially: **train 12.75 GB in 158s, val 1.44 GB in 19s**. This is
+   the single most important reason the two arms cannot simply be launched back-to-back from cold.
+3. **`manifold` / `denoising_*` must be disabled.** `eval_manifold` (`routines.py:218`) and both denoising
+   routines call `load_split_episodes_mm(cfg.data.root, "val", img_size=img_size)` with **no `cam` and no
+   `repo_id`**, so they default to `fpv` / `"torus"` and cannot find this dataset. Worse, the denoising
+   routines gate on `isinstance(m, MultiModalFlow)` — which **is** our model, so they do *not* self-skip —
+   and then read torus-only `ecfg.R` / `ecfg.r`, absent from `recorded.yaml`.
+4. **`ood_horizon` is safe** and stays on: it passes `cam` + `repo_id` (`routines.py:89`) and takes
+   geometry via `getattr(ecfg, "R", None)`, so the torus scene path degrades gracefully. "OOD" here means
+   horizon ≫ trained (H up to 2048 vs F=64) on the **val** split — not a distribution-shifted split, which
+   this dataset doesn't have.
+5. **`recorded.yaml` ships starling's dims AND its rate.** `obs_dim: 16` happens to match, but
+   `action_dim: 4` and `dt: 0.0333333` (30 Hz) do not — this dataset is 12-dim at 20 Hz. `dt` feeds
+   `fps = round(1.0/ecfg.dt)` in `eval_ood_horizon`, so without `environments.dt=0.05` the filmstrip and
+   rollout videos play 1.5× too fast.
+6. **`trainer.fast_dev_run` does not exist in this repo.** `Trainer(...)`
+   (`train_world_model.py:178-190`) never passes it, so plain `trainer.fast_dev_run=true` is rejected by
+   the struct and `+trainer.fast_dev_run=true` would be silently ignored. The wired equivalents are
+   `+trainer.limit_train_batches` / `+trainer.limit_val_batches`, which the script uses instead.
+   **`wizard/prompt.md`'s pre-flight step 3 is wrong for this codebase** and should be reworded.
+7. **Hydra override quoting.** `run_summary` prose containing `(` or `,` fails the override grammar
+   ("mismatched input ' ('"). Each arg is shell-single-quoted with the value double-quoted.
+8. **The duplicate-summary check is inert under `QUICKDRAW_LOG_ROOT`.** `_assert_summary_unique` is called
+   with its default `root="logs"` (`train_world_model.py:90`), globbing `logs/*/auto_run_summary.txt`,
+   while runs land in `logs/robocasa-scene4-4h/<run>/`. The summaries here are unique anyway; the smoke
+   stage carries `allow_duplicate=true` so re-running the script is safe.
+9. **Stale startup banner.** `[startup] data inventory` echoes `conf/data/torus.yaml`'s `splits:` block
+   (256 traj × 256 steps, `eval_ood_visual/geometric/dynamics`) — meaningless on this path. The real
+   numbers are the line above: `data ready in 65.9s: 242614 train / 27448 val windows`.
+10. **`snapshot_download` pulls the 1.13 GB `media/` dir** (2.54 GB total) that the loader never reads —
+    the lerobot videos it uses are under `train/videos/`. Cosmetic bandwidth waste only.
+11. **`docker compose exec` does not forward host env** (found 2026-08-05). The script `export`s
+    `QUICKDRAW_LOG_ROOT`, but that only affects the *host* shell; without an explicit `-e` on every `exec`,
+    `make_run_dir` falls back to plain `logs/` inside the container and the two arms scatter outside the
+    grouped subfolder. Every `exec` in the script now passes `-e QUICKDRAW_LOG_ROOT=…`.
+
+Items 1, 3 and 5 are latent bugs on the recorded+non-torus path rather than user error — worth fixing in
+the repo (thread `resolve_data_root` and `cam`/`repo_id` through the eval routines; make the denoising
+routines require torus geometry rather than just `MultiModalFlow`) if this dataset becomes a regular target.
+Item 6 is a documentation bug in `wizard/prompt.md` itself.
+
+## Pre-flight results
+
+**1. `check_dataset`** — passed:
+
+```
+[check] data=/caches/hf/hub/datasets--isaac-ronald-ward--robocasa-scene4-4h/snapshots/5a3df71e...
+        P=8 F=64  (an episode needs >= P+F = 72 steps for 1 window)  repo_id=robocasa-scene4-4h
+[check] env 'recorded': obs_dim=16 action_dim=12
+[check] train:  235 episodes | len min/mean/max = 615/1103/1749 | obs_dim=16 action_dim=12 -> 242614 training windows
+[check] val  :   26 episodes | len min/mean/max = 644/1126/2066 | obs_dim=16 action_dim=12 -> 27448 training windows
+
+[check] OK — dataset fits the config
+```
+
+**2. `model_summary`** — 3.22M (base) / 14.21M (large); see the arch tables above.
+
+**3. Smoke (2 train + 2 val batches)** — both configs pass, no nonfinite grads:
+
+| arm | run dir | train_loss | val_loss | nonfinite grads |
+|---|---|---|---|---|
+| base (3.22M, ViT-MSE) | `train_world_model_2026_08_04_20_52_19_rc4h_smoke_mse` | **2.5908** | **2.3219** | 0 |
+| large (14.21M, ViT-MSE) | `train_world_model_2026_08_05_03_07_14_rc4h_smoke_large` | **2.7071** | **2.3088** | 0 |
+
+Large-arm grad norms at step 1 — the image heads dominate and warmup is doing its job (preclip 2.62 clipped
+to 1.0): `decode_image 2.03`, `encode_image 1.63`, `decode_proprio 0.218`, `encode_proprio 0.073`,
+`flow 0.064`, `backbone 0.045`, `act_enc 0.0008`. The 14.2M arm fits at `batch=32` alongside the 14.2 GB
+resident frame store, which was the open risk.
+
+## Expected cost
+
+242,614 windows ÷ batch 32 = **7,582 steps/epoch**; the base smoke measured ~0.5 s/batch → **~63 min/epoch**,
+plus validation every 4 epochs ("~as long as the train epoch"). So **20 epochs ≈ 1 day for the base arm**;
+the large arm is wider and will be somewhat slower. Both run in parallel on separate GPUs. `best.ckpt`
+tracks `pointwise_error` (no `checkpoint_metric` hook on `RecordedEnv`). Resume with
+`+resume=<run_dir>/checkpoints/last.ckpt`.
+
+## What to compare when they finish
+
+Both runs write to `logs/robocasa-scene4-4h/train_world_model_<ts>_rc4h_{base,large}/`. The decisive
+products, all under `eval_ood_horizon/`:
+
+- `<head>/psnr|ssim|mse|l1` error-vs-step curves and the `@+x` scalars — the primary capacity readout. A
+  large PSNR gap means the base arm was underfitting the kitchen scene.
+- `image/filmstrip_<i>` — decoded vs ground-truth frames. Read this **alongside** PSNR: a conditional-mean
+  decoder is structurally favoured by PSNR, so check whether the larger model actually resolves movable
+  objects and the gripper rather than just lowering average error.
+- `eval_ood_horizon` / `pointwise_error` — the proprio-side scalar `best.ckpt` is chosen on.
+- Watch both for the documented failure mode: autoregressive **mean-collapse** (images → one frozen frame,
+  proprio → origin) and any nonfinite-grad skips, especially past ep10.
+
+**Then:** run `eval_interpret` (needs a drafted `conf/interpret/robocasa.yaml` — semantic factors + VLM
+prompt, the one non-automatic interpret input — plus `OPENAI_API_KEY`) and `train_reward_model` on whichever
+arm wins. Both are env-free and therefore available on this recorded dataset.
+
 ## Standing decisions
 
 - `num_tokens × d == L` exactly. **Never pad.**

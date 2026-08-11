@@ -22,6 +22,9 @@ def _model(window):
                           decode_kind="flow", decode_param="x0")]
     m = MultiModalFlow(specs, d=32, depth=2, heads=4, window=window, mlp_ratio=4.0, rope_theta=10000.0,
                        action_dim=2, sampling_steps=4,
+                       # EXPLICIT: these specs use the BESPOKE image trunk, and latent_norm=affine (the
+                       # default) needs a PRETRAINED one. No fallback exists by design -- name the norm.
+                       latent_norm="layernorm",
                        # PIN: stochastic_eval defaults TRUE since 2026-08-10 (train and eval must roll on the
                        # same distribution). Cached-vs-uncached PARITY is only defined for a deterministic
                        # readout -- with sampling each rollout draws fresh eps and |delta| is ~4, not ~1e-6.

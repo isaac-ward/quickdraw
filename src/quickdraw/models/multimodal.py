@@ -142,17 +142,18 @@ class MultiModalSequenceModel(nn.Module):
             # layernorm, and no modality affine because the trunk cannot do it) -- and since affine became the
             # DEFAULT on 2026-08-10, that silently applied to every bespoke run.
             if not _capable:
-                # FALL BACK to layernorm, LOUDLY -- do NOT raise and do NOT silently end up with nothing.
-                # `affine` is implemented on the PRETRAINED trunk only: it calibrates fixed per-channel stats of
-                # a FIXED latent, which a learned encoder does not have (its scale drifts as it trains). Since
-                # affine is also the DEFAULT (locked 2026-08-10), raising here would make the default unusable
-                # for every bespoke config; and falling through silently would leave NO normalization at all,
-                # which was the original bug. layernorm is the correct choice for a learned encoder anyway.
-                self.latent_norm, self.latent_norm_type = True, "layernorm"
-                print("[latent_norm] 'affine' requested but no modality supports it (it needs a PRETRAINED "
-                      "image trunk whose latent has fixed per-channel statistics; a learned encoder drifts its "
-                      "own scale) -> FALLING BACK to 'layernorm'. Set model.latent_norm=layernorm explicitly to "
-                      "silence this, or modalities.<i>.pretrained=true to actually use affine.")
+                # RAISE, no fallback (user, 2026-08-11). A config must MEAN what it says: a run that silently
+                # trains under a different normalization than the one requested is unattributable afterwards.
+                # affine is implemented on the PRETRAINED trunk only -- it calibrates fixed per-channel stats of
+                # a FIXED latent, and a learned encoder has none (it drifts its own scale as it trains), so a
+                # one-shot calibration at fit start is meaningless. Be explicit at the call site instead.
+                raise ValueError(
+                    "model.latent_norm='affine' but NO modality supports it (it needs a PRETRAINED image trunk: "
+                    "a learned/bespoke encoder has no fixed latent whose per-channel statistics can be "
+                    "calibrated once). Set model.latent_norm=layernorm EXPLICITLY for a bespoke AE "
+                    "(modalities.<i>.pretrained=false), or modalities.<i>.pretrained=true to use the frozen "
+                    "trunk affine was built for. There is deliberately NO fallback."
+                )
 
     def arch_table(self) -> list[tuple[str, str, int]]:
         """Rows (component, shape transform, #params) describing the token-bag dataflow — printed at the top
@@ -569,8 +570,18 @@ class MultiModalLSAR(MultiModalSequenceModel):
         # POLICY object here: MM keeps its own multi-encoder EMA/encode mechanics but reads the strategy's
         # flags + reg_loss + pred_metric. Reconstruction (obs grounds the encoder) is the default.
         self.collapse = collapse or Reconstruction()
-        if self.collapse.has_reg:                                # vicreg/sigreg: var/cov terms fight any norm
-            self.latent_norm, self.latent_norm_type = False, "none"
+        if self.collapse.has_reg and self.latent_norm_type != "none":
+            # RAISE, do not silently force (user, 2026-08-11). vicreg/sigreg regularize the latent's variance
+            # and covariance directly, and normalizing the carried bag fights them -- LN pins per-token variance
+            # to 1, which is exactly the statistic the reg term controls. Silently overriding meant the run
+            # trained under 'none' while its config said something else.
+            raise ValueError(
+                f"collapse strategy {type(self.collapse).__name__} regularizes latent variance/covariance "
+                f"(has_reg=True), which is incompatible with model.latent_norm='{self.latent_norm_type}': "
+                f"normalizing the bag pins the very statistic the regularizer controls. Set "
+                f"model.latent_norm=none EXPLICITLY for vicreg/sigreg, or use a collapse strategy with no "
+                f"variance term (reconstruction/ema/naked)."
+            )
         self.pred_obs_in_loss = self.collapse.obs_grounds_encoder
         self.predictor_q = None                                # BYOL online-only predictor q (asymmetry)
         if self.collapse.needs_predictor:

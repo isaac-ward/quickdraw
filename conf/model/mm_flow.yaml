@@ -82,6 +82,10 @@ latent_norm: affine      # layernorm | affine | none. HOW the latent is made sca
 #                          pinned to a ceiling training was destroying. Cause: the 3.51 dB LayerNorm tax is the
 #                          ONLY reason the adapter residual must learn anything, and it shares its 0.134M
 #                          params with the dynamics, which wins the tug-of-war. Remove the tax, remove the war.
+#                          NO FALLBACKS (user, 2026-08-11): 'affine' with no pretrained trunk RAISES, and a
+#                          variance-regularizing collapse strategy (vicreg/sigreg) with any norm but 'none'
+#                          RAISES. A run must train under the normalization its config names -- silently
+#                          substituting one makes the result unattributable afterwards. Name it explicitly.
 #                          CAVEAT ON THE EVIDENCE: epoch 0 only, and epoch 0 is the p_tf=1.0 teacher-forced
 #                          epoch. Strong and mechanistically explained, but not yet confirmed post-rollout.
 #
