@@ -132,6 +132,18 @@ class MultiModalSequenceModel(nn.Module):
         self.latent_norm = self.latent_norm_type == "layernorm"
         if self.latent_norm_type == "affine":       # normalization moves OFF the bag and ONTO the AE latent
             _capable = [n for n, md in self.modalities.items() if hasattr(md, "enable_latent_affine")]
+            # affine presupposes a FIXED latent. A pretrained trunk that is still TRAINING does not have one:
+            # its per-channel statistics drift away from the one-shot fit-start calibration, and the decode-side
+            # inverse then stops being an inverse. Same premise failure as a bespoke encoder, so same answer.
+            _thawed = [n for n in _capable if not getattr(self.modalities[n], "taesd_frozen", True)]
+            if _thawed:
+                raise ValueError(
+                    f"model.latent_norm='affine' requires a FROZEN pretrained trunk, but {_thawed} have "
+                    f"freeze=false. affine calibrates per-channel statistics ONCE at fit start and inverts them "
+                    f"exactly before decode; a trunk that keeps training drifts away from those numbers, so the "
+                    f"'inverse' silently stops inverting. Set modalities.<i>.freeze=true, or use "
+                    f"model.latent_norm=layernorm which re-normalizes every forward and needs no fixed stats."
+                )
             for _n in _capable:
                 self.modalities[_n].enable_latent_affine()
             # FAIL LOUDLY rather than silently degrade to `none`. `affine` is implemented on the PRETRAINED

@@ -91,6 +91,12 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
                       "invertible, 0 dB cost; the bag itself is left alone",
             "none": "no latent normalization anywhere"}.get(_nt, "")
     lines.append(f"[latent_norm] {_nt}: {_why}")
+    if _nt == "none":
+        lines.append("[latent_norm] WARNING: 'none' means the carried token bag is NOT normalized anywhere — not "
+                     "at encode, not after predict_next, not on the diffusion-forcing context. The dynamics is "
+                     "free to drift in scale across a rollout and nothing regularizes its outputs. This is a "
+                     "research escape hatch (and the REQUIRED setting for vicreg/sigreg, whose variance terms "
+                     "would fight any normalization); it is not a sensible default.")
     if hasattr(m, "arch_table"):   # token-bag dataflow (component | shape transform | params)
         lines.append(f"[arch] d={m.d} window={m.window} | per-step bag = {m.n_state} state token(s) + 1 action = {m.n_input} tokens")
         for comp, shape, params in m.arch_table():
