@@ -235,6 +235,13 @@ class LitWorldModel(L.LightningModule):
                                 gradient_clip_algorithm=gradient_clip_algorithm)
         self.log("grad/norm_preclip", pre)
         self.log("grad/norm_postclip", _total_norm())
+        # grad/clip_ratio = preclip / clip_val. ONE number: 1 means clipping never engaged, >>1 means the
+        # gradient is being LAUNDERED -- clipping throws away the magnitude but keeps the DIRECTION, so the
+        # optimizer takes a full-size confident step along whatever exploded. That degrades smoothly instead of
+        # NaN-ing, which is exactly why a 767x blowup in the transformer denoiser (2026-08-11) read as a
+        # modelling failure for two days: preclip and postclip were both logged the whole time, but the signal
+        # only screams once you divide them. reduce_fx=max -> the epoch value is the WORST step.
+        self.log("grad/clip_ratio", pre / max(float(gradient_clip_val), 1e-12), reduce_fx="max")
         # reduce_fx=max -> the epoch value is the WORST step (mean would dilute one spike across 1000s of clean
         # steps into ~0); nonfinite_skipped uses sum -> total # of skipped steps this epoch.
         self.log("grad/num_nans", float(n_nan), reduce_fx="max")

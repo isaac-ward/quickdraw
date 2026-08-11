@@ -74,6 +74,35 @@ cases, summary scalars added, losses dropped.
 Shoot-out: tag each run and group runs in W&B; the shared `eval/*/manifold_distance_error@*`
 scalars drive automatic comparison across runs × cases.
 
+## `diag`/`grad/` — and the one number that actually screams
+
+`grad/norm_preclip`, `grad/norm_postclip`, per-module `grad/norm/<part>`, `grad/num_nans`, `grad/num_infs` and
+`grad/nonfinite_skipped` have existed since the beginning. On 2026-08-11 a **767x gradient explosion in the
+transformer denoiser went unnoticed for two days** with all of them logging correctly, because the pair reads
+as two unremarkable numbers unless you divide them.
+
+**`grad/clip_ratio` = norm_preclip / gradient_clip_val is the number to watch.**
+
+| value | meaning |
+|---|---|
+| ~1 | clipping never engages. Healthy. |
+| a few | clipping engages sometimes. Normal for a spiky loss. |
+| >> 1 | **the update is direction-only and the magnitude is junk.** Clipping discards the norm but keeps the DIRECTION, which is dominated by whatever exploded, so the optimizer takes full-size confident steps into garbage. The run degrades SMOOTHLY instead of NaN-ing -- it looks like a modelling failure, not an optimizer one. |
+
+`norm_postclip` pinned at exactly the clip value while `preclip` grows is the signature. A tripwire in
+`LoggingCallback._grad_tripwire` (`GRAD_CLIP_RATIO_WARN = 20`) now writes a `[grad] WARNING` line to
+progress.log naming the worst modules and the usual causes (a residual branch that is not zero-init'd, too long
+a BPTT x ODE chain, too high an LR), because a metric nobody reads is not a diagnostic.
+
+MEASURED for reference -- the same config, two denoisers:
+
+```
+grad/norm/flow        ep0    ep1     ep2      ep3
+mlp                  0.43   0.85    0.49     0.59     stable, <1 throughout
+transformer          0.98   1.48  766.36    21.21     exploded; clip_ratio 767
+transformer+bespoke  2.10  65.62 10151.31     -
+```
+
 ## `normalization/` — how the latent is made scale-free, and whether it is drifting
 
 One folder describing the ACTIVE latent-normalization mechanism (`model.latent_norm`) and the statistic it
