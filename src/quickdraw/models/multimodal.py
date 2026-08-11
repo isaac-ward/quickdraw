@@ -302,26 +302,34 @@ class MultiModalSequenceModel(nn.Module):
         Returns the next state bag (B,*,n_state,d)."""
         raise NotImplementedError
 
-    def _cond(self, h_bag: Tensor) -> Tensor:
-        """Backbone output -> the per-token conditioning the readout/dynamics-loss consumes.
+    def _cond(self, h_bag: Tensor, act: Tensor | None = None) -> Tensor:
+        """Backbone output (+ the raw action) -> the per-token conditioning the dynamics consumes.
 
-        Default: the state slots only, `h_bag[..., :n_state, :]` -- which DISCARDS slot n_state, the action
-        token's own output. That slot is computed and thrown away, so the action's only influence is whatever
-        attention weight the state tokens choose to place on it; nothing stops them learning ~0 and measured
-        (2026-08-11) grad/norm/act_enc was 0.17% of the total gradient.
+        WITHOUT concat_action_embedding: `h_bag[..., :n_state, :]`. That DISCARDS slot n_state, the action
+        token's own output, so the action reaches the prediction ONLY via attention from the state tokens onto
+        1 of the bag's 10 slots. There is a complete path from input to output that never touches it, and
+        measured (2026-08-11) grad/norm/act_enc was 0.17% of the total gradient.
 
-        concat_action_embedding=True instead CONCATENATES that slot onto every state token, so the denoiser gets
-        the action on a dedicated channel it cannot route around, and it is re-consulted at every one of the
-        `sampling_steps` ODE steps rather than once per rollout step. Costs no new parameters for the embedding
-        itself (it is the tensor already being discarded); the flow's h_dim doubles d -> 2d."""
+        WITH it: the RAW pre-backbone `act_enc(act)` is concatenated onto every state token. Raw, deliberately:
+        the post-backbone action SLOT would also work and needs no plumbing, but it is contextualised and the
+        backbone could in principle cancel it (its residual branches can emit -act_enc(a), and before this
+        change that slot's output was discarded and therefore received NO gradient at all, so its value was
+        unconstrained). A copy that never passes through the backbone cannot be suppressed by it.
+
+        act is threaded from every call site rather than stashed on self, so the compiled rollout and the
+        checkpointed rollout see the same pure function. If a caller omits it the post-backbone slot is used as
+        a degraded fallback (no crash) -- all in-tree callers pass it."""
         h_state = h_bag[..., : self.n_state, :]
         if not getattr(self, "concat_action_embedding", False):
             return h_state
-        act = h_bag[..., self.n_state : self.n_state + 1, :].expand_as(h_state)
-        return torch.cat([h_state, act], dim=-1)                 # (..., n_state, 2d)
+        if act is not None:
+            a = self.act_enc(act).unsqueeze(-2).expand_as(h_state)        # RAW, never through the backbone
+        else:
+            a = h_bag[..., self.n_state : self.n_state + 1, :].expand_as(h_state)   # degraded fallback
+        return torch.cat([h_state, a], dim=-1)                            # (..., n_state, 2d)
 
-    def readout(self, h_bag: Tensor, prev_bag: Tensor) -> Tensor:
-        return self.predict_next(self._cond(h_bag), prev_bag)
+    def readout(self, h_bag: Tensor, prev_bag: Tensor, act: Tensor | None = None) -> Tensor:
+        return self.predict_next(self._cond(h_bag, act), prev_bag)
 
     def carry_transform(self, bag: Tensor) -> Tensor:
         """What gets fed back into the rollout. Latent models (LSAR/diffusion) carry the predicted latent
@@ -335,7 +343,7 @@ class MultiModalSequenceModel(nn.Module):
         when compile_rollout is on. Bit-identical to the inline eager body; factored out so the compiled and eager
         paths run the SAME code (detach/teacher-forcing/carry stay OUTSIDE, in the Python loop, per detach-segment)."""
         h_last = self.backbone(self._to_input(s_win, a_win), temporal_block_mask=bm)[:, -1]
-        return self.readout(h_last, prev_bag)
+        return self.readout(h_last, prev_bag, a_win[:, -1])
 
     def _compiled_step(self):
         """Lazily build (once) the compiled per-step fn. Each distinct pad -> a distinct temporal_block_mask ->
@@ -358,13 +366,13 @@ class MultiModalSequenceModel(nn.Module):
         only, so it's identical for every MM model; attn_eager routes through the double-backprop-able
         sdpa(MATH) path used by the contraction penalty's Jacobian power-iteration."""
         h = self.backbone(self._to_input(bag_win, act_win), attn_eager=attn_eager)
-        return self.readout(h[:, -1], bag_win[:, -1])
+        return self.readout(h[:, -1], bag_win[:, -1], act_win[:, -1])
 
     # ---- teacher-forced parallel forward ----
     def forward(self, obs: dict[str, Tensor], act: Tensor) -> Tensor:
         s = self.encode_state(obs)
         h = self.backbone(self._to_input(s, act))
-        return self.readout(h, s)
+        return self.readout(h, s, act)
 
     # ---- shared autoregressive rollout (token-bag analogue of SequenceWorldModel._rollout) ----
     def _rollout(self, ctx_obs: dict[str, Tensor], actions: Tensor, horizon: int, p_tf: float,
@@ -412,7 +420,7 @@ class MultiModalSequenceModel(nn.Module):
                 h_last = torch.utils.checkpoint.checkpoint(
                     lambda x_, _bm=bm: self.backbone(x_, temporal_block_mask=_bm)[:, -1],
                     x, use_reentrant=False)                         # (B,n_input,d)
-                s_pred = self.readout(h_last, bag_buf[-1])          # (B,n_state,d)
+                s_pred = self.readout(h_last, bag_buf[-1], a_win[:, -1])   # (B,n_state,d)
             else:
                 s_pred = self._rollout_step(s_win, a_win, bm, bag_buf[-1])  # (B,n_state,d)
             preds.append(s_pred)                                   # raw prediction -> loss/decode
@@ -447,7 +455,7 @@ class MultiModalSequenceModel(nn.Module):
         for h in range(horizon):
             idx = P - 1 + h                                          # read out at the last fed position
             h_last = step(bag_buf[idx], idx)                         # (B,n_input,d)
-            s_pred = self.readout(h_last, bag_buf[idx])              # (B,n_state,d)
+            s_pred = self.readout(h_last, bag_buf[idx], actions[:, idx])   # (B,n_state,d)
             preds.append(s_pred)
             bag_buf.append(self.carry_transform(s_pred))
         return torch.stack(preds, dim=1)                             # (B,horizon,n_state,d)
@@ -729,7 +737,7 @@ class MultiModalFlow(MultiModalSequenceModel):
             if self.latent_norm:
                 s = _ln(s)                                       # renormalized back onto the sphere
         h = self.backbone(self._to_input(s, act_seq[:, :L - 1], levels=levels))
-        h_state = self._cond(h)                                # (B,L-1,n_state,d) or 2d if concat_action
+        h_state = self._cond(h, act_seq[:, :L - 1])            # (B,L-1,n_state,d) or 2d if concat_action
         target = (z[:, 1:] - z[:, :-1]).detach() if self.predict_residual else z[:, 1:].detach()  # target off CLEAN z
         l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
         raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function

@@ -47,12 +47,12 @@ def main():
     s = m.encode_state(obs)
     h = m.backbone(m._to_input(s, act))
     with torch.no_grad():
-        r1 = m.readout(h, s)
-        r2 = m.readout(h, s)
+        r1 = m.readout(h, s, act)
+        r2 = m.readout(h, s, act)
     check("deterministic (eps=0) readout byte-identical", torch.equal(r1, r2))
     m.stochastic_eval = True                      # and the DEFAULT path must actually sample
     with torch.no_grad():
-        r3, r4 = m.readout(h, s), m.readout(h, s)
+        r3, r4 = m.readout(h, s, act), m.readout(h, s, act)
     check("stochastic_eval=true readout DIFFERS across calls", not torch.equal(r3, r4))
     m.stochastic_eval = _se
     m.train()

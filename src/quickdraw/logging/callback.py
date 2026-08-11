@@ -78,11 +78,7 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
         sq = float(getattr(ae, "squash", 4.0))
         fo = "OFF" if nf == 0 else f"{nf} bands (raw {ae.in_raw} + {2 * ae.in_raw * nf} sin/cos, |x|<={sq:g})"
         cat_on = bool(getattr(m, "concat_action_embedding", False))
-        why = ("the action token's backbone output is concatenated onto every state token, so the denoiser has "
-               "a dedicated action channel it cannot route around" if cat_on else
-               "WARNING: readout() DISCARDS the action slot, so actions reach the prediction ONLY via attention "
-               "onto 1 of the bag's slots — measured grad/norm/act_enc was 0.17% of the total gradient")
-        lines.append(f"[action] fourier={fo} | concat_to_denoiser={'ON' if cat_on else 'OFF'}  <- {why}")
+        lines.append(f"[action] fourier={fo} | concat_to_denoiser={'ON (raw pre-backbone act_enc)' if cat_on else 'OFF'}")
     for _n, _md in getattr(m, "modalities", {}).items():     # per-modality fourier (vector heads)
         _e = getattr(_md, "enc", None)
         _nf = int(getattr(_e, "n_freq", 0) or 0) if _e is not None else 0

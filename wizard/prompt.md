@@ -203,3 +203,17 @@ specific learnings you applied.
   (interpret + reward head do not).
 - Never `accumulate_grad_batches` or `window_stride>1`. Keep `head_dim=d/heads` a power of 2.
 - The `[startup] epoch 0 training started` log line is a fixed banner, not the real epoch — trust the ckpt.
+
+## Keeping the experiment record (REQUIRED)
+
+Every experimental batch gets a NEW NUMBERED SECTION in `wizard/records/<dataset>.md` (e.g.
+`wizard/records/robocasa-scene4-4h.md`) — that file is TRACKED and is the durable story of what was run and why.
+`wizard/scripts/` is gitignored: launch scripts and their stdout stay local, the record does not.
+
+A section must carry: the run's log folder path(s), the one-variable difference between arms, a table of the
+numbers WITH units, and the DECISION it produced. Write it when the batch is killed or finishes — not "later".
+Update the heading when a RUNNING batch stops (a section still marked RUNNING for a batch killed a day ago is
+worse than no section).
+
+This was not done reliably on 2026-08-09..11: sections stopped at 8 while four more batches had come and gone,
+and the file sat in `wizard/scripts/` where it was gitignored and therefore never synced to the other machine.
