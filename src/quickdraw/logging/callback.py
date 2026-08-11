@@ -372,6 +372,16 @@ class LoggingCallback(L.Callback):
             for name in self.routines:
                 try:
                     REGISTRY[name](self.cfg, m, self.norm, self.ecfg, self.writer, pl_module.device, epoch)
+                except NotImplementedError as e:   # the routine genuinely CANNOT run in THIS environment (e.g.
+                    #   control/interp need a live simulator; a recorded dataset has none). This is by design, not
+                    #   a bug and not a regression — it "fails" every eval forever — so it must NEVER count toward
+                    #   the fatal streak below (that streak is for DETERMINISTIC BUGS like a bad kwarg). Clean-skip.
+                    from ..controller.run import _plog
+                    _plog(self.writer, f"[eval:{name} @ep{epoch}] not supported in this env "
+                          f"({type(e).__name__}: {e}); skipping. Not counted as a failure.")
+                    self._skipped.append((epoch, name))
+                    self.writer.scalar(f"eval/skipped/{name}", 1.0, step=epoch)
+                    continue   # leave _fail_streak[name] untouched
                 except Exception as e:   # a DIAGNOSTIC eval must NEVER kill training — a diverged model can emit
                     #                       non-finite renders (e.g. a NaN control-arrow direction -> pyvista
                     #                       "matrix must have finite values"), OOM a viz, etc. Log loudly + go on.

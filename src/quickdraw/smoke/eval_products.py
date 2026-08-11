@@ -84,6 +84,38 @@ def main():
             ok, losses = False, {"error": e}
         check(f"recon_losses returns (losses, weights) on a {tag} trunk", ok, str(sorted(losses)))
 
+    # NEW seam: geometry-free proprio TRAJECTORY products (emit_openloop -> viz.fig_paths_3d/fig_pos_vs_time),
+    # gated on an EXPLICIT 3D position_idx. This is the recorded-env path (torus uses its atlas instead).
+    import matplotlib.pyplot as plt
+    from quickdraw.evaluation.products import emit_openloop
+    from quickdraw.logging import viz
+    N, Pc, Hh = 3, 8, 40
+    ctx = np.cumsum(np.random.randn(N, Pc, 3) * 0.1, axis=1)
+    tru = np.cumsum(np.random.randn(N, Hh, 3) * 0.1, axis=1)
+    prd = tru + np.random.randn(N, Hh, 3) * 0.2
+    fa = viz.fig_paths_3d(ctx[0], np.concatenate([ctx[0][-1:], tru[0]]),
+                          np.concatenate([ctx[0][-1:], prd[0]]), title="t")
+    check("fig_paths_3d returns a Figure", hasattr(fa, "savefig")); plt.close(fa)
+    fb = viz.fig_pos_vs_time(ctx[0], np.concatenate([ctx[0][-1:], tru[0]]),
+                             np.concatenate([ctx[0][-1:], prd[0]]), fork_step=Pc, title="t")
+    check("fig_pos_vs_time returns a Figure", hasattr(fb, "savefig")); plt.close(fb)
+
+    class _GenericEnv:                            # recorded-like: no render_diagnostics -> wants_diagnostics False
+        def rollout_metrics(self, a, b): return {}
+    cp = {"obs_error": np.linspace(1, .1, Hh), "pointwise_error": np.linspace(1, .1, Hh)}
+    common = dict(env=_GenericEnv(), R=None, r=None, coloring="hsv", fps=30, P=Pc, smooth_window=1,
+                  description="d", ctx_xyz=ctx, p_true_xyz=tru, p_hat_xyz=prd,
+                  actions=[np.zeros((Pc + Hh, 2)) for _ in range(N)], curves=cp, n_plot=2,
+                  obs_true=None, obs_pred=None)
+    w5 = _W(); emit_openloop(w5, "eval_ood_horizon/open_loop", 1, pos_explicit=True, **common)
+    check("generic env + explicit pos -> trajectory_plot per plotted episode",
+          sum("proprio/trajectory_plot_" in t for t in w5.tags) == 2)
+    check("generic env + explicit pos -> trajectory_axes per plotted episode",
+          sum("proprio/trajectory_axes_" in t for t in w5.tags) == 2)
+    w6 = _W(); emit_openloop(w6, "r", 1, pos_explicit=False, **common)
+    check("NON-explicit pos -> trajectory plots SKIPPED (only error curves)",
+          sum("trajectory" in t for t in w6.tags) == 0)
+
     print(f"{'ALL OK' if OK[0] == OK[1] else 'SOME FAILED'} ({OK[0]}/{OK[1]})")
     return 0 if OK[0] == OK[1] else 1
 

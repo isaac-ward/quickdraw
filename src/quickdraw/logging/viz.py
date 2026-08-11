@@ -820,6 +820,73 @@ def _pad3(P, frac=0.05):
     return tuple((float(lo[i] - pad[i]), float(hi[i] + pad[i])) for i in range(3))
 
 
+# Visual language SHARED by fig_paths_3d + fig_pos_vs_time (mirrors the torus rollout, generalized to any
+# recorded env): context = BLACK DASHED (no marker); GT = solid BLACK line + BLACK end-ball; pred = solid
+# GREY line + GREY end-ball; NO sphere at the fork.
+_GT_C, _PRED_C, _CTX_C = "black", "0.55", "black"
+
+
+def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0):
+    """Geometry-FREE 3D open-loop trajectory (the torus atlas' cross-env sibling): GT vs PRED world positions
+    for a recorded env with no renderable geometry. `true_xyz`/`pred_xyz` START at the fork anchor (the last
+    context point) so both branch from the same place; `ctx_xyz` is the pre-fork context. All inputs (·,3)
+    physical positions. Visual language: see _GT_C/_PRED_C above."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
+    ctx = np.asarray(ctx_xyz, float).reshape(-1, 3)
+    tru = np.asarray(true_xyz, float).reshape(-1, 3)
+    prd = np.asarray(pred_xyz, float).reshape(-1, 3)
+    (xl, yl, zl) = _pad3(np.concatenate([ctx, tru, prd], axis=0))
+    fig = plt.figure(figsize=(size, size))
+    ax = fig.add_subplot(111, projection="3d"); ax.set_proj_type("ortho")
+    ax.set_xlim(xl); ax.set_ylim(yl); ax.set_zlim(zl)
+    ax.set_box_aspect((xl[1] - xl[0], yl[1] - yl[0], zl[1] - zl[0]))
+    if len(ctx) > 1:
+        ax.plot(ctx[:, 0], ctx[:, 1], ctx[:, 2], color=_CTX_C, ls="--", lw=1.3, label="context")
+    ax.plot(tru[:, 0], tru[:, 1], tru[:, 2], color=_GT_C, lw=1.8, label="GT")
+    ax.plot(prd[:, 0], prd[:, 1], prd[:, 2], color=_PRED_C, lw=1.8, label="pred")
+    ax.scatter(*tru[-1], color=_GT_C, s=70, depthshade=False)          # GT end ball
+    ax.scatter(*prd[-1], color=_PRED_C, s=70, depthshade=False)        # pred end ball
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    ax.legend(loc="upper left", fontsize=8)
+    if title:
+        ax.set_title(title, fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def fig_pos_vs_time(ctx_xyz, true_xyz, pred_xyz, *, fork_step, labels=None, title=""):
+    """Per-axis position-vs-step panels (one row per position dim) — the readable companion to fig_paths_3d for
+    a docking-style approach (you see each coordinate converge or diverge). Same visual language; a faint
+    vertical dotted line marks the fork (a LINE, not a sphere). `true_xyz`/`pred_xyz` START at the fork anchor;
+    x-axis is the absolute step index (context occupies [0, fork_step))."""
+    ctx = np.asarray(ctx_xyz, float).reshape(-1, 3)
+    tru = np.asarray(true_xyz, float).reshape(-1, 3)
+    prd = np.asarray(pred_xyz, float).reshape(-1, 3)
+    D = ctx.shape[1]
+    base = list(labels) if labels is not None else ["x", "y", "z"]
+    labels = (base + [f"dim {i}" for i in range(D)])[:D]       # always >= D labels (no IndexError on short input)
+    P = len(ctx)
+    tc = np.arange(P)                              # context step indices
+    tf = np.arange(P - 1, P - 1 + len(tru))        # GT/pred start at the fork anchor (= last context step)
+    fig, axes = plt.subplots(D, 1, figsize=(10, 2.6 * D), sharex=True, squeeze=False)
+    for d in range(D):
+        ax = axes[d][0]
+        if P > 1:
+            ax.plot(tc, ctx[:, d], color=_CTX_C, ls="--", lw=1.2, label="context")
+        ax.plot(tf, tru[:, d], color=_GT_C, lw=1.6, label="GT")
+        ax.plot(tf, prd[:, d], color=_PRED_C, lw=1.6, label="pred")
+        ax.scatter(tf[-1], tru[-1, d], color=_GT_C, s=40, zorder=5)
+        ax.scatter(tf[-1], prd[-1, d], color=_PRED_C, s=40, zorder=5)
+        ax.axvline(fork_step - 1, color="0.8", lw=1.0, ls=":")     # fork marker (a line, not a sphere)
+        ax.set_ylabel(labels[d]); ax.grid(alpha=0.25)
+    axes[0][0].legend(loc="best", fontsize=8)
+    axes[-1][0].set_xlabel("step")
+    if title:
+        fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
 def diffusion_swarm_plain_frames(current, agent_tail, future_path, steps, title="", lims=None,
                                  size=6.0, dpi=VIDEO_DPI, log=None):
     """Geometry-FREE fallback for diffusion_quiver_sequential_frames: the SAME N-sequential-swarm denoising

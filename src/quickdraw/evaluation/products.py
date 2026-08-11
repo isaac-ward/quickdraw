@@ -71,11 +71,13 @@ def log_image_head(writer, routine, head, i, true_full, pred, step, fps, *,
 
 def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_window, description,
                   ctx_xyz, p_true_xyz, p_hat_xyz, actions, curves, n_plot, images=None,
-                  obs_true=None, obs_pred=None, title_fn=None, log=None):
+                  obs_true=None, obs_pred=None, title_fn=None, log=None, pos_explicit=False):
     """The ONE open-loop product orchestrator, shared by eval_ood_horizon (multimodal) and _openloop_split
     (vector). Given a COMPLETED rollout's per-episode positions + aggregate curves, it emits everything:
-    per-head nested under `<routine>/<head>/`: `proprio/error_vs_step_avg` + `proprio/trajectory_{plot,video}_i`
-    (+scene) and each image head's `<head>/error_vs_step_avg` + `<head>/rollout_i`/`filmstrip_i`. The rollout itself stays modality-specific
+    per-head nested under `<routine>/<head>/`: `proprio/error_vs_step_avg`, the position TRAJECTORY products
+    (`proprio/trajectory_{plot,video}_i` (+scene) for a torus/rich env; `proprio/trajectory_plot_i` +
+    `proprio/trajectory_axes_i` — geometry-free 3D path + per-axis panels — for a generic env when
+    `pos_explicit`), and each image head's `<head>/error_vs_step_avg` + `<head>/rollout_i`/`filmstrip_i`. The rollout itself stays modality-specific
     (dict-obs image decode vs vector tensor) — only the emission is unified here.
       env: the WorldEnv the rollout lives in. The per-episode scene video goes through
       `env.render_diagnostics` when the env offers it (torus: byte-identical to the legacy direct viz call);
@@ -95,6 +97,9 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
                          colors={"psnr": "red", "psnr_frozen": "grey", "lpips": "purple",
                                  "motion_ratio": "green"})
     rich = wants_diagnostics(env)
+    # Generic (geometry-free) proprio TRAJECTORY plots for a non-torus env — only when position_idx is EXPLICIT
+    # (config/env hook, not the [0,1,2] guess) and 3D. torus keeps its richer atlas via log_torus_paths.
+    plot_traj = bool(pos_explicit) and np.asarray(p_hat_xyz).shape[-1] == 3
     for i in range(n_plot):
         if log is not None:
             log(f"episode {i + 1}/{n_plot} visuals")
@@ -105,7 +110,19 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
                                    pred_xyz=np.concatenate([anchor, p_hat_xyz[i]]),
                                    actions=actions[i], P=P, step=step, fps=fps, smooth_window=smooth_window,
                                    title=title_fn(i), description=description, log=log)
-        if not rich:                                                       # generic env: render_obs filmstrip
+        if not rich:                                                       # generic env: trajectory plots + obs filmstrip
+            if plot_traj:                                                  # position rollout, GT(black) vs pred(grey)
+                try:                                                       # FAIL-SOFT: a proprio-viz error must NEVER
+                    anchor = ctx_xyz[i][-1:]                               #   take down the image rollout videos below
+                    txyz = np.concatenate([anchor, p_true_xyz[i]])
+                    pxyz = np.concatenate([anchor, p_hat_xyz[i]])
+                    f3 = viz.fig_paths_3d(ctx_xyz[i], txyz, pxyz, title=title_fn(i))
+                    writer.figure(product_tag(routine, "trajectory_plot", i=i, head="proprio"), f3, step); plt.close(f3)
+                    fa = viz.fig_pos_vs_time(ctx_xyz[i], txyz, pxyz, fork_step=P, title=title_fn(i))
+                    writer.figure(product_tag(routine, "trajectory_axes", i=i, head="proprio"), fa, step); plt.close(fa)
+                except Exception as _te:
+                    if log is not None:
+                        log(f"episode {i}: proprio trajectory plot failed ({type(_te).__name__}: {_te}); continuing")
             if obs_true is None or obs_pred is None:
                 if log is not None:
                     log(f"episode {i}: no diagnostic scene and no obs for the render_obs fallback — skipped")

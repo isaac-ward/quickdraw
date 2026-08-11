@@ -131,12 +131,14 @@ def proprio_curves(preds_norm, true_norm, p_hat, p_true, env, pos_slice=None):
 
 
 @torch.no_grad()
-def eval_batched(model, normalizer, env, P, obs_seq, act_seq):
+def eval_batched(model, normalizer, env, P, obs_seq, act_seq, pos=(0, 1, 2)):
     """obs_seq (N,L,6), act_seq (N,L,2) normalized on device. One batched rollout over all N episodes.
 
     Returns per-step metrics for every episode (N,horizon), the dataset-averaged curves (mean over
-    episodes per step), and denormalized positions/actions for plotting.
+    episodes per step), and denormalized positions/actions for plotting. `pos` = the world-xyz obs dims
+    (from `_pos_idx`; torus is [0,1,2] so the default keeps torus byte-identical).
     """
+    pos = list(pos)
     L = obs_seq.shape[1]
     horizon = L - P
     preds = model.imagine_eval(obs_seq[:, :P], act_seq[:, : L - 1], horizon)  # (N,horizon,6)
@@ -150,9 +152,9 @@ def eval_batched(model, normalizer, env, P, obs_seq, act_seq):
     return {
         "per_step": {k: v.cpu().numpy() for k, v in per_step.items()},  # (N,horizon) each
         "agg": agg,
-        "ctx_xyz": normalizer.denorm_obs(obs_seq[:, :P])[:, :, :3].cpu().numpy(),  # (N,P,3)
+        "ctx_xyz": normalizer.denorm_obs(obs_seq[:, :P])[:, :, pos].cpu().numpy(),  # (N,P,3)
         "p_hat_obs": p_hat.cpu().numpy(),             # (N,horizon,obs_dim) full obs — render_obs fallback
-        "p_hat_xyz": p_hat[:, :, :3].cpu().numpy(),   # (N,horizon,3)
-        "p_true_xyz": p_true[:, :, :3].cpu().numpy(),
+        "p_hat_xyz": p_hat[:, :, pos].cpu().numpy(),  # (N,horizon,3)
+        "p_true_xyz": p_true[:, :, pos].cpu().numpy(),
         "actions": normalizer.denorm_act(act_seq).cpu().numpy(),  # (N,L,2) for the action arrow
     }

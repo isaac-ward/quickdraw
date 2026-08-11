@@ -206,7 +206,7 @@ class MultiModalSequenceModel(nn.Module):
         out.update(rt); wts.update(rtw)
         return out, wts
 
-    def roundtrip_losses(self, targets: dict[str, Tensor]) -> dict[str, Tensor]:
+    def roundtrip_losses(self, targets: dict[str, Tensor]) -> tuple[dict, dict]:
         """ENCODE->DECODE round-trip loss for pretrained-AE trunks (#12), through THE MODEL'S OWN path.
 
         Deliberately uses encode_state()/to_obs() rather than the modality's encode/decode: whatever the

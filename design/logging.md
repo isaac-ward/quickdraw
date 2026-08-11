@@ -21,7 +21,8 @@ caption = equation + one sentence (the definitions in `environment.md`):
 
 - scalars: `manifold_distance_error`, `pointwise_error`, `tangent_velocity_error` (mean over rollout)
 - `…/error_vs_step` — the three errors vs rollout step (plot)
-- `…/trajectory_plot` — predicted vs true trajectory on the torus (plot)
+- `…/trajectory_plot` — predicted vs true trajectory (torus atlas if geometry; else a geometry-free 3D path — GT black / pred grey / context black-dashed — for any env with an explicit `position_idx`) (plot)
+- `…/trajectory_axes` — per-axis position vs step (GT vs pred), the readable companion to the 3D path (plot, geometry-free envs)
 - `…/rollout_video` — the same animated on the torus surface (video)
 - `…/obs_image_video` — predicted vs ground-truth ego frames (image stage)
 

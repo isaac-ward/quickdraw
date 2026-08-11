@@ -83,7 +83,8 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
         override["init_speed"] = float(v_scale)
     env = make_env(cfg.environments.get("name", "torus_world"),      # THIS split's geometry (may be OOD);
                    OmegaConf.merge(cfg.environments, override), 1, "cpu")
-    res = eval_batched(model, norm, env, P, obs, act)
+    pos, _ = _pos_idx(cfg, env=env)                                  # world-xyz obs dims (torus hook -> [0,1,2])
+    res = eval_batched(model, norm, env, P, obs, act, pos=pos)
     _plog(writer, f"[{prefix} @ep{step}] rollout done in {time.perf_counter() - t0:.1f}s; rendering...")
 
     desc = ("Open-loop long-horizon rollout on the torus: a BLACK agent on the TRUE path and a GREY agent on "
@@ -205,7 +206,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
                       actions=[eps[i][1][:P + Hm].astype(_np.float32) for i in range(n_plot)],
                       curves=curves, n_plot=n_plot, images=(images or None),
                       obs_true=_np.concatenate([ctx_obs, pt[:n_plot].cpu().numpy()], axis=1),
-                      obs_pred=p_hat[:n_plot].cpu().numpy(),
+                      obs_pred=p_hat[:n_plot].cpu().numpy(), pos_explicit=pos_explicit,
                       title_fn=lambda i: f"{subroutine} #{i} H={Hm}", log=lambda msg: prog(50, msg))
         return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
 
@@ -310,7 +311,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
                   actions=[eps[i][1][:P + H].astype(_np.float32) for i in range(n_plot)],
                   curves=curves, n_plot=n_plot, images=(images or None),
                   obs_true=_np.concatenate([ctx_obs, p_true[:n_plot].cpu().numpy()], axis=1),
-                  obs_pred=p_hat[:n_plot].cpu().numpy(),
+                  obs_pred=p_hat[:n_plot].cpu().numpy(), pos_explicit=pos_explicit,
                   title_fn=lambda i: f"eval_ae_floor #{i} (encode->decode ceiling)", log=lambda msg: prog(50, msg))
     if was:
         m.train()
@@ -403,6 +404,10 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     from ..models.multimodal import MultiModalFlow
     m = getattr(model, "_orig_mod", model)
     if not isinstance(m, MultiModalFlow):
+        return {}
+    if getattr(getattr(m, "flow", None), "arch", "mlp") == "transformer":     # self-skip (not a failure): the
+        _plog(writer, f"[denoising_multistep @ep{step}] skipped — the per-token swarm samples the proprio token "  # per-token
+              f"alone, which a JOINT transformer flow can't do (it needs the full bag); not yet ported.")          # swarm
         return {}
     was = m.training
     m.eval()
@@ -522,6 +527,10 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     m = getattr(model, "_orig_mod", model)
     if not isinstance(m, MultiModalFlow):
         return {}   # flow-in-dynamics is the ONLY precondition now (#11); non-torus renders in plain 3D world space
+    if getattr(getattr(m, "flow", None), "arch", "mlp") == "transformer":     # self-skip (not a failure): the pooled
+        _plog(writer, f"[denoising_aggregate @ep{step}] skipped — the pooled per-token next-state swarm assumes a "  # per-token
+              f"factorized flow; the joint transformer flow can't sample the proprio token alone; not yet ported.")  # swarm
+        return {}
     was = m.training
     m.eval()
     t0 = time.perf_counter()
@@ -585,11 +594,6 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     m.eval()
     t0 = time.perf_counter()
     dev = device if isinstance(device, str) else device.type
-    off = 0                                                          # bag offset of the image tokens
-    for name, n in m.layout:
-        if name == img_head:
-            n_img = n; break
-        off += n
     P, K = cfg.data.P, int(cfg.eval.get("denoising_filmstrip_steps", 8) or 8)   # LOCAL K (not the training value)
     n_seeds = int(cfg.eval.get("denoising_filmstrip_seeds", 4) or 4)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
@@ -613,19 +617,24 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
             w = min(m.window, t_ctx + 1)
             h = m.backbone(m._to_input(z[:, t_ctx - w + 1:t_ctx + 1], act[:, t_ctx - w + 1:t_ctx + 1]))[:, -1]  # (1,n_input,d)
         z_bag = z[0, t_ctx].float()                                 # (n_state, d) carried tokens
-        h_img = h[0, off:off + n_img, :].float()                    # (n_img, d) conditioning for the image tokens
-        z_img = z_bag[off:off + n_img]
+        h_state = h[0, :m.n_state, :].float()                       # (n_state, d) FULL-bag conditioning. The
+        #   dynamics flow is JOINT over the whole bag — a transformer velocity ATTENDS across all n_state tokens
+        #   (it asserts token axis == n_state), so it must be sampled over the full bag and the image tokens read
+        #   off AFTER, exactly as predict_next does. (For the factorized mlp velocity the image tokens are
+        #   identical either way, so this unifies both arches.)
 
-        def decode_step(x):                                         # image-token residual -> (H,W,3) float in [0,1]
-            bag = z_bag.clone()[None, None]                        # (1,1,n_state,d)
-            bag[0, 0, off:off + n_img] = _ln(z_img + x)
-            return m.to_obs(bag, heads=[img_head])[img_head][0, 0].clamp(0, 1).float().cpu().numpy()
+        def decode_step(x_bag):                                     # full-bag flow output (n_state,d) -> (H,W,3)
+            nb = z_bag + x_bag if m.predict_residual else x_bag     # mirror predict_next EXACTLY: residual add,
+            if m.latent_norm:                                       #   then LN only for latent_norm=layernorm.
+                nb = _ln(nb)                                        #   affine/none leave the bag alone (the affine
+            #                                                         inverse is applied inside to_obs -> decode).
+            return m.to_obs(nb[None, None], heads=[img_head])[img_head][0, 0].clamp(0, 1).float().cpu().numpy()
 
         gt = (im[t_ctx + 1].astype(_np.float32) / 255.0)           # GT next frame
         rows = []
         for s in range(n_seeds):
-            e = torch.randn(n_img, m.d, generator=g, device=device)
-            _, path = m.flow.sample(h_img, steps=K, deterministic=False, eps=e, record_path=True)  # K+1 latent states
+            e = torch.randn(m.n_state, m.d, generator=g, device=device)   # full-bag noise (was image-tokens only)
+            _, path = m.flow.sample(h_state, steps=K, deterministic=False, eps=e, record_path=True)  # K+1 bag states
             rows.append([gt] + [decode_step(x) for x in path])     # [GT, noise(path0), step1..K]
         col_titles = ["GT", "noise"] + [f"k{k}" for k in range(1, len(rows[0]) - 1)]
         ncol = len(rows[0])

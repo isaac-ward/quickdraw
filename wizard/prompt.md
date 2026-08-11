@@ -70,8 +70,10 @@ Ask: **"What are you bringing?"** One of three (this mirrors `docs/byo.md`):
   using `environments/examples/pendulum.py` as the copyable full example (all optional hooks). Each hook
   unlocks one eval (rollout_metrics, checkpoint_metric, render_diagnostics, control_goals, physical_loss,
   POLICIES, fork, position_indices). `position_indices` returns the obs dims that are ambient world xyz and
-  unlocks the flow/manifold world-space viz (`eval_flow`, `ood_horizon` paths); recorded datasets set it via
-  `environments.position_idx` instead (config overrides the hook; default `[0,1,2]` + a one-time warning).
+  unlocks the flow/manifold world-space viz (`eval_flow`, `ood_horizon` paths) AND the per-episode proprio
+  position-trajectory plots (`ood_horizon/<mode>/proprio/trajectory_plot_i` + `trajectory_axes_i`); recorded
+  datasets set it via `environments.position_idx` instead (config overrides the hook; default `[0,1,2]` + a
+  one-time warning — the trajectory plots need it set EXPLICITLY, the fallback guess is skipped for them).
 
 **Where the data comes from depends on the path:**
 - **Recorded data** → there IS a dataset; you inspected it, so process it (`data.processors`) and point

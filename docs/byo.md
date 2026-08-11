@@ -33,8 +33,11 @@ path demands of you, and what it unlocks (**✓** works · **✗** unavailable /
 ¹ `rollout_metrics`, `checkpoint_metric`, `render_diagnostics`, `control_goals`, `physical_loss`,
 `POLICIES`, `fork`, `position_indices` — each independent, each with a graceful fallback (the ✗ rows above).
 `position_indices` (obs dims that are ambient world xyz) unlocks the flow/manifold **world-space viz**
-(`eval_flow` denoising + `ood_horizon` paths); recorded datasets that don't ship an env set it via
-`environments.position_idx` instead (config overrides the hook). Fallback `[0,1,2]` with a one-time warning.
+(`eval_flow` denoising + `ood_horizon` paths) and — for ANY env, geometry or not — the per-episode proprio
+**position-trajectory** plots (`ood_horizon/<mode>/proprio/trajectory_plot_i` 3D path + `trajectory_axes_i`
+per-axis-vs-step, GT black / pred grey); recorded datasets that don't ship an env set it via
+`environments.position_idx` instead (config overrides the hook). The trajectory plots require an EXPLICIT
+setting — the `[0,1,2]` fallback only warns and is NOT used for them (it can't be trusted to be world xyz).
 ² interpret + the reward head use only the frozen WM + data + a VLM — **no env stepping** — so recorded
 (no-simulator) data can do them (they need a `conf/interpret/<env>.yaml` + a VLM). Only the **control** row
 needs a steppable env: the goal race *and* language steering both execute plans in the env.
@@ -159,7 +162,7 @@ eval you want. This is the extra-in → extra-out:
 | `physical_loss` | off-circle + energy-drift + continuity residuals | physics-informed training term | variation unavailable |
 | `POLICIES` | `swingup` (bang-bang) + `sinusoid` | scripted play policies (`data.action_sampler=swingup`) | `random` only |
 | `fork` | copy `θ`/`θ̇`/torque into a `k`-batch clone | the **oracle** rollout baseline in control | control skips the oracle |
-| `position_indices` | `return [0, 1, 2]` (first 3 obs = xyz) | flow/manifold **world-space viz** (`eval_flow`, `ood_horizon` paths) | `environments.position_idx` config, else `[0,1,2]` + warning |
+| `position_indices` | `return [0, 1, 2]` (first 3 obs = xyz) | flow/manifold **world-space viz** + proprio **position-trajectory** plots (`ood_horizon/<mode>/proprio/trajectory_plot_i` + `trajectory_axes_i`) | `environments.position_idx` config, else `[0,1,2]` + warning (trajectory plots need it EXPLICIT — the fallback is skipped) |
 
 Implement all seven and pendulum runs the **entire** pipeline.
 
@@ -179,7 +182,9 @@ Because the pendulum's rod render *is* its image modality, `ood_horizon` gives t
 twice: the **scene** (`trajectory_video_i`, rods superimposed in one analytic panel — tests the *dynamics
 geometry*) and the **image filmstrip** (`image/filmstrip_i`, two stacked rows of decoded vs ground-truth
 frames — tests the *pixel decoder*). Torus's static atlas PNG + 3D scene JSON are torus-only bonuses (they
-need the `R/r` geometry) and are gated off for other envs.
+need the `R/r` geometry) and are gated off for other envs — but any env with an EXPLICIT `position_idx` still
+gets the geometry-free proprio `trajectory_plot_i` (3D path, GT black / pred grey / context black-dashed) +
+`trajectory_axes_i` (per-axis position vs step) instead, so recorded datasets aren't left with only curves.
 
 ---
 
