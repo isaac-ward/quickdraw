@@ -89,10 +89,10 @@ as two unremarkable numbers unless you divide them.
 | a few | clipping engages sometimes. Normal for a spiky loss. |
 | >> 1 | **the update is direction-only and the magnitude is junk.** Clipping discards the norm but keeps the DIRECTION, which is dominated by whatever exploded, so the optimizer takes full-size confident steps into garbage. The run degrades SMOOTHLY instead of NaN-ing -- it looks like a modelling failure, not an optimizer one. |
 
-`norm_postclip` pinned at exactly the clip value while `preclip` grows is the signature. A tripwire in
-`LoggingCallback._grad_tripwire` (`GRAD_CLIP_RATIO_WARN = 20`) now writes a `[grad] WARNING` line to
-progress.log naming the worst modules and the usual causes (a residual branch that is not zero-init'd, too long
-a BPTT x ODE chain, too high an LR), because a metric nobody reads is not a diagnostic.
+`norm_postclip` pinned at exactly the clip value while `preclip` grows is the signature. Watch clip_ratio's
+TREND, not any single value -- a legitimately spiky loss can sit above 1 and train fine, so what matters is
+whether it is climbing. Usual causes when it is: a residual branch that is not zero-init'd, too long a
+BPTT x ODE chain (detach_every x sampling_steps), or too high an LR.
 
 MEASURED for reference -- the same config, two denoisers:
 

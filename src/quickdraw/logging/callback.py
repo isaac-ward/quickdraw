@@ -286,32 +286,6 @@ class LoggingCallback(L.Callback):
         if self._compile_s is None and self._t_b0 is not None:
             self._compile_s = time.perf_counter() - self._t_b0  # ~ one-time compile
 
-    GRAD_CLIP_RATIO_WARN = 20.0   # preclip/clip_val above this = the update is direction-only, magnitude junk
-
-    def _grad_tripwire(self, trainer, epoch):
-        """Say it out loud when gradient clipping stops protecting the run and starts HIDING a blowup.
-
-        grad/norm_preclip and grad/norm_postclip were logged from day one, and a 767x explosion in the
-        transformer denoiser still went unnoticed for two days (2026-08-11) because the pair reads as two
-        unremarkable numbers unless you divide them. postclip pinned at exactly the clip value while preclip
-        grows means every step is a full-size step in a direction dominated by whatever exploded -- the run then
-        degrades SMOOTHLY rather than NaN-ing, which looks like a modelling problem. This makes it a log line."""
-        r = trainer.callback_metrics.get("grad/clip_ratio")
-        if r is None:
-            return
-        r = float(r)
-        if r >= self.GRAD_CLIP_RATIO_WARN:
-            from ..controller.run import _plog
-            worst = {k: float(v) for k, v in trainer.callback_metrics.items() if k.startswith("grad/norm/")}
-            top = sorted(worst.items(), key=lambda kv: -kv[1])[:3]
-            _plog(self.writer, f"[grad] WARNING ep{epoch}: clip_ratio={r:.1f} — the pre-clip gradient norm is "
-                               f"{r:.0f}x the clip value, so clipping is discarding the MAGNITUDE and keeping a "
-                               f"direction dominated by whatever is exploding. Training will degrade smoothly "
-                               f"rather than crash. Worst modules: "
-                               + ", ".join(f"{k.split('/')[-1]}={v:.1f}" for k, v in top)
-                               + ". Suspect a residual branch that is not zero-init'd, too long a BPTT/ODE "
-                                 "chain (detach_every x sampling_steps), or too high an LR.")
-
     @torch.no_grad()
     def _log_normalization(self, pl_module, step):
         """EVERY EPOCH under normalization/. The affine PARAMETERS are frozen after calibration, so what is
@@ -447,7 +421,6 @@ class LoggingCallback(L.Callback):
         # forward every aggregated scalar metric (train/* and val/*) through the one writer
         self.writer.scalars({k: v.item() for k, v in trainer.callback_metrics.items()}, step=epoch)
         self._log_normalization(pl_module, epoch)
-        self._grad_tripwire(trainer, epoch)
 
         metrics = {}                                  # eval routines now run in on_train_epoch_end (decoupled from val cadence)
 
