@@ -74,6 +74,26 @@ latent_norm: affine      # layernorm | affine | none. HOW the latent is made sca
 #                          params with the dynamics, which wins the tug-of-war. Remove the tax, remove the war.
 #                          CAVEAT ON THE EVIDENCE: epoch 0 only, and epoch 0 is the p_tf=1.0 teacher-forced
 #                          epoch. Strong and mechanistically explained, but not yet confirmed post-rollout.
+#
+#                          *** READ THIS BEFORE INHERITING THE CONCLUSION (2026-08-11) ***
+#                          EVERY number above is a RECONSTRUCTION metric (ae_floor, codec/roundtrip, one-step
+#                          PSNR). motion_ratio did not exist when this was locked, and it points the OTHER WAY:
+#                                                   motion_ratio @+32   @+64    ae_floor
+#                            tf_ln     (ep1)              0.628        0.463     17.99   <- "eroding"
+#                            tf_affine (ep1)              0.165        0.145     24.28   <- "healthy"
+#                          The arm whose codec was collapsing had 3-4x MORE MOTION. Same pattern across the
+#                          tokenizer itself at ep0: the bespoke learned AE has an 8.6 dB WORSE codec (15.29 vs
+#                          23.88) yet is 2 dB BETTER at 64 steps (9.06 vs 7.06) with motion_ratio 1.12 vs 0.59.
+#                          So what was diagnosed as the dynamics DESTROYING the codec may instead be the
+#                          dynamics CO-ADAPTING the latent to be predictable -- paying reconstruction for
+#                          movement, which is the co-trained-tokenizer argument (a reconstruction-optimised
+#                          frozen latent is a hostile prediction target). Under the stated goal -- sharp AND
+#                          coherent at 32-64 steps, with motion actually modelled -- that trade may be the one
+#                          we WANT, and affine may be optimising for the wrong thing.
+#                          The lock STANDS for now (affine wins decisively on every metric available at the
+#                          time, and the counter-evidence is epoch-0/epoch-1 only), but do NOT treat it as
+#                          settled: the open test is taesd + layernorm run long enough, scored on
+#                          motion_ratio and psnr-minus-psnr_frozen rather than on codec fidelity.
 #                          WE WANT THE DYNAMICS TO RECEIVE NORMALIZED TOKENS -- that requirement is LOCKED; only
 #                          the MECHANISM is a choice. `none` is a research escape hatch, not a default.
 #   layernorm  (default, and bit-identical to every run before 2026-08-10) per-token non-affine LayerNorm on the
