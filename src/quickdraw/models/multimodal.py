@@ -99,6 +99,7 @@ class MultiModalSequenceModel(nn.Module):
         # _ln sites gate on. It MUST be honoured at EVERY point the bag is produced — encode_state AND
         # predict_next AND the DF noised context — or the encoder and the dynamics emit bags in two different
         # spaces (bug, 2026-08-09: predict_next LN'd unconditionally).
+        self.concat_action_embedding = False    # Flow subclass opts in; LSAR/DSAR predictors expect width d
         self.latent_norm_type = resolve_latent_norm(latent_norm)
         self.latent_norm = self.latent_norm_type == "layernorm"
         if self.latent_norm_type == "affine":       # normalization moves OFF the bag and ONTO the AE latent
@@ -270,8 +271,26 @@ class MultiModalSequenceModel(nn.Module):
         Returns the next state bag (B,*,n_state,d)."""
         raise NotImplementedError
 
+    def _cond(self, h_bag: Tensor) -> Tensor:
+        """Backbone output -> the per-token conditioning the readout/dynamics-loss consumes.
+
+        Default: the state slots only, `h_bag[..., :n_state, :]` -- which DISCARDS slot n_state, the action
+        token's own output. That slot is computed and thrown away, so the action's only influence is whatever
+        attention weight the state tokens choose to place on it; nothing stops them learning ~0 and measured
+        (2026-08-11) grad/norm/act_enc was 0.17% of the total gradient.
+
+        concat_action_embedding=True instead CONCATENATES that slot onto every state token, so the denoiser gets
+        the action on a dedicated channel it cannot route around, and it is re-consulted at every one of the
+        `sampling_steps` ODE steps rather than once per rollout step. Costs no new parameters for the embedding
+        itself (it is the tensor already being discarded); the flow's h_dim doubles d -> 2d."""
+        h_state = h_bag[..., : self.n_state, :]
+        if not getattr(self, "concat_action_embedding", False):
+            return h_state
+        act = h_bag[..., self.n_state : self.n_state + 1, :].expand_as(h_state)
+        return torch.cat([h_state, act], dim=-1)                 # (..., n_state, 2d)
+
     def readout(self, h_bag: Tensor, prev_bag: Tensor) -> Tensor:
-        return self.predict_next(h_bag[..., : self.n_state, :], prev_bag)
+        return self.predict_next(self._cond(h_bag), prev_bag)
 
     def carry_transform(self, bag: Tensor) -> Tensor:
         """What gets fed back into the rollout. Latent models (LSAR/diffusion) carry the predicted latent
@@ -587,6 +606,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = True, time_sampling: str = "uniform", flow_hidden: int = 0,
                  flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
+                 concat_action_embedding: bool = True,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
@@ -603,7 +623,11 @@ class MultiModalFlow(MultiModalSequenceModel):
         self.lambda_flow, self.lambda_consistency = lambda_flow, lambda_consistency
         # flow_arch="transformer" makes the denoiser token-mixing -> a JOINT over the bag instead of a product
         # of per-token marginals. n_state (NOT n_input) is the token axis predict_next denoises.
-        self.flow = FlowField(d, h_dim=d, hidden=(flow_hidden or d), cond="concat", shortcut=shortcut,
+        # concat_action_embedding: give the denoiser the action token's own backbone output on a dedicated
+        # channel (see _cond). Doubles the conditioning width, so the FlowField's h_dim doubles with it.
+        self.concat_action_embedding = bool(concat_action_embedding)
+        _hd = d * (2 if self.concat_action_embedding else 1)
+        self.flow = FlowField(d, h_dim=_hd, hidden=(flow_hidden or d), cond="concat", shortcut=shortcut,
                               arch=flow_arch, n_tokens=self.n_state, depth=flow_arch_depth, heads=flow_arch_heads)
         self.pred_obs_in_loss = True
         self.lambda_pred_obs = 1.0
@@ -669,7 +693,7 @@ class MultiModalFlow(MultiModalSequenceModel):
             if self.latent_norm:
                 s = _ln(s)                                       # renormalized back onto the sphere
         h = self.backbone(self._to_input(s, act_seq[:, :L - 1], levels=levels))
-        h_state = h[..., : self.n_state, :]                     # (B,L-1,n_state,d)
+        h_state = self._cond(h)                                # (B,L-1,n_state,d) or 2d if concat_action
         target = (z[:, 1:] - z[:, :-1]).detach() if self.predict_residual else z[:, 1:].detach()  # target off CLEAN z
         l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
         raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function

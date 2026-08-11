@@ -159,6 +159,19 @@ diffusion:
 #                            the finding: the blur is in what the flow learned, not in how it is sampled.
   time_sampling: uniform
   flow_hidden: 0           # 0 -> mirror d
+  concat_action_embedding: true   # DEFAULT ON (user, 2026-08-11). Concatenate the ACTION token's own backbone
+#                            output onto every state token before the denoiser, instead of discarding it.
+#                            WHY: the action enters as 1 slot in a 10-token bag and readout() dropped slot
+#                            n_state entirely, so its ONLY influence was whatever attention weight the state
+#                            tokens chose to give it -- and measured, grad/norm/act_enc was 0.0010 vs the flow's
+#                            0.5932, i.e. 0.17% of the total gradient. The action was very nearly decoration,
+#                            which is the leading explanation for rollouts where the arm does not move.
+#                            This gives it a dedicated channel the model cannot route around, re-consulted at
+#                            every one of the sampling_steps ODE steps rather than once per rollout step, and
+#                            costs NO new embedding parameters (it is the tensor already being thrown away) --
+#                            only the flow's h_dim doubling d -> 2d.
+#                            NOT bit-identical to runs before 2026-08-11. LSAR/DSAR ignore it (their per-token
+#                            predictors expect width d).
   flow_arch: mlp           # mlp | transformer — how the velocity net sees the OTHER tokens being denoised.
 #                            mlp (DEFAULT, bit-identical to every run before 2026-08-10): a per-token MLP, so
 #                              token k's velocity depends only on its own x_k and h_k. The K sampling steps

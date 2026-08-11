@@ -195,6 +195,7 @@ def build_model(cfg):
                                        flow_arch=str(dfg("flow_arch", "mlp")),
                                        flow_arch_depth=int(dfg("flow_arch_depth", 2)),
                                        flow_arch_heads=int(dfg("flow_arch_heads", 4)),
+                                       concat_action_embedding=bool(dfg("concat_action_embedding", True)),
                                        lambda_flow=m.get("lambda_flow", 1.0),
                                        lambda_consistency=m.get("lambda_consistency", 1.0),
                                        df_scale=df_scale, df_granularity=df_granularity,
