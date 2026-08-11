@@ -72,6 +72,22 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
                          f"{info['M']} floats carry no latent) — {T} tokens are attended every step but only "
                          f"{info['per']}/{dd} dims per token feed the decoder at init{damage}. "
                          f"For EXACT set {hint}.")
+    ae = getattr(m, "act_enc", None)                       # ACTION CONDITIONING, stated explicitly
+    if ae is not None:
+        nf = int(getattr(ae, "n_freq", 0) or 0)
+        sq = float(getattr(ae, "squash", 4.0))
+        fo = "OFF" if nf == 0 else f"{nf} bands (raw {ae.in_raw} + {2 * ae.in_raw * nf} sin/cos, |x|<={sq:g})"
+        cat_on = bool(getattr(m, "concat_action_embedding", False))
+        why = ("the action token's backbone output is concatenated onto every state token, so the denoiser has "
+               "a dedicated action channel it cannot route around" if cat_on else
+               "WARNING: readout() DISCARDS the action slot, so actions reach the prediction ONLY via attention "
+               "onto 1 of the bag's slots — measured grad/norm/act_enc was 0.17% of the total gradient")
+        lines.append(f"[action] fourier={fo} | concat_to_denoiser={'ON' if cat_on else 'OFF'}  <- {why}")
+    for _n, _md in getattr(m, "modalities", {}).items():     # per-modality fourier (vector heads)
+        _e = getattr(_md, "enc", None)
+        _nf = int(getattr(_e, "n_freq", 0) or 0) if _e is not None else 0
+        if _nf > 0:
+            lines.append(f"[fourier] {_n}: {_nf} bands (raw {_e.in_raw} + {2 * _e.in_raw * _nf} sin/cos)")
     _nt = getattr(m, "latent_norm_type", "layernorm")
     _why = {"layernorm": "per-token non-affine LN on the bag at encode + after every dynamics step — scale-free "
                          "but NOT invertible (drops 2 scalars/token; -3.51 dB measured on robocasa/TAESD)",

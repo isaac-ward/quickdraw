@@ -53,6 +53,16 @@ p_tf_warmup_epochs: 1    # DEFAULT 1 (2026-08-07): with a decently-sized dataset
 # NOTE (user, 2026-08-10): "affine is clearly right for a frozen AE where the latent scale is a fixed property
 # of the data. For the bespoke learned AE the encoder can drift its own scale during training, and LN may be
 # doing real work there. So the default probably needs to be per-modality, not global."
+action_fourier_freqs: 0  # 0 = OFF (default, bit-identical). >0 prepends `2*action_dim*n_freq` sin/cos bands
+#                           to the ACTION encoder input, so small action differences are linearly separable.
+#                           WHY: robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ
+#                           slightly, so a raw Linear maps near-collinear inputs to near-collinear embeddings.
+#                           The flow head has ALWAYS done this for its diffusion time (n_freq=16); the action
+#                           never did. 16 bands on a 12-dim action = 12 + 384 = 396 input dims.
+#                           The input is squashed to [-1,1] first (features.fourier_features): actions are
+#                           z-scored and UNBOUNDED, and some dims are near-constant (robocasa action std floors
+#                           near 1e-6, so a 0.5 deviation normalizes to 5e5) -- a raw expansion would alias.
+#                           Vector modalities have their own knob: modalities.<i>.fourier_freqs.
 latent_norm: affine      # layernorm | affine | none. HOW the latent is made scale-free for the dynamics.
 #                          LOCKED affine (user, 2026-08-10). DEFINITIVE TEST: tf_ln vs tf_affine, identical in
 #                          every respect except this flag (transformer denoiser, 8x128 EXACT bag, frozen TAESD

@@ -24,9 +24,12 @@ from torch import Tensor
 
 
 def _time_features(t: Tensor, freqs: Tensor) -> Tensor:
-    """Scalar t in [0,1] (any leading shape, last dim 1) -> [sin, cos] Fourier features (..., 2*F)."""
-    ang = t * freqs
-    return torch.cat([ang.sin(), ang.cos()], dim=-1)
+    """Scalar t in [0,1] (any leading shape, last dim 1) -> [sin, cos] Fourier features (..., 2*F).
+
+    Thin alias over models.features.fourier_features so the expansion has ONE implementation. squash=None
+    because tau is already in [0,1]; bit-identical to the previous inline `cat([(t*freqs).sin(), .cos()])`."""
+    from .features import fourier_features
+    return fourier_features(t, freqs, squash=None)
 
 
 class TransportHead(nn.Module):

@@ -55,6 +55,30 @@ def _mlp(i: int, o: int, h: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(i, h), nn.GELU(), nn.Linear(h, o))
 
 
+class FourierMLP(nn.Module):
+    """[raw x | fourier_features(x)] -> MLP -> out. n_freq=0 makes it EXACTLY the plain `_mlp(i, o, h)` it
+    replaces (same submodule name `net`, same shapes, same init order), so it is bit-identical when off.
+
+    Used for the ACTION encoder and for vector-modality encoders: both take z-scored, unbounded inputs whose
+    small differences matter, and a raw linear map of near-collinear inputs discards exactly that. `squash`
+    bounds the input first -- required, see features.fourier_features."""
+
+    def __init__(self, i: int, o: int, h: int, n_freq: int = 0, squash: float = 4.0):
+        super().__init__()
+        from .features import fourier_dim, fourier_freqs
+        self.n_freq, self.squash, self.in_raw = int(n_freq), float(squash), int(i)
+        in_dim = i + (fourier_dim(i, n_freq) if n_freq > 0 else 0)
+        if n_freq > 0:
+            self.register_buffer("freqs", fourier_freqs(n_freq), persistent=False)
+        self.net = _mlp(in_dim, o, h)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.n_freq > 0:
+            from .features import fourier_features
+            x = torch.cat([x, fourier_features(x, self.freqs, squash=self.squash)], dim=-1)
+        return self.net(x)
+
+
 def _pred_loss(pred: Tensor, target: Tensor, metric: str) -> Tensor:
     """Latent-prediction loss (mirrors models/lsar.py.pred_loss): stop-grad the target; mse / BYOL
     normed_mse / cosine per the collapse strategy's pred_metric."""
@@ -75,7 +99,8 @@ class MultiModalSequenceModel(nn.Module):
 
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
                  mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
-                 compile_rollout: bool = False, latent_norm: str | bool = "affine"):
+                 compile_rollout: bool = False, latent_norm: str | bool = "affine",
+                 action_fourier_freqs: int = 0):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)
@@ -91,7 +116,10 @@ class MultiModalSequenceModel(nn.Module):
         self.n_state = sum(n for _, n in self.layout)
         self.n_input = self.n_state + 1                       # + action token
         self.d, self.window = d, window
-        self.act_enc = _mlp(action_dim, d, d)                 # action -> 1 token
+        # action -> 1 token. action_fourier_freqs>0 prepends sin/cos features so SMALL action differences are
+        # linearly separable (robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ
+        # slightly). 0 = off = bit-identical to a plain _mlp.
+        self.act_enc = FourierMLP(action_dim, d, d, n_freq=int(action_fourier_freqs))
         self.backbone = SpaceTimeTransformer(d, depth, heads, window, mlp_ratio,
                                              n_slots=self.n_input, rope_theta=rope_theta)
         # How the latent is made scale-free for the dynamics — see resolve_latent_norm for the three options.
@@ -114,14 +142,17 @@ class MultiModalSequenceModel(nn.Module):
             # layernorm, and no modality affine because the trunk cannot do it) -- and since affine became the
             # DEFAULT on 2026-08-10, that silently applied to every bespoke run.
             if not _capable:
-                raise ValueError(
-                    "model.latent_norm='affine' but no modality supports it (affine is implemented on the "
-                    "PRETRAINED image trunk only: it calibrates fixed per-channel stats of a FIXED latent, "
-                    "which a learned/bespoke encoder does not have -- its scale drifts as it trains). This "
-                    "config would otherwise run with NO latent normalization at all. Use "
-                    "model.latent_norm=layernorm for a bespoke AE (modalities.<i>.pretrained=false), or set "
-                    "modalities.<i>.pretrained=true to use the frozen TAESD trunk affine was built for."
-                )
+                # FALL BACK to layernorm, LOUDLY -- do NOT raise and do NOT silently end up with nothing.
+                # `affine` is implemented on the PRETRAINED trunk only: it calibrates fixed per-channel stats of
+                # a FIXED latent, which a learned encoder does not have (its scale drifts as it trains). Since
+                # affine is also the DEFAULT (locked 2026-08-10), raising here would make the default unusable
+                # for every bespoke config; and falling through silently would leave NO normalization at all,
+                # which was the original bug. layernorm is the correct choice for a learned encoder anyway.
+                self.latent_norm, self.latent_norm_type = True, "layernorm"
+                print("[latent_norm] 'affine' requested but no modality supports it (it needs a PRETRAINED "
+                      "image trunk whose latent has fixed per-channel statistics; a learned encoder drifts its "
+                      "own scale) -> FALLING BACK to 'layernorm'. Set model.latent_norm=layernorm explicitly to "
+                      "silence this, or modalities.<i>.pretrained=true to actually use affine.")
 
     def arch_table(self) -> list[tuple[str, str, int]]:
         """Rows (component, shape transform, #params) describing the token-bag dataflow — printed at the top
@@ -144,7 +175,7 @@ class MultiModalSequenceModel(nn.Module):
             if is_img and hasattr(mod, "taesd"):
                 earch = f"taesd{'-frozen' if getattr(mod, 'taesd_frozen', False) else ''}+adapter"
             rows.append((f"{name} encoder ({earch})", f"{ins} -> (B,T,{ntok},{self.d})", npar(enc)))
-        rows.append(("action_enc", f"(B,T,{self.act_enc[0].in_features}) -> (B,T,1,{self.d})", npar(self.act_enc)))
+        rows.append(("action_enc", f"(B,T,{self.act_enc.in_raw}) -> (B,T,1,{self.d})", npar(self.act_enc)))
         # backbone: fuse the token bag over space (within-step) + time (causal)
         rows.append(("space-time backbone", f"(B,T,{self.n_input},{self.d}) -> same "
                      f"[spatial {self.n_input} tok/step + temporal causal]", npar(self.backbone)))
@@ -159,7 +190,7 @@ class MultiModalSequenceModel(nn.Module):
         # proposal (never fed back into the WM). Only present when action_head.enabled -> show it so the head is visible.
         if getattr(self, "action_head_enabled", False) and getattr(self, "action_flow", None) is not None:
             rows.append(("action_flow (learned action prior)",
-                         f"context h -> (B,T,{self.act_enc[0].in_features}) action dist", npar(self.action_flow)))
+                         f"context h -> (B,T,{self.act_enc.in_raw}) action dist", npar(self.action_flow)))
         if getattr(self, "predictor_q", None) is not None:
             rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
         # decode heads (predicted tokens -> obs)
@@ -514,12 +545,13 @@ class MultiModalLSAR(MultiModalSequenceModel):
     pred_latent = MSE to the encoded true-next bag (Reconstruction collapse: obs heads ground the encoder)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True,
+                 grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True, action_fourier_freqs: int = 0,
                  pred_hidden: int = 0, lambda_pred_latent: float = 1.0,
                  collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
-                         compile_rollout=compile_rollout, latent_norm=latent_norm)
+                         compile_rollout=compile_rollout, latent_norm=latent_norm,
+                         action_fourier_freqs=action_fourier_freqs)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
@@ -602,7 +634,10 @@ class MultiModalFlow(MultiModalSequenceModel):
     (deterministic ε=0 at eval unless stochastic_eval — the committed prediction)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True,
+                 grad_checkpoint: bool = False, compile_rollout: bool = False,
+                 latent_norm: str | bool = "affine",   # was `bool = True` -> silently gave LAYERNORM on a direct
+                 #                                       construct, contradicting the LOCKED affine default
+                 action_fourier_freqs: int = 0,
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = True, time_sampling: str = "uniform", flow_hidden: int = 0,
                  flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
@@ -614,7 +649,8 @@ class MultiModalFlow(MultiModalSequenceModel):
                  dynamics_detach_encoder: bool = False):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
-                         compile_rollout=compile_rollout, latent_norm=latent_norm)
+                         compile_rollout=compile_rollout, latent_norm=latent_norm,
+                         action_fourier_freqs=action_fourier_freqs)
         assert predict in ("residual", "absolute")
         self.predict_residual = predict == "residual"
         self.sampling_steps = int(sampling_steps)

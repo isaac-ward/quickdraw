@@ -66,6 +66,8 @@ class ModalitySpec:
     #                              the round-trip is the IDENTITY at step 0 whenever num_tokens*d >= latent floats
     #                              (mode EXACT or PADDED). dense=true swaps the pad for a learned per->d projection
     #                              (mode PROJECTED: dense tokens, no idle decode width, but NO identity guarantee).
+    fourier_freqs: int = 0                       # VECTOR modalities: sin/cos feature bands prepended to the
+    #                                              encoder input (0 = off, bit-identical). See models/features.py.
     latent_loss_weight: float = 1.0              # weight of the adapter ROUND-TRIP loss ||up(down(g))-g||^2 (#12).
     #                              The ONLY term that supervises the adapter pair directly; decode_loss only ever
     #                              trains up() on the dynamics' predicted bag. 0 -> off.
@@ -121,7 +123,10 @@ class VectorModality(Modality):
         self.noise_std = float(spec.noise_std)
         self.decode_kind = spec.decode_kind
         self.dim = spec.dim
-        self.enc = _mlp(spec.dim, d, hidden)
+        # fourier_freqs>0: [raw | sin/cos] before the trunk. Same rationale as the action encoder -- proprio is
+        # z-scored and unbounded, and its small step-to-step differences ARE the motion. 0 = off = bit-identical.
+        from .multimodal import FourierMLP
+        self.enc = FourierMLP(spec.dim, d, hidden, n_freq=int(getattr(spec, "fourier_freqs", 0) or 0))
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
         self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
