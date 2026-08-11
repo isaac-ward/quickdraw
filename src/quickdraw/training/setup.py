@@ -78,9 +78,12 @@ def _modality_specs(cfg):
 # is 4*16*16 = 1024 floats, and the adapter wants num_tokens*d == 1024 EXACTLY.
 #   mini   8*128 = 1024  -> EXACT. The only preset that fits.
 #   tiny   8*64  =  512  -> RAISES (LOSSY: the bag cannot hold the latent). Needs modalities.<img>.pretrained=false.
-#   small 16*192 = 3072  -> builds, but PADDED: 67% of the bag carries no latent, and padding is ACTIVE damage
-#                           under a per-token norm (measured -4.4 dB). Use it with pretrained=false, or pick
-#                           num_tokens*d == 1024.
+#   small 16*192 = 3072  -> builds, but PADDED: 67% of the bag carries no latent. HOW BAD depends on the norm:
+#                           under layernorm padding is ACTIVE damage (-4.4 dB measured) because _ln is per TOKEN,
+#                           so the zeros enter the mean/std the real floats are divided by; under affine there is
+#                           no bag LN at all, so zero-pad + strip is an exact bijection and the cost is only
+#                           wasted width -- the denoiser still spends capacity on dims that get stripped. Either
+#                           way prefer num_tokens*d == 1024.
 SIZE_PRESETS = {
     "tiny":  {"d": 64, "heads": 4, "num_tokens": 8, "decode_base": 16},      # d=64/heads=4 -> head_dim 16 (min power-of-2); narrow U-Net decoder
     "mini":  {"d": 128, "num_tokens": 8, "decode_base": 16},                 # heads=8 -> head_dim 16; narrow (16) U-Net decoder, wider backbone than tiny
