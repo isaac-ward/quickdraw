@@ -63,7 +63,14 @@ action_fourier_freqs: 0  # 0 = OFF (default, bit-identical). >0 prepends `2*acti
 #                           z-scored and UNBOUNDED, and some dims are near-constant (robocasa action std floors
 #                           near 1e-6, so a 0.5 deviation normalizes to 5e5) -- a raw expansion would alias.
 #                           Vector modalities have their own knob: modalities.<i>.fourier_freqs.
-latent_norm: affine      # layernorm | affine | none. HOW the latent is made scale-free for the dynamics.
+latent_norm: layernorm   # layernorm | affine | none. HOW the latent is made scale-free for the dynamics.
+#                          NOTE THE DEFAULT IS layernorm, NOT affine, and that is deliberate: this file's image
+#                          modality is `pretrained: false` (the BESPOKE conv/U-Net AE), and affine RAISES on a
+#                          learned encoder because it has no FIXED latent to calibrate. Defaulting to affine
+#                          made `model=mm_flow` crash at construction for every preset. The affine LOCK below
+#                          is therefore scoped: WHEN THE TRUNK IS A FROZEN PRETRAINED AE, USE AFFINE -- pass
+#                          model.latent_norm=affine together with modalities.<i>.pretrained=true (that pairing
+#                          is what the evidence below was measured on).
 #                          LOCKED affine (user, 2026-08-10). DEFINITIVE TEST: tf_ln vs tf_affine, identical in
 #                          every respect except this flag (transformer denoiser, 8x128 EXACT bag, frozen TAESD
 #                          @128px, batch 32, stochastic eval) -- logs/robocasa-tfaff/*_19_36_25_tf_{ln,affine}.

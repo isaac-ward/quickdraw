@@ -258,7 +258,8 @@ class LitWorldModel(L.LightningModule):
         # NaN-ing, which is exactly why a 767x blowup in the transformer denoiser (2026-08-11) read as a
         # modelling failure for two days: preclip and postclip were both logged the whole time, but the signal
         # only screams once you divide them. reduce_fx=max -> the epoch value is the WORST step.
-        self.log("grad/clip_ratio", pre / max(float(gradient_clip_val), 1e-12), reduce_fx="max")
+        if gradient_clip_val:      # None/0 = clipping disabled -> the ratio is undefined, not infinite
+            self.log("grad/clip_ratio", pre / max(float(gradient_clip_val), 1e-12), reduce_fx="max")
         # reduce_fx=max -> the epoch value is the WORST step (mean would dilute one spike across 1000s of clean
         # steps into ~0); nonfinite_skipped uses sum -> total # of skipped steps this epoch.
         self.log("grad/num_nans", float(n_nan), reduce_fx="max")

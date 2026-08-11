@@ -65,8 +65,8 @@ STAGGER=45
 launch 0 so_dsar        model=mm_dsar_proprio;                                                sleep $STAGGER
 launch 1 so_lsar_ema    model=mm_lsar_proprio +collapse=ema;            sleep $STAGGER
 launch 0 so_lsar_naked  model=mm_lsar_proprio +collapse=naked;          sleep $STAGGER
-launch 1 so_lsar_sigreg model=mm_lsar_proprio +collapse=sigreg;         sleep $STAGGER
+launch 1 so_lsar_sigreg model=mm_lsar_proprio +collapse=sigreg model.latent_norm=none;         sleep $STAGGER
 launch 0 so_lsar_recon  model=mm_lsar_proprio +collapse=reconstruction; sleep $STAGGER
-launch 1 so_lsar_vicreg model=mm_lsar_proprio +collapse=vicreg
+launch 1 so_lsar_vicreg model=mm_lsar_proprio +collapse=vicreg model.latent_norm=none
 
 echo "[shootout] launched 6 (3 per GPU, staggered). Monitor: logs/train_*so_*/progress.log or wandb."

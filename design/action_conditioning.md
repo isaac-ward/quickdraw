@@ -27,21 +27,23 @@ Two distinct senses of "the action is in there":
   token, so the denoiser receives the action as its own dedicated 128 dims:
 
 ```python
-def _cond(self, h_bag):
+def _cond(self, h_bag, act):
     h_state = h_bag[..., : self.n_state, :]
     if not self.concat_action_embedding: return h_state
-    act = h_bag[..., self.n_state : self.n_state+1, :].expand_as(h_state)
-    return torch.cat([h_state, act], dim=-1)          # (..., n_state, 2d)
+    a = self.act_enc(act).unsqueeze(-2).expand_as(h_state)   # RAW, never through the backbone
+    return torch.cat([h_state, a], dim=-1)                   # (..., n_state, 2d)
 ```
 
-It needed **no plumbing**: the action slot is already present in `h_bag` at all six `readout` call sites and in
-`loss_terms`. Cost: **no new embedding parameters** (it is the tensor already being discarded); the flow's
-`h_dim` doubles, `in_dim` 288 -> 416, flow params 0.0721M -> 0.0885M. It is also re-consulted at every one of
-the `sampling_steps` ODE steps, instead of once per rollout step.
+`act` is THREADED from all five `readout` call sites plus `loss_terms` — not stashed on `self`, so the compiled
+and grad-checkpointed rollouts see the same pure function. Cost: no new embedding parameters; the flow's
+`h_dim` doubles (`in_dim` 288 -> 416, flow params 0.0721M -> 0.0885M).
 
-**Honest scope:** this is the action slot's **post-backbone** value, not the raw `act_enc(act)`. It is
-contextualised (attention has mixed other tokens in), though a pre-norm residual stream preserves the slot's
-own input strongly. A truly unmediated raw embedding would require threading actions into `predict_next`.
+**Why RAW and not the post-backbone slot.** An earlier version concatenated `h_bag[..., n_state:n_state+1, :]`
+— the action token's own backbone output — which needed no plumbing at all. It was replaced because that value
+is *suppressible*: the backbone's residual branches can learn to emit `-act_enc(a)`, and before
+`concat_action_embedding` existed that slot's output was DISCARDED and therefore received no gradient, so its
+value was entirely unconstrained. A copy that never passes through the backbone cannot be cancelled by it. The
+post-backbone slot survives only as a fallback when a caller omits `act` (no in-tree caller does).
 
 ---
 
@@ -105,7 +107,7 @@ Widths: a 12-dim action at 16 bands -> `12 + 2*12*16 = 396` input dims. 16-dim p
 
 | thing | knob | default |
 |---|---|---|
-| Action concatenated onto every state token for the denoiser | `model.diffusion.concat_action_embedding` | **true** |
+| RAW pre-backbone `act_enc(act)` concatenated onto every state token for the denoiser | `model.diffusion.concat_action_embedding` | **true** |
 | Fourier features on the ACTION encoder | `model.action_fourier_freqs` | **0 (off)** |
 | Fourier features on VECTOR modality encoders | `model.modalities.<i>.fourier_freqs` | **0 (off)** |
 | Shared expansion, one implementation | `models/features.py` | — |
@@ -114,25 +116,19 @@ Widths: a 12-dim action at 16 bands -> `12 + 2*12*16 = 396` input dims. 16-dim p
 `progress.log` now prints, at startup:
 
 ```
-[action] fourier=16 bands (raw 12 + 384 sin/cos, |x|<=4) | concat_to_denoiser=ON  <- the action token's
-         backbone output is concatenated onto every state token, so the denoiser has a dedicated action
-         channel it cannot route around
+[action] fourier=16 bands (raw 12 + 384 sin/cos, |x|<=4) | concat_to_denoiser=ON (raw pre-backbone act_enc)
 [fourier] proprio: 16 bands (raw 16 + 512 sin/cos)
 ```
 
 and when conditioning is off it says so, with the reason:
 
 ```
-[action] fourier=OFF | concat_to_denoiser=OFF  <- WARNING: readout() DISCARDS the action slot, so actions
-         reach the prediction ONLY via attention onto 1 of the bag's slots — measured grad/norm/act_enc was
-         0.17% of the total gradient
+[action] fourier=OFF | concat_to_denoiser=OFF
 ```
 
 **NOT IMPLEMENTED** (discussed, deliberately not built)
 
 - **FiLM / adaLN action conditioning** — rejected, see §2.
-- **Raw (pre-backbone) action embedding into the denoiser** — the concat uses the post-backbone slot; an
-  unmediated version needs actions threaded into `predict_next`.
 - **Motion-weighted reconstruction** (reweight recon by `|o_t - o_{t-1}|`) — not wanted.
 - **Inverse dynamics auxiliary head** (predict `a_t` from `(z_t, z_{t+1})`) — not wanted.
 - **Action-sensitivity metric** (`||rollout(a) - rollout(a')||`) — designed, not built. This is the ONLY direct

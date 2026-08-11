@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import os
 
 import torch
@@ -196,7 +197,12 @@ def build_model(cfg):
                                        flow_arch=str(dfg("flow_arch", "mlp")),
                                        flow_arch_depth=int(dfg("flow_arch_depth", 2)),
                                        flow_arch_heads=int(dfg("flow_arch_heads", 4)),
-                                       concat_action_embedding=bool(dfg("concat_action_embedding", True)),
+                                       # FALLBACK False on purpose: a config that does not MENTION this key is
+                                       # an OLD config (e.g. adopted from a checkpoint's logs/config.json by
+                                       # run_standalone), and it was trained without the extra channel -- so
+                                       # rebuilding it with True doubles the flow's h_dim and the checkpoint
+                                       # fails to load with a size mismatch. New runs get True from mm_flow.yaml.
+                                       concat_action_embedding=bool(dfg("concat_action_embedding", False)),
                                        lambda_flow=m.get("lambda_flow", 1.0),
                                        lambda_consistency=m.get("lambda_consistency", 1.0),
                                        df_scale=df_scale, df_granularity=df_granularity,
@@ -422,6 +428,27 @@ def load_checkpoint(model, path: str):
         if k.startswith("model."):
             k = k[len("model."):]
         k = k.replace("_orig_mod.", "")  # strip torch.compile wrapper anywhere (whole-model or submodule)
+        # 2026-08-11: act_enc and every VectorModality.enc became a FourierMLP wrapping the old Sequential as
+        # `.net`, so `act_enc.0.weight` -> `act_enc.net.0.weight`. Migrate the OLD layout forward, otherwise a
+        # pre-existing checkpoint loads with those encoders left at RANDOM INIT and says nothing (strict=False).
+        for _pre in ("act_enc", "enc"):
+            k = re.sub(rf"(^|\.)({_pre})\.(\d+)\.", rf"\1\2.net.\3.", k)
         clean[k] = v
-    model.load_state_dict(clean, strict=False)
+    inc = model.load_state_dict(clean, strict=False)
+    # strict=False is REQUIRED (buffers like lat_mean/lat_std are absent from older checkpoints), but silently
+    # discarding IncompatibleKeys is how a partly-RANDOM model gets evaluated as if it were trained. Missing
+    # PARAMETERS are fatal; missing buffers that have a defined default are reported and tolerated.
+    _param_names = {n for n, _ in model.named_parameters()}
+    _missing_params = [k for k in inc.missing_keys if k in _param_names]
+    if inc.missing_keys or inc.unexpected_keys:
+        print(f"[load_checkpoint] missing={len(inc.missing_keys)} unexpected={len(inc.unexpected_keys)}"
+              + (f"\n  missing: {inc.missing_keys[:8]}" if inc.missing_keys else "")
+              + (f"\n  unexpected: {inc.unexpected_keys[:8]}" if inc.unexpected_keys else ""))
+    if _missing_params:
+        raise RuntimeError(
+            f"checkpoint is missing {len(_missing_params)} PARAMETER tensors, so those modules would stay at "
+            f"random init and be evaluated as if trained: {_missing_params[:10]}. This is usually a layout "
+            f"change between the checkpoint and the current code -- add a migration to load_checkpoint rather "
+            f"than evaluating a partly-random model."
+        )
     return model

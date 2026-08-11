@@ -134,7 +134,9 @@ dmypy.json
 logs/
 
 # wizard-generated scripts (AI output — never committed; keep the dir via .gitkeep)
+# experiment RECORDS (wizard/records/*.md) are tracked -- they are the durable story of what was run and why.
+# Only the launch scripts and their stdout stay local. NOTE: `wizard/scripts/*` does not cover wizard/records,
+# so no negation is needed; the two `!` lines that used to sit here had INLINE comments, which git treats as
+# part of the pattern, so they matched nothing.
 wizard/scripts/*
-!wizard/records/          # experiment RECORDS are tracked (they are the durable story of what was run and why);
-!wizard/records/*.md      #   only the launch scripts + their stdout stay local
 !wizard/scripts/.gitkeep
