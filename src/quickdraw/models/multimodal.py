@@ -102,9 +102,25 @@ class MultiModalSequenceModel(nn.Module):
         self.latent_norm_type = resolve_latent_norm(latent_norm)
         self.latent_norm = self.latent_norm_type == "layernorm"
         if self.latent_norm_type == "affine":       # normalization moves OFF the bag and ONTO the AE latent
-            for _md in self.modalities.values():
-                if hasattr(_md, "enable_latent_affine"):
-                    _md.enable_latent_affine()
+            _capable = [n for n, md in self.modalities.items() if hasattr(md, "enable_latent_affine")]
+            for _n in _capable:
+                self.modalities[_n].enable_latent_affine()
+            # FAIL LOUDLY rather than silently degrade to `none`. `affine` is implemented on the PRETRAINED
+            # trunk only, because it presupposes a FIXED latent whose per-channel statistics can be calibrated
+            # once from the data. A bespoke/learned AE has no such fixed latent -- its encoder drifts its own
+            # scale during training, so a one-shot calibration is meaningless. Without this check an
+            # affine + pretrained=false run got NO normalization anywhere (no bag LN because the type is not
+            # layernorm, and no modality affine because the trunk cannot do it) -- and since affine became the
+            # DEFAULT on 2026-08-10, that silently applied to every bespoke run.
+            if not _capable:
+                raise ValueError(
+                    "model.latent_norm='affine' but no modality supports it (affine is implemented on the "
+                    "PRETRAINED image trunk only: it calibrates fixed per-channel stats of a FIXED latent, "
+                    "which a learned/bespoke encoder does not have -- its scale drifts as it trains). This "
+                    "config would otherwise run with NO latent normalization at all. Use "
+                    "model.latent_norm=layernorm for a bespoke AE (modalities.<i>.pretrained=false), or set "
+                    "modalities.<i>.pretrained=true to use the frozen TAESD trunk affine was built for."
+                )
 
     def arch_table(self) -> list[tuple[str, str, int]]:
         """Rows (component, shape transform, #params) describing the token-bag dataflow — printed at the top
