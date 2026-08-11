@@ -63,6 +63,27 @@ def main():
     check("emit_horizon_readouts covers every metric incl. lpips",
           all(any(f"/{k}/@+" in t for t in w4.tags) for k in c), f"{len(w4.tags)} scalars")
 
+    # recon_losses on a BESPOKE trunk (no pretrained AE -> roundtrip_losses has no heads). This is the exact
+    # config that broke with "not enough values to unpack": the early return was a bare dict, not a tuple.
+    from quickdraw.models.modalities import ModalitySpec
+    from quickdraw.models.multimodal import MultiModalFlow
+    for tag, spec in (("bespoke", dict(pretrained=False, encode_arch="conv", decode_arch="unet")),
+                      ("pretrained", dict(pretrained=True, pretrained_name="madebyollin/taesd",
+                                          pretrained_init=True, freeze=True))):
+        sp = [ModalitySpec(name="proprio", kind="vector", dim=16, num_tokens=1),
+              ModalitySpec(name="image", kind="image", num_tokens=8, img_size=64, patch=16, channels=3, **spec)]
+        torch.manual_seed(0)
+        m = MultiModalFlow(sp, d=128, depth=2, heads=8, window=8, mlp_ratio=2.0, rope_theta=1e4,
+                           action_dim=12, latent_norm="layernorm")
+        obs = {"proprio": torch.randn(2, 4, 16), "image": torch.rand(2, 4, 64, 64, 3)}
+        bag = m.encode_state(obs)
+        try:
+            losses, weights = m.recon_losses(bag, obs)
+            ok = set(losses) == set(weights) and any(k.startswith("decode/") for k in losses)
+        except Exception as e:
+            ok, losses = False, {"error": e}
+        check(f"recon_losses returns (losses, weights) on a {tag} trunk", ok, str(sorted(losses)))
+
     print(f"{'ALL OK' if OK[0] == OK[1] else 'SOME FAILED'} ({OK[0]}/{OK[1]})")
     return 0 if OK[0] == OK[1] else 1
 

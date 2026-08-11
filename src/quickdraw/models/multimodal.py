@@ -219,7 +219,10 @@ class MultiModalSequenceModel(nn.Module):
         wts = {n: getattr(self.modalities[n], "latent_loss_weight", 0.0) for n, _ in self.layout}
         heads = [n for n, w in wts.items() if w > 0 and hasattr(self.modalities[n], "taesd")]
         if not heads:
-            return {}
+            return {}, {}      # NOTE the TUPLE: recon_losses unpacks (losses, weights). A bare {} here broke
+            #                    every bespoke-AE run (no pretrained trunk -> no heads) with
+            #                    "ValueError: not enough values to unpack (expected 2, got 0)" -- missed when
+            #                    this function changed contract, because nothing tested a non-pretrained trunk.
         bag = self.encode_state(targets)                 # the REAL encode (LN included when latent_norm)
         rec = self.to_obs(bag, heads=heads)              # the REAL decode
         # RAW mse + its weight, so the logged series is comparable across runs that sweep latent_loss_weight
