@@ -187,7 +187,8 @@ class MultiModalSequenceModel(nn.Module):
             off += n
         return out
 
-    def recon_losses(self, bag: Tensor, targets: dict[str, Tensor]) -> dict[str, Tensor]:
+    def recon_losses(self, bag: Tensor, targets: dict[str, Tensor],
+                     pre_z_targets: Tensor | None = None) -> dict[str, Tensor]:
         """Per-modality DECODE loss of the predicted token bag vs clean target obs.
 
         Returns (losses, weights) -- the SAME contract as loss_terms, so no caller infers a weight by parsing
@@ -202,11 +203,11 @@ class MultiModalSequenceModel(nn.Module):
             if sc is not None:                                  # flow decoders only
                 out[f"decode/{name}_shortcut"], wts[f"decode/{name}_shortcut"] = sc, float(mod.weight)
             off += n
-        rt, rtw = self.roundtrip_losses(targets)                # codec/roundtrip_<name>
+        rt, rtw = self.roundtrip_losses(targets, pre_z=pre_z_targets)   # codec/roundtrip_<name>
         out.update(rt); wts.update(rtw)
         return out, wts
 
-    def roundtrip_losses(self, targets: dict[str, Tensor]) -> tuple[dict, dict]:
+    def roundtrip_losses(self, targets: dict[str, Tensor], pre_z: Tensor | None = None) -> tuple[dict, dict]:
         """ENCODE->DECODE round-trip loss for pretrained-AE trunks (#12), through THE MODEL'S OWN path.
 
         Deliberately uses encode_state()/to_obs() rather than the modality's encode/decode: whatever the
@@ -216,14 +217,19 @@ class MultiModalSequenceModel(nn.Module):
 
         Note decode_loss only ever trains the decoder on the dynamics' PREDICTED bag; nothing else asks the
         encode->decode path to reconstruct, which is how the first adapter reached only ~10.5 dB."""
-        wts = {n: getattr(self.modalities[n], "latent_loss_weight", 0.0) for n, _ in self.layout}
-        heads = [n for n, w in wts.items() if w > 0 and hasattr(self.modalities[n], "taesd")]
+        wts = {n: (getattr(self.modalities[n], "latent_loss_weight", 0.0) or 0.0) for n, _ in self.layout}
+        # Any modality with latent_loss_weight>0 gets the encode->decode anchor -- NOT just pretrained/taesd
+        # trunks. A TRAINABLE (bespoke) encoder needs Dec(Enc(x))->x too, or it collapses (design/collapse.md);
+        # `to_obs`/`encode_state` below are already modality-agnostic, this was only gated off.
+        heads = [n for n, w in wts.items() if w > 0]
         if not heads:
             return {}, {}      # NOTE the TUPLE: recon_losses unpacks (losses, weights). A bare {} here broke
             #                    every bespoke-AE run (no pretrained trunk -> no heads) with
             #                    "ValueError: not enough values to unpack (expected 2, got 0)" -- missed when
             #                    this function changed contract, because nothing tested a non-pretrained trunk.
-        bag = self.encode_state(targets)                 # the REAL encode (LN included when latent_norm)
+        bag = self.encode_state(targets) if pre_z is None else pre_z   # REAL encode (LN incl.); pre_z = the SAME
+        #                          encode already computed by the shared-encode fast path (_step), sliced to these
+        #                          target frames -- bit-identical at noise_std=0 (see design/accelerations P4).
         rec = self.to_obs(bag, heads=heads)              # the REAL decode
         # RAW mse + its weight, so the logged series is comparable across runs that sweep latent_loss_weight
         # (every sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec
@@ -314,7 +320,10 @@ class MultiModalSequenceModel(nn.Module):
     def _rollout(self, ctx_obs: dict[str, Tensor], actions: Tensor, horizon: int, p_tf: float,
                  true_future: dict[str, Tensor] | None, detach_every: int, use_cache: bool = False) -> Tensor:
         bag_buf = list(self.encode_state(ctx_obs).unbind(dim=1))     # P bags of (B,n_state,d)
-        tf_future = self.encode_state(true_future) if true_future is not None else None
+        # Only encode the true future when teacher forcing can actually USE it (p_tf>0). At p_tf==0 — the
+        # steady AR regime (most of training) AND all of val — tf_future is never read (see the `p_tf > 0.0`
+        # guard at the mix below), so encoding F frames + retaining their adapter graph is pure waste.
+        tf_future = self.encode_state(true_future) if (true_future is not None and p_tf > 0.0) else None
         return self._rollout_from(bag_buf, actions, horizon, p_tf, tf_future, detach_every, use_cache=use_cache)
 
     def _rollout_from(self, bag_buf, actions: Tensor, horizon: int, p_tf: float,
@@ -393,8 +402,13 @@ class MultiModalSequenceModel(nn.Module):
             bag_buf.append(self.carry_transform(s_pred))
         return torch.stack(preds, dim=1)                             # (B,horizon,n_state,d)
 
-    def rollout_train(self, ctx_obs, actions, true_future: dict, p_tf: float, detach_every: int = 8) -> Tensor:
+    def rollout_train(self, ctx_obs, actions, true_future: dict, p_tf: float, detach_every: int = 8,
+                      precomputed_ctx: Tensor | None = None) -> Tensor:
         horizon = next(iter(true_future.values())).shape[1]
+        if precomputed_ctx is not None:                       # shared-encode fast path (_step, p_tf==0 only):
+            assert p_tf == 0.0, "precomputed_ctx is the p_tf==0 shared encode (no teacher forcing)"  # ctx already
+            return self._rollout_from(list(precomputed_ctx.unbind(dim=1)),                            # LN'd
+                                      actions, horizon, 0.0, None, detach_every)
         return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every)
 
     @torch.no_grad()
@@ -638,10 +652,10 @@ class MultiModalFlow(MultiModalSequenceModel):
         out = prev_bag + out if self.predict_residual else out
         return _ln(out) if self.latent_norm else out
 
-    def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None):
+    def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None, pre_z: Tensor | None = None):
         """Teacher-forced rectified-flow loss over the bag (mirrors models/diffusion.py)."""
         assert act_seq is not None
-        z = self.encode_state(obs)                              # (B,L,n_state,d)
+        z = self.encode_state(obs) if pre_z is None else pre_z  # (B,L,n_state,d); pre_z = shared-encode fast path
         L = z.shape[1]
         s = z[:, :-1]                                           # contexts (B,L-1,n_state,d)
         if self.dynamics_detach_encoder:                        # stop-grad: dynamics loss won't reshape the encoder

@@ -239,7 +239,12 @@ class LoggingCallback(L.Callback):
                                      f"eval_ae_floor/{nm}/init_raw_ae_psnr": r["raw_db"],
                                      f"eval_ae_floor/{nm}/init_delta_db": r["delta_db"]}, step=0)
         except AssertionError:
-            raise                                  # a broken identity is fatal — do NOT train through it
+            if self.cfg.get("resume"):             # on RESUME the adapter has TRAINED — its residual is no longer
+                from ..controller.run import _plog  # bit-exact identity (that's expected/fine), so the init-only
+                _plog(self.writer, "[ae_floor @ep0] identity-floor gate SKIPPED on resume "  # gate must not fire.
+                      "(a resumed adapter's trained residual legitimately deviates from init identity).")
+            else:
+                raise                              # a broken identity is fatal at FRESH init — do NOT train through it
         except Exception as e:                     # a missing AE/dataset must not kill a run over a diagnostic
             from ..controller.run import _plog
             _plog(self.writer, f"[ae_floor @ep0] skipped ({type(e).__name__}: {e})")

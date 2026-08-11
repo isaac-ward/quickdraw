@@ -107,11 +107,25 @@ class LitWorldModel(L.LightningModule):
         if tag == "train":
             obs_in = {k: (v + torch.randn_like(v) * m.modalities[k].noise_std) if m.modalities[k].noise_std > 0 else v
                       for k, v in obs.items()}
+        # SHARED-ENCODE fast path (design/accelerations P4): when inputs == targets (all noise_std==0) in the
+        # p_tf==0 AR regime, encode the frames ONCE and slice for the rollout ctx + loss_terms + roundtrip
+        # instead of re-encoding them 2-3x. Bit-identical (smoke-verified). Flow model only; encode is per-frame,
+        # so z_full[:, sl] == encode(obs[:, sl]) exactly. noise_std>0 -> inputs differ from targets -> OFF.
+        share = (p_tf == 0.0) and hasattr(m, "flow") and \
+            (tag != "train" or all(m.modalities[k].noise_std == 0 for k in obs))
+        z_full = m.encode_state(obs_in) if share else None
+        if tag == "train" and not getattr(self, "_noise_share_noted", False):
+            self._noise_share_noted = True
+            noisy = [k for k in obs if m.modalities[k].noise_std > 0]
+            if noisy:
+                print(f"[encode-share] input noise on {noisy} -> shared-encode fast path OFF; frames are "
+                      f"re-encoded per loss site (slower). Set modalities.<i>.noise_std=0 to enable it.", flush=True)
         if p_tf >= 1.0:                                        # parallel teacher forcing
             preds = m({k: v[:, :-1] for k, v in obs_in.items()}, act[:, :-1])[:, P - 1:]
         else:                                                 # autoregressive rollout (TF source = noised input)
             ctx = {k: v[:, :P] for k, v in obs_in.items()}
-            preds = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf, self.detach_every)
+            preds = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf,
+                                    self.detach_every, precomputed_ctx=(z_full[:, :P] if share else None))
         future = {k: v[:, P:] for k, v in obs.items()}         # CLEAN targets
         # EMA/JEPA heads: obs recon is a decoder-only probe (detach preds so it doesn't shape the encoder).
         recon_src = preds if getattr(m, "pred_obs_in_loss", True) else preds.detach()
@@ -124,13 +138,16 @@ class LitWorldModel(L.LightningModule):
             Tf = recon_src.shape[1]; k = max(1, int(round(frac * Tf)))
             idx = torch.randperm(Tf, device=recon_src.device)[:k]
             src, fut = recon_src[:, idx], {kk: v[:, idx] for kk, v in future.items()}
+            z_tgt = z_full[:, P:][:, idx] if share else None   # shared-encode: the SAME encode sliced to `fut`
         else:
             src, fut = recon_src, future
-        recon, rw = m.recon_losses(src, fut)                  # decode/<name>[_shortcut] + codec/roundtrip_<name>
+            z_tgt = z_full[:, P:] if share else None
+        recon, rw = m.recon_losses(src, fut, pre_z_targets=z_tgt)   # decode/<name>[_shortcut] + codec/roundtrip_<name>
         # NOTE: do NOT decode here (to_obs) in train — recon_losses is the decode loss, and for flow decoders
         # to_obs would SAMPLE the ViT decoder every step (with grad) for nothing -> huge wasted memory (OOM). The
         # decoded sample is only needed for val metrics; computed there under no_grad.
-        raw, w = m.loss_terms(preds, future, obs, p_tf, act)
+        raw, w = (m.loss_terms(preds, future, obs, p_tf, act, pre_z=z_full) if share
+                  else m.loss_terms(preds, future, obs, p_tf, act))   # pre_z: shared-encode fast path (flow only)
         # recon_losses returns its OWN weights (same contract as loss_terms). It used to be reconstructed here
         # by parsing the key -- wts[k.split("/")[-1]] -- which mapped "roundtrip/image" to the IMAGE DECODE
         # weight, so ablating a head's decode recon with modalities.<i>.weight=0 silently also deleted that

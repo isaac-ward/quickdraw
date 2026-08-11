@@ -142,6 +142,10 @@ class ImageModality(Modality):
     def __init__(self, spec: ModalitySpec, d: int):
         super().__init__()
         self.name, self.n_tokens, self.weight = spec.name, spec.num_tokens, spec.weight
+        _llw = getattr(spec, "latent_loss_weight", 1.0)     # ROUND-TRIP anchor weight (design/collapse.md): a
+        self.latent_loss_weight = float(1.0 if _llw is None else _llw)   # bespoke AE needs Dec(Enc(x))->x to not
+        #                          collapse. Exposed here (was PretrainedImageModality-only) so roundtrip_losses
+        #                          can anchor a TRAINABLE encoder too. Explicit 0 disables it (None -> default 1).
         self.noise_std = float(spec.noise_std)
         self.decode_kind = spec.decode_kind
         self.decode_arch = getattr(spec, "decode_arch", "vit")
