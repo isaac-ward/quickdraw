@@ -164,6 +164,19 @@ class _TokenMixBlock(nn.Module):
         self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
         self.qkv, self.proj = nn.Linear(dim, 3 * dim), nn.Linear(dim, dim)
         self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        # ZERO-INIT BOTH RESIDUAL BRANCHES so the block is an EXACT identity at init and has to earn its
+        # contribution (ControlNet / DiT adaLN-zero; the same _zero_init_last trick vision.py uses on the
+        # adapter). Without this the block perturbs the velocity field from step 0, and MEASURED
+        # (2026-08-11) the flow's gradients then explode inside the rollout: grad/norm/flow went
+        # 0.98 -> 1.48 -> 766 on tf_affine and 2.10 -> 65.6 -> 10151 on tf_bespoke, while the per-token MLP
+        # denoiser stayed under 1.0 the whole time. gradient_clip_val=1.0 then LAUNDERS the blowup -- postclip
+        # is exactly 1.000 every epoch, so training keeps taking confident unit-norm steps in a direction
+        # dominated by the exploded component. That degrades smoothly instead of NaN-ing, which is why it
+        # looked like a modelling problem rather than an optimisation one.
+        for _lin in (self.proj, self.mlp[-1]):
+            nn.init.zeros_(_lin.weight)
+            if _lin.bias is not None:
+                nn.init.zeros_(_lin.bias)
 
     def forward(self, y: Tensor) -> Tensor:                       # (M, N, d)
         M, N, d = y.shape
