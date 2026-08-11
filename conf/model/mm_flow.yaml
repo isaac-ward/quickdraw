@@ -26,9 +26,14 @@ size: null                # null | tiny | small — ONE knob that sets the capac
 #                           num_tokens, image decode_base) from setup.SIZE_PRESETS. Applied onto cfg before the
 #                           resolved dump, so config.resolved records the real values. RAISES if you also override
 #                           one of those knobs individually (use size OR the knobs, not both). Basic starting points.
-d: 32                     # backbone/token width (all modality tokens live at d)
+d: 128                    # backbone/token width (all modality tokens live at d). 128 NOT 32 (2026-08-11):
+#                           the default trunk is now the FROZEN TAESD, whose latent is 4*16*16 = 1024 floats, and
+#                           the adapter demands num_tokens*d == that exactly -> 8*128. At d=32 the bag holds 256
+#                           floats and the adapter raises LOSSY. d=128/heads=8 also gives head_dim=16, which is
+#                           the minimum the COMPILED FlexAttention kernel accepts (d=32 gave head_dim=4, so
+#                           compile_rollout could never have been used with the old default).
 depth: 4
-heads: 8                   # head_dim = 4 (d/heads; power of 2 for FlexAttention)
+heads: 8                   # head_dim = 16 (d/heads; power of 2 AND >=16 for compiled FlexAttention)
 window: 32                 # temporal attention span
 mlp_ratio: 4.0
 rope_theta: 10000.0
@@ -63,60 +68,14 @@ action_fourier_freqs: 0  # 0 = OFF (default, bit-identical). >0 prepends `2*acti
 #                           z-scored and UNBOUNDED, and some dims are near-constant (robocasa action std floors
 #                           near 1e-6, so a 0.5 deviation normalizes to 5e5) -- a raw expansion would alias.
 #                           Vector modalities have their own knob: modalities.<i>.fourier_freqs.
-latent_norm: layernorm   # layernorm | affine | none. HOW the latent is made scale-free for the dynamics.
-#                          NOTE THE DEFAULT IS layernorm, NOT affine, and that is deliberate: this file's image
-#                          modality is `pretrained: false` (the BESPOKE conv/U-Net AE), and affine RAISES on a
-#                          learned encoder because it has no FIXED latent to calibrate. Defaulting to affine
-#                          made `model=mm_flow` crash at construction for every preset. The affine LOCK below
-#                          is therefore scoped: WHEN THE TRUNK IS A FROZEN PRETRAINED AE, USE AFFINE -- pass
-#                          model.latent_norm=affine together with modalities.<i>.pretrained=true (that pairing
-#                          is what the evidence below was measured on).
-#                          LOCKED affine (user, 2026-08-10). DEFINITIVE TEST: tf_ln vs tf_affine, identical in
-#                          every respect except this flag (transformer denoiser, 8x128 EXACT bag, frozen TAESD
-#                          @128px, batch 32, stochastic eval) -- logs/robocasa-tfaff/*_19_36_25_tf_{ln,affine}.
-#                          At epoch 0 affine won on EVERY axis:
-#                            one-step PSNR      14.48  vs   8.78   (+5.7 dB)
-#                            dynamics/latent   0.1977  vs  0.3935   (HALF the loss; every prior run sat ~0.29)
-#                            codec/roundtrip   0.0034  vs  0.0058
-#                            val loss total    0.5518  vs  1.3365
-#                            motion_ratio       0.822  vs   2.060   (calibrated vs 2x jitter)
-#                            ae_floor (codec)   24.92  vs  22.89
-#                          The ae_floor number is the mechanism, not just a score: under affine the codec
-#                          IMPROVES past its own 23.92 dB raw-AE floor (the adapter residual learns to
-#                          pre-distort the latent so TAESD's decoder reconstructs better), whereas under
-#                          layernorm it ERODES -- df_off went 23.52 -> 21.63 over four epochs with
-#                          closed_loop_1_steps tracking it down 22.45 -> 21.13, i.e. one-step prediction was
-#                          pinned to a ceiling training was destroying. Cause: the 3.51 dB LayerNorm tax is the
-#                          ONLY reason the adapter residual must learn anything, and it shares its 0.134M
-#                          params with the dynamics, which wins the tug-of-war. Remove the tax, remove the war.
-#                          NO FALLBACKS (user, 2026-08-11): 'affine' with no pretrained trunk RAISES, and a
-#                          variance-regularizing collapse strategy (vicreg/sigreg) with any norm but 'none'
-#                          RAISES. A run must train under the normalization its config names -- silently
-#                          substituting one makes the result unattributable afterwards. Name it explicitly.
-#                          CAVEAT ON THE EVIDENCE: epoch 0 only, and epoch 0 is the p_tf=1.0 teacher-forced
-#                          epoch. Strong and mechanistically explained, but not yet confirmed post-rollout.
-#
-#                          *** READ THIS BEFORE INHERITING THE CONCLUSION (2026-08-11) ***
-#                          EVERY number above is a RECONSTRUCTION metric (ae_floor, codec/roundtrip, one-step
-#                          PSNR). motion_ratio did not exist when this was locked, and it points the OTHER WAY:
-#                                                   motion_ratio @+32   @+64    ae_floor
-#                            tf_ln     (ep1)              0.628        0.463     17.99   <- "eroding"
-#                            tf_affine (ep1)              0.165        0.145     24.28   <- "healthy"
-#                          The arm whose codec was collapsing had 3-4x MORE MOTION. Same pattern across the
-#                          tokenizer itself at ep0: the bespoke learned AE has an 8.6 dB WORSE codec (15.29 vs
-#                          23.88) yet is 2 dB BETTER at 64 steps (9.06 vs 7.06) with motion_ratio 1.12 vs 0.59.
-#                          So what was diagnosed as the dynamics DESTROYING the codec may instead be the
-#                          dynamics CO-ADAPTING the latent to be predictable -- paying reconstruction for
-#                          movement, which is the co-trained-tokenizer argument (a reconstruction-optimised
-#                          frozen latent is a hostile prediction target). Under the stated goal -- sharp AND
-#                          coherent at 32-64 steps, with motion actually modelled -- that trade may be the one
-#                          we WANT, and affine may be optimising for the wrong thing.
-#                          The lock STANDS for now (affine wins decisively on every metric available at the
-#                          time, and the counter-evidence is epoch-0/epoch-1 only), but do NOT treat it as
-#                          settled: the open test is taesd + layernorm run long enough, scored on
-#                          motion_ratio and psnr-minus-psnr_frozen rather than on codec fidelity.
-#                          WE WANT THE DYNAMICS TO RECEIVE NORMALIZED TOKENS -- that requirement is LOCKED; only
-#                          the MECHANISM is a choice. `none` is a research escape hatch, not a default.
+latent_norm: affine      # layernorm | affine | none. HOW the latent is made scale-free for the dynamics.
+#                          LOCKED affine (user, 2026-08-10) and it is COUPLED to two other defaults in this file:
+#                          affine needs a FROZEN PRETRAINED trunk (it calibrates fixed per-channel stats of a
+#                          FIXED latent), so modalities.<image>.pretrained MUST be true, and the EXACT adapter
+#                          then forces num_tokens*d == 1024 -> d=128. Change any one of the three and this file
+#                          stops building; that is deliberate (there is no fallback, see below).
+#                          For a BESPOKE AE (pretrained=false) pass model.latent_norm=layernorm explicitly --
+#                          affine RAISES on a learned encoder, which has no fixed latent to calibrate.
 #   layernorm  (default, and bit-identical to every run before 2026-08-10) per-token non-affine LayerNorm on the
 #              carried bag, applied everywhere the bag is produced: encode_state, predict_next, and the
 #              diffusion-forcing noised context. Scale-free and stable, but NOT invertible -- it discards each
@@ -265,7 +224,7 @@ modalities:
   # unet+mse) — expected to keep MSE's metrics AND kill the grid, but VALIDATE before trusting. encode stays ViT.
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
   - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet,
-     pretrained: false, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2}}
+     pretrained: true, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2}}
   # TOKEN BUDGET RULE (measured 2026-08-09, robocasa 128px + frozen TAESD): keep num_tokens * d EXACTLY equal to
   #   the AE latent size (TAESD @128px -> 4*16*16 = 1024 floats; @256px -> 4096). NEVER pad.
   #   Padding is NOT idle capacity -- LayerNorm is PER TOKEN, so pad floats enter the mean/std the real floats are

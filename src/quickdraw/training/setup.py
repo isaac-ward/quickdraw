@@ -74,13 +74,23 @@ def _modality_specs(cfg):
 # starting point. d/heads = backbone width + attention heads (head_dim=d/heads must be a POWER OF 2 and >=16 for the
 # compiled FlexAttention -> small uses heads=12 so 192/12=16); num_tokens = image latent tokens; decode_base = U-Net
 # decoder width. Keys in _SIZE_MODEL_KEYS live at model level; the rest are set on the image modality.
+# COMPATIBILITY WITH THE PRETRAINED DEFAULT (2026-08-11): mm_flow now defaults to the frozen TAESD, whose latent
+# is 4*16*16 = 1024 floats, and the adapter wants num_tokens*d == 1024 EXACTLY.
+#   mini   8*128 = 1024  -> EXACT. The only preset that fits.
+#   tiny   8*64  =  512  -> RAISES (LOSSY: the bag cannot hold the latent). Needs modalities.<img>.pretrained=false.
+#   small 16*192 = 3072  -> builds, but PADDED: 67% of the bag carries no latent, and padding is ACTIVE damage
+#                           under a per-token norm (measured -4.4 dB). Use it with pretrained=false, or pick
+#                           num_tokens*d == 1024.
 SIZE_PRESETS = {
     "tiny":  {"d": 64, "heads": 4, "num_tokens": 8, "decode_base": 16},      # d=64/heads=4 -> head_dim 16 (min power-of-2); narrow U-Net decoder
     "mini":  {"d": 128, "num_tokens": 8, "decode_base": 16},                 # heads=8 -> head_dim 16; narrow (16) U-Net decoder, wider backbone than tiny
     "small": {"d": 192, "heads": 12, "num_tokens": 16, "decode_base": 64},   # heads=12 -> head_dim 16 (power of 2)
 }
 _SIZE_MODEL_KEYS = ("d", "heads", "depth")
-_SIZE_BASE = {"d": 32, "heads": 8, "depth": 4, "num_tokens": 8, "decode_base": 32}   # base defaults, to detect clashes
+_SIZE_BASE = {"d": 128, "heads": 8, "depth": 4, "num_tokens": 8, "decode_base": 32}  # base defaults, to detect
+#   clashes. MUST TRACK conf/model/mm_flow.yaml: d moved 32 -> 128 on 2026-08-11 (the default trunk became the
+#   frozen TAESD, whose 1024-float latent forces num_tokens*d == 1024). If this disagrees with the yaml, every
+#   `model.size=...` raises a bogus "you also overrode model.d=..." clash.
 
 
 def apply_size_preset(cfg):
