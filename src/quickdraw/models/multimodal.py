@@ -128,6 +128,7 @@ class MultiModalSequenceModel(nn.Module):
         # predict_next AND the DF noised context — or the encoder and the dynamics emit bags in two different
         # spaces (bug, 2026-08-09: predict_next LN'd unconditionally).
         self.concat_action_embedding = False    # Flow subclass opts in; LSAR/DSAR predictors expect width d
+        self.use_action_slot = False            #   same -- see _cond
         self.latent_norm_type = resolve_latent_norm(latent_norm)
         self.latent_norm = self.latent_norm_type == "layernorm"
         if self.latent_norm_type == "affine":       # normalization moves OFF the bag and ONTO the AE latent
@@ -318,28 +319,34 @@ class MultiModalSequenceModel(nn.Module):
     def _cond(self, h_bag: Tensor, act: Tensor | None = None) -> Tensor:
         """Backbone output (+ the raw action) -> the per-token conditioning the dynamics consumes.
 
-        WITHOUT concat_action_embedding: `h_bag[..., :n_state, :]`. That DISCARDS slot n_state, the action
-        token's own output, so the action reaches the prediction ONLY via attention from the state tokens onto
-        1 of the bag's 10 slots. There is a complete path from input to output that never touches it, and
-        measured (2026-08-11) grad/norm/act_enc was 0.17% of the total gradient.
+        Up to three channels per state token, concatenated on the feature axis:
+          h_state   h_bag[..., :n_state, :]                   the state slots (always)
+          slot      h_bag[..., n_state, :]  broadcast         the ACTION token's own backbone output --
+                    (use_action_slot)                         the action CONTEXTUALISED by the current state
+          raw       act_enc(act)            broadcast         the RAW pre-backbone embedding
+                    (concat_action_embedding)
 
-        WITH it: the RAW pre-backbone `act_enc(act)` is concatenated onto every state token. Raw, deliberately:
-        the post-backbone action SLOT would also work and needs no plumbing, but it is contextualised and the
-        backbone could in principle cancel it (its residual branches can emit -act_enc(a), and before this
-        change that slot's output was discarded and therefore received NO gradient at all, so its value was
-        unconstrained). A copy that never passes through the backbone cannot be suppressed by it.
+        WHY BOTH, and why the slot is no longer discarded. readout() used to slice slot n_state off entirely, so
+        the action's only influence was whatever attention weight the state tokens chose to give 1 of 10 slots --
+        measured grad/norm/act_enc 0.17% of the total gradient at ep0. Computing that slot through the whole
+        backbone and then throwing it away is a configuration NOBODY in the literature uses: TWM (2303.07109)
+        reads out ONLY through action positions, IRIS (2209.00588) generates the next frame conditioned on the
+        action token, and DiT's own ablation (2212.09748) found append-a-token-then-remove-it the WORST
+        conditioning scheme it tested. The two channels carry DIFFERENT information and are kept for different
+        reasons: the slot is action x state but is suppressible (the backbone's residual branches could cancel
+        it); the raw embedding never passes through the backbone so it cannot be cancelled, but it is the same
+        vector for every token and knows nothing about the current state.
 
-        act is threaded from every call site rather than stashed on self, so the compiled rollout and the
-        checkpointed rollout see the same pure function. If a caller omits it the post-backbone slot is used as
-        a degraded fallback (no crash) -- all in-tree callers pass it."""
+        act is threaded from every call site rather than stashed on self, so the compiled and grad-checkpointed
+        rollouts see the same pure function. If a caller omits it, the raw channel is skipped -- which would
+        change the conditioning WIDTH, so callers must pass it whenever concat_action_embedding is on."""
         h_state = h_bag[..., : self.n_state, :]
-        if not getattr(self, "concat_action_embedding", False):
-            return h_state
-        if act is not None:
-            a = self.act_enc(act).unsqueeze(-2).expand_as(h_state)        # RAW, never through the backbone
-        else:
-            a = h_bag[..., self.n_state : self.n_state + 1, :].expand_as(h_state)   # degraded fallback
-        return torch.cat([h_state, a], dim=-1)                            # (..., n_state, 2d)
+        parts = [h_state]
+        if getattr(self, "use_action_slot", False):
+            parts.append(h_bag[..., self.n_state : self.n_state + 1, :].expand_as(h_state))
+        if getattr(self, "concat_action_embedding", False) and act is not None:
+            parts.append(self.act_enc(act).unsqueeze(-2).expand_as(h_state))
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
     def readout(self, h_bag: Tensor, prev_bag: Tensor, act: Tensor | None = None) -> Tensor:
         return self.predict_next(self._cond(h_bag, act), prev_bag)
@@ -693,7 +700,10 @@ class MultiModalFlow(MultiModalSequenceModel):
         # concat_action_embedding: give the denoiser the action token's own backbone output on a dedicated
         # channel (see _cond). Doubles the conditioning width, so the FlowField's h_dim doubles with it.
         self.concat_action_embedding = bool(concat_action_embedding)
-        _hd = d * (2 if self.concat_action_embedding else 1)
+        # The action slot's backbone output is ALWAYS used now (user, 2026-08-12) -- never sliced off. Not a
+        # config knob: computing it and discarding it was the one configuration with no precedent.
+        self.use_action_slot = True
+        _hd = d * (1 + int(self.use_action_slot) + int(self.concat_action_embedding))
         self.flow = FlowField(d, h_dim=_hd, hidden=(flow_hidden or d), cond="concat", shortcut=shortcut,
                               arch=flow_arch, n_tokens=self.n_state, depth=flow_arch_depth, heads=flow_arch_heads)
         self.pred_obs_in_loss = True
