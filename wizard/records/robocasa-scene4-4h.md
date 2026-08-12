@@ -231,10 +231,34 @@ Salvaged from the killed 02:22 pair, against §10's `tfz_affine` which has no ac
 | `open_loop psnr@+64` | 9.83 → 13.64 | 10.28 → 13.69 | 10.37 → **13.79** |
 | val loss total | 0.4841 → 0.2544 | 0.3757 → 0.2651 | 0.3979 → 0.2540 |
 
-**5.6× more gradient reaches the action pathway (7.4× with Fourier), and the motion collapse is ~28% less
-severe** — at no cost to sharpness or loss. But `motion_ratio` is still 0.16, not ~1: this bought a dent in
-the collapse, not motion. Two epochs only. Fourier is ahead on every column but by margins a single seed
-cannot separate.
+**5.6× more gradient reaches the action pathway (7.4× with Fourier)** — at no cost to sharpness or loss.
+
+### CORRECTION (08-12 later): the motion gain did NOT replicate. Only the gradient did.
+
+The 3rd launch is a **same-config, same-seed replicate** of the killed 2nd launch (verified by diffing the
+resolved configs — the only difference is the new `action_squash: none` key, which is prior behaviour). So
+there are now n=2 per arm, and the replicate spread is **larger than every effect claimed above**:
+
+| ep1 | `tfz_affine` | `tfz_act` 2nd / 3rd | `tfz_act_fourier` 2nd / 3rd |
+|---|---|---|---|
+| `motion_ratio@+64` | 0.126 | 0.161 / **0.131** | 0.163 / **0.131** |
+| `open_loop psnr@+64` | 13.64 | 13.69 / **13.60** | 13.79 / **12.98** |
+| val 1-step PSNR | 18.29 | 18.28 / **18.55** | 18.55 / **18.06** |
+| `grad/norm/act_enc` | 0.0089 | 0.0498 / **0.0520** | 0.0661 / **0.1441** |
+
+Same config gives `motion_ratio` 0.161 vs 0.131 and `open_loop@+64` 13.79 vs 12.98 (**0.81 dB of pure
+noise**). The live pair's motion (0.131) is indistinguishable from the no-action-conditioning baseline
+(0.126). **Noise floor: ±0.03 on `motion_ratio@+64`, ±0.8 dB on `open_loop@+64`, ±0.5 dB on 1-step.** Every
+future single-seed claim on this dataset must clear those.
+
+Only `grad/norm/act_enc` is reproducible: 5.8–16× in both replicates of both arms. **The plumbing works and
+moves no outcome metric.** §12 explains why.
+
+Also retracted: the reading that ep0 (`p_tf=1`) "moves the arm" and the model trades motion for PSNR.
+`motion_ratio = ‖Δpred‖/‖Δtrue‖` is a **magnitude ratio — direction-blind** — so noise scores high, and ep0
+scores `psnr@+64 = 9.64` against a do-nothing baseline of 10.40, i.e. worse than holding frame 0. `tf_ln`
+ep0 reads 2.060 and `tf_bespoke` 1.117; those are noise, not motion. ep0 is an unconverged predictor, not a
+moving one, so the universal ep0→ep1 motion drop is much weaker evidence than it looks.
 
 ### Why it died, and the two fixes
 
@@ -280,6 +304,77 @@ therefore ~33 h, not ~17 h.
 **Known record-keeping flaw:** the launch script writes `$OUT/<arm>.out` with `>`, so relaunching an arm
 overwrites the dead run's stdout — the reason the 01:21 pair was restarted is no longer recoverable. The
 watchdog appends to a distinct `<arm>.resumeN.out` instead.
+
+## 12. Action-sensitivity probe — the model uses action DISTRIBUTION, not action ORDER (08-12)
+
+A one-off on the §11 ep3 checkpoints (`src/quickdraw/_oneoff_action_sensitivity.py`, a NEW file so it could
+not tear the live runs' cached imports). Asks the question `motion_ratio` cannot: hold the context fixed,
+change only the **commanded future**, and see whether the imagined future changes — in the latent bag and in
+pixels separately, because `to_obs` decodes the very bags `_rollout` returns.
+
+**The control that makes it mean anything:** `stochastic_eval: true`, so two rollouts with identical actions
+already differ. Every variant is rolled under the same reseeded RNG, and **3 same-actions/different-seed
+draws** give the noise floor. Floor spread is only 1.04–1.28× on pixel MSE, so ratios above ~1.3 are real.
+Run in fp32 (no autocast) — bf16 nondeterminism is another noise source. Only actions from index `P-1` on
+are perturbed, so the context and its aligned actions stay intact.
+
+### Finding 1 — there is NO latent/pixel gap, so recon capacity is NOT the lever
+
+Latent and pixel divergence track each other at every horizon, and where they differ the decoder
+**amplifies** the latent difference rather than washing it out (Fourier arm @+64: latent 2.18× floor →
+pixel 9.81×). The "dynamics is action-sensitive but the decoder hides it" hypothesis is dead.
+
+### Finding 2 — order-only perturbations are free at +64; distribution changes are not
+
+A random permutation is a WEAK perturbation here and the first run of this probe was confounded by it:
+robocasa actions are near-smooth (**lag-1 r = +0.988**, consecutive steps differ 13%, dim 3 constant, dim 4
+binary, dims 8–10 near-dead), so a permutation is 0.771 relative L2 against 1.936 for a clip swap and
+**exactly 0 in >10% of windows**. Fixed by adding reversal + half-window shift; all five perturbations then
+sit at 1.00–1.43 relative L2, i.e. matched. `tfz_act` @+64, response PER UNIT of action change:
+
+| perturbation | keeps action multiset? | pixel/pert | ΔPSNR vs GT (reseed band 16.96–17.11) |
+|---|---|---|---|
+| `shuffled_time` | yes | 0.13 | 17.03 — **inside noise** |
+| `shift_half` | yes | 0.12 | 17.07 — **inside noise** |
+| `reversed_time` | yes | 0.28 | 17.11 — **inside noise** |
+| `other_clip` | no | **1.34** | 16.15 (−0.83 dB) |
+| `zero` | no | **1.29** | 16.50 (−0.48 dB) |
+
+**At 64 steps you can REVERSE the action sequence and the prediction is no worse.** 5–10× differential at
+matched perturbation size. And the horizon structure matches the freeze: at **+16** `reversed_time` costs
+−0.6 dB (18.41 → 17.84) at 1.27× floor, so ordering does matter there. **The model tracks action timing for
+~16 steps, then falls back to action statistics** — the same horizon where `motion_ratio` bottoms out.
+
+### Finding 3 — CFG would amplify the WRONG axis, and Fourier already demonstrates it
+
+CFG amplifies `v_action − v_null`, which is exactly the true-vs-`zero` axis. The two arms differ only by the
+Fourier expansion and are wildly apart on it:
+
+| | `zero` pixel/pert @+64 | `zero` ΔPSNR @+64 | order-only pixel/pert @+64 | `motion_ratio@+64` |
+|---|---|---|---|---|
+| `tfz_act` | 1.29 | −0.48 dB | 0.12–0.28 | 0.168 |
+| `tfz_act_fourier` | **9.81** | **−3.96 dB** | 0.20–0.26 | 0.154 |
+
+**7.6× more response on precisely CFG's axis, and it bought nothing**: same order-insensitivity, no better
+motion, no better PSNR. Most likely 384 sin/cos bands make a sustained zeroed action sequence OOD, so
+−3.96 dB is brittleness, not comprehension. **CFG + action dropout is therefore NOT the recommended next
+move** — it was proposed (§11 follow-up, `design/ideas.md`) on the theory that the model needed an
+action-conditional difference manufactured; it has one, on the axis that does not matter.
+
+### What this supports, and the limit that can't be worked around here
+
+The lever the evidence points at is **long-horizon order sensitivity**: penalise the rollout for being
+invariant to action order (roll true + permuted actions, penalise their similarity). It optimises exactly
+the measured quantity, costs ~2× rollout, and is neither motion-weighted recon nor inverse dynamics.
+
+**But the ceiling on it is unmeasurable on this dataset.** With lag-1 r = 0.988 the true future may itself
+depend only weakly on action ordering, and `RecordedEnv` cannot `step`, so the counterfactual true future
+under reordered actions cannot be generated. We would be optimising order-sensitivity without knowing how
+much is warranted — an argument for a small steppable-sim dataset, not a bigger run here.
+
+**Cheapest action regardless:** promote this probe to a tracked eval routine. ~2 min, and a far sharper
+diagnostic than `motion_ratio` (direction-blind, whole-frame). Blocked only because `evaluation/*` cannot be
+edited while the runs are live.
 
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 

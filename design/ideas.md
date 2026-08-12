@@ -99,6 +99,19 @@ Cheap thing to try: 2D Fourier features of each latent cell's (h,w), folded into
 branch. Costs no tokens and no capacity, keeps EXACT, and would tell us whether "the model does not know
 where anything is" is a real handicap or a non-issue at 8 tokens.
 
+
+## RETRACTED (2026-08-12): action dropout + CFG is not the next move
+
+Measured on the §11 ep3 checkpoints (record §12). CFG amplifies `v_action - v_null` -- the true-vs-zeroed-action
+axis. The model already responds strongly there and it buys nothing: `tfz_act_fourier` has **7.6x** the
+response of `tfz_act` on that axis (pixel/pert 9.81 vs 1.29 at +64, -3.96 dB vs -0.48 dB when actions are
+zeroed) with **identical** order-insensitivity (0.20-0.26 vs 0.12-0.28) and no better motion (0.154 vs
+0.168). The dead axis is action ORDER, which CFG does not touch: at +64 the action sequence can be REVERSED
+with zero accuracy cost (17.11 vs 17.03 true, reseed band 16.96-17.11). Fourier's large zeroed-action
+response is most likely OOD brittleness from 384 sin/cos bands, not comprehension.
+
+Keep the design below for reference, but do not implement it on this evidence.
+
 ## Action dropout + classifier-free guidance on the action (designed 2026-08-12, NOT implemented)
 
 The consensus fix in the literature for a world model that under-uses its actions. Four independent systems use
