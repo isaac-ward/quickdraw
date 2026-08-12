@@ -166,7 +166,8 @@ def build_model(cfg):
                       grad_checkpoint=bool(m.get("grad_checkpoint", False)),
                       compile_rollout=compile_rollout,
                       latent_norm=m.get("latent_norm", "layernorm"),
-                      action_fourier_freqs=int(m.get("action_fourier_freqs", 0)))
+                      action_fourier_freqs=int(m.get("action_fourier_freqs", 0)),
+                      action_squash=str(m.get("action_squash", "none")))
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}

@@ -15,6 +15,24 @@ import torch
 from torch import Tensor
 
 
+def symlog(x: Tensor) -> Tensor:
+    """sign(x) * log(1 + |x|) -- monotone, INVERTIBLE (symexp undoes it), near-identity for |x| < 1.
+
+    For z-scored inputs. data/dataset.Normalizer does (x - mean)/std, which centers and scales but does NOT
+    bound: a 10-sigma value becomes 10.0, and robocasa action dims whose std floors near 1e-6 turn a real 0.5
+    deviation into 5e5 (measured). symlog compresses that to ~13.1 while PRESERVING ORDER, where a hard clamp or
+    a unit-ball projection would map all of that dim's variation onto one value and destroy it. Needs no dataset
+    statistics at all -- normalization_stats.json carries only mean/std, no min/max, so a true [0,1] rescale
+    would mean regenerating it. GAIA-2 (arXiv:2503.20523) applies symlog to actions for the same reason;
+    DreamerV3 symlogs observations/rewards and uses a/max(1,|a|) for actions."""
+    return torch.sign(x) * torch.log1p(x.abs())
+
+
+def symexp(x: Tensor) -> Tensor:
+    """Inverse of symlog."""
+    return torch.sign(x) * (x.abs().expm1())
+
+
 def fourier_freqs(n_freq: int, f_max: float = 100.0) -> Tensor:
     """The frequency ladder: 2*pi * logspace(1 .. f_max), `n_freq` bands. Matches the flow head's historical
     `2*pi*logspace(0,2,16)` exactly at n_freq=16, f_max=100."""

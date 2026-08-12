@@ -98,3 +98,82 @@ We do NEITHER:
 Cheap thing to try: 2D Fourier features of each latent cell's (h,w), folded into the adapter's residual
 branch. Costs no tokens and no capacity, keeps EXACT, and would tell us whether "the model does not know
 where anything is" is a real handicap or a non-issue at 8 tokens.
+
+## Action dropout + classifier-free guidance on the action (designed 2026-08-12, NOT implemented)
+
+The consensus fix in the literature for a world model that under-uses its actions. Four independent systems use
+it: Vid2World (arXiv:2505.14357, which fixes exactly "lacks counterfactual reasoning" this way), UniSim
+(2310.06114), GAIA-2 (2503.20523) and Genie 2. It slots directly into a rectified-flow denoiser.
+
+**Training — no extra loss term.** With probability p (~0.1, per-timestep in Vid2World) replace the action
+embedding with a LEARNED NULL vector. The flow-matching loss is unchanged; because the model sometimes sees the
+null, it learns both v(.|a) and v(.|null) as a byproduct. It is a data augmentation on the conditioning, not a
+new objective. Free.
+
+**Sampling — CFG.** Integrate a field that exaggerates the action-attributable component:
+
+    v = v(null) + w * ( v(a) - v(null) )        w > 1;  w = 1 is exactly off
+
+This is a decomposition, not a hack: v(a) - v(null) IS "the part of the predicted change attributable to the
+action". It CANNOT live in the loss -- the loss must fit the true conditional, whereas CFG deliberately samples
+from a SHARPENED, non-data distribution ~ p(x|a) * [p(x|a)/p(x)]^(w-1), trading diversity for conditioning
+fidelity. Hence sampling-time only.
+
+**Knobs it would need:** `model.diffusion.action_dropout_p` (training) and `model.diffusion.action_cfg_weight`
+(sampling, 1.0 = off). NOT an eval routine -- CFG changes how the model samples, like stochastic_eval.
+
+**Cost:** dropout free; CFG DOUBLES the denoiser (12 velocity evaluations per rollout step instead of 6, the
+backbone still running once) -> guess +25-35% of rollout time, unmeasured. Apply at eval/inference only, as the
+papers do; using it inside the training rollout would double training cost and is not standard.
+
+**TWO TRAPS.**
+1. CFG AMPLIFIES action-dependence, it does not create it. If the model truly ignored actions then
+   v(a) ~ v(null), the difference is ~0 and CFG is a no-op. It cannot rescue an action-blind model; it makes a
+   weak-but-real dependence visible. If the dependence is noise, it amplifies noise. So measure first (see the
+   shuffled-action mode below) -- know there is something to amplify.
+2. THE NULL TOKEN IS NOT A ZERO ACTION. `null` = "no conditioning given"; `a = 0` = the real command "hold
+   still". v(a=0) should predict nothing moves; v(null) should predict the AVERAGE over plausible actions. They
+   differ, so CFG correctly pushes commanded stillness to be STILLER. But if null were implemented as ZEROS, and
+   a zero action also encodes to ~zeros, the two collapse and CFG becomes a no-op exactly when the action is "do
+   nothing". null MUST be a distinct learned parameter.
+
+## Shuffled-action rollout mode + action_delta (designed 2026-08-12, NOT implemented)
+
+The field's minimum bar for CLAIMING action-conditioning; Genie's DeltaPSNR (arXiv:2402.15391) is the canonical
+form. GameNGen is the cautionary tale -- it shipped fidelity numbers and human raters with NO action-following
+metric at all.
+
+**shuffled_action is a MODE (a rollout).** Same context, but the model is fed SOMEONE ELSE'S action sequence,
+permuted across the BATCH -- so every action stays a real action from the dataset, just paired with the wrong
+episode. A difference then means "the model reads WHICH action", not "the model reacts to garbage". Scored
+against the SAME ground-truth future: with the true actions you should match it, with someone else's you should
+not.
+
+It folds into eval_ood_horizon as a 4th mode. The descriptor there is (name, every, horizon) where `every` is
+the re-grounding interval; shuffled_action varies a different axis, so it grows a flag:
+
+    modes = [("open_loop", H, H, shuffle=False)]
+          + [(f"closed_loop_{x}_steps", x, cl_h, shuffle=False) for x in cl_steps]
+          + [("shuffled_action", H, H, shuffle=True)]
+
+Every metric comes free (psnr/ssim/mse/l1/lpips/psnr_frozen/motion_ratio, the @+N readouts, the figures). Cost:
+one extra rollout, ~+15 s on top of the current 45.5 s for three modes.
+
+**action_delta is a DERIVED CURVE (subtraction), not a rollout:**
+
+    action_delta[t] = open_loop[t] - shuffled_action[t]
+
+Log it as full curves so the figure shows WHERE along the horizon action-sensitivity decays. Both absolutes must
+be kept to interpret it -- a 0.5 dB delta means something different at 13.9/13.4 than at 5.0/4.5.
+
+**The two deciding numbers:**
+
+    eval_ood_horizon/action_delta/image/psnr/@+64          ~ 0  =>  action-blind
+    eval_ood_horizon/action_delta/image/motion_ratio/@+64  ~ 0  =>  the motion produced is
+                                                                    UNRELATED to the command
+
+The second is the sharper statement: PSNR-delta says the prediction changes with the action; motion_ratio-delta
+says whether the MOVEMENT is action-driven.
+
+Related, more work: Vista (2405.17398) infers the trajectory back out of generated video with an IDM and reports
+L2 to the commanded one (3.785 -> 0.832 with conditioning).

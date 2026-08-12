@@ -58,6 +58,19 @@ p_tf_warmup_epochs: 1    # DEFAULT 1 (2026-08-07): with a decently-sized dataset
 # NOTE (user, 2026-08-10): "affine is clearly right for a frozen AE where the latent scale is a fixed property
 # of the data. For the bespoke learned AE the encoder can drift its own scale during training, and LN may be
 # doing real work there. So the default probably needs to be per-modality, not global."
+# ---- ACTION ENCODER (act_enc) -- these two knobs are a pair; there is no `action_encoder:` group yet, they
+#      sit flat at model level because act_enc lives on the BASE class (LSAR/DSAR have it too, unlike the
+#      diffusion.* knobs which are Flow-only). Grouping them would be tidier but would break every CLI override
+#      currently in flight.
+action_squash: none      # none | symlog. Pointwise transform on the RAW action before act_enc (and therefore
+#                          before the fourier expansion too, so the fourier clamp stops doing the bounding).
+#                          WHY: Normalizer does (x-mean)/std, which does NOT bound -- a 10-sigma value becomes
+#                          10.0, and robocasa action dims whose std floors near 1e-6 turn a 0.5 deviation into
+#                          5e5 (measured). symlog = sign(x)*log(1+|x|) compresses that to ~13.1 while PRESERVING
+#                          ORDER; a clamp or unit-ball projection would collapse all of that dim's variation onto
+#                          one value. Needs NO dataset stats (normalization_stats.json has only mean/std, no
+#                          min/max), unlike a true [0,1] rescale. GAIA-2 symlogs actions for this reason.
+#                          none = OFF = bit-identical.
 action_fourier_freqs: 0  # 0 = OFF (default, bit-identical). >0 prepends `2*action_dim*n_freq` sin/cos bands
 #                           to the ACTION encoder input, so small action differences are linearly separable.
 #                           WHY: robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ

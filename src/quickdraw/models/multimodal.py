@@ -63,16 +63,25 @@ class FourierMLP(nn.Module):
     small differences matter, and a raw linear map of near-collinear inputs discards exactly that. `squash`
     bounds the input first -- required, see features.fourier_features."""
 
-    def __init__(self, i: int, o: int, h: int, n_freq: int = 0, squash: float = 4.0):
+    def __init__(self, i: int, o: int, h: int, n_freq: int = 0, squash: float = 4.0,
+                 input_squash: str = "none"):
         super().__init__()
         from .features import fourier_dim, fourier_freqs
+        if input_squash not in ("none", "symlog"):
+            raise ValueError(f"input_squash must be 'none' or 'symlog', got {input_squash!r}")
         self.n_freq, self.squash, self.in_raw = int(n_freq), float(squash), int(i)
+        self.input_squash = input_squash
         in_dim = i + (fourier_dim(i, n_freq) if n_freq > 0 else 0)
         if n_freq > 0:
             self.register_buffer("freqs", fourier_freqs(n_freq), persistent=False)
         self.net = _mlp(in_dim, o, h)
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.input_squash == "symlog":
+            from .features import symlog
+            x = symlog(x)                    # BEFORE both paths: the raw copy AND the fourier expansion see it,
+            #                                  so the fourier clamp below becomes nearly inert rather than doing
+            #                                  the bounding by itself (and losing everything past the threshold).
         if self.n_freq > 0:
             from .features import fourier_features
             x = torch.cat([x, fourier_features(x, self.freqs, squash=self.squash)], dim=-1)
@@ -100,7 +109,7 @@ class MultiModalSequenceModel(nn.Module):
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
                  mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
                  compile_rollout: bool = False, latent_norm: str | bool = "affine",
-                 action_fourier_freqs: int = 0):
+                 action_fourier_freqs: int = 0, action_squash: str = "none"):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)
@@ -119,7 +128,8 @@ class MultiModalSequenceModel(nn.Module):
         # action -> 1 token. action_fourier_freqs>0 prepends sin/cos features so SMALL action differences are
         # linearly separable (robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ
         # slightly). 0 = off = bit-identical to a plain _mlp.
-        self.act_enc = FourierMLP(action_dim, d, d, n_freq=int(action_fourier_freqs))
+        self.act_enc = FourierMLP(action_dim, d, d, n_freq=int(action_fourier_freqs),
+                                  input_squash=str(action_squash))
         self.backbone = SpaceTimeTransformer(d, depth, heads, window, mlp_ratio,
                                              n_slots=self.n_input, rope_theta=rope_theta)
         # How the latent is made scale-free for the dynamics — see resolve_latent_norm for the three options.
@@ -573,13 +583,13 @@ class MultiModalLSAR(MultiModalSequenceModel):
     pred_latent = MSE to the encoded true-next bag (Reconstruction collapse: obs heads ground the encoder)."""
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
-                 grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True, action_fourier_freqs: int = 0,
+                 grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True, action_fourier_freqs: int = 0, action_squash: str = "none",
                  pred_hidden: int = 0, lambda_pred_latent: float = 1.0,
                  collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
-                         action_fourier_freqs=action_fourier_freqs)
+                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
@@ -675,7 +685,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  grad_checkpoint: bool = False, compile_rollout: bool = False,
                  latent_norm: str | bool = "affine",   # was `bool = True` -> silently gave LAYERNORM on a direct
                  #                                       construct, contradicting the LOCKED affine default
-                 action_fourier_freqs: int = 0,
+                 action_fourier_freqs: int = 0, action_squash: str = "none",
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = True, time_sampling: str = "uniform", flow_hidden: int = 0,
                  flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
@@ -688,7 +698,7 @@ class MultiModalFlow(MultiModalSequenceModel):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
-                         action_fourier_freqs=action_fourier_freqs)
+                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash)
         assert predict in ("residual", "absolute")
         self.predict_residual = predict == "residual"
         self.sampling_steps = int(sampling_steps)

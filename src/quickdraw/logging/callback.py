@@ -77,8 +77,12 @@ def arch_summary_lines(m, *, max_epochs=None, device=None) -> list[str]:
         nf = int(getattr(ae, "n_freq", 0) or 0)
         sq = float(getattr(ae, "squash", 4.0))
         fo = "OFF" if nf == 0 else f"{nf} bands (raw {ae.in_raw} + {2 * ae.in_raw * nf} sin/cos, |x|<={sq:g})"
+        sqi = str(getattr(ae, "input_squash", "none"))
         cat_on = bool(getattr(m, "concat_action_embedding", False))
-        lines.append(f"[action] fourier={fo} | concat_to_denoiser={'ON (raw pre-backbone act_enc)' if cat_on else 'OFF'}")
+        slot_on = bool(getattr(m, "use_action_slot", False))
+        chans = 1 + int(slot_on) + int(cat_on)
+        lines.append(f"[action] squash={sqi} | fourier={fo} | cond channels={chans}x d "
+                     f"(state{' + slot(action x state)' if slot_on else ''}{' + raw act_enc' if cat_on else ''})")
     for _n, _md in getattr(m, "modalities", {}).items():     # per-modality fourier (vector heads)
         _e = getattr(_md, "enc", None)
         _nf = int(getattr(_e, "n_freq", 0) or 0) if _e is not None else 0
