@@ -159,18 +159,30 @@ the re-grounding interval; shuffled_action varies a different axis, so it grows 
 Every metric comes free (psnr/ssim/mse/l1/lpips/psnr_frozen/motion_ratio, the @+N readouts, the figures). Cost:
 one extra rollout, ~+15 s on top of the current 45.5 s for three modes.
 
-**action_delta is a DERIVED CURVE (subtraction), not a rollout:**
+**The delta is a DERIVED CURVE (subtraction), not a rollout -- and it lives INSIDE the shuffled_action
+namespace** (user, 2026-08-12), not as a sibling of the modes. It only exists because that mode was run, so
+attaching it anywhere else orphans it from its cause:
 
-    action_delta[t] = open_loop[t] - shuffled_action[t]
+    eval_ood_horizon/shuffled_action/image/psnr                 the mode's own curve  (+ _mean, + @+N)
+    eval_ood_horizon/shuffled_action/image/delta_psnr           open_loop - shuffled  (+ _mean, + @+N)
+    eval_ood_horizon/shuffled_action/image/delta_motion_ratio
+    eval_ood_horizon/shuffled_action/image/delta_lpips
 
-Log it as full curves so the figure shows WHERE along the horizon action-sensitivity decays. Both absolutes must
-be kept to interpret it -- a 0.5 dB delta means something different at 13.9/13.4 than at 5.0/4.5.
+Implementation shape: add `delta_<metric>` as extra KEYS in the shuffled_action mode's icurves dict --
+the same trick that got lpips for free. Every consumer already iterates that dict, so the curves, the `_mean`
+scalars, the `@+{1,8,16,32,64}` readouts and the figures all come along with no call-site changes.
+
+ORDERING CONSTRAINT: the delta needs open_loop's curves, so shuffled_action must be scored AFTER open_loop in
+the mode loop (or the deltas computed once all modes are done).
+
+Both absolutes must be kept alongside the delta to interpret it -- a 0.5 dB delta means something different at
+13.9/13.4 than at 5.0/4.5.
 
 **The two deciding numbers:**
 
-    eval_ood_horizon/action_delta/image/psnr/@+64          ~ 0  =>  action-blind
-    eval_ood_horizon/action_delta/image/motion_ratio/@+64  ~ 0  =>  the motion produced is
-                                                                    UNRELATED to the command
+    eval_ood_horizon/shuffled_action/image/delta_psnr/@+64          ~ 0  =>  action-blind
+    eval_ood_horizon/shuffled_action/image/delta_motion_ratio/@+64  ~ 0  =>  the motion produced is
+                                                                            UNRELATED to the command
 
 The second is the sharper statement: PSNR-delta says the prediction changes with the action; motion_ratio-delta
 says whether the MOVEMENT is action-driven.
