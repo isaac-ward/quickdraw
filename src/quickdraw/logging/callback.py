@@ -220,7 +220,8 @@ class LoggingCallback(L.Callback):
         self._eval_cum = 0.0
         self._compile_s = None
         self._skipped = []   # (epoch, name) of every non-fatally-skipped eval, for the run-end summary
-        self._fail_streak: dict = {}   # routine -> CONSECUTIVE failures; EVAL_FAIL_LIMIT in a row is fatal
+        self._fail_streak: dict = {}   # routine -> CONSECUTIVE failures
+        self._disabled: set = set()    # routines switched off after EVAL_FAIL_LIMIT consecutive failures
 
     def _eval_due(self, epoch: int) -> bool:
         # Cadence uses Lightning's (epoch+1)%N phase — SAME phase as validation (check_val_every_n_epoch) and
@@ -397,6 +398,8 @@ class LoggingCallback(L.Callback):
         t_eval = time.perf_counter()
         try:
             for name in self.routines:
+                if name in self._disabled:            # deterministically broken earlier in this run
+                    continue
                 try:
                     REGISTRY[name](self.cfg, m, self.norm, self.ecfg, self.writer, pl_module.device, epoch)
                 except NotImplementedError as e:   # the routine genuinely CANNOT run in THIS environment (e.g.
@@ -429,12 +432,19 @@ class LoggingCallback(L.Callback):
                     # blip -- it will not fix itself, so fail loudly NOW instead of at the end.
                     self._fail_streak[name] = self._fail_streak.get(name, 0) + 1
                     if self._fail_streak[name] >= self.EVAL_FAIL_LIMIT:
-                        raise RuntimeError(
-                            f"eval routine {name!r} failed {self._fail_streak[name]} times IN A ROW "
-                            f"(last: {type(e).__name__}: {e}). This is deterministic, not transient -- the rest "
-                            f"of this run would produce no {name} metrics at all. Fix the routine and restart "
-                            f"(or disable eval.during_train.evals.{name}) rather than training on blind."
-                        ) from e
+                        # DISABLE the routine, do NOT kill the run (2026-08-12). Raising here cost two healthy
+                        # runs 4.5 hours of completed training because a FILMSTRIP -- a picture, not a metric we
+                        # judge on -- could not render. The point of escalating was to stop silently producing
+                        # nothing for 12 epochs; disabling achieves that (you are told once, loudly, and stop
+                        # paying the eval cost) without throwing away the training. Training is the expensive
+                        # part; a diagnostic is not worth it.
+                        self._disabled.add(name)
+                        _plog(self.writer, f"[eval:{name}] DISABLED for the rest of this run after "
+                                           f"{self._fail_streak[name]} consecutive failures ({type(e).__name__}: "
+                                           f"{e}). Deterministic, so it will not fix itself -- TRAINING "
+                                           f"CONTINUES and every other routine is unaffected. Fix it and "
+                                           f"restart if you need {name}.")
+                        self.writer.scalar(f"eval/disabled/{name}", 1.0, step=epoch)
                 else:
                     self._fail_streak[name] = 0                     # a success clears the streak
         finally:

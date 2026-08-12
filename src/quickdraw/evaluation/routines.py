@@ -617,7 +617,13 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
             w = min(m.window, t_ctx + 1)
             h = m.backbone(m._to_input(z[:, t_ctx - w + 1:t_ctx + 1], act[:, t_ctx - w + 1:t_ctx + 1]))[:, -1]  # (1,n_input,d)
         z_bag = z[0, t_ctx].float()                                 # (n_state, d) carried tokens
-        h_state = h[0, :m.n_state, :].float()                       # (n_state, d) FULL-bag conditioning. The
+        # Route through m._cond so this NEVER hand-builds the flow's conditioning again. It used to slice
+        # h[0, :n_state, :] itself (width d), which broke the moment the conditioning gained channels: with the
+        # action slot + raw action embedding it is now 3*d, and the velocity net's first Linear expects
+        # d_x + time_dim + 3*d = 544 while this passed 288 -> "mat1 and mat2 shapes cannot be multiplied
+        # (9x288 and 544x128)", which killed two runs at ep1 (2026-08-12). _cond is the single source of truth
+        # for that width; any call site that reimplements it is a latent break.
+        h_state = m._cond(h, act[:, t_ctx])[0].float()               # (n_state, cond_width) FULL-bag cond. The
         #   dynamics flow is JOINT over the whole bag — a transformer velocity ATTENDS across all n_state tokens
         #   (it asserts token axis == n_state), so it must be sampled over the full bag and the image tokens read
         #   off AFTER, exactly as predict_next does. (For the factorized mlp velocity the image tokens are
