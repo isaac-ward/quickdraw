@@ -106,6 +106,10 @@ def main(cfg):
     summary_text = _run_summary_text(cfg)   # fail if the run note is missing (present on resume via the
     if not resume:                          # resolved config). A resume is a CONTINUATION, so skip the unique
         _assert_summary_unique(summary_text, cfg)   # run-note gate + the config.resolved.yaml re-write below.
+    # Frame stride, set ONCE before anything loads episodes (autobatch below loads data too). Applied inside
+    # the loaders so the training windows and every eval routine cannot end up at different rates.
+    from .data.dataset import set_subsample
+    set_subsample(int(cfg.data.get("subsample", 1) or 1))
     if not data_exists(cfg):
         raise FileNotFoundError(
             "No dataset found. Run `python -m quickdraw.data_generation` first, then pass its run "

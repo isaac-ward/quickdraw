@@ -42,6 +42,78 @@ class Normalizer:
         return a * self.a_std.to(a) + self.a_mean.to(a)
 
 
+# ---- TEMPORAL SUBSAMPLING (data.subsample; 1 = OFF = bit-identical) -------------------------------
+# WHY: robocasa is 20 Hz, and at 20 Hz the true per-step image change is 0.0389 RMSE against the frozen
+# TAESD's own 0.0637 reconstruction RMSE -- the signal is 0.61x the NOISE FLOOR of the codec we predict
+# through, with only 3.18% of pixels moving more than that error. Predicting zero motion is then the
+# CORRECT solution to the objective, which is exactly what every run did (record §13). At stride 5 the
+# per-step change is 1.36x the floor, the action's linear R2 on the observed state change rises 4.7x
+# (0.0062 -> 0.0293) and the value of correct action TIMING rises 39x (0.0002 -> 0.0078). Every published
+# robot world model that demonstrably controls long rollouts subsamples: V-JEPA-2-AC 4 fps with integrated
+# EEF deltas (2506.09985), HMA 2 Hz (2502.04296), IRASim ~4 fps (2406.14540).
+#
+# NOT `window_stride` -- that is LOCKED at 1 and skips training-window STARTS (thinning coverage). This
+# thins the FRAMES INSIDE every window, changing the physical timestep the dynamics models.
+#
+# Set ONCE per process, and applied INSIDE both episode loaders rather than threaded through their ~12
+# call sites. That is deliberate: the catastrophic failure here is a MISSED call site leaving eval at
+# 20 Hz while training runs at 4 Hz -- the metrics would be measuring a different problem and would look
+# like the model failing. One source of truth makes that inconsistency impossible to write.
+_SUBSAMPLE = 1
+_SUBSAMPLE_USED = False
+
+
+def set_subsample(n: int) -> None:
+    """Set the process-wide frame stride. Raises if changed after a load, since a mid-process change would
+    silently mix rates between the training windows and the eval episodes."""
+    global _SUBSAMPLE
+    n = int(n)
+    if n < 1:
+        raise ValueError(f"data.subsample must be >= 1, got {n}")
+    if _SUBSAMPLE_USED and n != _SUBSAMPLE:
+        raise RuntimeError(f"data.subsample changed {_SUBSAMPLE} -> {n} AFTER episodes were already loaded; "
+                           "train and eval would run at different rates. Set it once at startup.")
+    _SUBSAMPLE = n
+
+
+def get_subsample() -> int:
+    return _SUBSAMPLE
+
+
+def _subsample_episodes(eps, tag: str):
+    """Keep every s-th frame; AGGREGATE the actions that drive each kept transition. act[t] drives
+    t -> t+1 (see MultiModalFlow._rollout_step, which reads a_win[:, -1]), so the action for the kept
+    step i is the aggregate of act[i*s : (i+1)*s].
+
+    Aggregation is a SUM for delta-like dims (EEF/rotation deltas compose additively over the skipped
+    frames) but TAKE-LAST for near-binary dims: summing robocasa's gripper/flag dims would turn +-1 into
+    +-5 and destroy their semantics. Binary dims are DETECTED (<=2 unique values), not hardcoded, and
+    logged -- on this dataset that is the flag at dim 4 and the gripper at dim 11."""
+    global _SUBSAMPLE_USED
+    _SUBSAMPLE_USED = True
+    s = _SUBSAMPLE
+    if s <= 1:
+        return eps
+    acts = np.concatenate([e[1] for e in eps], 0)
+    hold = [d for d in range(acts.shape[1]) if len(np.unique(acts[:, d])) <= 2]
+    out, dropped = [], 0
+    for ep in eps:
+        o, a = ep[0], ep[1]
+        n = len(o) // s
+        if n < 2:                                     # too short to yield even one transition
+            dropped += 1
+            continue
+        grp = a[:n * s].reshape(n, s, -1)
+        aa = grp.sum(axis=1)
+        if hold:
+            aa[:, hold] = grp[:, -1, hold]            # last raw action in the group, not the sum
+        out.append((o[:n * s:s], aa) + tuple(x[:n * s:s] for x in ep[2:]))
+    print(f"[subsample] {tag}: stride {s} | {len(eps)} eps {len(acts)} frames -> {len(out)} eps "
+          f"{sum(len(e[0]) for e in out)} frames | actions SUMMED except take-last on dims {hold} "
+          f"| {dropped} eps dropped as too short", flush=True)
+    return out
+
+
 def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
     """Return list of (obs (T,D), act (T,A)) float32 arrays. ISOLATED lerobot read. `repo_id` is the
     prefix the split was written with (<repo_id>/<split>; torus datasets = "torus")."""
@@ -52,7 +124,8 @@ def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
     ep_idx = np.asarray(hf["episode_index"])
     obs_all = np.stack(hf["observation_vector"]).astype(np.float32)
     act_all = np.stack(hf["action"]).astype(np.float32)
-    return [(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)]
+    return _subsample_episodes([(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)],
+                               f"{repo_id}/{split}")
 
 
 def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 128,
@@ -125,7 +198,9 @@ def load_split_episodes_mm(root: str, split: str, img_size: int | tuple[int, int
     act_all = np.stack(hf["action"]).astype(np.float32)
     frames_all = load_fpv_frames(root, split, size=img_size, cam=cam)      # (N, H, W, 3), row order
     assert len(frames_all) == len(obs_all), f"{cam}/row count mismatch: {len(frames_all)} vs {len(obs_all)}"
-    return [(obs_all[ep_idx == e], act_all[ep_idx == e], frames_all[ep_idx == e]) for e in np.unique(ep_idx)]
+    return _subsample_episodes(
+        [(obs_all[ep_idx == e], act_all[ep_idx == e], frames_all[ep_idx == e]) for e in np.unique(ep_idx)],
+        f"{repo_id}/{split}+{cam}")
 
 
 class MMWindowLoader:

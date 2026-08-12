@@ -53,6 +53,10 @@ def run_standalone(cfg, routines, label: str | None = None):
     run_dir = make_run_dir(f"eval_{label}", cfg.experiment)
 
     writer = make_writer(run_dir, cfg, job_type=f"eval_{label}")
+    # match the trained rate: a checkpoint trained at data.subsample=5 MUST be evaluated at 5, or the
+    # rollout is being asked for a timestep it never saw (the saved config carries the value)
+    from ..data.dataset import set_subsample
+    set_subsample(int(cfg.data.get("subsample", 1) or 1))
     norm, ecfg = normalizer(cfg), env_cfg(cfg)
     # WorldEnv contract self-report (environments/base.py): one ✓/✗ line at eval start (additive, log-only)
     env_name = cfg.environments.get("name", "torus_world")

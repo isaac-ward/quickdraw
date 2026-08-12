@@ -10,6 +10,24 @@ F: 64          # future horizon rolled out during training (sets the BPTT length
 window_stride: 1   # LOCKED at 1 (user, 2026-07-20): NEVER use window_stride > 1. It skips training-window starts
                    # (e.g. 8 = only every 8th start -> 8x fewer batches/epoch); the user does not want this speed
                    # shortcut — always full dense coverage (stride 1). DO NOT CHANGE.
+subsample: 1   # FRAME stride: keep every Nth frame and AGGREGATE the actions across the skipped ones. 1 = OFF
+               # = bit-identical. NOT window_stride (above): that thins window STARTS and is locked; this thins
+               # the frames INSIDE every window, i.e. it changes the physical timestep the dynamics models.
+               #
+               # WHY IT EXISTS (2026-08-12, record §13): robocasa is 20 Hz, and at 20 Hz the true per-step image
+               # change is 0.0389 RMSE against the frozen TAESD's OWN 0.0637 reconstruction RMSE. The motion we
+               # ask the dynamics to predict is 0.61x the NOISE FLOOR of the codec it predicts through, and only
+               # 3.18% of pixels move more than that error. Predicting zero motion is therefore the CORRECT
+               # solution to the objective -- which is what every run did (motion_ratio 0.13-0.17), and why
+               # stronger action conditioning changed nothing. Measured against stride:
+               #     stride 1 (20 Hz): delta 0.0389 = 0.61x floor | action R2 0.0062, timing worth 0.0002
+               #     stride 5  (4 Hz): delta 0.0864 = 1.36x floor | action R2 0.0293, timing worth 0.0078
+               # so 5 flips SNR above 1, raises the action's explanatory power 4.7x and the value of correct
+               # action TIMING 39x, makes F=64 span 16 s instead of 3.2 s, AND costs 5x less per epoch.
+               # Every published robot world model that controls long rollouts subsamples: V-JEPA-2-AC 4 fps
+               # with integrated EEF deltas (2506.09985), HMA 2 Hz (2502.04296), IRASim ~4 fps (2406.14540).
+               # Applied inside BOTH episode loaders (data/dataset.py) rather than threaded through their ~12
+               # call sites, so eval can never silently run at a different rate than training.
 batch: 1024    # fast baseline: 515K model + F=64 full BPTT fits ~51 GB at this batch. OVERRIDDEN at startup
                #   by the autobatch finder below (unless autobatch=false) — this is only the fallback/floor.
 autobatch: true            # DEFAULT ON (2026-08-05): probe the AR step at startup + set data.batch to the

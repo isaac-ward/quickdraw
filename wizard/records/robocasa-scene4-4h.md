@@ -482,6 +482,77 @@ Cheaper than baseline, violates no standing constraint, and attacks the measured
 symptom. Pre-check first, for free: regress the true next-state delta on the action at stride 1 vs stride 4/5
 and compare R² — if subsampling does not raise the action's explanatory power, do not spend the run.
 
+### CONFIRMED against torus-world (08-12) — the mechanism predicts BOTH outcomes
+
+The user pushed back: torus-world learns video prediction from very little data, so little data cannot be
+the blocker. Correct, and §13 predicts exactly that. Measured with the SAME frozen TAESD at 128px
+(`_torus_check.py`, self-validated by first reproducing robocasa's 23.41 dB before trusting the torus number):
+
+| | codec floor | per-step delta | **delta / floor** | % pixels moving |
+|---|---|---|---|---|
+| **torus-world** (60 fps) | 0.0259 (31.73 dB) | 0.0505 | **1.95x** | 3.68% |
+| **robocasa** (20 Hz) | 0.0675 (23.41 dB) | 0.0389 | **0.61x** | 3.18% |
+| robocasa @ 4 Hz (new runs) | 0.0675 | 0.0863 | **1.35x** | 8.08% |
+
+Torus's per-step SNR is **3.2x** robocasa's, from two compounding causes: its codec floor is **2.6x lower**
+(synthetic flat-textured frames round-trip at 31.73 dB vs 23.41) and its per-step motion is 1.3x larger in
+absolute terms *despite running at 3x the frame rate*. One mechanism explains both results: torus sits at
+SNR ~2, robocasa-at-20-Hz at SNR ~0.6. Data quantity is not what separates them.
+
+**REFINEMENT — the moving-pixel fraction is NOT the discriminator.** §13 above cites 3.18% of pixels moving
+as part of the problem; torus has essentially the same fraction (3.68%) and learns motion fine. The
+discriminator is the **delta-to-codec-floor RATIO** alone. The pixel fraction explains why whole-frame MSE
+is an insensitive objective in both datasets, but it does not explain the robocasa failure.
+
+**Implication for the target rate:** matching torus's 1.95x would need robocasa stride ~8-10 (2.5-2 Hz), not
+5. Stride 5 (1.35x) is the conservative first step and matches V-JEPA-2-AC's 4 fps; if 4 Hz shows motion but
+weakly, stride 8-10 is the indicated follow-up rather than any change to conditioning.
+
+**Corollary already noted, now quantified:** a better codec is a motion lever, and it is the LARGER of the
+two terms here (2.6x vs 1.3x). 256px, or any encoder with lower reconstruction error on robocasa frames,
+buys more SNR than subsampling does.
+
+### Correction: this repo sets NO training seed
+
+§11 called the 2nd and 3rd launches "same-config, same-seed replicates". Wrong: there is no
+`seed_everything` or `manual_seed` anywhere in the training path, and no top-level `seed` key. The +-0.8 dB
+spread is therefore genuine seed-to-seed variance, which is the correct yardstick for architectural claims
+(and means two runs of one config ARE a 2-seed replicate -- what the 4 Hz pair is doing).
+
+### The 20 Hz runs COLLAPSED at ep4 (not merely regressed)
+
+Killed at user instruction to free the GPUs; ep4 metrics were already logged and show a full collapse, so
+nothing was lost:
+
+| | ep2 (peak) | ep3 | ep4 |
+|---|---|---|---|
+| `tfz_act` 1-step / ol@64 | 18.83 / 13.90 | 17.98 / 12.64 | **9.07 / 7.78** |
+| `tfz_act_fourier` 1-step / ol@64 | 18.40 / 13.44 | 18.09 / 13.36 | **8.54 / 7.26** |
+
+`motion_ratio@+64` ROSE as they collapsed (0.170 and 0.325) -- independent confirmation that it is
+direction-blind and that a diverged model scores high on it. Never judge a run on it alone. Peak-at-ep2 then
+collapse matches GameNGen's small-data ablation (2408.14837).
+
+## 14. `hz4_seedA` / `hz4_seedB` — 4 Hz, two seeds (08-12 21:31, RUNNING)
+
+`data.subsample=5` (new knob, `conf/data/torus.yaml`; 1 = off = bit-identical). Applied inside BOTH episode
+loaders so training windows and all 5 eval call sites cannot diverge in rate -- a missed call site would
+leave eval at 20 Hz and look like the model failing. Actions are SUMMED across skipped frames except
+auto-detected near-binary dims (measured [3, 4, 11] = the constant, the flag, the gripper), which take-last.
+Smoke-verified: lengths T//5, obs/images exactly every 5th frame, additive dims equal the group sum, hold
+dims differ from it, and the resulting per-step delta is 0.0863 = 1.35x floor, matching the prediction.
+
+235/235 train episodes survive (min length 123 >= P+F=72) -> 35,085 windows, ~1,100 batches/epoch vs 7,582,
+so ~25 min/epoch. 40 epochs (~17 h), in the 30-200 range the small-data literature uses. F=64 now spans
+**16 s** of real time instead of 3.2 s. Fourier bands OFF (§12: no benefit, likely OOD brittleness),
+symlog OFF (user).
+
+TWO SEEDS, NOT AN A/B, on purpose: every A/B this week had an effect inside the +-0.8 dB noise floor, so this
+measures the effect against the well-established 20 Hz baseline AND establishes the floor at the new rate.
+
+Judge on: `motion_ratio@+64` (target >0.4, ceiling ~0.92) **together with** PSNR and the §12 action-order
+gap -- never motion_ratio alone, per the collapse above.
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
