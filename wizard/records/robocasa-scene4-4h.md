@@ -209,6 +209,78 @@ entirely, so actions reached a prediction ONLY via attention onto 1 of 10 slots.
 state token; `model.action_fourier_freqs` and `modalities.<i>.fourier_freqs` (both default 0/off) add sin/cos
 bands. NOT bit-identical to these runs — they predate it.
 
+## 11. `tfz_act` vs `tfz_act_fourier` — action conditioning (08-12, 3rd launch RUNNING)
+
+The first test of the §10 consequence. Both arms carry the corrected conditioning; they differ **only** in
+`model.action_fourier_freqs` (0 vs 16). `_cond` now returns **3 channels** per state token — the state, the
+action token's backbone output (action × state, no longer sliced away), and the raw pre-backbone
+`act_enc(act)` — so the flow's `in_dim` went 288 → 544.
+
+Launched three times: 01:21 (restarted at 50% of ep0), 02:22 (**completed ep0 and ep1, then killed** — see
+below), 07:19 (current, 12 epochs).
+
+### The result so far — the mechanism engages, the payoff is small
+
+Salvaged from the killed 02:22 pair, against §10's `tfz_affine` which has no action conditioning:
+
+| | `tfz_affine` ep0→ep1 | `tfz_act` ep0→ep1 | `tfz_act_fourier` ep0→ep1 |
+|---|---|---|---|
+| `grad/norm/act_enc` | 0.0010 → 0.0089 | 0.0117 → **0.0498** | 0.0206 → **0.0661** |
+| `motion_ratio@+64` | 0.700 → 0.126 | 0.589 → **0.161** | 0.665 → **0.163** |
+| val 1-step PSNR | 15.55 → 18.29 | 15.87 → 18.28 | 15.83 → **18.55** |
+| `open_loop psnr@+64` | 9.83 → 13.64 | 10.28 → 13.69 | 10.37 → **13.79** |
+| val loss total | 0.4841 → 0.2544 | 0.3757 → 0.2651 | 0.3979 → 0.2540 |
+
+**5.6× more gradient reaches the action pathway (7.4× with Fourier), and the motion collapse is ~28% less
+severe** — at no cost to sharpness or loss. But `motion_ratio` is still 0.16, not ~1: this bought a dent in
+the collapse, not motion. Two epochs only. Fourier is ahead on every column but by margins a single seed
+cannot separate.
+
+### Why it died, and the two fixes
+
+`eval_denoising_filmstrip` hand-built the conditioning as `h[0, :m.n_state, :]` (width `d`) instead of
+calling `_cond`, so the moment `in_dim` became 544 it raised
+`mat1 and mat2 shapes cannot be multiplied (9x288 and 544x128)` — every eval, deterministically. It now
+routes through `m._cond(h, act[:, t_ctx])`. **`_cond` is the single source of truth for the conditioning
+width; any call site that reimplements it is a latent break.**
+
+Then `EVAL_FAIL_LIMIT` did what §10's incident asked for and **raised**, destroying two arms that had
+4.5 h of good training, over a *filmstrip*. That trade is wrong: the escalation exists to stop a run
+silently emitting nothing, and **disabling the routine** achieves that without discarding the expensive
+part. It now adds the routine to `_disabled`, logs one loud line + `eval/disabled/<name>`, and continues.
+
+### Hardening done before leaving them overnight (user asked: "anticipate further problems")
+
+- **All six enabled routines probed green** against a same-architecture checkpoint, out-of-process
+  (`ae_floor`, `ood_horizon`, `manifold`, `denoising_filmstrip`, `denoising_multistep`,
+  `denoising_aggregate`). The suspected second instance of the filmstrip bug — `manifold_clouds` calls
+  `m.flow.sample(h_pro)` at width `d` — is **unreachable** here: `denoising_multistep`/`_aggregate`
+  clean-skip on a joint transformer flow before reaching it. Full eval cost ~4 min/epoch.
+- **`wizard/scripts/wd/watchdog.sh`** resumes a dead arm from its own rolling checkpoint (≤3 attempts,
+  15 min settling window, stalls are reported but never killed). Two traps found by testing it:
+  - **A naive resume OOMs instantly.** `train_world_model` skips autobatch on resume but nothing re-injects
+    the chosen batch, so `data.batch` falls back to the config default of **1024** against a chosen 32. The
+    watchdog reads the chosen value out of `config.resolved.yaml` and refuses to resume if it can't.
+  - **`last.ckpt` goes stale after a resume.** Lightning writes the rolling checkpoint as `last-v1.ckpt`
+    (then `-v2`) and leaves `last.ckpt` frozen at the pre-resume epoch, so resuming from the literal
+    `last.ckpt` would rewind to the previous resume's start and re-lose the same epochs every retry. Takes
+    the newest `last*.ckpt`. Not `epoch=*.ckpt` — those are top-k by val metric and can be stale (the dead
+    `tfz_act` held only `epoch=0` after dying in epoch 1).
+  - Verified end-to-end: a resume of a **copy** of the dead run restored to epoch 1, wrote
+    `epoch=1-step=7585.ckpt` (7582 + 3 limited batches — the step counter restores), exit 0. It also
+    OOM'd `manifold` (8.07 GiB in one allocation, the largest of any routine) because the test shared a
+    GPU — an unplanned but real demonstration that an eval OOM is now survived rather than fatal.
+
+### Timing
+
+ep0 ~1.33 h, but **ep1+ cost ~2.9 h**: ep0 runs at `p_tf=1` (teacher-forced, hits the P1 fast path) and
+`p_tf_warmup_epochs=1` drops it to 0 afterwards, so the full AR rollout only starts at ep1. 12 epochs is
+therefore ~33 h, not ~17 h.
+
+**Known record-keeping flaw:** the launch script writes `$OUT/<arm>.out` with `>`, so relaunching an arm
+overwrites the dead run's stdout — the reason the 01:21 pair was restarted is no longer recoverable. The
+watchdog appends to a distinct `<arm>.resumeN.out` instead.
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
@@ -692,8 +764,12 @@ arm wins. Both are env-free and therefore available on this recorded dataset.
   `TypeError: fig_error_vs_step() got an unexpected keyword 'split_bottom'`. `logging/viz` was imported at
   process start with the old signature; `evaluation/products` imports lazily at the first eval and got the
   new code — one process running two generations. It would have burned 46 GPU-hours emitting nothing, as a
-  "FAILED non-fatally ... CONTINUING training" line. **Fix:** 2 consecutive failures of one routine is now
-  fatal, plus `smoke/eval_products.py` covering that seam.
+  "FAILED non-fatally ... CONTINUING training" line. **Fix:** 2 consecutive failures of one routine now
+  escalate, plus `smoke/eval_products.py` covering that seam.
+- **The escalation then over-corrected and killed two healthy runs** (§11, 08-12): it *raised*, so a
+  `denoising_filmstrip` that could not render destroyed 4.5 h of completed training on both arms. 2
+  consecutive failures now **DISABLE that one routine** (loud line + `eval/disabled/<name>`) and training
+  continues. Training is the expensive part; a diagnostic never justifies discarding it.
 - **Epoch-0 evals were skipped** as an "untrained baseline" — wrong, `on_train_epoch_end` fires after a full
   epoch (6066 batches), and ep0 is the `p_tf=1` teacher-forced baseline every later epoch should be read
   against. Now evaluated.
