@@ -376,6 +376,112 @@ much is warranted — an argument for a small steppable-sim dataset, not a bigge
 diagnostic than `motion_ratio` (direction-blind, whole-frame). Blocked only because `evaluation/*` cannot be
 edited while the runs are live.
 
+## 13. THE MECHANISM: at 20 Hz the motion we ask for is BELOW our own codec's error floor (08-12)
+
+Prompted by a literature review (agent, 08-12) whose headline was that every working robot world model
+subsamples to 2–5 Hz. Checked our own data and it is decisive.
+
+**`fps = 20`** (`meta/info.json`, both splits). So `F=64` — everything we have called "long horizon" all
+week — is **3.2 seconds of real time**. Published long-horizon controllability runs at 2–5 Hz, where 64
+steps is 13–30 s.
+
+Measured on val, against the codec ceiling of 23.92 dB (per-pixel RMSE **0.0637**):
+
+| stride | seconds | frame-delta RMSE | vs codec floor | % pixels moving > codec error |
+|---|---|---|---|---|
+| **1 (what we train)** | 0.05 | **0.0389** | **0.61×** | **3.18%** |
+| 2 | 0.10 | 0.0570 | 0.90× | — |
+| 4 | 0.20 | 0.0788 | 1.24× | 8.08% |
+| 5 | 0.25 | 0.0864 | 1.36× | — |
+| 8 | 0.40 | 0.1028 | 1.61× | 12.21% |
+| 32 | 1.60 | 0.1506 | 2.36× | 21.24% |
+
+**At 20 Hz the per-step motion is 0.61× the reconstruction error of the autoencoder we predict through, and
+only 3.18% of pixels move more than that error.** The signal is below the noise floor. Hedging to zero is
+not a pathology of the model, it is the correct solution to the objective we wrote down.
+
+This single fact explains every observation in §11 and §12 at once:
+- `motion_ratio` → 0.13: predicting ~zero minimises whole-frame MSE when the target is sub-floor.
+- Action ORDER free, DISTRIBUTION costly (§12): ordering selects *which* sub-noise-floor motion occurs, so
+  it cannot register; only the aggregate action statistics survive above the floor.
+- 5.8–16× more action gradient changing nothing (§11): no quantity of action information helps when the
+  regression target is below the model's own precision.
+- One-step 1.59 dB from the codec ceiling: 97% of the frame is static background the codec nails.
+
+Subsampling to 4–5 Hz flips SNR from 0.61× to 1.24–1.36×, makes 64 steps 13–16 s, and costs **4–5× LESS**
+per epoch (fewer windows). Literature convergence: V-JEPA-2-AC 4 fps with *integrated* EEF deltas
+(2506.09985), HMA resamples 40 datasets to 2 Hz (2502.04296), IRASim ~4 fps (2406.14540); FAST (2501.09747)
+names high-frequency action correlation as the cause — our lag-1 r = 0.988 is NORMAL for 20 Hz teleop, not
+anomalous.
+
+### Corollary: a BETTER codec is a motion lever
+
+The floor is 0.0637 *because* the codec is good; anything that lowers reconstruction error (256px, per
+`capacity.md`) lowers the floor and makes per-step motion learnable. The "excellent AE floor + no motion"
+pairing the user spotted is not a coincidence — the same number is both.
+
+### Live confirmation: both arms peaked at ep2 and REGRESSED at ep3
+
+| | ep0 | ep1 | ep2 | ep3 |
+|---|---|---|---|---|
+| `tfz_act` 1-step / ol@64 / mot@64 / vloss | 15.14 / 9.64 / 0.559 / .5118 | 18.55 / 13.60 / 0.131 / .2534 | **18.83 / 13.90 / 0.168 / .2441** | 17.98 / 12.64 / 0.118 / .2552 |
+| `tfz_act_fourier` same | 15.71 / 9.82 / 0.750 / .4760 | 18.06 / 12.98 / 0.131 / .2774 | **18.40 / 13.44 / 0.154 / .2706** | 18.09 / 13.36 / 0.119 / .2664 |
+
+`motion_ratio@+64` fell in BOTH arms at ep3 (0.168→0.118, 0.154→0.119) — two independent runs, same
+direction. **This contradicts §12's "motion may be recovering, 12 epochs will resolve it" reading; it is
+resolving negatively.** `tfz_act`'s val loss also worsened (0.2441→0.2552). Matches GameNGen's small-data
+ablation (2408.14837): below ~10^7 examples, test quality peaks EARLY then degrades. Runs left alive to
+finish (user instruction), but they are past peak.
+
+### Also from the review — established, and load-bearing
+
+- **91k steps is NORMAL, not short**: V-JEPA-2-AC 94.5k, Vid2World 100k, Genie 125k, WHAM 200k. And **no
+  published controllability-vs-steps curve exists** — "controllability emerges late, we just aren't there"
+  is unsupported by anything in the literature. Do not buy more epochs at this design.
+- **Scale**: 4.17M params is ~220× below the cohort median (~0.9–1B) and 10× below the smallest working
+  action-conditioned video world model (HMA-Base 44M — pretrained on >2.5B frames). 4 h is ~700× below
+  median and 22× below the smallest from-scratch single-scene success (DIAMOND CS:GO 87 h / 381M params,
+  itself described as brittle). **No published <50M-param, <50 h, from-scratch, 30–64-step controllable arm
+  video result exists.**
+- **Our action injection is on the losing side of three independent ablations.** Cosmos-Predict2.5
+  (2511.00062, Table 20): TimeEmbedding-add **24.95 PSNR / 146 FVD** > CrossAttention 24.41/159 >
+  ChannelConcat **23.11/267**. HMA (2502.04296): per-layer modulation > token-concat ("token concatenation
+  along the sequence dimension does not have enough expressiveness"). IRASim (2406.14540): frame-level AdaLN
+  **28.82 vs 23.89** PSNR. Our design is a hybrid of the two losing arms. **NOTE: this conflicts with the
+  user's 08-11 call ("i don't like film adaln") — that decision was made about PROPRIO going in as a bag,
+  and this evidence is about the ACTION specifically. User's call, but the evidence should be on the table.**
+- **`action_squash: symlog` is wrong for actions.** DreamerV3 symlogs observations/rewards/values, NOT
+  actions. The literature standard is per-dim **quantile normalisation** (1st/99th → [-1,1]; FAST, OpenVLA,
+  π0), which also handles our near-dead dims by stretching them. Nobody drops dead dims.
+- **Adopt standard controllability metrics** for comparability: Genie **ΔPSNR** (true vs random actions;
+  published values 1.3–2.1 dB), dWorldEval **Δ-LPIPS + shuffle**, ActSWM step-drift gap. Our reversal probe
+  (§12) is **sharper than anything published** — the review found no paper that perturbs action ORDER — so
+  keep it, but report ΔPSNR alongside.
+- Our failure mode is named elsewhere: **"context collapse"** (ActSWM), **"visual inertia"** (Astra),
+  **"stagnation"** (Steady-Forcing). Caveat: ActSWM's pathology is recorded-vs-**zero** being identical, and
+  we already differ there (−0.48 dB, −3.96 dB for the Fourier arm), so their hinge fix targets an axis we
+  partly have. The order/distribution dissociation is ours.
+
+**CAVEAT on citations:** the 2026-dated arXiv IDs in the review (26xx.*) were verified by the agent only via
+fetched pages and are past this assistant's knowledge cutoff — re-verify before citing anywhere external.
+The load-bearing ones (2511.00062, 2502.04296, 2406.14540, 2501.09747, 2506.09985, 2408.14837) are older and
+checkable.
+
+### Metric bug found
+
+`psnr_frozen@+1` logs **120.00 dB** — the clamp for *identical images*. At +1 the frozen baseline is
+comparing the held frame with itself, so the frozen curve is misaligned by one step against the model curve.
+`psnr_frozen@+1` is unusable as written. The +64 comparison (13.90 vs 10.40) is not materially affected, but
+note that at +8 the model is now **tied** with persistence (15.13 vs 15.11 at ep3).
+
+### Recommended next run (not started)
+
+**Subsample to 4–5 Hz with integrated actions**: keep every 4th–5th frame; the conditioning action is the
+SUM of the skipped EEF deltas (rotations composed, gripper = last), optionally plus absolute EEF pose.
+Cheaper than baseline, violates no standing constraint, and attacks the measured mechanism rather than a
+symptom. Pre-check first, for free: regress the true next-state delta on the action at stride 1 vs stride 4/5
+and compare R² — if subsampling does not raise the action's explanatory power, do not spend the run.
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
