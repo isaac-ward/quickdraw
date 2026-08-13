@@ -237,7 +237,7 @@ modalities:
   # unet+mse) — expected to keep MSE's metrics AND kill the grid, but VALIDATE before trusting. encode stays ViT.
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
   - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet,
-     pretrained: true, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2}, latent_loss_weight: 1.0}
+     pretrained: true, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2}, latent_loss_weight: 1.0, encode_base: 32, decode_base: 32}
   # latent_loss_weight (DECLARED here 2026-08-13 so a bare `model.modalities.1.latent_loss_weight=N` override
   #   works -- it was only a dataclass default, so Hydra rejected the override with "not in struct", the same
   #   trap `model.compile_rollout` hit). Weight on `codec/roundtrip_image` = MSE(to_obs(encode_state(x)), x):

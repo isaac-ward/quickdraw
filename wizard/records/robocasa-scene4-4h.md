@@ -553,6 +553,131 @@ measures the effect against the well-established 20 Hz baseline AND establishes 
 Judge on: `motion_ratio@+64` (target >0.4, ceiling ~0.92) **together with** PSNR and the §12 action-order
 gap -- never motion_ratio alone, per the collapse above.
 
+## 15. The anchor WORKED, and SNR 1.43x is still not enough (08-13)
+
+`latent_loss_weight=10` did exactly what it was supposed to. `anch128`, 9 epochs:
+
+| | roundtrip | codec floor | 1step | ol@64 | mot@64 |
+|---|---|---|---|---|---|
+| unanchored (w=1), ep0->ep11 | 0.0038 -> 0.0087 | 23.9 -> **19.9** (-4.0) | 16.45 | 13.66 | 0.177 |
+| **anchored (w=10), ep0->ep8** | 0.0033 -> 0.0035 | 24.79 -> **24.39** (-0.40) | 16.64 | 13.94 | 0.167 |
+
+Erosion 3.55 dB -> **0.40 dB**. The mechanism and the fix are both confirmed, and the SNR the subsampling
+bought is now retained (0.85x -> 1.43x).
+
+**And it changed nothing about motion.** `anch128` plateaued from ep5: 1step 16.4->16.6, ol@64 13.8->13.94,
+`mot@64` flat at **0.16-0.20** for nine epochs. So:
+
+> **SNR 1.43x is NOT sufficient for motion.** That is the single most useful number of the week -- it puts a
+> floor under what any future arm has to beat, and it was measured with the codec held stable so nothing else
+> can be blamed.
+
+`anch256` (SNR 2.33x, floor holding 28.4 -> 28.2 dB) is the arm that says whether ~2x IS sufficient. Left
+running through its ep15 judgement.
+
+### The proprio head is the existence proof inside our own model (08-13, user spotted it)
+
+The user noticed the open-loop PROPRIO rollouts look excellent while the image rollouts are frozen. Same
+dynamics, same bag, same actions -- the difference is entirely the readout's bottleneck:
+
+```
+image     128*128*3 = 49,152 values -> 1,024 floats  = 48x COMPRESSION (lossy, frozen TAESD)
+proprio          16 values ->   128 floats           =  8x EXPANSION   (no bottleneck at all)
+```
+
+| head | per-step change | codec floor | change/floor |
+|---|---|---|---|
+| image | 0.0863 | 0.0598 | **1.44x** |
+| **proprio** | 0.1835 | **0.0160** | **11.47x** |
+
+**8x the SNR, and it visibly moves.** The dynamics can model this arm; the image readout cannot express it
+above its own reconstruction error. Ranks every case correctly: proprio 11.5x works, torus 1.95x works,
+256px 2.33x TBD, 128px 1.43x fails, 20 Hz 0.61x fails.
+
+**A hypothesis of mine died here:** I expected "proprio has no static background to hide behind" to explain
+it. It does not -- the IMAGE changes a larger fraction of its own spread per step (31.4% vs 20.0%). The
+moving-fraction favours proprio only 2.6x (25.2% of dims vs 9.8% of pixels) against a 7.9x floor advantage.
+**The codec floor dominates; background dilution is secondary.**
+
+## 16. HOLIDAY PROGRAM: non-pretrained flow image decoder (08-13, RUNNING UNATTENDED)
+
+User direction: a bunch of tests on a non-pretrained flow image decoder, layernorm to start but try things,
+15-epoch monitors, new configs when one does not work, no new code except bug fixes, branch
+`holiday-bespoke-flow-decoder`, do not commit to main.
+
+### It needs NO code. Verified by building it.
+
+`pretrained: false` gives the bespoke `ImageModality`, which encodes **directly** to `(num_tokens, d)` -- no
+adapter, and therefore **no `num_tokens * d == L` constraint at all**, so the compression ratio becomes a
+design choice instead of TAESD's 48x. It also honours `decode_kind: flow` (the pretrained path hardcodes
+`self.decode_kind = "mse"`), giving `ImageUNetFlowHead` -- a trainable generative decoder, structurally the
+same class of head as the proprio flow MLP that works. Built and forward-passed both arms:
+
+```
+nt=8   4.46M params  ImageUNetFlowHead  1024 floats  48.0x compression  bag (B,32,9,128)
+nt=32  6.04M params  ImageUNetFlowHead  4096 floats  12.0x compression  bag (B,32,33,128)
+roundtrip anchor wired at weight 10.0 in both
+```
+
+Two config declarations were needed, both the same bug as gotcha #1 (`compile_rollout`): `latent_loss_weight`
+and now `encode_base`/`decode_base` existed only as dataclass defaults, so hydra rejected bare overrides with
+"not in struct". Declared with values matching the code defaults -> bit-identical.
+
+**Forced constraint:** bespoke must use `latent_norm=layernorm`; `affine` RAISES without a frozen pretrained
+latent (it calibrates fixed per-channel stats once, and a learned encoder drifts its own scale). So
+bespoke-vs-TAESD is confounded with LN-vs-affine. `bsp8` vs `bsp32` is clean.
+
+### The honest odds, stated up front
+
+`anch128` held 24.4 dB and still failed. The only historical bespoke measurement is **~15 dB** (48x
+compression, unanchored, and it eroded to 10.6). **So a bespoke arm must find ~+9 dB over history merely to
+reach a configuration that already failed.** Its two routes are less compression (`num_tokens`) and AE
+capacity (`encode_base`/`decode_base`), which is exactly how the queue is ordered. The counter-argument for
+running it: nobody has ever run a learned encoder at 12x compression WITH the anchor, and the old bespoke
+failures are contaminated by the erosion we only diagnosed yesterday.
+
+### Judgement bar (auditable, calibrated on measured baselines)
+
+At ep15, judged once, all five numbers logged:
+
+```
+KILL if 1step < 12       -> collapsed (every 20 Hz run did this by ep4)
+KILL if ae_floor < 21 dB -> codec hopeless (24.4 dB ALREADY fails, so <21 cannot win)
+KILL if mot@64 < 0.22    -> the same static failure as all 14 prior runs (baseline 0.16-0.20)
+else KEEP to ep40
+```
+
+Validated against five real runs before launch: `anch128`@ep8 -> KILL (no motion), `hz4_seedA`@ep11 -> KILL
+(floor 19.96), the collapsed `tfz_act`@ep4 -> KILL (COLLAPSED). The ep>=15 gate is what stops `anch256` being
+killed at ep1 on a number that is always low early.
+
+### Queue (`wizard/scripts/holiday/queue.txt`, popped onto whichever GPU frees)
+
+bsp32 (12x compression, primary) | bsp32wide (base 64, AE capacity) | bsp8 (48x control) | bsp16 | bsp32none
+(no latent norm) | bsp32mse (is the flow decoder earning its keep?) | bsp32llw30 | bsp32vit | bsp32deep |
+bsp32widest (base 96) | bsp64 (6x compression) | bsp32sub8 (2.5 Hz)
+
+### Orchestrator
+
+`wizard/scripts/holiday/orchestrator.sh`, polls 10 min: free GPU -> pop next config; running and ep<15 ->
+leave alone; ep>=15 -> judge once, KEEP or KILL-and-free; died -> log and move on. Adopts `anch256` under the
+same rule. Every pgrep/pkill uses the bracket trick ([t]rain not train) because a bare pattern also matches
+the orchestrator's own command line -- a plain `pkill -f watchdog.sh` killed one of my own shells today.
+
+### Still open / not done
+
+- `motion_ratio` is direction-blind and whole-frame; a COLLAPSED model scores HIGHER on it (the ep4 collapse
+  read 0.17-0.33). It is in the kill rule only as a floor, never as evidence of success on its own.
+- The §12 action-sensitivity probe is NOT promoted to an eval routine (would be new code). Run it post-hoc:
+  `src/quickdraw/_oneoff_action_sensitivity.py` against any checkpoint.
+- Decoder-only fine-tune of TAESD (keep its encoder's 9 dB prior, train its decoder on this one scene) is
+  the untried lever I rate highest, and it needs a small code change (split `freeze`, narrow the affine
+  guard to the ENCODER -- the guard's own rationale is about encoder drift, so it is stricter than needed).
+- A 16-channel VAE would be 12x compression at 128px with a pretrained prior -- the "less compression"
+  lever without paying the 9 dB.
+- No watchdog is running. The orchestrator relaunches from the queue but does NOT resume a crashed run from
+  its checkpoint.
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
