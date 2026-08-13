@@ -237,7 +237,20 @@ modalities:
   # unet+mse) — expected to keep MSE's metrics AND kill the grid, but VALIDATE before trusting. encode stays ViT.
   - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
   - {name: image, kind: image, num_tokens: 8, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet,
-     pretrained: true, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2}}
+     pretrained: true, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2}, latent_loss_weight: 1.0}
+  # latent_loss_weight (DECLARED here 2026-08-13 so a bare `model.modalities.1.latent_loss_weight=N` override
+  #   works -- it was only a dataclass default, so Hydra rejected the override with "not in struct", the same
+  #   trap `model.compile_rollout` hit). Weight on `codec/roundtrip_image` = MSE(to_obs(encode_state(x)), x):
+  #   encode a REAL frame into the bag and decode it straight back, measured through the MODEL'S OWN path so
+  #   whatever the dynamics consumes is what gets supervised. It anchors ONLY the adapter's zero-init refine
+  #   branch + decoder (TAESD is frozen), so it does NOT tax the dynamics -- and the adapter STARTS at a
+  #   bit-exact identity at the raw AE's best fidelity, so drift can only lose ground, never gain any.
+  #   MEASURED 2026-08-13 (record §14): at 4 Hz this term was 1.08% of val loss against a dynamics term 80x
+  #   larger, and the codec eroded 23.9 -> 19.9 dB, raising the noise floor ~1.5x and cancelling the SNR that
+  #   subsampling bought (1.35x -> 0.85x). At 20 Hz the codec held at weight 1.0 against a dynamics loss of
+  #   0.24; at 4 Hz that loss is 0.835, so ~3.5 merely restores the old balance and 10 is ~3x firmer.
+  #   RAISE THIS whenever the dynamics loss grows (bigger timestep, harder target) or `codec/roundtrip_*`
+  #   climbs -- a rising roundtrip means the dynamics is dragging the tokenizer off fidelity.
   # TOKEN BUDGET RULE (measured 2026-08-09, robocasa 128px + frozen TAESD): keep num_tokens * d EXACTLY equal to
   #   the AE latent size (TAESD @128px -> 4*16*16 = 1024 floats; @256px -> 4096). NEVER pad.
   #   Padding is NOT idle capacity -- LayerNorm is PER TOKEN, so pad floats enter the mean/std the real floats are
