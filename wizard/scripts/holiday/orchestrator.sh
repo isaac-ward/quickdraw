@@ -60,7 +60,7 @@ BASE=(
   model.latent_norm=layernorm                  # affine RAISES without a frozen pretrained latent
   data.root=$DATA data.repo_id=robocasa-scene4-4h data.cam=robot0_agentview_left
   data.subsample=5 data.F=64
-  data.autobatch=true data.autobatch_headroom=0.35
+  data.autobatch=true                    # headroom: use the conf default 0.25, NOT 0.35 (measured overhead is only +4.5GB)
   environments=recorded environments.obs_dim=16 environments.action_dim=12
   environments.position_idx=[7,8,9]
   trainer.max_epochs=$MAX_EPOCHS trainer.check_val_every_n_epoch=1

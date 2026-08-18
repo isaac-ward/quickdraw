@@ -1,0 +1,62 @@
+# =============================================================================================
+# bsp32mse — the best-measured world-model recipe on robocasa-scene4-4h as of 2026-08-18.
+# THIS IS THE EXECUTABLE FORM of src/quickdraw/models/recipes/bsp32mse.md — read that for WHY, and for the
+# per-dataset numbers you must re-derive (chiefly data.subsample). Select with `model=bsp32mse`.
+#
+# Inherits mm_flow and changes ONLY the image codec: a from-scratch conv encoder + U-Net decoder replacing
+# the frozen TAESD trunk. Measured against 13 other configs including pretrained arms with a 7 dB better
+# reconstruction ceiling: best open-loop image PSNR of all of them (14.25 mean), LPIPS 0.390 vs 0.525-0.542
+# for every pretrained arm, and motion_ratio 0.331 that RISES with training where every pretrained run
+# collapsed. It wins while LOSING 2 dB of one-step PSNR and 7 dB of codec ceiling -- neither of which predicts
+# long-horizon quality on this problem.
+#
+# NOT covered here (a model config cannot hold them) -- pass on the CLI, see the .md:
+#   data.subsample=<k>   MUST be re-derived per dataset. 5 for 20 Hz robocasa -> 4 Hz.
+#   data.F=64            rollout length
+#   model.action_dim / modalities.0.dim / environments.*   to match your dataset
+# =============================================================================================
+defaults:
+  - mm_flow
+  - _self_
+
+# --- DYNAMICS settings the measurement used. These are NOT mm_flow defaults, and omitting them silently ran a
+# DIFFERENT (worse) model -- caught 2026-08-18 by diffing this config against the run's own resolved config.
+compile_rollout: true
+action_head: {enabled: false}   # collapsed 2/2 on this dataset
+diffusion:
+  flow_arch: transformer        # mm_flow defaults to mlp. The transformer denoiser PROTECTS the codec: measured
+  flow_arch_depth: 2            #   -0.55 dB erosion vs -2.8 dB for the per-token mlp.
+  flow_arch_heads: 4
+  concat_action_embedding: true
+
+latent_norm: layernorm     # REQUIRED: `affine` RAISES without a frozen pretrained latent (it calibrates fixed
+#                            per-channel stats once, and a learned encoder drifts its own scale). Also measured
+#                            BETTER than none: latent_norm=none gave motion 0.197 vs 0.497.
+action_squash: none        # symlog is for observations/rewards/values, NOT actions
+action_fourier_freqs: 0    # measured: more action gradient, no motion, and OOD-brittle when actions are zeroed
+recon_frac: 0.25           # NOTE: the mm_flow default is 1.0. 0.25 is what the measurement used; raising it is
+#                            the most obvious untested lever on sharpness.
+
+modalities:
+  # restated in full: OmegaConf replaces lists rather than merging them, so inheriting mm_flow and editing one
+  # entry is not possible -- and being explicit here is what makes the recipe auditable.
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  - {name: image, kind: image, weight: 1.0, img_size: 128,
+     pretrained: false,        # <-- the whole point: NO pretrained tokenizer, so there is also no adapter and
+     #                               no num_tokens*d == latent_size constraint. Compression is a free choice.
+     num_tokens: 32,           # 32 x d(128) = 4096 latent floats = 12x compression at 128px. Sweeping 8/16/32/64
+     #                               moved the reconstruction floor NOT AT ALL (18.7-20.4 dB across an 8x range
+     #                               of latent floats) -- this codec is not rate-limited. 32 gave the best balance.
+     encode_arch: conv,        # ConvImageEncoder: mirrors the U-Net down-path (symmetric, no patch grid)
+     encode_base: 32,
+     decode_kind: mse,         # the U-Net run ONCE deterministically, NOT a pixel regression. decode_kind=flow
+     #                               bought ~nothing on sharpness (LPIPS 0.385 vs 0.390), cost 1.1 dB of PSNR,
+     #                               and its extra motion is likely sampling jitter. p(image|latent) on ONE scene
+     #                               is nearly deterministic, so the conditional mean is already sharp; the
+     #                               multimodality MSE would blur lives in the DYNAMICS, already a flow.
+     decode_arch: unet,        # ViT decoder measured much worse: motion 0.141, and it collapsed
+     decode_base: 32,
+     decode_param: x0, patch: 16, ae_depth: 4,
+     latent_loss_weight: 10}   # round-trip anchor. DO NOT leave at 1.0: it was 1% of the objective against a
+     #                               dynamics term 80x larger and the codec eroded 3.55 dB in 4 epochs, undoing
+     #                               the benefit of subsampling. At 10 the erosion was 0.40 dB over 9 epochs.

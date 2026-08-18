@@ -380,9 +380,9 @@ def autobatch_find(cfg, device, log=print) -> int:
     if lo == hi:                               # fit to the cap without going over
         log(f"[autobatch] fits to cap: data.batch={lo} (VRAM {total/1e9:.0f}GB @ {int(headroom*100)}% headroom, cap {cap})")
         return done(confirm_compiled(lo))
-    while hi - lo > 8:                          # bisect to a multiple of 8
-        mid = (((lo + hi) // 2) // 8) * 8
-        if mid <= lo or mid >= hi: break
+    while hi - lo > 1:                          # bisect to EXACT resolution (was: multiples of 8, which on a
+        mid = (lo + hi) // 2                    #   [8,16) bracket had no landing point at all and silently
+        if mid <= lo or mid >= hi: break        #   returned the low end -- see the below-base branch comment
         ok, p = fits(mid)
         if ok: lo = mid
         else: hi = mid

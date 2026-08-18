@@ -5,6 +5,20 @@ Self-contained spec for the best-performing world-model configuration measured o
 DIFFERENT dataset without reading the whole run log. Full history: `wizard/records/robocasa-scene4-4h.md`
 §13–§16.
 
+## Run it
+
+```
+model=bsp32mse                       # conf/model/bsp32mse.yaml -- the EXECUTABLE form of this document
+data.subsample=<k> data.F=64         # k MUST be re-derived per dataset, see below
+model.action_dim=<A> model.modalities.0.dim=<O> environments=<env> environments.obs_dim=<O> environments.action_dim=<A>
+```
+
+The config is authoritative for everything under `model.*`; this document explains WHY and covers the
+`data.*` / `environments.*` parts a model config cannot hold. The config was verified by diffing its composed
+output against the resolved config of the run that produced the numbers below -- which caught three settings
+(`compile_rollout`, `action_head.enabled`, `diffusion.flow_arch=transformer`) whose omission would have
+silently run a different, worse model.
+
 ## What it is, in one sentence
 
 A **fully trained-from-scratch (non-pretrained) image codec** — conv encoder + U-Net decoder — feeding an
@@ -62,7 +76,7 @@ model.modalities.1.encode_base=32 model.modalities.1.decode_base=32
 model.modalities.1.latent_loss_weight=10   # round-trip anchor; see below
 data.F=64
 data.subsample=5                        # <-- MUST be re-derived per dataset, see below
-data.autobatch=false data.batch=8       # <-- PIN IT. See "reproducibility across machines" below.
+data.autobatch=true                     # DEFAULT ON. headroom comes from conf/data (0.25); do NOT pass 0.35
 trainer.max_epochs=50 trainer.check_val_every_n_epoch=1
 ```
 
@@ -92,19 +106,24 @@ term 80x larger**, and the codec eroded 3.55 dB in 4 epochs, which cancelled the
 subsampling. At 10 the erosion was 0.40 dB over 9 epochs. **Rule: raise it whenever the dynamics loss grows
 or `codec/roundtrip_*` climbs.**
 
-## Reproducibility across machines: PIN THE BATCH
+## Batch size: autobatch stays ON, but know what it picked
 
-`data.autobatch=true` sizes the batch to fill *this* GPU, which makes the effective config **hardware
-dependent** -- a different card picks a different batch, and batch size is a training variable, so the run
-will not reproduce. The measured runs used **batch 8** on a 95.8 GB card. Pin `data.autobatch=false
-data.batch=8` to reproduce them, and only raise it deliberately.
+`data.autobatch=true` is the default and should stay on -- the AR step is dispatch-bound, so filling VRAM is
+nearly-free throughput. Just be aware the effective batch is hardware-dependent, so **record what it chose**
+when comparing across machines. The measurements in this file were taken at **batch 8** on a 95.8 GB card,
+which was itself too small for two reasons, both fixed 2026-08-18:
 
-If you do let autobatch choose, note it under-fills: its below-base branch used to halve from `autobatch_base`
-and return the first batch that fit, with no upward search, so a base of 16 that did not fit landed on 8 and
-never tried 9..15. Measured on this config: 82.2 GB at batch 16, 41.2 GB at batch 8 -- so it ran at 41 of a
-65 GB budget, 43% of the card, at 61% GPU utilisation (the AR step is dispatch-bound, so a small batch wastes
-compute as well as memory). Fixed 2026-08-18 to bisect upward, which picks batch 12 (~62 GB) for this config.
-The two runs in flight deliberately keep batch 8 for comparability with the original measurement.
+- the below-base search halved from `autobatch_base` and returned the FIRST size that fit, with no upward
+  search -- base 16 did not fit, so it landed on 8 and never tried 9..15. Measured: 82.2 GB at batch 16 vs
+  41.2 GB at batch 8, i.e. it trained at 41 of a 65 GB budget (43% of the card) at 61% GPU utilisation.
+- the base-fits branch bisected only to multiples of 8, which on an [8,16) bracket has no landing point at all.
+
+Both now bisect at resolution 1. Peak memory is almost perfectly LINEAR in batch (slope 5.125 GB/sample,
+intercept 0.2 GB -- at 6.4M params the weights and Adam states are ~0.1 GB, so activations dominate entirely),
+so `batch ~= budget / slope` and the search lands exactly. Also do NOT pass
+`data.autobatch_headroom=0.35`: the conf default is 0.25, and the measured eval/allocator overhead above the
+training probe is only **+3.8 to +4.9 GB** across 8 healthy runs. At 0.25 that is a 5.3x margin and gives
+batch 14 for this config; 0.20 gives the same 14, so 0.25 is strictly better -- same batch, more safety.
 
 ## Porting to a new dataset: what you MUST re-derive
 
