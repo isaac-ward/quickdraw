@@ -413,17 +413,14 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
     incompatible ranges are not squashed together:
 
       TOP     `split_top`     unbounded, own units          (psnr, dB)
-      MIDDLE  everything else, ~[0,1]                       (ssim, mse, l1, lpips) -> ylim [0, max(1, data)]
-      BOTTOM  `split_bottom`  unbounded ratio               (motion_ratio) -> floors at 0, grows
+      MIDDLE  everything else, genuinely bounded [0,1]      (ssim, mse, l1)
+      BOTTOM  `split_bottom`  UNBOUNDED ABOVE               (lpips, motion_ratio) -> floors at 0, grows
 
-    GROUPING CHANGED 2026-08-18 (user): motion_ratio gets the bottom panel to ITSELF and lpips joins the
-    ssim/mse/l1 panel. motion_ratio is the one that genuinely needs its own axis -- it is a RATIO with no upper
-    bound (2.06 and 1.17 have both been logged, and a diverged model scores HIGHER on it), so sharing an axis
-    with anything bounded squashes the bounded curves. lpips sits in ~[0,1] in practice (0.34-0.84 across every
-    run measured here), so it reads fine alongside the others; the middle panel's limit is FLOORED at 1 rather
-    than pinned to it so an lpips excursion above 1 still shows. Note the middle panel mixes directions
-    (ssim higher-better; mse/l1/lpips lower-better) -- it already did, since mse and l1 live there.
-    Any empty group is dropped. Captions (per-curve
+    lpips and motion_ratio share the bottom panel because both are unbounded above and both are the metrics you
+    look at when things go wrong: lpips exceeds 1 exactly on the badly-wrong predictions worth seeing, and
+    motion_ratio is a RATIO (2.06 and 1.17 have both been logged, and a DIVERGED model scores HIGHER on it).
+    Neither can share the middle panel without being clipped by its bounded axis. Tried splitting them on
+    2026-08-18 and reverted for that reason. Any empty group is dropped. Captions (per-curve
     CAPTIONS, plus a free-form `caption`) render below the axes."""
     top = set(split_top or ()) & set(errors)
     bot = (set(split_bottom or ()) & set(errors)) - top
