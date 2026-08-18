@@ -62,10 +62,6 @@ CAPTIONS = {
         "mse  ·  MSE = mean_pixels((x̂ − x)²),  x,x̂ ∈ [0,1]  ·  per-pixel L2 (= the image training loss)  ·  lower = closer  ·  [0, 1]",
     "l1":
         "l1  ·  L1 = mean_pixels(|x̂ − x|),  x,x̂ ∈ [0,1]  ·  per-pixel L1, less outlier-sensitive than MSE  ·  lower = closer  ·  [0, 1]",
-    "psnr_frozen":
-        "psnr_frozen  ·  PSNR of HOLDING FRAME 0 for the whole rollout (predict no change at all)  ·  the "
-        "do-nothing baseline: our psnr must stay ABOVE this or the model is not predicting motion. Also reads "
-        "as difficulty — a static scene gives high psnr_frozen  ·  TOP panel, dB, [0, ∞)",
     "motion_ratio":
         "motion_ratio  ·  ‖x̂ₜ − x̂ₜ₋₁‖ / ‖xₜ − xₜ₋₁‖ (RMS over pixels)  ·  magnitude of PREDICTED frame-to-frame "
         "change vs TRUE.  1 = right amount of motion; <1 = under-predicting motion / drifting toward a frozen "

@@ -132,7 +132,9 @@ kill_exp(){ # $1=experiment name
 
 launch(){ # $1=gpu $2=exp $3=overrides(string)
   local gpu="$1" exp="$2" ov="$3"
-  local uniq="Config $exp with overrides $ov, launched by the holiday orchestrator on GPU $gpu."
+  # The repo gates on a UNIQUE run_summary, so a RELAUNCH of the same config on the same GPU is rejected as a
+  # duplicate -- it blocked exactly that on 2026-08-18. Stamp the launch time so a rerun is distinguishable.
+  local uniq="Config $exp with overrides $ov, launched by the holiday orchestrator on GPU $gpu at $(date -u '+%Y-%m-%d %H:%M:%S') UTC."
   # shellcheck disable=SC2206
   local EXTRA=($ov)
   docker compose exec -T -e QUICKDRAW_LOG_ROOT=logs/holiday -e CUDA_VISIBLE_DEVICES="$gpu" app \
