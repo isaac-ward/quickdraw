@@ -27,16 +27,20 @@ place by a round-trip anchor.
 
 ## Why this one won
 
-Measured against 13 other configurations on the same dataset, including frozen-TAESD arms at a 7 dB better
-reconstruction ceiling:
+Measured against 13 other configurations on the same dataset:
 
-| | this recipe | best pretrained arm |
-|---|---|---|
-| open-loop image PSNR (mean over horizon) | **14.25** | 14.05 |
-| open-loop image **LPIPS** | **0.390** | 0.534 |
-| `motion_ratio@+64` | **0.331**, and RISING with training | 0.156, and collapsing |
-| 1-step PSNR | 16.66 | 18.61 |
-| codec reconstruction floor | 20.03 dB | 27.23 dB |
+| | this recipe (bespoke 128px) | pretrained 128px (`anch128`) | pretrained 256px (`anch256`) |
+|---|---|---|---|
+| open-loop image PSNR (mean over horizon) | **14.25** | 13.95 | 14.05 |
+| open-loop image **LPIPS** | **0.390** | 0.525 | 0.534 |
+| `motion_ratio@+64` | **0.331**, RISING with training | 0.167, collapsing | 0.156, collapsing |
+| 1-step PSNR | 16.66 | 16.64 | 18.61 |
+| codec reconstruction floor | 20.03 dB | 24.39 dB | 27.23 dB |
+
+**The from-scratch codec penalty is ~3.4-4.4 dB, NOT 7.** An earlier version of this table quoted 7 dB by
+comparing this 128px recipe against the 256px pretrained arm -- apples to oranges. Like-for-like at 128px it is
+24.39 (anch128) or 23.47 (raw TAESD measured directly) against 20.03. Do NOT use a fixed dB gap to *predict*
+the from-scratch floor on a new dataset -- see the warning under `data.subsample` below.
 
 The counter-intuitive part: it wins on perceptual quality and motion while LOSING on one-step PSNR and on
 codec fidelity. One-step PSNR is decoupled from long-horizon quality on this problem (swapping in a pretrained
