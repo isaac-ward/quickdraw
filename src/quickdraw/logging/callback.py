@@ -305,6 +305,13 @@ class LoggingCallback(L.Callback):
 
     def on_train_epoch_start(self, trainer, pl_module):
         self._t_epoch = time.perf_counter()
+        # Start a CLEAN memory window for this epoch's TRAINING phase. Before 2026-08-18 nothing ever reset the
+        # CUDA peak counter, so mem/peak_gb was a monotonic PROCESS max that silently mixed autobatch's rejected
+        # probes (82.2 GB at batch 16 on one config), the sanity check, training and eval -- and was therefore
+        # useless for attributing memory to a phase or for sizing a budget.
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        self._mem_train = None      # cleared so a NON-eval epoch cannot log last epoch's stale split
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         if trainer.current_epoch == 0 and batch_idx == 0 and self._t_b0 is None:
@@ -395,6 +402,13 @@ class LoggingCallback(L.Callback):
         m = pl_module.model
         was_training = m.training
         m.eval()
+        # Close the TRAIN window, open the INFERENCE one. Everything after this point until
+        # on_validation_epoch_end is eval routines + the validation loop -- both no_grad, and the val loop is a
+        # real consumer too (an autoregressive val pass over hundreds of batches), so they are measured together
+        # as the "not training" phase. That MAX is what a memory budget has to clear alongside training.
+        if torch.cuda.is_available():
+            self._mem_train = (torch.cuda.max_memory_allocated() / 1e9, torch.cuda.max_memory_reserved() / 1e9)
+            torch.cuda.reset_peak_memory_stats()
         t_eval = time.perf_counter()
         try:
             for name in self.routines:
@@ -472,7 +486,15 @@ class LoggingCallback(L.Callback):
         if self._compile_s is not None:
             metrics["time/compile_seconds"] = self._compile_s
         if torch.cuda.is_available():
-            metrics["mem/peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
+            metrics["mem/peak_gb"] = torch.cuda.max_memory_allocated() / 1e9          # this window only, not the process
+            metrics["mem/peak_reserved_gb"] = torch.cuda.max_memory_reserved() / 1e9  # RESERVED is what OOMs, not allocated
+            mt = getattr(self, "_mem_train", None)
+            if mt is not None:
+                metrics["mem/peak_train_gb"], metrics["mem/peak_train_reserved_gb"] = mt
+                # the inference window (eval routines + val loop); mem/peak_* above IS that window
+                metrics["mem/peak_infer_gb"] = metrics["mem/peak_gb"]
+                metrics["mem/peak_infer_reserved_gb"] = metrics["mem/peak_reserved_gb"]
+                metrics["mem/train_vs_infer_reserved_gb"] = mt[1] - metrics["mem/peak_reserved_gb"]
         self.writer.scalars(metrics, step=epoch)
 
     def on_fit_end(self, trainer, pl_module):

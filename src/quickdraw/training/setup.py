@@ -232,20 +232,29 @@ _hf_root_cache: dict = {}   # hf_repo -> snapshot path (avoid re-resolving/downl
 
 
 def autobatch_find(cfg, device, log=print) -> int:
-    """Binary-search the largest `data.batch` whose AR training step fits `VRAM*(1-headroom)`, capped at
-    `autobatch_max`. The AR step is DISPATCH-bound (accelerations.md Exp 8), so bigger batch is nearly-free
-    throughput until memory binds — pick the largest that fits with headroom. Builds a THROWAWAY model +
+    """Size `data.batch` to the largest whose AR training step fits `VRAM - autobatch_reserve_gb`, capped at
+    `autobatch_max`. Sizes by a LINEAR FIT of peak-vs-batch (2 probes + confirm), falling back to a
+    bracket-and-bisect search; budgets on RESERVED memory (what OOMs), not allocated. The AR step is DISPATCH-bound (accelerations.md Exp 8), so bigger batch is nearly-free
+    throughput until memory binds — pick the largest that fits. Builds a THROWAWAY model +
     SYNTHETIC batches (memory is shape- not value-dependent), probes real `rollout_train` fwd + decode + bwd,
     then frees. Probes the REAL training step (rollout_train -> recon + flow loss, backward, AND an AdamW
     step so optimizer states count) — the earlier synthetic pow(2) proxy under-counted the loss graph +
     optimizer by ~12 GB and picked batches that OOM'd. Headroom still covers eval-phase spikes + allocator
-    reserve — raise `data.autobatch_headroom` if an eval OOMs. Config: data.autobatch{,_headroom,_max,_base}."""
+    Config: data.autobatch{,_reserve_gb,_max,_base}."""
     import gc
-    headroom = float(cfg.data.get("autobatch_headroom", 0.25))
+    # ONE ABSOLUTE MARGIN (2026-08-18), replacing `autobatch_headroom` (a fraction). The two reserves that used
+    # to exist covered the same thing, and after this change neither has its original job: fragmentation is now
+    # MEASURED (we budget on reserved, not allocated) and the eval spike is now GATED (probe_eval below). What is
+    # left is one residual -- allocator growth over a full epoch beyond a 2-iteration probe, evidenced at +12 GB
+    # by the "batch 112 probed 81GB then OOM'd at 93GB" incident. That is a property of the ALLOCATOR, not of the
+    # card, so it must be absolute: a 12 GB spike is 12 GB whether the card is 40 GB or 100 GB, whereas a 25%
+    # fraction is 10 GB on one and 25 GB on the other. `autobatch_headroom` is deliberately DELETED from
+    # conf/data so stale `data.autobatch_headroom=...` overrides fail LOUDLY instead of silently doing nothing.
+    reserve = float(cfg.data.get("autobatch_reserve_gb", 12.0)) * 1e9
     cap = int(cfg.data.get("autobatch_max", 512))
     base = int(cfg.data.get("autobatch_base", 16))
     total = torch.cuda.get_device_properties(device).total_memory
-    budget = int(total * (1.0 - headroom))
+    budget = int(max(total * 0.25, total - reserve))     # floor at 25% of the card so a bad reserve cannot zero it
     P, F = int(cfg.data.P), int(cfg.data.F); L = P + F
     de = int(cfg.model.get("detach_every", 16)); rf = float(cfg.model.get("recon_frac", 1.0))
     specs = _modality_specs(cfg); adim = int(cfg.model.get("action_dim", 2))
@@ -307,12 +316,17 @@ def autobatch_find(cfg, device, log=print) -> int:
                         raise
                     loss = preds_fn(obs, act).float().pow(2).mean()        # fall back to a pred-only estimate
             loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
-        return torch.cuda.max_memory_allocated(device)
+        # RESERVED, not allocated (2026-08-18). The allocator's reserved pool is what actually OOMs -- the gap is
+        # fragmentation, and budgeting on `allocated` made that gap invisible and left it to be absorbed by a
+        # hand-tuned headroom fraction. On record: "batch 112 probed 81GB then OOM'd at 93GB". Both are returned
+        # so the ratio is logged rather than assumed.
+        return torch.cuda.max_memory_reserved(device), torch.cuda.max_memory_allocated(device)
 
     def probe(B):   # peak = MAX(p_tf=0 rollout, p_tf=1 parallel forward). The old probe measured ONLY the rollout,
         try:        #   missing the parallel-forward peak that epoch 0 hits -> under-sized -> OOM at epoch 0. None on OOM.
             obs, act = synth(B)
-            return max(_probe_path(obs, act, _seq_preds), _probe_path(obs, act, _par_preds))
+            a, b_ = _probe_path(obs, act, _seq_preds), _probe_path(obs, act, _par_preds)
+            return max(a[0], b_[0]), max(a[1], b_[1])       # (reserved, allocated), each maxed over both paths
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if not (isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower()):
                 raise
@@ -320,28 +334,172 @@ def autobatch_find(cfg, device, log=print) -> int:
             torch.cuda.empty_cache(); return None
 
     def fits(B):
-        p = probe(B); return (p is not None and p <= budget), p
+        pr = probe(B)
+        if pr is None:
+            return False, None
+        res, alloc = pr
+        if alloc > 0:
+            log(f"[autobatch] probe b={B}: reserved {res/1e9:.1f}GB / allocated {alloc/1e9:.1f}GB "
+                f"(frag {100*(res-alloc)/max(alloc,1):.0f}%) vs budget {budget/1e9:.0f}GB")
+        return res <= budget, res
 
     def done(b):   # free probe activations before the caller builds loaders + the real model
-        gc.collect(); torch.cuda.empty_cache(); return b
+        gc.collect(); torch.cuda.empty_cache()
+        # RESET the peak counter (2026-08-18): the probes legitimately allocate far more than training will ever
+        # use (a rejected batch-16 probe hit 82.2 GB on one config), and nothing downstream reset it -- so every
+        # mem/* metric for the whole run was really "max since process start, including probes we threw away".
+        torch.cuda.reset_peak_memory_stats(device)
+        return b
 
     def confirm_compiled(b):   # validate the eager-chosen batch on the REAL compiled step (recompiles per shape)
         if not compiled_run:
             return b
         model.compile_rollout = True
-        for _ in range(4):
+        # FIXED 2026-08-18. Two bugs: (1) it stepped down by a CONSTANT 8, which on the batch<=16 configs this
+        # repo actually runs is a >=50% jump; (2) when `b - 8 < 1` it logged "over budget down to batch {b};
+        # using {b}" and RETURNED b -- a batch it had just measured as NOT fitting. At b=8 that was the branch
+        # taken, i.e. every bespoke run. Now the step is PROPORTIONAL to the measured overshoot and an
+        # over-budget batch is never returned.
+        for _ in range(6):
             log(f"[autobatch] compiled-confirm: probing batch {b} on the compiled step (one-time ~1-2 min compile)...")
             ok_, p_ = fits(b)
             if ok_:
                 log(f"[autobatch] compiled-confirm OK: batch {b} ({(p_ or 0)/1e9:.1f}/{budget/1e9:.0f}GB compiled)")
                 return b
-            if b - 8 < 1:
-                log(f"[autobatch] compiled step over budget down to batch {b}; using {b}")
-                return b
-            log(f"[autobatch] compiled step over budget at {b} — stepping down to {b - 8}")
-            b -= 8
+            if b <= 1:
+                # The EAGER probe accepted a larger batch, so a compiled failure at b=1 is a compile-time
+                # transient rather than a real capacity result. Warn loudly and proceed at 1 rather than raise,
+                # so this cannot turn a previously-working config into a hard startup failure.
+                log("[autobatch] WARNING: compiled step over budget even at batch 1 — the eager probe accepted "
+                    "more, so this is likely a compile-time transient. Using 1; raise data.autobatch_reserve_gb "
+                    "or set data.autobatch=false data.batch=<n> if this run OOMs.")
+                return 1
+            nb = max(1, int(b * budget / p_)) if p_ else b // 2      # step PROPORTIONAL to the overshoot
+            nb = min(nb, b - 1)                                       # always make progress
+            log(f"[autobatch] compiled step over budget at {b} "
+                f"({(p_ or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — stepping down to {nb}")
+            b = nb
+        log(f"[autobatch] compiled-confirm exhausted its retries; using the last probed batch {b}")
         return b
 
+    # ---- Step 4 (2026-08-18): PROBE THE INFERENCE PHASE ---------------------------------------------------
+    # Until now eval memory was never measured -- it was covered by a headroom fraction, and the documented
+    # remedy for an eval OOM was "raise the fraction". Worse, the number people cited as the eval cost
+    # (epoch_peak - probe_peak, ~+4.5 GB) was NOT a measurement of eval at all: nothing reset the CUDA peak
+    # counter, so the epoch peak was a process max that also included autobatch's own rejected probes.
+    #
+    # KEY PROPERTY that makes this a GATE rather than a subtraction: eval memory does NOT depend on data.batch.
+    # It is fixed by the eval config (ood_horizon hardcodes n_ep=8 at routines.py:133, plus eval.horizon,
+    # ae_floor_episodes, closed_loop_steps) and by the model. Training activations are freed before eval and the
+    # allocator reuses those blocks, so the two phases do not add -- each must independently fit the budget.
+    def _synth_eval(B, T_ctx, H):
+        obs = {}
+        for sp in specs:
+            if getattr(sp, "kind", "vector") == "image":
+                sz = getattr(sp, "img_size", 128)
+                hw = (sz, sz) if isinstance(sz, int) else tuple(int(x) for x in sz)
+                obs[sp.name] = torch.rand(B, T_ctx, hw[0], hw[1], 3, device=device)
+            else:
+                obs[sp.name] = torch.randn(B, T_ctx, int(getattr(sp, "dim", 6)), device=device)
+        return obs, torch.randn(B, T_ctx + H, adim, device=device)
+
+    def probe_eval():
+        """Peak RESERVED bytes of one eval-shaped rollout+decode. Returns None if it cannot be measured."""
+        H = max(1, min(int(cfg.eval.get("horizon", 128) or 128), 256))   # capped: the routine itself clamps to
+        n_ep = 8                                                         #   episode length, which we cannot know here
+        try:
+            torch.cuda.synchronize(device); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
+            with torch.no_grad():
+                obs, act = _synth_eval(n_ep, P, H)
+                bag = model._rollout(obs, act, H, 0.0, None, 0)
+                out = model.to_obs(bag, heads=[sp.name for sp in specs])
+                # hold pred AND a same-shape target, which is what image_curves does per timestep
+                held = [v.float() for v in out.values()]
+                _ = sum(float(torch.mean((v - torch.rand_like(v)) ** 2)) for v in held)
+            return torch.cuda.max_memory_reserved(device)
+        except Exception as e:
+            oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower()
+            log(f"[autobatch] eval probe {'OOM' if oom else 'skipped'} ({type(e).__name__}: {str(e)[:120]})")
+            return -1.0 if oom else None
+        finally:
+            gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
+
+    _ev = probe_eval()
+    if _ev == -1.0:
+        log(f"[autobatch] WARNING: the eval phase OOM'd on its own, INDEPENDENT of data.batch. Training will "
+            f"still be sized, but expect eval routines to fail (they self-disable after 2 failures rather than "
+            f"killing the run). Shrink eval.horizon / eval.closed_loop_steps / eval.ae_floor_episodes, or turn "
+            f"off manifold.")
+    elif _ev is not None:
+        pct = 100.0 * _ev / budget
+        log(f"[autobatch] eval probe: {_ev/1e9:.1f}GB reserved ({pct:.0f}% of the {budget/1e9:.0f}GB budget) "
+            f"at n_ep=8, horizon={max(1, min(int(cfg.eval.get('horizon', 128) or 128), 256))}")
+        if _ev > budget:
+            # WARN, do not raise. The plan said raise, but eval failures no longer kill a run (a routine that
+            # fails twice self-disables), so blocking startup on an ESTIMATE is the worse trade: a mis-estimating
+            # probe would refuse to start runs that would have trained fine.
+            log("[autobatch] WARNING: the eval phase alone exceeds the budget. Training is sized independently, "
+                "so it will still run; eval routines may fail and self-disable.")
+
+    # ---- Step 3 (2026-08-18): LINEAR-FIT SIZING, with the bisection below as fallback ---------------------
+    # peak(B) = a*B + b. `b` is persistent (fp32 weights + grads + Adam m,v = 16 B/param); `a` is per-sample
+    # activations. Measured on bsp32mse: 41.2GB @ B=8 and 82.2GB @ B=16 -> a=5.125 GB/sample, b=0.20GB, i.e.
+    # essentially pure-linear-through-the-origin because activations dominate a 6.4M-param model entirely.
+    #
+    # WHY THIS RATHER THAN BISECTION, and the reason is SAFETY not speed: bisection's base-fits branch walks a
+    # doubling ladder (32, 64, ... autobatch_max=512) and EVERY RUNG IS A REAL ALLOCATION -- batch 16 already
+    # reserved 82.2 of a 95.8GB card on one config, and a proprio-only config climbs to the cap. On a shared box
+    # that threatens the CO-RESIDENT run. A fit probes SMALL and jumps straight to the answer, never allocating
+    # far above what it will choose. It also yields a reusable GB/sample model instead of one search result.
+    def _persistent_bytes():
+        n = sum(q.numel() for q in model.parameters())
+        return n * 16          # fp32 param + grad + Adam m + Adam v
+
+    def _fit_predict():
+        pts = []                                   # (B, reserved_bytes) from SUCCESSFUL probes (over-budget is fine)
+        b0 = base
+        while b0 >= 1:
+            _, pv = fits(b0)
+            if pv is not None:
+                pts.append((b0, pv)); break
+            b0 //= 2                               # OOM -> cannot even measure; halve
+        if not pts:
+            return None
+        b1 = max(1, pts[0][0] // 2)
+        if b1 == pts[0][0]:
+            return None                            # only one probeable point (base already 1)
+        _, pv1 = fits(b1)
+        if pv1 is None:
+            return None
+        pts.append((b1, pv1))
+        (x0, y0), (x1, y1) = pts
+        a = (y0 - y1) / (x0 - x1)
+        if a <= 0:
+            log(f"[autobatch] fit rejected: non-positive slope from {pts} — falling back to bisection")
+            return None
+        b_fit = y0 - a * x0
+        log(f"[autobatch] fit: {a/1e9:.3f} GB/sample, intercept {b_fit/1e9:.2f}GB "
+            f"(analytic persistent {_persistent_bytes()/1e9:.2f}GB) from B={x0},{x1}")
+        for _ in range(3):                         # predict -> confirm -> re-fit with the new point
+            pred = int((budget - b_fit) // a)
+            pred = max(1, min(pred, cap))
+            okp, pp = fits(pred)
+            if okp:
+                log(f"[autobatch] fit chose data.batch={pred} ({(pp or 0)/1e9:.1f}/{budget/1e9:.0f}GB reserved)")
+                return pred
+            if pp is None or pred <= 1:
+                break
+            a = (pp - y1) / max(1, pred - x1)      # re-fit against the newly measured over-budget point
+            if a <= 0: break
+            b_fit = pp - a * pred
+            log(f"[autobatch] batch {pred} over budget ({pp/1e9:.1f}GB) — re-fit to {a/1e9:.3f} GB/sample")
+        log("[autobatch] fit did not converge — falling back to bisection")
+        return None
+
+    _fb = _fit_predict()
+    if _fb is not None:
+        return done(confirm_compiled(_fb))
+    # ---- fallback: the original bracket-and-bisect search (unchanged behaviour) ---------------------------
     ok, p = fits(base)
     if not ok:
         # base itself is over budget (or OOM'd while probing -> p is None). DON'T return base — that would launch a
@@ -366,19 +524,19 @@ def autobatch_find(cfg, device, log=print) -> int:
                     if okm: lo2, pb = mid, pm
                     else: hi2 = mid
                 log(f"[autobatch] fits below base: data.batch={lo2} ({_pm(pb)} @ "
-                    f"{int(headroom*100)}% headroom; bisected in [{b}, {b*2}))")
+                    f"reserve {reserve/1e9:.0f}GB; bisected in [{b}, {b*2}))")
                 return done(confirm_compiled(lo2))
             log(f"[autobatch] batch {b} over budget ({_pm(pb)}) — halving")
             b //= 2
         raise RuntimeError(f"[autobatch] even batch 1 exceeds the {budget/1e9:.0f}GB budget — this model+F+recon_frac "
-                           f"does not fit; lower model.size / data.F / recon_frac (or raise data.autobatch_headroom).")
+                           f"does not fit; lower model.size / data.F / recon_frac (or lower data.autobatch_reserve_gb).")
     lo = hi = base
     while hi * 2 <= cap:                       # double to bracket [lo fits, hi over]
         ok, p = fits(hi * 2)
         if ok: lo = hi = hi * 2
         else: hi = hi * 2; break
     if lo == hi:                               # fit to the cap without going over
-        log(f"[autobatch] fits to cap: data.batch={lo} (VRAM {total/1e9:.0f}GB @ {int(headroom*100)}% headroom, cap {cap})")
+        log(f"[autobatch] fits to cap: data.batch={lo} (VRAM {total/1e9:.0f}GB, reserve {reserve/1e9:.0f}GB, cap {cap})")
         return done(confirm_compiled(lo))
     while hi - lo > 1:                          # bisect to EXACT resolution (was: multiples of 8, which on a
         mid = (lo + hi) // 2                    #   [8,16) bracket had no landing point at all and silently
@@ -386,8 +544,8 @@ def autobatch_find(cfg, device, log=print) -> int:
         ok, p = fits(mid)
         if ok: lo = mid
         else: hi = mid
-    log(f"[autobatch] chose data.batch={lo}  (VRAM {total/1e9:.0f}GB, budget {budget/1e9:.0f}GB @ "
-        f"{int(headroom*100)}% headroom; probed rollout_train fwd+decode+bwd)")
+    log(f"[autobatch] chose data.batch={lo}  (VRAM {total/1e9:.0f}GB, budget {budget/1e9:.0f}GB, "
+        f"reserve {reserve/1e9:.0f}GB; probed rollout_train fwd+decode+bwd)")
     return done(confirm_compiled(lo))
 
 

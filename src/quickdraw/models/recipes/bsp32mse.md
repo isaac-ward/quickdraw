@@ -124,10 +124,11 @@ which was itself too small for two reasons, both fixed 2026-08-18:
 
 Both now bisect at resolution 1. Peak memory is almost perfectly LINEAR in batch (slope 5.125 GB/sample,
 intercept 0.2 GB -- at 6.4M params the weights and Adam states are ~0.1 GB, so activations dominate entirely),
-so `batch ~= budget / slope` and the search lands exactly. Also do NOT pass
-`data.autobatch_headroom=0.35`: the conf default is 0.25, and the measured eval/allocator overhead above the
-training probe is only **+3.8 to +4.9 GB** across 8 healthy runs. At 0.25 that is a 5.3x margin and gives
-batch 14 for this config; 0.20 gives the same 14, so 0.25 is strictly better -- same batch, more safety.
+so `batch ~= budget / slope` and the search lands exactly. Do NOT pass `data.autobatch_headroom=...` -- that knob was DELETED on 2026-08-18 and any stale override now
+fails loudly. The margin is one absolute `data.autobatch_reserve_gb` (default 12), because the residual it
+covers (allocator growth over an epoch, evidenced at +12 GB) is an absolute quantity, not a fraction of
+whatever card you happen to have. Budgeting is now on RESERVED memory, and the eval phase is probed and
+reported separately at startup.
 
 ## Porting to a new dataset: what you MUST re-derive
 

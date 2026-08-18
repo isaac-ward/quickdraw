@@ -95,7 +95,7 @@ else: print('')" "$dir/checkpoints/config.resolved.yaml" 2>/dev/null)"
   local CMD=()
   for a in "${ARGV[@]}"; do
     [[ -n "$a" ]] || continue
-    case "$a" in data.batch=*|data.autobatch=*|data.autobatch_headroom=*|+resume=*) continue ;; esac
+    case "$a" in data.batch=*|data.autobatch=*|data.autobatch_reserve_gb=*|+resume=*) continue ;; esac
     CMD+=("$a")
   done
   CMD+=("data.autobatch=false" "data.batch=$batch" "+resume=$ck")

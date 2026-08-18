@@ -34,11 +34,18 @@ autobatch: true            # DEFAULT ON (2026-08-05): probe the AR step at start
                            #   largest that fits VRAM*(1-headroom). The AR step is dispatch-bound so bigger
                            #   batch is ~free throughput (accelerations.md Exp 8). Set false for controlled
                            #   A/Bs that need a FIXED batch. Resumes keep their original batch (never re-probed).
-autobatch_headroom: 0.25   # reserve fraction of VRAM for eval-phase spikes + near-ceiling allocator growth.
-                           #   Bumped 0.15->0.25 (2026-08-06): the probe now measures the REAL training loss +
-                           #   optimizer (faithful), but near the ceiling the allocator still fragments/grows over
-                           #   a full epoch (batch 112 probed 81GB then OOM'd at 93GB) — 0.25 leaves margin for
-                           #   that + eval. RAISE further if an eval OOMs (control/denoising spike above train).
+autobatch_reserve_gb: 12   # ABSOLUTE margin (GB) held back from VRAM: budget = total - this. REPLACED the old
+                           #   `autobatch_headroom` FRACTION on 2026-08-18. Two reasons the fraction was wrong:
+                           #   (1) it was covering two things that are now handled properly -- fragmentation is
+                           #   MEASURED (the probe budgets on max_memory_RESERVED, not allocated) and the eval
+                           #   phase is PROBED and reported (probe_eval); (2) the residual it still covers,
+                           #   allocator growth over a full epoch beyond a 2-iteration probe, is an ABSOLUTE
+                           #   quantity -- evidenced at +12 GB by "batch 112 probed 81GB then OOM'd at 93GB".
+                           #   A 12 GB spike is 12 GB whether the card is 40 GB or 100 GB; a 25% fraction is
+                           #   10 GB on one and 25 GB on the other, i.e. wrong on both.
+                           #   `autobatch_headroom` is deliberately GONE, not aliased, so any stale
+                           #   `data.autobatch_headroom=...` override fails loudly instead of silently doing
+                           #   nothing. RAISE this if a run OOMs late in an epoch; LOWER it to fill the card.
 autobatch_max: 512         # cap (memory usually binds first for image models; this bounds proprio-only runs).
 autobatch_base: 16         # smallest probe batch (assumed to fit).
 workers: 16    # image mp4-decode is CPU-heavy; too few workers starves the GPU (low util). 80 cores here.
