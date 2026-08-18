@@ -94,7 +94,8 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
         # [0,1] nor higher-is-better). psnr_frozen used to share the top panel and was removed 2026-08-18 --
         # it was a per-DATASET constant (10.89 dB at 128px, 10.76 at 256px), not a per-run metric.
         log_error_curves(writer, routine, d["icurves"], step, head=head,
-                         split_top={"psnr"}, split_bottom={"lpips", "motion_ratio"},
+                         split_top={"psnr"}, split_bottom={"motion_ratio"},   # motion_ratio ALONE (unbounded
+                         #   ratio); lpips falls through to the middle panel with ssim/mse/l1 (user, 2026-08-18)
                          colors={"psnr": "red", "lpips": "purple",
                                  "motion_ratio": "green"})
     rich = wants_diagnostics(env)

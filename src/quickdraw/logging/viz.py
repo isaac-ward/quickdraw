@@ -413,12 +413,17 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
     incompatible ranges are not squashed together:
 
       TOP     `split_top`     unbounded, own units          (psnr, dB)
-      MIDDLE  everything else bounded [0,1]                 (ssim, mse, l1)  -> ylim pinned to [0,1] on linear
-      BOTTOM  `split_bottom`  unbounded, DIFFERENT direction (lpips, lower-is-better) -> floors at 0, grows
+      MIDDLE  everything else, ~[0,1]                       (ssim, mse, l1, lpips) -> ylim [0, max(1, data)]
+      BOTTOM  `split_bottom`  unbounded ratio               (motion_ratio) -> floors at 0, grows
 
-    LPIPS gets its own panel rather than sharing the bounded one: it is unbounded above (it exceeds 1 exactly
-    on the badly-wrong predictions worth seeing, which a [0,1] axis would clip) and it runs the OPPOSITE
-    direction to ssim, so overlaying them invites misreading. Any empty group is dropped. Captions (per-curve
+    GROUPING CHANGED 2026-08-18 (user): motion_ratio gets the bottom panel to ITSELF and lpips joins the
+    ssim/mse/l1 panel. motion_ratio is the one that genuinely needs its own axis -- it is a RATIO with no upper
+    bound (2.06 and 1.17 have both been logged, and a diverged model scores HIGHER on it), so sharing an axis
+    with anything bounded squashes the bounded curves. lpips sits in ~[0,1] in practice (0.34-0.84 across every
+    run measured here), so it reads fine alongside the others; the middle panel's limit is FLOORED at 1 rather
+    than pinned to it so an lpips excursion above 1 still shows. Note the middle panel mixes directions
+    (ssim higher-better; mse/l1/lpips lower-better) -- it already did, since mse and l1 live there.
+    Any empty group is dropped. Captions (per-curve
     CAPTIONS, plus a free-form `caption`) render below the axes."""
     top = set(split_top or ()) & set(errors)
     bot = (set(split_bottom or ()) & set(errors)) - top
@@ -456,9 +461,13 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
     ax_bottom = panels[-1][0]
     if yscale == "linear":
         for (ax_, keys), kind in zip(panels, kinds):
-            if kind == "mid" and len(panels) > 1:                # ssim/mse/l1 are genuinely bounded -> pin [0,1]
-                ax_.set_ylim(0, 1)
-            elif kind == "bottom":                               # lpips: floor at 0, grow only if a curve needs it
+            if kind == "mid" and len(panels) > 1:                # ssim/mse/l1 are genuinely bounded -> [0,1]...
+                # ...but floor the LIMIT at 1 rather than PINNING to it (2026-08-18): lpips now shares this panel
+                # and is only *usually* under 1 -- it exceeds 1 on the badly-wrong predictions that are the whole
+                # point of looking. ssim/mse/l1 never exceed 1, so for them this is still exactly [0,1].
+                _hi = max([float(np.nanmax(errors[k])) for k in keys if len(errors[k])] or [1.0])
+                ax_.set_ylim(0, max(1.0, _hi * 1.05))
+            elif kind == "bottom":                               # motion_ratio: floor at 0, grow if a curve needs it
                 _hi = max([float(np.nanmax(errors[k])) for k in keys if len(errors[k])] or [1.0])
                 ax_.set_ylim(0, max(1.0, _hi * 1.05))
     # vlines: {color: [step indices]} -> dotted verticals marking events (e.g. goal switches), on the bottom panel
