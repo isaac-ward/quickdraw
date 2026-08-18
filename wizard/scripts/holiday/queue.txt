@@ -1,0 +1,35 @@
+# QUEUE for the non-pretrained (bespoke) FLOW image-decoder program. One line per config:
+#   <expname>|<extra hydra overrides>
+# Popped top-down onto whichever GPU is free. Every line inherits BASE in orchestrator.sh:
+#   pretrained=false, encode_arch=conv, decode_kind=flow, decode_arch=unet, latent_loss_weight=10,
+#   latent_norm=layernorm, 128px, subsample=5, F=64, 40 epochs.
+# Judged at epoch 15 (see judge() in orchestrator.sh); KILLED and skipped if it clearly is not working.
+#
+# ORDER = expected value. The binding constraint is the codec floor: anch128 held 24.4 dB (SNR 1.43x) and
+# STILL showed no motion, while the only historical bespoke measurement is ~15 dB. So a bespoke arm has to
+# find ~+9 dB over history just to reach a configuration that already failed. The two axes that could do
+# that are LESS COMPRESSION (num_tokens) and AE CAPACITY (encode_base/decode_base) -- hence the ordering.
+#
+# ---- 2026-08-18, after reviewing the first pass. bsp32mse is the winner: OL image PSNR 14.25 (best of ALL
+# 14 runs incl. pretrained), LPIPS 0.390 vs 0.525-0.542 for every pretrained arm, motion 0.331 (2x pretrained)
+# and RISING with training rather than collapsing, LPIPS still falling and the codec floor still climbing when
+# the old judge killed it at ep15. These two run it to 50 epochs as a clean ONE-VARIABLE comparison:
+#   A = the exact winning config, longer  -> the control, establishes its real ceiling
+#   B = A + decode_base 32->64            -> decoder capacity, the never-tested axis (bsp32wide died at ep0
+#                                            to a prefix-kill bug of mine, so this has never actually run)
+# recon_frac stays 0.25 in BOTH: raising it would be a second variable AND could push autobatch below batch 8,
+# making it a third. It is the next experiment, not part of this one.
+bsp32mse_long|model.modalities.1.num_tokens=32 model.modalities.1.decode_kind=mse
+bsp32mse_sharp|model.modalities.1.num_tokens=32 model.modalities.1.decode_kind=mse model.modalities.1.decode_base=64
+bsp32|model.modalities.1.num_tokens=32
+bsp32wide|model.modalities.1.num_tokens=32 model.modalities.1.encode_base=64 model.modalities.1.decode_base=64
+bsp8|model.modalities.1.num_tokens=8
+bsp16|model.modalities.1.num_tokens=16
+bsp32none|model.modalities.1.num_tokens=32 model.latent_norm=none
+bsp32mse|model.modalities.1.num_tokens=32 model.modalities.1.decode_kind=mse
+bsp32llw30|model.modalities.1.num_tokens=32 model.modalities.1.latent_loss_weight=30
+bsp32vit|model.modalities.1.num_tokens=32 model.modalities.1.decode_arch=vit
+bsp32deep|model.modalities.1.num_tokens=32 model.modalities.1.ae_depth=6
+bsp32widest|model.modalities.1.num_tokens=32 model.modalities.1.encode_base=96 model.modalities.1.decode_base=96
+bsp64|model.modalities.1.num_tokens=64
+bsp32sub8|model.modalities.1.num_tokens=32 data.subsample=8

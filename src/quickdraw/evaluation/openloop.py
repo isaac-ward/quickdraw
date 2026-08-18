@@ -46,7 +46,7 @@ def _lpips_net(device):
 
 
 def image_curves(pred, true):
-    """Per-timestep IMAGE metrics -> {psnr, ssim, mse, l1, lpips, psnr_frozen, motion_ratio}, each a (H,) numpy
+    """Per-timestep IMAGE metrics -> {psnr, ssim, mse, l1, lpips, motion_ratio}, each a (H,) numpy
     array. pred/true: (N, H, s, s, 3) in [0,1] (caller clamps pred). SHARED by eval_ood_horizon (rollout preds)
     and eval_ae_floor (encode->decode recon) -- the arithmetic is bit-for-bit the same in both.
 
@@ -54,9 +54,8 @@ def image_curves(pred, true):
     would score respectably while modelling nothing at all. The last three keys exist to catch that:
       lpips        perceptual distance (LOWER better). Rises with blur even when MSE does not, separating
                    "hedging toward the mean frame" from "confidently wrong".
-      psnr_frozen  PSNR of holding frame 0 for the whole rollout -- the do-nothing baseline. psnr must stay
-                   ABOVE it or no change is being predicted. Also reads as difficulty: a static scene has a
-                   high psnr_frozen, so beating it is the real bar.
+      (psnr_frozen was REMOVED 2026-08-18 at the user's request -- do not re-add it. It was a per-DATASET
+       constant, not a per-run metric, and its @+1 reading was off by one.)
       motion_ratio ||pred_t - pred_{t-1}|| / ||true_t - true_{t-1}||. 1 = right amount of motion, <1 =
                    under-predicting it (drifting toward a frozen scene), >1 = jitter. This is the one metric
                    that separates "blurry but moving" from "sharp but static"; the others conflate them.
@@ -78,16 +77,13 @@ def image_curves(pred, true):
         # the net is cached for the process, so without this the state grows without bound on the eval device.
         lp.reset()
 
-    frozen = true[:, :1].expand_as(true)                                   # the do-nothing prediction
-    fz = [float(torch.mean((frozen[:, t] - true[:, t]) ** 2)) for t in range(H)]
-    frozen_s = np.array([-10.0 * np.log10(max(m, 1e-12)) for m in fz])
     dp = [float(torch.mean((pred[:, t] - pred[:, t - 1]) ** 2)) ** 0.5 for t in range(1, H)]
     dt_ = [float(torch.mean((true[:, t] - true[:, t - 1]) ** 2)) ** 0.5 for t in range(1, H)]
     ratio = np.array([p / max(q, 1e-12) for p, q in zip(dp, dt_)])
     ratio = np.concatenate([ratio[:1], ratio]) if len(ratio) else np.ones(H)   # t=0 has no delta -> repeat t=1
 
     out = {"psnr": np.array(psnr_s), "ssim": np.array(ssim_s), "mse": np.array(mse_s), "l1": np.array(l1_s),
-           "psnr_frozen": frozen_s, "motion_ratio": ratio}
+           "motion_ratio": ratio}
     if lp_s:
         out["lpips"] = np.array(lp_s)          # LOWER is better (unlike psnr/ssim)
     assert all(len(v) == H for v in out.values()), \

@@ -90,11 +90,12 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
     title_fn = title_fn or (lambda i: f"{routine} #{i}")
     log_error_curves(writer, routine, curves, step, head="proprio")        # proprio averaged curves + scalars
     for head, d in (images or {}).items():                                 # per image head, mirrored (PSNR split top)
-        # psnr_frozen shares the TOP panel with psnr (same dB units) so "do we beat a frozen scene?" is one
-        # glance. lpips + motion_ratio share the BOTTOM panel (neither is bounded [0,1] nor higher-is-better).
+        # psnr owns the TOP panel (dB units); lpips + motion_ratio share the BOTTOM panel (neither is bounded
+        # [0,1] nor higher-is-better). psnr_frozen used to share the top panel and was removed 2026-08-18 --
+        # it was a per-DATASET constant (10.89 dB at 128px, 10.76 at 256px), not a per-run metric.
         log_error_curves(writer, routine, d["icurves"], step, head=head,
-                         split_top={"psnr", "psnr_frozen"}, split_bottom={"lpips", "motion_ratio"},
-                         colors={"psnr": "red", "psnr_frozen": "grey", "lpips": "purple",
+                         split_top={"psnr"}, split_bottom={"lpips", "motion_ratio"},
+                         colors={"psnr": "red", "lpips": "purple",
                                  "motion_ratio": "green"})
     rich = wants_diagnostics(env)
     # Generic (geometry-free) proprio TRAJECTORY plots for a non-torus env — only when position_idx is EXPLICIT
