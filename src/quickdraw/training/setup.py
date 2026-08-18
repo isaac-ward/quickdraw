@@ -347,15 +347,28 @@ def autobatch_find(cfg, device, log=print) -> int:
         # base itself is over budget (or OOM'd while probing -> p is None). DON'T return base — that would launch a
         # run doomed to OOM at epoch 0 (this is exactly what small+F64+unet-decode hit on 2026-08-06). Step DOWN,
         # halving, until a batch fits; only then return it (compiled-confirmed).
-        log(f"[autobatch] base batch {base} over budget ({(p or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — searching below base")
+        _pm = lambda v: "OOM while probing" if v is None else f"{v/1e9:.1f}/{budget/1e9:.0f}GB"
+        log(f"[autobatch] base batch {base} over budget ({_pm(p)}) — searching below base")
         b = base // 2
         while b >= 1:
             okb, pb = fits(b)
             if okb:
-                log(f"[autobatch] fits below base: data.batch={b} ({(pb or 0)/1e9:.1f}/{budget/1e9:.0f}GB @ "
-                    f"{int(headroom*100)}% headroom)")
-                return done(confirm_compiled(b))
-            log(f"[autobatch] batch {b} over budget ({(pb or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — halving")
+                # BISECT UPWARD (fix 2026-08-18). This branch used to RETURN the first halving that fit, with no
+                # upward search -- so a base of 16 that did not fit landed on 8 and never tried 9..15. Measured
+                # cost: bsp32mse_long probed 82.2GB at batch 16 and 41.2GB at batch 8, so it ran at 41 of a 65GB
+                # budget (32% of a 95.8GB card) at 61% GPU utilisation, dispatch-bound, for want of ~batch 12.
+                # The base-FITS branch below always bisected properly; only this one did not. Granularity 1 here
+                # because the interesting range (8..16) contains no multiple of 8 to bisect to.
+                lo2, hi2 = b, b * 2                       # lo2 fits, hi2 does not
+                while hi2 - lo2 > 1:
+                    mid = (lo2 + hi2) // 2
+                    okm, pm = fits(mid)
+                    if okm: lo2, pb = mid, pm
+                    else: hi2 = mid
+                log(f"[autobatch] fits below base: data.batch={lo2} ({_pm(pb)} @ "
+                    f"{int(headroom*100)}% headroom; bisected in [{b}, {b*2}))")
+                return done(confirm_compiled(lo2))
+            log(f"[autobatch] batch {b} over budget ({_pm(pb)}) — halving")
             b //= 2
         raise RuntimeError(f"[autobatch] even batch 1 exceeds the {budget/1e9:.0f}GB budget — this model+F+recon_frac "
                            f"does not fit; lower model.size / data.F / recon_frac (or raise data.autobatch_headroom).")

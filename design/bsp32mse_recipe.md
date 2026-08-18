@@ -62,7 +62,7 @@ model.modalities.1.encode_base=32 model.modalities.1.decode_base=32
 model.modalities.1.latent_loss_weight=10   # round-trip anchor; see below
 data.F=64
 data.subsample=5                        # <-- MUST be re-derived per dataset, see below
-data.autobatch=true data.autobatch_headroom=0.35
+data.autobatch=false data.batch=8       # <-- PIN IT. See "reproducibility across machines" below.
 trainer.max_epochs=50 trainer.check_val_every_n_epoch=1
 ```
 
@@ -91,6 +91,20 @@ loss for the SAME encoder/decoder parameters. At weight 1.0 it was **1% of the o
 term 80x larger**, and the codec eroded 3.55 dB in 4 epochs, which cancelled the whole benefit of
 subsampling. At 10 the erosion was 0.40 dB over 9 epochs. **Rule: raise it whenever the dynamics loss grows
 or `codec/roundtrip_*` climbs.**
+
+## Reproducibility across machines: PIN THE BATCH
+
+`data.autobatch=true` sizes the batch to fill *this* GPU, which makes the effective config **hardware
+dependent** -- a different card picks a different batch, and batch size is a training variable, so the run
+will not reproduce. The measured runs used **batch 8** on a 95.8 GB card. Pin `data.autobatch=false
+data.batch=8` to reproduce them, and only raise it deliberately.
+
+If you do let autobatch choose, note it under-fills: its below-base branch used to halve from `autobatch_base`
+and return the first batch that fit, with no upward search, so a base of 16 that did not fit landed on 8 and
+never tried 9..15. Measured on this config: 82.2 GB at batch 16, 41.2 GB at batch 8 -- so it ran at 41 of a
+65 GB budget, 43% of the card, at 61% GPU utilisation (the AR step is dispatch-bound, so a small batch wastes
+compute as well as memory). Fixed 2026-08-18 to bisect upward, which picks batch 12 (~62 GB) for this config.
+The two runs in flight deliberately keep batch 8 for comparability with the original measurement.
 
 ## Porting to a new dataset: what you MUST re-derive
 
