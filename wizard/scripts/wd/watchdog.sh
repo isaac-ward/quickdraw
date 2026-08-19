@@ -75,10 +75,14 @@ alive() {   # any training process pinned to this GPU index
 resume_arm() {
   local gpu="$1" name="${RUN[$1]}" dir ck batch
   dir="$(run_dir_for "$name")"
-  # NEWEST last*.ckpt, not the literal last.ckpt. Verified 2026-08-12: resuming into an existing
-  # checkpoints/ dir makes Lightning write its rolling checkpoint as last-v1.ckpt (then -v2, ...) and
-  # leaves last.ckpt FROZEN at the pre-resume epoch. Hardcoding last.ckpt would make the 2nd resume
-  # rewind to the 1st resume's starting point and re-lose the same epochs on every retry.
+  # NEWEST last*.ckpt, not the literal last.ckpt -- kept as belt-and-braces, but the REASON I gave on
+  # 2026-08-12 was WRONG and an audit on 2026-08-19 refuted it. I observed last-v1.ckpt appearing and
+  # last.ckpt frozen, and concluded that is what a resume does. It is not: that is an artifact of
+  # resuming a MOVED/COPIED run dir. ModelCheckpoint restores best_model_score/last_model_path only if
+  # its dirpath EQUALS the one in the checkpoint (lightning model_checkpoint.py:556-572), so on a moved
+  # dir the state is lost AND the version counter bumps. Measured in place: the rolling file is REUSED
+  # (no -v2), last.ckpt untouched, and the monitor restores as a real number (0.26734) instead of nan.
+  # So pass the resume path ABSOLUTE and matching the original, or top-k/best tracking silently resets.
   # NOT epoch=*.ckpt: those are ModelCheckpoint's top-k by val metric, so the highest-numbered one can
   # be stale (the dead tfz_act run held only epoch=0 after dying in epoch 1). last* is the rolling one.
   ck="$(ls -t "$dir"/checkpoints/last*.ckpt 2>/dev/null | head -1)"
@@ -95,7 +99,11 @@ else: print('')" "$dir/checkpoints/config.resolved.yaml" 2>/dev/null)"
   local CMD=()
   for a in "${ARGV[@]}"; do
     [[ -n "$a" ]] || continue
-    case "$a" in data.batch=*|data.autobatch=*|data.autobatch_reserve_gb=*|+resume=*) continue ;; esac
+    case "$a" in data.batch=*|data.autobatch=*|data.autobatch_reserve_gb=*|data.autobatch_headroom=*|+resume=*) continue ;; esac
+    #   autobatch_headroom is KEPT in this filter even though the knob was DELETED on 2026-08-18: any argv
+    #   captured BEFORE that deletion still carries `data.autobatch_headroom=0.35`, and hydra now REJECTS it
+    #   ('not in struct'), so a replay that does not strip it dies at composition. Both currently-live runs
+    #   carry exactly that token. Renaming the knob silently broke this filter until an audit caught it.
     CMD+=("$a")
   done
   CMD+=("data.autobatch=false" "data.batch=$batch" "+resume=$ck")

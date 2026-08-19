@@ -285,11 +285,16 @@ part. It now adds the routine to `_disabled`, logs one loud line + `eval/disable
   - **A naive resume OOMs instantly.** `train_world_model` skips autobatch on resume but nothing re-injects
     the chosen batch, so `data.batch` falls back to the config default of **1024** against a chosen 32. The
     watchdog reads the chosen value out of `config.resolved.yaml` and refuses to resume if it can't.
-  - **`last.ckpt` goes stale after a resume.** Lightning writes the rolling checkpoint as `last-v1.ckpt`
-    (then `-v2`) and leaves `last.ckpt` frozen at the pre-resume epoch, so resuming from the literal
-    `last.ckpt` would rewind to the previous resume's start and re-lose the same epochs every retry. Takes
-    the newest `last*.ckpt`. Not `epoch=*.ckpt` — those are top-k by val metric and can be stale (the dead
-    `tfz_act` held only `epoch=0` after dying in epoch 1).
+  - **`last.ckpt` goes stale after a resume.** ~~Lightning writes the rolling checkpoint as `last-v1.ckpt`
+    (then `-v2`) and leaves `last.ckpt` frozen at the pre-resume epoch.~~ **REFUTED 2026-08-19 by audit.**
+    That only happens when the run dir was MOVED or COPIED. `ModelCheckpoint` restores
+    `best_model_score`/`last_model_path` only if its `dirpath` EQUALS the one stored in the checkpoint
+    (lightning `model_checkpoint.py:556-572`); on a moved dir that state is lost, which is both why the
+    score read `nan` and why the version counter bumped to `-v1`. Measured IN PLACE: the rolling file is
+    REUSED (no `-v2`), `last.ckpt` is untouched, and the monitor restores as a real number (0.26734).
+    **The real lesson is the opposite one: pass the resume path ABSOLUTE and identical to the original, or
+    top-k and best-checkpoint tracking silently reset.** Taking the newest `last*.ckpt` is still kept as
+    cheap insurance. Not `epoch=*.ckpt` — those are top-k by val metric and can be stale.
   - Verified end-to-end: a resume of a **copy** of the dead run restored to epoch 1, wrote
     `epoch=1-step=7585.ckpt` (7582 + 3 limited batches — the step counter restores), exit 0. It also
     OOM'd `manifold` (8.07 GiB in one allocation, the largest of any routine) because the test shared a
