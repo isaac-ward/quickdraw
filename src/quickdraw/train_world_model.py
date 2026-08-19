@@ -85,8 +85,20 @@ def _assert_summary_unique(summary_text, cfg, root=None) -> None:
                 "only for a deliberate exact rerun).")
 
 
+def _cli_overrides():
+    """The hydra task overrides the caller actually typed (so a resume can tell 'unset' from 'explicitly set')."""
+    try:
+        from hydra.core.hydra_config import HydraConfig
+        return list(HydraConfig.get().overrides.task)
+    except Exception:
+        return []
+
+
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
 def main(cfg):
+    # Seed FIRST, before anything draws a random number (model init happens in build_model far below, but the
+    # autobatch probe builds a throwaway model too). workers=True also seeds dataloader workers.
+    L.seed_everything(int(cfg.get("seed", 0) or 0), workers=True)
     torch.set_float32_matmul_precision("high")
     # Safety net for dynamo recompiles: the rollout/eval flex-attention paths can produce several mask
     # variants; a too-small cache (default 8) evicts and thrashes. The fixed-window rollout already
@@ -137,6 +149,22 @@ def main(cfg):
     if not resume and bool(cfg.data.get("autobatch", True)) and torch.cuda.is_available():
         cfg.data.batch = int(autobatch_find(cfg, torch.device("cuda"), log=lambda m: _startup_log(run_dir, m)))
         OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))  # record chosen batch
+    elif resume:
+        # A RESUME KEEPS ITS ORIGINAL BATCH -- which the comment above always claimed but nothing implemented
+        # (fixed 2026-08-18). autobatch is skipped on resume regardless of data.autobatch, so cfg.data.batch fell
+        # through to the CONFIG DEFAULT (1024 in conf/data/torus.yaml) while the run had actually trained at e.g.
+        # 8, and the resume OOM'd instantly. The chosen batch was already recorded in config.resolved.yaml by the
+        # branch above ("record chosen batch") -- it was written and never read back. Read it back.
+        # An explicit `data.batch=` on the resume command still wins: this only fills in when the caller did not
+        # say, which is exactly when guessing 1024 was doing damage.
+        _rc = os.path.join(run_dir, "checkpoints", "config.resolved.yaml")
+        if os.path.exists(_rc) and not any(str(o).startswith("data.batch=") for o in _cli_overrides()):
+            _saved = OmegaConf.load(_rc).data.get("batch", None)
+            if _saved is not None and int(_saved) != int(cfg.data.batch):
+                print(f"[train] resume: restoring data.batch={int(_saved)} from config.resolved.yaml "
+                      f"(was {int(cfg.data.batch)} from the config default -- autobatch does not re-probe on "
+                      f"resume, so without this the run would train at the wrong batch or OOM)", flush=True)
+                cfg.data.batch = int(_saved)
 
     _t = time.perf_counter()
     _startup_log(run_dir, "[startup] loading dataset (GPU-resident windows) + normalizer...")

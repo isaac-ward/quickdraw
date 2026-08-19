@@ -36,12 +36,15 @@ COMMON="data.root=$DATA data.repo_id=robocasa-scene4-4h data.cam=robot0_agentvie
 probe_one () {  # $1=label  $2=old_batch  $3...=overrides
   local label="$1" old="$2"; shift 2
   echo; echo "==================== $label   (old choice: batch $old) ===================="
-  docker compose exec -T -e CUDA_VISIBLE_DEVICES=0 -e WANDB_MODE=disabled app uv run python - "$@" <<'PY' 2>&1 | grep -E "autobatch|CHOSE|persistent|ERROR"
-import sys, torch, hydra
-from omegaconf import OmegaConf
+  docker compose exec -T -e CUDA_VISIBLE_DEVICES=0 -e WANDB_MODE=disabled app uv run python - "$@" <<'PY' 2>&1 | grep -E "autobatch|CHOSE|persistent|Error|Traceback|Exception|error"
+import sys, torch
+# initialize_config_dir with an ABSOLUTE path: a relative config_path resolves against the CALLING FILE, and a
+# stdin script has none, so `../../conf` became `/conf` and every probe died with MissingConfigException --
+# which the old grep filter then swallowed, printing nothing at all.
+from hydra import initialize_config_dir, compose
 ov = sys.argv[1:]
-with hydra.initialize(config_path="../../conf", version_base=None):
-    cfg = hydra.compose(config_name="config", overrides=ov)
+with initialize_config_dir(config_dir="/app/conf", version_base=None):
+    cfg = compose(config_name="config", overrides=ov)
 from quickdraw.training.setup import autobatch_find
 b = autobatch_find(cfg, torch.device("cuda"), log=print)
 print(f"CHOSE data.batch={b}")
