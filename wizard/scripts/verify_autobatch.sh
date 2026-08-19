@@ -29,7 +29,11 @@ if [ "${FORCE:-0}" != "1" ]; then
 fi
 
 DATA=/caches/hf/hub/datasets--isaac-ronald-ward--robocasa-scene4-4h/snapshots/5a3df71eb0b7d9ecbf1a7ada843da026d4bc0785
-COMMON="data.root=$DATA data.repo_id=robocasa-scene4-4h data.cam=robot0_agentview_left data.subsample=5 data.F=64
+# eval.horizon MUST be passed: without it the config default of 2048 applies, the eval probe falls back to its
+# own cap of 256, and it reports ~91GB for a config whose real eval costs ~32GB allocated at horizon 128. That
+# omission is what made me wrongly call the probe untrustworthy.
+COMMON="eval.horizon=128 eval.closed_loop_steps=[1,16]
+        data.root=$DATA data.repo_id=robocasa-scene4-4h data.cam=robot0_agentview_left data.subsample=5 data.F=64
         environments=recorded environments.obs_dim=16 environments.action_dim=12 environments.position_idx=[7,8,9]
         model.action_dim=12 model.modalities.0.dim=16"
 

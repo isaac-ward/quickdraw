@@ -311,7 +311,7 @@ class LoggingCallback(L.Callback):
         # useless for attributing memory to a phase or for sizing a budget.
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        self._mem_train = None      # cleared so a NON-eval epoch cannot log last epoch's stale split
+        self._mem_trainval = None   # cleared so a NON-eval epoch cannot log last epoch's stale split
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         if trainer.current_epoch == 0 and batch_idx == 0 and self._t_b0 is None:
@@ -402,12 +402,13 @@ class LoggingCallback(L.Callback):
         m = pl_module.model
         was_training = m.training
         m.eval()
-        # Close the TRAIN window, open the INFERENCE one. Everything after this point until
-        # on_validation_epoch_end is eval routines + the validation loop -- both no_grad, and the val loop is a
-        # real consumer too (an autoregressive val pass over hundreds of batches), so they are measured together
-        # as the "not training" phase. That MAX is what a memory budget has to clear alongside training.
+        # Close the TRAIN+VAL window, open the EVAL-ROUTINE one. NOTE THE ORDER (fixed 2026-08-19): Lightning
+        # runs the validation loop INSIDE the training epoch, so on_validation_epoch_end fires BEFORE this hook.
+        # My first attempt recorded the split here but LOGGED it there, so the value was always None and the
+        # split keys never appeared at all -- caught by a diagnostic run, not by reading the code. The scalars
+        # are therefore written at the END of this hook (below), once both windows have actually been measured.
         if torch.cuda.is_available():
-            self._mem_train = (torch.cuda.max_memory_allocated() / 1e9, torch.cuda.max_memory_reserved() / 1e9)
+            self._mem_trainval = (torch.cuda.max_memory_allocated() / 1e9, torch.cuda.max_memory_reserved() / 1e9)
             torch.cuda.reset_peak_memory_stats()
         t_eval = time.perf_counter()
         try:
@@ -464,6 +465,17 @@ class LoggingCallback(L.Callback):
         finally:
             m.train(was_training)
         self._eval_cum += time.perf_counter() - t_eval
+        # Both windows are now measured: train+val (captured above) and the eval routines (the counter since).
+        if torch.cuda.is_available() and getattr(self, "_mem_trainval", None) is not None:
+            ta, tr = self._mem_trainval
+            # ALLOCATED is the only per-window-meaningful figure. reset_peak_memory_stats() rebases the peak
+            # counters, but the allocator's RESERVED pool does not shrink -- so max_memory_reserved() for the
+            # second window immediately reports the pool the first window already grew, and the two windows read
+            # identically (measured: train+val 63.7 and eval-routines 63.7 reserved, while allocated was 63.5 vs
+            # 32.1). The reserved figures are kept for the FIRST window only, where they are honest.
+            self.writer.scalars({"mem/peak_trainval_gb": ta, "mem/peak_trainval_reserved_gb": tr,
+                                 "mem/peak_evalroutines_gb": torch.cuda.max_memory_allocated() / 1e9},
+                                step=epoch)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -488,13 +500,9 @@ class LoggingCallback(L.Callback):
         if torch.cuda.is_available():
             metrics["mem/peak_gb"] = torch.cuda.max_memory_allocated() / 1e9          # this window only, not the process
             metrics["mem/peak_reserved_gb"] = torch.cuda.max_memory_reserved() / 1e9  # RESERVED is what OOMs, not allocated
-            mt = getattr(self, "_mem_train", None)
-            if mt is not None:
-                metrics["mem/peak_train_gb"], metrics["mem/peak_train_reserved_gb"] = mt
-                # the inference window (eval routines + val loop); mem/peak_* above IS that window
-                metrics["mem/peak_infer_gb"] = metrics["mem/peak_gb"]
-                metrics["mem/peak_infer_reserved_gb"] = metrics["mem/peak_reserved_gb"]
-                metrics["mem/train_vs_infer_reserved_gb"] = mt[1] - metrics["mem/peak_reserved_gb"]
+            # mem/peak_* here covers TRAIN + VAL (the counter is reset at on_train_epoch_start and this hook
+            # fires before on_train_epoch_end). The train+val / eval-routine SPLIT is written by
+            # on_train_epoch_end instead, because only it runs after both windows exist.
         self.writer.scalars(metrics, step=epoch)
 
     def on_fit_end(self, trainer, pl_module):
