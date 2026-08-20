@@ -355,3 +355,69 @@ Eval suite = smoke-validated only (ae_floor + ood_horizon + manifold; denoising 
 flags); relative/obs_keep/mse affect inference, anchor + physical-loss are TRAINING-ONLY (no inference effect).
 LESSON (rt10): never `pkill -f` on a name that's a PREFIX of another (`coop_ego13_rt1` matched `..._rt10`) — use
 exact match.
+
+## Finding 6 (08-20) — the control failure is WM model-exploitation; a residual-PHYSICS proprio WM is the fix
+
+MPPI overshoots because it maximizes reward on the WM's IMAGINED rollout, and the black-box WM mis-learns the
+action-response (open-loop plots: the y/cross-track axis goes the WRONG way). It then commits to actions that move
+reality the opposite way. Reward shaping is downstream noise; the lever is the WM's action-response fidelity.
+
+**Verified the chaser dynamics against the ground-truth sim CODE** (`outofthisworldmodel-envs/.../envs/
+iss_numerical/dynamics.py`), not just data:
+- **Thrust is EXACT**: line 416 `accel_chaser += rotate_body_to_world(q_bi, u[0:3]) / mass` == `a = R(q)·F/m`,
+  `q_bi=[w,x,y,z]` body→ECI, `mass=cfg.physics.mass=12000`. Data-fit agreed: cos 0.996, magratio 1.00.
+- **NOT Clohessy-Wiltshire**: the env integrates BOTH chief+chaser as full ECI states (zonal J2–J6 + third-body
+  sun/moon + drag, RK4) and DIFFERENCES them; the obs is the LVLH `relative_view`. CW is only the linearization of
+  that relative motion → **CW dropped**; the residual learns the (near-linear) relative orbital drift itself.
+- **Attitude**: `q̇ = ½ q⊗ω` (line 431); obs quat is body→world (q_bw), rates are ω_rel.
+- **Subsampled (sub=5)**: `Δv = R(q)·(F_summed/mass)·raw_dt` (raw_dt 0.05); `p' = p + v'·dt_eff` (dt_eff=sub·raw_dt=0.25).
+
+**#14 fixed**: `absolutize_proprio` de-relativization forced fp32 (was bf16 → ~1 m quantization on the ~100s-of-m
+absolute position, which capped proprio error AND fed MPPI coarse states).
+
+## Experiments 08-20 — physics-prior proprio WM (residual-physics), coop + noncoop
+
+Recipe (all): mm_flow single proprio modality dim 13, d128 depth4 heads8 window32, `latent_norm=layernorm`
+(REQUIRED for bespoke), `relative_position=true` scale [0.107,0.133,0.113], anchor `latent_loss_weight=10`,
+subsample 5, F 64, batch 256 (autobatch off), cam=fpv (proprio-only loader skips frames), manifold off, 10 epochs.
+Physics ON = `+environments.dynamics_prior=true +environments.quat_idx=[6,7,8,9]` (bodyrate idx auto-derived
+[10,11,12]); gated in `owm_physics.py`, byte-identical off. eval OL horizon 128, closed-loop {1,16}. Launcher:
+scratchpad `launch_proprio.sh` (`GPU=<n> DATA=<dataset> bash launch_proprio.sh EXP FOURIER PHYSICS <5 summaries>`).
+
+| run | data | phys | fourier | extras | result |
+|---|---|---|---|---|---|
+| A_baseline | coop | off | off | — | val_ptw→3.03; eval OL 10.43 (black-box) |
+| B_fourier | coop | off | 8 | — | worse (fourier HURTS): OL 10.96, ptw 3.36 |
+| C_physics (v1) | coop | on | off | thrust-only, teacher-forced loss | best of the 4; OL 9.78 (BB); **chained** OL **2.94**, cl1 **0.066**, cl16 **0.072** (tracks GT on x/z; y plateaus = thrust-only) |
+| D_physicsfourier | coop | on | 8 | — | fourier hurts again: OL 10.98, ptw 3.76 |
+| **C2** (v2) | coop | on | off | **+attitude kinematics +p_tf-chained loss** | RUNNING (GPU0). val_phys 32.9→0.25→0.065→0.050 (ep0-3) |
+| **C2_noncoop** | noncoop | on | off | same as C2 | RUNNING (GPU1) — for MPPI benchmark's evasive-target scenario |
+
+**Two fixes over C_physics v1 (→ C2):** (a) BAKE exact attitude kinematics `q'=q⊗exp(½ω dt)` — verified on data
+**0.006°/step vs 0.42° copy (49×)**; (b) p_tf-RESPECTING chained physics loss (`physics_proprio_chained`): the
+residual trains on the SAME autoregressive compounding regime the eval rollout uses, closing the
+teacher-forced-train / AR-eval exposure gap that left C_physics-v1's y-axis plateauing.
+
+**C2 is a PHYSICS-CHAIN-ONLY model.** With the weight-1.0 physics loss the model routes proprio accuracy through
+the physics chain, so the black-box latent decoder degrades: `val_ptw` (pointwise err via the black-box decode,
+NOT the physics path) 22→17→12→6.5 while ABCD sit ~3. This is FINE — MPPI uses the physics chain. The metrics that
+matter are `val/loss/physics/proprio` (the AR physics-chain rollout error, normalized) and the physics-chained
+`eval_ood_horizon` (meters; fires at epochs 5 and 9). `val_ptw` is a red herring for physics models — and
+`checkpoint_metric=pointwise_error` selects best.ckpt on it, so for MPPI use the epoch with lowest val_phys /
+best chained eval, NOT best.ckpt. (Open q: we still TRAIN decode/proprio + codec roundtrip though the chain doesn't
+use the decoder — droppable in a future run; the residual reads the raw latent token.)
+
+**imagine_eval / imagine_shared UNIFIED + two MPPI bugs fixed.** They were two divergent rollout paths;
+`imagine_shared` (the ONLY rollout MPPI uses, controller/mppi.py) (1) never passed `norm` → scored the black-box
+dynamics, and (2) never threaded the rel-position anchor → fed absolute positions through a relative encoder for
+relative_position=true = garbage. **Prior MPPI runs on this model are invalid.** Fix: one core `_imagine`
+(imagine_eval=K=1, imagine_shared=K≥1 fan-out), physics shared via `_physics_proprio_rollout` (INVARIANT note),
+anchor threaded for all K, mppi.py passes `norm`. PARITY VERIFIED bit-identical (imagine_eval==imagine_shared(K=1),
+max|d|=0). Branch `physics-prior` @ 6d982b6 (pushed to origin).
+
+**MPPI benchmark handoff (owm-bench agent):** (1) use the C2 checkpoint chosen by val_phys, NOT best.ckpt; (2)
+build the model WITH the hook (`+environments.dynamics_prior=true +environments.quat_idx=[6,7,8,9]`) — else
+`dynamics_prior=None` and it silently black-boxes; (3) ALWAYS pass `norm` to imagine_shared/imagine_eval; (4) feed
+fp32 ctx obs, no outer bf16 autocast (#14); (5) I/O contract: ctx `(B,P,13)` normalized fp32, actions
+`(B·K,P-1+H,6)` normalized (action for step t at index P-1+t), returns normalized proprio → denorm → reward; (6)
+re-baseline from scratch (old numbers invalid).
