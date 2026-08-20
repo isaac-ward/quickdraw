@@ -29,6 +29,15 @@ class Normalizer:
         with open(os.path.join(root, "normalization_stats.json")) as f:
             return cls(json.load(f))
 
+    def subset_obs(self):
+        """Restrict the obs stats to the process-wide _OBS_KEEP subset (set_obs_keep), so norm/denorm match
+        the subset the loaders apply. Single source of truth: no obs_keep is threaded. No-op if unset."""
+        idx = get_obs_keep()
+        if idx is not None:
+            t = torch.as_tensor(idx, dtype=torch.long)
+            self.o_mean, self.o_std = self.o_mean[t], self.o_std[t]
+        return self
+
     def norm_obs(self, o):
         return (o - self.o_mean.to(o)) / self.o_std.to(o)
 
@@ -80,6 +89,34 @@ def get_subsample() -> int:
     return _SUBSAMPLE
 
 
+_OBS_KEEP = None
+_OBS_KEEP_USED = False
+
+
+def set_obs_keep(idx) -> None:
+    """Set the process-wide obs-dim subset: a list of indices to KEEP (None = full vector). Mirrors
+    set_subsample -- applied INSIDE both episode loaders AND the Normalizer stats, so NO call site can load a
+    different obs layout than training saw. Raises if changed after a load (would desync train vs eval)."""
+    global _OBS_KEEP
+    idx = None if idx is None else [int(i) for i in idx]
+    if _OBS_KEEP_USED and idx != _OBS_KEEP:
+        raise RuntimeError(f"data.obs_keep changed {_OBS_KEEP} -> {idx} AFTER obs were already loaded; "
+                           "train and eval would see different obs layouts. Set it once at startup.")
+    _OBS_KEEP = idx
+
+
+def get_obs_keep():
+    return _OBS_KEEP
+
+
+def _apply_obs_keep(obs_all):
+    """Slice loaded obs to the process-wide _OBS_KEEP subset (no-op if None). Sets the used-flag so a later
+    set_obs_keep with a different value raises rather than silently desyncing."""
+    global _OBS_KEEP_USED
+    _OBS_KEEP_USED = True
+    return obs_all if _OBS_KEEP is None else obs_all[:, _OBS_KEEP]
+
+
 def _subsample_episodes(eps, tag: str):
     """Keep every s-th frame; AGGREGATE the actions that drive each kept transition. act[t] drives
     t -> t+1 (see MultiModalFlow._rollout_step, which reads a_win[:, -1]), so the action for the kept
@@ -116,13 +153,14 @@ def _subsample_episodes(eps, tag: str):
 
 def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
     """Return list of (obs (T,D), act (T,A)) float32 arrays. ISOLATED lerobot read. `repo_id` is the
-    prefix the split was written with (<repo_id>/<split>; torus datasets = "torus")."""
+    prefix the split was written with (<repo_id>/<split>; torus datasets = "torus"). The obs subset
+    (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
-    obs_all = np.stack(hf["observation_vector"]).astype(np.float32)
+    obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
     act_all = np.stack(hf["action"]).astype(np.float32)
     return _subsample_episodes([(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)],
                                f"{repo_id}/{split}")
@@ -188,13 +226,14 @@ def load_split_episodes_mm(root: str, split: str, img_size: int | tuple[int, int
                            cam: str = "fpv", repo_id: str = "torus"):
     """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled to img_size,
     uint8), aligned 1:1 with obs steps. Returns list of (obs (T,D), act (T,A), img (T,H,W,3) uint8).
-    The chunked video is read in dataset row order (== obs row order), then split by episode_index."""
+    The chunked video is read in dataset row order (== obs row order), then split by episode_index.
+    The obs subset (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
-    obs_all = np.stack(hf["observation_vector"]).astype(np.float32)
+    obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
     act_all = np.stack(hf["action"]).astype(np.float32)
     frames_all = load_fpv_frames(root, split, size=img_size, cam=cam)      # (N, H, W, 3), row order
     assert len(frames_all) == len(obs_all), f"{cam}/row count mismatch: {len(frames_all)} vs {len(obs_all)}"

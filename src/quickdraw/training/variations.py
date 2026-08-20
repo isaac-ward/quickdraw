@@ -97,22 +97,33 @@ class PhysicalLoss(Variation):
         phys = getattr(ctx.env, "physical_loss", None)     # the env's physics-residual hook (base.py)
         if phys is None:                                   # env with no analytic physics (e.g. recorded)
             return None, {"skipped": 1.0}
-        state = ctx.model.physical_state(ctx.preds)        # (B, H, 6) physical readout, or None
+        # relative-position (arm B): de-relativize the readout to ABSOLUTE — v = dp/dt only holds in absolute
+        # units (relativization scales position but not velocity), so the continuity residual must see real
+        # physical quantities. anchor derived from ctx.obs (absolute); None when the feature is off.
+        anchor = ctx.model.rel_anchor(ctx.obs_seq) if getattr(ctx.model, "_rel_on", lambda: False)() else None
+        state = ctx.model.physical_state(ctx.preds, anchor)   # (B, H, dim) physical readout, or None
         if state is None:                                  # e.g. a vision model with no physical head
             return None, {"skipped": 1.0}
         obs_phys = ctx.norm.denorm_obs(state)              # to PHYSICAL units (affine -> grad preserved)
         res = phys(obs_phys)                               # dimensionless residuals (torus: d_off/v_off/continuity)
-        d_off, v_off = res["d_off"], res["v_off"]
+        if not res:                                        # env returned nothing (e.g. recorded w/o position_idx)
+            return None, {"skipped": 1.0}
         # HUBER, not squared: residuals are normalized to ~O(1), so Huber(delta=1) is quadratic for
         # normal jitter but LINEAR (bounded gradient) for large residuals -> a rollout jitter spike can't
         # produce an explosive gradient that diverges the weights (the failure mode that NaN'd before).
+        # Penalize EVERY key the env returns (durable: a new env's residuals just work); `continuity` uses
+        # its own weight, all others (torus algebraic: d_off/v_off) use self.weight.
         hub = lambda x: F.huber_loss(x, torch.zeros_like(x), delta=1.0, reduction="none")
-        total = self.weight * (hub(d_off).mean() + hub(v_off).mean())   # algebraic: on-surface + tangent
-        diag = {"d_off": d_off.abs().mean().detach(), "v_off": v_off.abs().mean().detach()}
-        if self.continuity > 0.0 and "continuity" in res:                 # kinematic continuity v = dp/dt
-            cont = hub(res["continuity"]).sum(-1).mean()
-            total = total + self.continuity * cont
-            diag["continuity"] = cont.detach()
+        total, diag = 0.0, {}
+        for key, r in res.items():
+            w = self.continuity if key == "continuity" else self.weight
+            if w <= 0.0:
+                continue
+            term = hub(r).sum(-1).mean() if key == "continuity" else hub(r).mean()   # continuity is per-dim (...,k)
+            total = total + w * term
+            diag[key] = r.abs().mean().detach()
+        if not diag:                                       # nothing weighted -> skip cleanly
+            return None, {"skipped": 1.0}
         total = ctx.physical_ramp * total   # warmup ramp (0->1) avoids hitting the jittery early decode
         if not torch.isfinite(total):       # physical-scoped guard: drop ONLY this term if non-finite
             return None, {"nonfinite": 1.0}  # (logged) -> the step proceeds on the other losses, not corrupted

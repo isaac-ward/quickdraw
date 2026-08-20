@@ -35,6 +35,13 @@ d: 128                    # backbone/token width (all modality tokens live at d)
 depth: 4
 heads: 8                   # head_dim = 16 (d/heads; power of 2 AND >=16 for compiled FlexAttention)
 window: 32                 # temporal attention span
+relative_position: false   # FLOOR lever (design/collapse.md): re-express proprio POSITION relative to the
+#                            window's first step, p~=(p-anchor)/relative_scale, so the codec represents the small
+#                            within-window displacement (~8.6x smaller than absolute ±300) -> lower raw floor.
+#                            Applied at the obs<->bag boundary only; anchor is a transient arg (never stored);
+#                            callers stay in ABSOLUTE obs. position_idx comes from environments.position_idx.
+relative_scale: null       # per-position-dim NORMALIZED within-window displacement std (the rescale-to-unit gain
+#                            denominator). null -> 1.0 (center only). owm-iss ego-13: [0.107,0.133,0.113].
 mlp_ratio: 4.0
 rope_theta: 10000.0
 action_dim: 2

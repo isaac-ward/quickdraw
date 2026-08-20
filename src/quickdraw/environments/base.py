@@ -18,6 +18,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+
+def continuity_residual(obs_phys, position_idx, velocity_idx, dt, v_scale: float = 1.0):
+    """Reusable kinematic-continuity residual `v = dp/dt` (dimensionless), for any env's `physical_loss` hook.
+
+    obs_phys: (..., T, D) rollout in PHYSICAL units. Compares the velocity channels to the CENTRAL difference
+    of the position channels over the time axis (dim -2). Returns (..., T-2, len(position_idx)) — one residual
+    per interior timestep per position dim; the physical_loss training variation Huber-penalizes it. Any env
+    whose obs carries a position and its own time-derivative implements physical_loss in ~3 lines by calling
+    this (no per-env physics to reimplement). See WorldEnv.physical_loss."""
+    import torch  # local: base.py is imported very early; keep torch off the module import path
+    p = obs_phys[..., list(position_idx)]                       # (...,T,k)
+    v = obs_phys[..., list(velocity_idx)]                       # (...,T,k)
+    dpdt = (p[..., 2:, :] - p[..., :-2, :]) / (2.0 * float(dt))  # central diff over time -> (...,T-2,k)
+    return (v[..., 1:-1, :] - dpdt) / float(v_scale)
+
 import numpy as np
 from torch import Tensor
 
@@ -120,8 +135,11 @@ class WorldEnv(Protocol):
 
     # OPTIONAL — dimensionless analytic physics residuals {name: per-element Tensor} of a PHYSICAL-units obs
     # batch/rollout (torus: off-surface distance, normal velocity, kinematic continuity). Consumed by the
-    # physical_loss training variation (training/variations.py), which applies Huber/weights/warmup on top;
-    # the physics MATH lives here in the env. Envs without analytic physics omit it -> the variation skips.
+    # physical_loss training variation (training/variations.py), which Huber-penalizes EVERY key returned
+    # (weights/warmup on top); the physics MATH lives here in the env. Envs without analytic physics omit it
+    # -> the variation skips. To ADD physical_loss to a new env: return whatever residual dict you have; a
+    # generic `v = dp/dt` term is one call to `continuity_residual(obs_phys, position_idx, velocity_idx, dt)`
+    # (module fn above) -> `return {"continuity": continuity_residual(...)}` (see RecordedEnv).
     def physical_loss(self, obs_phys: Tensor) -> dict[str, Tensor]: ...
 
     # OPTIONAL — split obs rows by a MEANINGFUL state feature, for the by-state action-distribution eval

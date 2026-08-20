@@ -109,7 +109,8 @@ class MultiModalSequenceModel(nn.Module):
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
                  mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
                  compile_rollout: bool = False, latent_norm: str | bool = "affine",
-                 action_fourier_freqs: int = 0, action_squash: str = "none"):
+                 action_fourier_freqs: int = 0, action_squash: str = "none",
+                 relative_position: bool = False, position_idx=None, relative_scale=None):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)
@@ -125,6 +126,21 @@ class MultiModalSequenceModel(nn.Module):
         self.n_state = sum(n for _, n in self.layout)
         self.n_input = self.n_state + 1                       # + action token
         self.d, self.window = d, window
+        # RELATIVE POSITION ENCODING (design/collapse.md floor lever): re-express the proprio POSITION channels
+        # relative to the window's first step, `p~ = (p - anchor)/s_rel`, so the codec represents a small
+        # within-window displacement (~8.6x smaller than absolute) instead of a ±300 value -> lower raw floor.
+        # Applied at the obs<->bag boundary only (encode_state input / to_obs+recon output); the latent rollout
+        # is untouched, and every EXTERNAL caller passes/receives ABSOLUTE obs (the anchor is a transient arg,
+        # never stored). Default OFF = bit-identical. position_idx are the proprio dims that are world position.
+        self.relative_position = bool(relative_position)
+        self._pos_idx = list(int(i) for i in position_idx) if (relative_position and position_idx is not None) else None
+        if self._pos_idx is not None:
+            sc = relative_scale if relative_scale is not None else 1.0
+            sc = torch.as_tensor(sc, dtype=torch.float32)
+            if sc.ndim == 0:
+                sc = sc.repeat(len(self._pos_idx))
+            assert len(sc) == len(self._pos_idx), f"relative_scale {sc.shape} != position_idx {len(self._pos_idx)}"
+            self.register_buffer("_rel_scale", sc)   # NORMALIZED-space per-dim std of the within-window displacement
         # action -> 1 token. action_fourier_freqs>0 prepends sin/cos features so SMALL action differences are
         # linearly separable (robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ
         # slightly). 0 = off = bit-identical to a plain _mlp.
@@ -229,41 +245,87 @@ class MultiModalSequenceModel(nn.Module):
             rows.append((f"{name} decode ({net})", f"(B,T,{ntok},{self.d}) -> {ins}", npar(dh)))
         return rows
 
+    # ---- relative-position encoding (pure helpers; no-op when off) ----
+    def _rel_on(self) -> bool:
+        return self.relative_position and self._pos_idx is not None
+
+    def rel_anchor(self, obs) -> Tensor:
+        """Per-window anchor = the proprio POSITION at the FIRST timestep (in normalized space). obs may be the
+        obs dict or a proprio tensor (B,T,dim). Returns (B,1,len(pos_idx)), broadcastable over the time axis."""
+        p = obs["proprio"] if isinstance(obs, dict) else obs
+        return p[..., :1, self._pos_idx]
+
+    def relativize(self, obs: dict, anchor: Tensor) -> dict:
+        """obs dict -> obs dict with proprio position channels re-expressed as (p - anchor)/s_rel. No-op if off.
+        Does NOT mutate the input. `anchor` is (B,1,len(pos_idx)); broadcasts over T."""
+        if not self._rel_on():
+            return obs
+        p = obs["proprio"]
+        rel = p.clone()
+        # .to(rel.dtype): _rel_scale is fp32 so the RHS promotes to fp32; under bf16 autocast the destination is
+        # bf16 and index_put requires matching dtypes. Cast back so it works in fp32 AND autocast.
+        rel[..., self._pos_idx] = ((p[..., self._pos_idx] - anchor) / self._rel_scale).to(rel.dtype)
+        return {**obs, "proprio": rel}
+
+    def absolutize_proprio(self, proprio: Tensor, anchor: Tensor) -> Tensor:
+        """Inverse of relativize on a proprio tensor (B,T,dim): position channels -> value*s_rel + anchor.
+        No-op if off. Used so decoded/reconstructed proprio comes back to ABSOLUTE for loss/report.
+        fp32 (issue #14): the absolute position is a small displacement ON TOP OF a ~hundreds-of-metres anchor.
+        Storing it in bf16 (~3 sig-figs) quantizes it to ~1 m, which INFLATES the reported position error AND
+        caps the proprio decode loss at a ~1 m floor. Compute + return the position channels in fp32."""
+        if not self._rel_on():
+            return proprio
+        out = proprio.float()
+        out[..., self._pos_idx] = proprio[..., self._pos_idx].float() * self._rel_scale + anchor.float()
+        return out
+
     # ---- modality <-> token bag ----
-    def encode_state(self, obs: dict[str, Tensor]) -> Tensor:        # {name:(B,T,*)} -> (B,T,n_state,d)
+    # `anchor` (relative-position encoding): the per-window position anchor (see rel_anchor). When given (and the
+    # feature is on), encode relativizes the input position channels and to_obs de-relativizes the decoded ones,
+    # so the CODEC works in the small within-window frame while every caller stays in ABSOLUTE obs. None = off.
+    def encode_state(self, obs: dict[str, Tensor], anchor: Tensor | None = None) -> Tensor:  # -> (B,T,n_state,d)
+        if anchor is not None:
+            obs = self.relativize(obs, anchor)                       # no-op if _rel_on() is False
         toks = [self.modalities[name].encode(obs[name]) for name, _ in self.layout]
         bag = torch.cat(toks, dim=-2)
         return _ln(bag) if self.latent_norm else bag
 
-    def to_obs(self, bag: Tensor, heads=None) -> dict[str, Tensor]:  # (B,*,n_state,d) -> {name:(B,*,*)}
+    def to_obs(self, bag: Tensor, heads=None, anchor: Tensor | None = None) -> dict[str, Tensor]:
         out, off = {}, 0
         for name, n in self.layout:
             if heads is None or name in heads:                       # partial decode (e.g. proprio-only long rollouts)
                 out[name] = self.modalities[name].decode(bag[..., off:off + n, :])
             off += n
+        if anchor is not None and "proprio" in out:
+            out["proprio"] = self.absolutize_proprio(out["proprio"], anchor)   # back to ABSOLUTE (no-op if off)
         return out
 
     def recon_losses(self, bag: Tensor, targets: dict[str, Tensor],
-                     pre_z_targets: Tensor | None = None) -> dict[str, Tensor]:
+                     pre_z_targets: Tensor | None = None, anchor: Tensor | None = None) -> dict[str, Tensor]:
         """Per-modality DECODE loss of the predicted token bag vs clean target obs.
 
         Returns (losses, weights) -- the SAME contract as loss_terms, so no caller infers a weight by parsing
         a key. Keys are ROLE-first and never encode the decode parameterization: `decode/<name>` for every
         modality (mse or flow), `decode/<name>_shortcut` for flow decoders with self-consistency, and
         `codec/roundtrip_<name>` from roundtrip_losses. All values are RAW; weights are applied at the sum."""
+        # decode_loss decodes the predicted bag (in the RELATIVE frame when the anchor is on) WITHOUT going
+        # through to_obs, so it never de-relativizes -> its targets must be relativized to match. (roundtrip
+        # below goes through to_obs, which DOES de-relativize, so it keeps the ABSOLUTE targets.)
+        dtgt = self.relativize(targets, anchor) if anchor is not None else targets
         out, wts, off = {}, {}, 0
         for name, n in self.layout:
             mod = self.modalities[name]
-            main, sc = mod.decode_loss(bag[..., off:off + n, :], targets[name])
+            main, sc = mod.decode_loss(bag[..., off:off + n, :], dtgt[name])
             out[f"decode/{name}"], wts[f"decode/{name}"] = main, float(mod.weight)
             if sc is not None:                                  # flow decoders only
                 out[f"decode/{name}_shortcut"], wts[f"decode/{name}_shortcut"] = sc, float(mod.weight)
             off += n
-        rt, rtw = self.roundtrip_losses(targets, pre_z=pre_z_targets)   # codec/roundtrip_<name>
+        rt, rtw = self.roundtrip_losses(targets, pre_z=pre_z_targets, anchor=anchor)   # codec/roundtrip_<name>
         out.update(rt); wts.update(rtw)
         return out, wts
 
-    def roundtrip_losses(self, targets: dict[str, Tensor], pre_z: Tensor | None = None) -> tuple[dict, dict]:
+    def roundtrip_losses(self, targets: dict[str, Tensor], pre_z: Tensor | None = None,
+                         anchor: Tensor | None = None) -> tuple[dict, dict]:
         """ENCODE->DECODE round-trip loss for pretrained-AE trunks (#12), through THE MODEL'S OWN path.
 
         Deliberately uses encode_state()/to_obs() rather than the modality's encode/decode: whatever the
@@ -283,10 +345,10 @@ class MultiModalSequenceModel(nn.Module):
             #                    every bespoke-AE run (no pretrained trunk -> no heads) with
             #                    "ValueError: not enough values to unpack (expected 2, got 0)" -- missed when
             #                    this function changed contract, because nothing tested a non-pretrained trunk.
-        bag = self.encode_state(targets) if pre_z is None else pre_z   # REAL encode (LN incl.); pre_z = the SAME
-        #                          encode already computed by the shared-encode fast path (_step), sliced to these
-        #                          target frames -- bit-identical at noise_std=0 (see design/accelerations P4).
-        rec = self.to_obs(bag, heads=heads)              # the REAL decode
+        bag = self.encode_state(targets, anchor) if pre_z is None else pre_z   # REAL encode (LN incl.; relativizes
+        #                          internally when anchor on). pre_z = the SAME encode from the shared-encode fast
+        #                          path (_step), sliced -- bit-identical at noise_std=0 (design/accelerations P4).
+        rec = self.to_obs(bag, heads=heads, anchor=anchor)   # REAL decode, de-relativized -> ABSOLUTE (matches targets)
         # RAW mse + its weight, so the logged series is comparable across runs that sweep latent_loss_weight
         # (every sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec
         # panel rescale while the decode panels did not.
@@ -302,9 +364,11 @@ class MultiModalSequenceModel(nn.Module):
         bag = self._add_level_emb(bag, levels)                 # DF: condition the backbone on context noise levels
         return torch.cat([bag, self.act_enc(act).unsqueeze(-2)], dim=-2)
 
-    def physical_state(self, bag: Tensor):
-        """Proprio 6-vec for the physical-loss variation, decoded with a FROZEN decoder (grad flows to the
-        latent, not the decoder weights — like LSAR). Returns None if there is no proprio head."""
+    def physical_state(self, bag: Tensor, anchor: Tensor | None = None):
+        """Proprio physical readout for the physical-loss variation, decoded with a FROZEN decoder (grad flows
+        to the latent, not the decoder weights — like LSAR). Returns None if there is no proprio head.
+        `anchor`: de-relativize to ABSOLUTE units (v = dp/dt continuity only holds in absolute — relativization
+        scales position but not velocity), so the physics residual is computed on real physical quantities."""
         from torch.func import functional_call
         off = 0
         for name, n in self.layout:
@@ -316,7 +380,8 @@ class MultiModalSequenceModel(nn.Module):
                 temb = head._temb(cond.new_ones(cond.shape[:-1] + (1,)))
                 pb = {k: v.detach() for k, v in head.named_parameters()}   # FROZEN decoder (grad -> latent only)
                 pb.update({k: b.detach() for k, b in head.named_buffers()})
-                return functional_call(head, pb, (x0, temb, cond, None))   # head.forward == velocity -> (...,6)
+                out = functional_call(head, pb, (x0, temb, cond, None))    # head.forward == velocity -> (...,dim)
+                return self.absolutize_proprio(out, anchor) if anchor is not None else out
             off += n
         return None
 
@@ -399,19 +464,21 @@ class MultiModalSequenceModel(nn.Module):
         return self.readout(h[:, -1], bag_win[:, -1], act_win[:, -1])
 
     # ---- teacher-forced parallel forward ----
-    def forward(self, obs: dict[str, Tensor], act: Tensor) -> Tensor:
-        s = self.encode_state(obs)
+    def forward(self, obs: dict[str, Tensor], act: Tensor, anchor: Tensor | None = None) -> Tensor:
+        s = self.encode_state(obs, anchor)
         h = self.backbone(self._to_input(s, act))
         return self.readout(h, s, act)
 
     # ---- shared autoregressive rollout (token-bag analogue of SequenceWorldModel._rollout) ----
     def _rollout(self, ctx_obs: dict[str, Tensor], actions: Tensor, horizon: int, p_tf: float,
-                 true_future: dict[str, Tensor] | None, detach_every: int, use_cache: bool = False) -> Tensor:
-        bag_buf = list(self.encode_state(ctx_obs).unbind(dim=1))     # P bags of (B,n_state,d)
+                 true_future: dict[str, Tensor] | None, detach_every: int, use_cache: bool = False,
+                 anchor: Tensor | None = None) -> Tensor:
+        bag_buf = list(self.encode_state(ctx_obs, anchor).unbind(dim=1))     # P bags of (B,n_state,d)
         # Only encode the true future when teacher forcing can actually USE it (p_tf>0). At p_tf==0 — the
         # steady AR regime (most of training) AND all of val — tf_future is never read (see the `p_tf > 0.0`
         # guard at the mix below), so encoding F frames + retaining their adapter graph is pure waste.
-        tf_future = self.encode_state(true_future) if (true_future is not None and p_tf > 0.0) else None
+        # SAME anchor as the context (the window's first-step position) so ctx and future share the frame.
+        tf_future = self.encode_state(true_future, anchor) if (true_future is not None and p_tf > 0.0) else None
         return self._rollout_from(bag_buf, actions, horizon, p_tf, tf_future, detach_every, use_cache=use_cache)
 
     def _rollout_from(self, bag_buf, actions: Tensor, horizon: int, p_tf: float,
@@ -491,13 +558,13 @@ class MultiModalSequenceModel(nn.Module):
         return torch.stack(preds, dim=1)                             # (B,horizon,n_state,d)
 
     def rollout_train(self, ctx_obs, actions, true_future: dict, p_tf: float, detach_every: int = 8,
-                      precomputed_ctx: Tensor | None = None) -> Tensor:
+                      precomputed_ctx: Tensor | None = None, anchor: Tensor | None = None) -> Tensor:
         horizon = next(iter(true_future.values())).shape[1]
         if precomputed_ctx is not None:                       # shared-encode fast path (_step, p_tf==0 only):
             assert p_tf == 0.0, "precomputed_ctx is the p_tf==0 shared encode (no teacher forcing)"  # ctx already
-            return self._rollout_from(list(precomputed_ctx.unbind(dim=1)),                            # LN'd
-                                      actions, horizon, 0.0, None, detach_every)
-        return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every)
+            return self._rollout_from(list(precomputed_ctx.unbind(dim=1)),           # LN'd + relativized already
+                                      actions, horizon, 0.0, None, detach_every)      # (encoded with anchor in _step)
+        return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every, anchor=anchor)
 
     @torch.no_grad()
     def imagine_shared(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int, heads=None,
@@ -528,14 +595,17 @@ class MultiModalSequenceModel(nn.Module):
         batch x decode_chunk frames instead of batch x horizon -> long-horizon image eval doesn't OOM
         (PR #8 bug 2). None -> decode the whole bag at once (unchanged)."""
         uc = self.use_kv_cache if use_cache is None else use_cache
+        # Relative-position: derive the anchor from THIS context (its first step = the window start) and thread
+        # it into the rollout's encode + the decode, so eval callers pass/receive ABSOLUTE obs unchanged.
+        anchor = self.rel_anchor(ctx_obs) if self._rel_on() else None
         with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
-            bag = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=uc)
+            bag = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=uc, anchor=anchor)
             if decode_chunk and bag.ndim >= 2 and bag.shape[1] > decode_chunk:   # chunk decode over the time axis
-                parts = [self.to_obs(bag[:, s:s + decode_chunk], heads=heads)
+                parts = [self.to_obs(bag[:, s:s + decode_chunk], heads=heads, anchor=anchor)
                          for s in range(0, bag.shape[1], decode_chunk)]
                 out = {k: torch.cat([p[k] for p in parts], dim=1) for k in parts[0]}
             else:
-                out = self.to_obs(bag, heads=heads)
+                out = self.to_obs(bag, heads=heads, anchor=anchor)
         return {k: v.float() for k, v in out.items()}
 
     @torch.no_grad()
@@ -585,11 +655,11 @@ class MultiModalLSAR(MultiModalSequenceModel):
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
                  grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True, action_fourier_freqs: int = 0, action_squash: str = "none",
                  pred_hidden: int = 0, lambda_pred_latent: float = 1.0,
-                 collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256):
+                 collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256, **kw):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
-                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash)
+                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash, **kw)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
@@ -694,11 +764,11 @@ class MultiModalFlow(MultiModalSequenceModel):
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
-                 dynamics_detach_encoder: bool = False):
+                 dynamics_detach_encoder: bool = False, **kw):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
-                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash)
+                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash, **kw)
         assert predict in ("residual", "absolute")
         self.predict_residual = predict == "residual"
         self.sampling_steps = int(sampling_steps)
@@ -763,10 +833,11 @@ class MultiModalFlow(MultiModalSequenceModel):
         out = prev_bag + out if self.predict_residual else out
         return _ln(out) if self.latent_norm else out
 
-    def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None, pre_z: Tensor | None = None):
+    def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None, pre_z: Tensor | None = None,
+                   anchor: Tensor | None = None):
         """Teacher-forced rectified-flow loss over the bag (mirrors models/diffusion.py)."""
         assert act_seq is not None
-        z = self.encode_state(obs) if pre_z is None else pre_z  # (B,L,n_state,d); pre_z = shared-encode fast path
+        z = self.encode_state(obs, anchor) if pre_z is None else pre_z  # (B,L,n_state,d); pre_z = shared-encode (already relativized)
         L = z.shape[1]
         s = z[:, :-1]                                           # contexts (B,L-1,n_state,d)
         if self.dynamics_detach_encoder:                        # stop-grad: dynamics loss won't reshape the encoder

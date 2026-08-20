@@ -16,13 +16,14 @@ import sys
 import hydra
 import numpy as np
 
-from .data.dataset import load_split_episodes
+from .data.dataset import load_split_episodes, set_obs_keep
 from .training.setup import env_cfg, resolve_data_root
 
 
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
 def main(cfg):
     root = resolve_data_root(cfg)
+    set_obs_keep(cfg.data.get("obs_keep", None))   # check the EFFECTIVE obs (subset), so dims match env/model
     P, F = int(cfg.data.P), int(cfg.data.F)
     need = P + F
     repo = str(cfg.data.get("repo_id", "torus"))

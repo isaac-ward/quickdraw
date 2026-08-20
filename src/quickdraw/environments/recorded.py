@@ -22,6 +22,8 @@ class RecordedConfig:
     obs_dim: int = 16
     action_dim: int = 4
     dt: float = 1.0 / 30.0
+    position_idx: list | None = None   # obs dims that are world POSITION (for physical_loss continuity)
+    velocity_idx: list | None = None   # obs dims that are velocity; default = position block shifted by its length
     # inert placeholders: train_world_model reads e.R / e.r / e.init_speed unconditionally (torus geometry
     # knobs for variations + LoggingCallback); nothing consumes them on a recorded run.
     R: float = 1.0
@@ -39,6 +41,21 @@ class RecordedEnv:
         self.obs_dim = int(cfg.obs_dim)
         self.action_dim = int(cfg.action_dim)
         self.dt = float(cfg.dt)
+        pi = getattr(cfg, "position_idx", None)
+        self.position_idx = [int(i) for i in pi] if pi is not None else None
+        vi = getattr(cfg, "velocity_idx", None)
+        # default: the velocity block immediately follows position (owm-iss ego state: pos [0,1,2], vel [3,4,5])
+        self.velocity_idx = ([int(i) for i in vi] if vi is not None
+                             else ([i + len(self.position_idx) for i in self.position_idx] if self.position_idx else None))
+
+    def physical_loss(self, obs_phys):
+        """Kinematic continuity v = dp/dt on the recorded ego state (no analytic surface physics). Reuses the
+        shared `continuity_residual` helper -> a durable pattern any recorded env gets for free. Returns {}
+        (variation skips) when position_idx is unset."""
+        if self.position_idx is None:
+            return {}
+        from .base import continuity_residual
+        return {"continuity": continuity_residual(obs_phys, self.position_idx, self.velocity_idx, self.dt)}
 
     # `not_provided` marks the raising stubs / generic defaults so `log_env_capabilities` reports them ✗
     # (reporting only — call behavior is unchanged).

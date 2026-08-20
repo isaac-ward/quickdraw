@@ -50,7 +50,9 @@ def env_cfg(cfg):
     if str(e.name).lower() == "recorded":
         from ..environments.recorded import RecordedConfig
         return RecordedConfig(obs_dim=int(e.obs_dim), action_dim=int(e.action_dim),
-                              dt=_recorded_dt(cfg, float(e.dt)))
+                              dt=_recorded_dt(cfg, float(e.dt)),
+                              position_idx=(list(e.position_idx) if e.get("position_idx", None) is not None else None),
+                              velocity_idx=(list(e.velocity_idx) if e.get("velocity_idx", None) is not None else None))
     raise ValueError(f"env_cfg: no config dataclass for environments.name={e.name!r}")
 
 
@@ -167,7 +169,13 @@ def build_model(cfg):
                       compile_rollout=compile_rollout,
                       latent_norm=m.get("latent_norm", "layernorm"),
                       action_fourier_freqs=int(m.get("action_fourier_freqs", 0)),
-                      action_squash=str(m.get("action_squash", "none")))
+                      action_squash=str(m.get("action_squash", "none")),
+                      # relative-position encoding (floor lever): OFF by default. position_idx are the proprio
+                      # dims that are world position (from the env); relative_scale is their normalized
+                      # within-window displacement std (the rescale-to-unit-variance gain denominator).
+                      relative_position=bool(m.get("relative_position", False)),
+                      position_idx=(cfg.environments.get("position_idx", None) if m.get("relative_position", False) else None),
+                      relative_scale=(list(m.get("relative_scale")) if m.get("relative_scale", None) is not None else None))
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}
@@ -405,7 +413,7 @@ def resolve_data_root(cfg) -> str:
 
 
 def normalizer(cfg) -> Normalizer:
-    return Normalizer.from_file(resolve_data_root(cfg))
+    return Normalizer.from_file(resolve_data_root(cfg)).subset_obs()   # subset via the process-wide set_obs_keep
 
 
 def window_loaders(cfg, norm: Normalizer):

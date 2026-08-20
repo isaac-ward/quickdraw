@@ -270,12 +270,15 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
         obs_full[h] = torch.stack([torch.from_numpy(im[:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
 
     # per-frame encode->decode (encode_state is per-frame; chunk over time so image decode memory stays bounded)
+    # relative-position: ONE anchor for the whole trajectory (its first frame), threaded to every chunk so the
+    # codec is exercised in the SAME relative frame it was trained in; to_obs de-relativizes -> ABSOLUTE recon.
+    anchor = m.rel_anchor(obs_full) if m._rel_on() else None
     chunk = int(cfg.eval.get("decode_chunk", 64) or 64)
     rec_acc = {}
     for s in range(0, P + H, chunk):
         sub = {k: v[:, s:s + chunk] for k, v in obs_full.items()}
         with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
-            rec = m.to_obs(m.encode_state(sub), heads=["proprio"] + img_heads)
+            rec = m.to_obs(m.encode_state(sub, anchor), heads=["proprio"] + img_heads, anchor=anchor)
         for k, v in rec.items():
             rec_acc.setdefault(k, []).append(v.float())
     recon = {k: torch.cat(v, dim=1) for k, v in rec_acc.items()}

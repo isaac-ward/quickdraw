@@ -123,6 +123,10 @@ class VectorModality(Modality):
         self.noise_std = float(spec.noise_std)
         self.decode_kind = spec.decode_kind
         self.dim = spec.dim
+        # ROUND-TRIP anchor weight (design/collapse.md): the roundtrip_losses gate reads this OFF THE MODULE, so
+        # a vector modality must expose it too or the config value is silently dropped. Default 0.0 = no anchor
+        # (unchanged behavior); set model.modalities.<i>.latent_loss_weight>0 to anchor the proprio codec floor.
+        self.latent_loss_weight = float(getattr(spec, "latent_loss_weight", 0.0) or 0.0)
         # fourier_freqs>0: [raw | sin/cos] before the trunk. Same rationale as the action encoder -- proprio is
         # z-scored and unbounded, and its small step-to-step differences ARE the motion. 0 = off = bit-identical.
         from .multimodal import FourierMLP

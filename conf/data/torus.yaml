@@ -4,6 +4,12 @@ hf_repo: null  # null -> load from the local data.root; set to <namespace>/<name
 repo_id: torus # lerobot repo prefix the splits were WRITTEN with (<repo_id>/<split>); recorded datasets
 #                use their recording name (e.g. flightroom_starling)
 cam: fpv       # camera stream name -> videos/observation.images.<cam> (torus: fpv; recorded starling: ego)
+obs_keep: null # OFF by default (full observation_vector). Set to a list of dim INDICES to KEEP, applied inside
+#                BOTH episode loaders + the Normalizer stats (so training and every eval see the same subset).
+#                Motivates a focused study: e.g. owm-iss keeps [2..14] (ego pos/vel/quat/bodyrate), dropping the
+#                broken absolute-time dims 0-1 and the redundant goal-relative block 15-26. When set you MUST also
+#                update model.modalities.0.dim, environments.obs_dim, and environments.position_idx to the SUBSET
+#                indexing (owm-iss [2..14] -> obs_dim 13, position triple at [0,1,2]).
 P: 8           # past context steps fed before prediction starts (obs already carries velocity, so
                # the state is near-Markov -> little history needed; P need NOT equal F)
 F: 64          # future horizon rolled out during training (sets the BPTT length, not test horizon)

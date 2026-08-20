@@ -79,6 +79,9 @@ def main(cfg):
 
     _t = time.perf_counter()
     _startup_log(run_dir, "[startup] loading dataset (GPU-resident windows) + normalizer...")
+    from .data.dataset import set_obs_keep, set_subsample
+    set_subsample(int(cfg.data.get("subsample", 1) or 1))          # match the rate + obs layout the WM trained on
+    set_obs_keep(cfg.data.get("obs_keep", None))                   # applied inside every loader + the normalizer
     norm = normalizer(cfg)
     loaders = window_loaders(cfg, norm)
     _startup_log(run_dir, f"[startup] data ready in {time.perf_counter() - _t:.1f}s: "

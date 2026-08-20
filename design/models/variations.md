@@ -55,6 +55,15 @@ should be **tangent** to it. It reuses the **exact** `environments/torus.py` fun
 `normal`, `angles_from_point`) — already verified to be **pure, batched, differentiable torch** with
 gradients flowing — so the *same* code is the eval metric and the training penalty (no separate impl).
 
+**Extensible per env (2026-08-19).** The penalty is now env-agnostic: the training variation calls the env's
+`physical_loss(obs_phys)` hook and **Huber-penalizes every residual key it returns** (`continuity` uses
+`physical_loss.continuity`, all others use `physical_loss.weight`) — a new env just returns whatever residual
+dict it has, no variation change. A generic kinematic-continuity term `v = dp/dt` is one call to the shared
+`environments/base.py:continuity_residual(obs_phys, position_idx, velocity_idx, dt)`, so **`RecordedEnv` now
+implements `physical_loss`** (returns `{"continuity": …}` from `environments.position_idx`; velocity block
+auto-derived as the block after position). Off unless `physical_loss.continuity > 0`. NB when relative-position
+encoding is on, `physical_state` de-relativizes to ABSOLUTE first (v = dp/dt holds only in absolute units).
+
 Definition (one canonical form — squared **distance**, not the residual):
 
 ```
