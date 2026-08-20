@@ -172,7 +172,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         segs = {h: [] for h in heads}
         for r0 in range(0, rows, cap):
             sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
-            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc)
+            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc, norm=norm)
             for h in heads:
                 segs[h].append(o_c[h])
         out = {}

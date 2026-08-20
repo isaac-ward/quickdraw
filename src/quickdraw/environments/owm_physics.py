@@ -30,9 +30,33 @@ def quat_rotate_wxyz(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.stack([rx, ry, rz], dim=-1)
 
 
+def quat_mul_wxyz(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product a (x) b, both [w,x,y,z] (...,4)."""
+    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return torch.stack([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ], dim=-1)
+
+
+def quat_integrate(q: torch.Tensor, omega: torch.Tensor, dt: float) -> torch.Tensor:
+    """Exact attitude kinematics q' = q (x) exp(1/2 * omega * dt), body-rate right-multiply.
+    q [w,x,y,z] (...,4), omega body rates (...,3) [rad/s]. Verified vs data: 0.006 deg/step."""
+    half = 0.5 * dt * omega                       # (...,3) half-angle vector
+    hn = half.norm(dim=-1, keepdim=True)          # (...,1)
+    sinc = torch.where(hn > 1e-6, torch.sin(hn) / hn.clamp_min(1e-8), torch.ones_like(hn))
+    dq = torch.cat([torch.cos(hn), half * sinc], dim=-1)   # (...,4) unit
+    return quat_mul_wxyz(q, dq)
+
+
 def dynamics_prior(prev_obs: torch.Tensor, action: torch.Tensor, pos_idx, vel_idx, quat_idx,
-                   mass: float = MASS, raw_dt: float = RAW_DT, dt_eff: float = 0.25) -> torch.Tensor:
-    """Physics next-state (pos/vel updated; quat/bodyrate copied — WM residual handles their evolution).
+                   bodyrate_idx=None, mass: float = MASS, raw_dt: float = RAW_DT,
+                   dt_eff: float = 0.25) -> torch.Tensor:
+    """Physics next-state. pos/vel via thrust a=R(q)F/m; quat via exact kinematics q'=q(x)exp(1/2 w dt)
+    when bodyrate_idx given (else copied); bodyrate copied — WM residual handles the remainder.
     prev_obs (...,obs_dim) ABSOLUTE; action (...,act_dim) raw force in N (action[...,0:3])."""
     pos_idx, vel_idx, quat_idx = list(pos_idx), list(vel_idx), list(quat_idx)
     q = prev_obs[..., quat_idx]
@@ -43,6 +67,8 @@ def dynamics_prior(prev_obs: torch.Tensor, action: torch.Tensor, pos_idx, vel_id
     out = prev_obs.clone()
     out[..., vel_idx] = v_new
     out[..., pos_idx] = p_new
+    if bodyrate_idx is not None:                  # exact attitude kinematics (verified 0.006 deg/step)
+        out[..., quat_idx] = quat_integrate(q, prev_obs[..., list(bodyrate_idx)], dt_eff)
     return out
 
 

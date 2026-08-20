@@ -107,7 +107,8 @@ def _mm_model_rollout_fn(model, normalizer, ctx_pro, ctx_fpv, pa, img_head, dist
             ctx[img_head] = ctx_fpv                                          # (G,p,s,s,3) rendered FPV context
         paK = pa[:, None].expand(G, K, pa.shape[1], A).reshape(G * K, pa.shape[1], A)
         actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, A)], dim=1))  # (G*K, p-1+H, A)
-        out = model.imagine_shared(ctx, actK, H, K, heads=["proprio"], return_bag=(dist_bag is not None))
+        out = model.imagine_shared(ctx, actK, H, K, heads=["proprio"], return_bag=(dist_bag is not None),
+                                   norm=normalizer)   # norm -> physics-anchored proprio rollout (owm); no-op if no hook
         pr = normalizer.denorm_obs(out["proprio"]).view(G, K, H, -1)
         dist = dist_bag(out["_bag"].view(G, K, H, -1)) if dist_bag is not None else None   # (G,K,H) reward distance
         return pr[..., :3], pr[..., 3:], dist
@@ -393,7 +394,7 @@ def _model_rollout_obs_fn(model, normalizer, ctx_pro, pa, obs_dim):
         ctx = {"proprio": normalizer.norm_obs(ctx_pro)}                      # (G,p,obs_dim)
         paK = pa[:, None].expand(G, K, pa.shape[1], A).reshape(G * K, pa.shape[1], A)
         actK = normalizer.norm_act(torch.cat([paK, cand.reshape(G * K, H, A)], dim=1))  # (G*K, p-1+H, A)
-        out = model.imagine_shared(ctx, actK, H, K, heads=["proprio"])
+        out = model.imagine_shared(ctx, actK, H, K, heads=["proprio"], norm=normalizer)  # physics rollout (owm); no-op if no hook
         return normalizer.denorm_obs(out["proprio"]).view(G, K, H, obs_dim)
     return fn
 

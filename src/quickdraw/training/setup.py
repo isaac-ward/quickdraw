@@ -146,13 +146,18 @@ def _make_dynamics_prior(cfg):
     pos = list(e.position_idx)
     vel = list(e.velocity_idx) if e.get("velocity_idx", None) is not None else [i + len(pos) for i in pos]
     quat = list(e.quat_idx)
+    # Body rate for the exact attitude kinematics q'=q(x)exp(1/2 w dt). ego-13: quat [6,7,8,9] -> rate [10,11,12].
+    # Explicit override via environments.bodyrate_idx; else the three dims after quat.
+    bodyrate = (list(e.bodyrate_idx) if e.get("bodyrate_idx", None) is not None
+                else [quat[-1] + 1 + i for i in range(3)])
     mass, raw_dt = float(e.get("mass", 12000.0)), float(e.get("raw_dt", 0.05))
     # DERIVE dt_eff from subsample (audit finding #1): action is SUMMED over the subsample window so Δv uses
     # raw_dt, but position integrates over the FULL subsampled-step duration = subsample*raw_dt. Hardcoding 0.25
     # was only right for subsample=5; derive it so the physics can't silently drift if subsample changes.
     sub = int(cfg.data.get("subsample", 1) or 1)
     dt_eff = sub * raw_dt
-    return lambda prev, act: _dp(prev, act, pos, vel, quat, mass=mass, raw_dt=raw_dt, dt_eff=dt_eff)
+    return lambda prev, act: _dp(prev, act, pos, vel, quat, bodyrate_idx=bodyrate,
+                                 mass=mass, raw_dt=raw_dt, dt_eff=dt_eff)
 
 
 def build_model(cfg):

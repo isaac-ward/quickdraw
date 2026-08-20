@@ -393,6 +393,32 @@ class MultiModalSequenceModel(nn.Module):
         base = self.dynamics_prior(prev_obs_abs.float(), act_raw.float())  # (...,obs_dim) ABSOLUTE, fp32
         return base + residual
 
+    def physics_proprio_chained(self, pred_bag: Tensor, prev0_abs: Tensor, true_future_abs: Tensor,
+                                act_raw: Tensor, p_tf: float) -> Tensor:
+        """p_tf-respecting chained physics rollout, ABSOLUTE units, (B,F,obs_dim). Each step feeds the PREVIOUS
+        step's own prediction forward with probability (1-p_tf) instead of the true prev — so the residual head
+        trains on the SAME compounding-error regime the eval rollout (imagine_eval) uses, closing the
+        teacher-forced-train / autoregressive-eval exposure-bias gap. At p_tf>=1 this reduces exactly to the
+        fully teacher-forced physics_proprio loss; at p_tf<=0 it is the eval rollout `_physics_proprio_rollout`
+        (see its INVARIANT note — this is the scheduled-sampling GENERALIZATION of that same physics formula).
+        pred_bag (B,F,n_state,d); prev0_abs (B,obs_dim) true ctx-last; true_future_abs (B,F,obs_dim); act_raw (B,F,act_dim)."""
+        steps = pred_bag.shape[1]
+        prev = prev0_abs.float()
+        outs = []
+        for t in range(steps):
+            token = pred_bag[:, t, self._proprio_off, :]                   # (B,d)
+            cur = self.dynamics_prior(prev, act_raw[:, t].float()) + self.residual_head(token).float()
+            outs.append(cur)
+            true_t = true_future_abs[:, t].float()
+            if p_tf >= 1.0:
+                prev = true_t                                             # full teacher forcing (== physics_proprio)
+            elif p_tf <= 0.0:
+                prev = cur                                                # fully autoregressive (eval regime)
+            else:                                                         # scheduled sampling, per-element coin
+                tf = (torch.rand(cur.shape[0], 1, device=cur.device) < p_tf).float()
+                prev = tf * true_t + (1.0 - tf) * cur
+        return torch.stack(outs, dim=1)                                   # (B,F,obs_dim) ABSOLUTE
+
     def physical_state(self, bag: Tensor, anchor: Tensor | None = None):
         """Proprio physical readout for the physical-loss variation, decoded with a FROZEN decoder (grad flows
         to the latent, not the decoder weights — like LSAR). Returns None if there is no proprio head.
@@ -595,47 +621,92 @@ class MultiModalSequenceModel(nn.Module):
                                       actions, horizon, 0.0, None, detach_every)      # (encoded with anchor in _step)
         return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every, anchor=anchor)
 
+    def _physics_proprio_rollout(self, bag: Tensor, prev0_abs: Tensor, actions: Tensor,
+                                 horizon: int, P: int, norm) -> Tensor:
+        """Canonical fully-autoregressive physics proprio rollout (shared by imagine_eval + imagine_shared):
+        obs[t] = dynamics_prior(obs[t-1], act[t]) + residual_head(latent[t]), chained on its OWN prediction,
+        obs[-1] = last true context. fp32 (issue #14). Returns NORMALIZED (B,horizon,obs_dim) matching the decode
+        it replaces. `actions` NORMALIZED (B,P-1+horizon,act_dim); the action for step t is index P-1+t.
+
+        INVARIANT — one rollout, one physics, two entry points. There is now a SINGLE inference rollout
+        implementation, `_imagine`; imagine_eval and imagine_shared are thin specializations of it (K=1 vs
+        encode-once K fan-out), so they are equivalent BY CONSTRUCTION for matched inputs (K=1) — not by two
+        code paths kept in sync. Keep it that way:
+          * imagine_eval   == _imagine(K=1).
+          * imagine_shared == _imagine(K>=1) (fan out K action variants from one encode).
+          * physics_proprio_chained (training loss) GENERALIZES the physics here to p_tf scheduled sampling;
+                            THIS helper is its p_tf<=0 branch (chain on own prediction, no true-prev coin).
+        Do NOT re-inline the physics per call site (that, plus imagine_shared skipping the rel-position anchor,
+        is exactly how it silently rolled the black-box / wrong-frame dynamics before this was unified). If you
+        change the physics, change it HERE; if you touch _imagine, keep the imagine_eval-vs-imagine_shared(K=1)
+        obs parity (parity test)."""
+        acts_raw = norm.denorm_act(actions).float()
+        prev = prev0_abs.float()
+        traj = []
+        for t in range(horizon):
+            token = bag[:, t, self._proprio_off, :]
+            cur = self.dynamics_prior(prev, acts_raw[:, P - 1 + t]) + self.residual_head(token).float()
+            traj.append(cur)
+            prev = cur
+        return norm.norm_obs(torch.stack(traj, dim=1))
+
     @torch.no_grad()
-    def imagine_shared(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int, heads=None,
-                       return_bag: bool = False) -> dict[str, Tensor]:
-        """MPPI helper: encode B contexts ONCE (the expensive image encode), expand to B*K, then roll K
-        action variants per context. ctx_obs: (B,P,*); actions: (B*K, P-1+horizon, 2). Decodes only `heads`
-        (e.g. ['proprio'] for scoring). Avoids re-encoding the image context per candidate.
-        return_bag=True also returns the rolled latent token bag under key `_bag` ((B*K,H,n_state,d)) — the
-        object a language reward scores directly (decode-free)."""
+    def _imagine(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int = 1, heads=None,
+                 use_cache: bool | None = None, decode_chunk: int | None = None, norm=None,
+                 return_bag: bool = False) -> dict[str, Tensor]:
+        """THE single inference rollout. `imagine_eval` (K=1) and `imagine_shared` (K>=1, encode-once fan-out)
+        are thin specializations that just call this — there is ONE rollout path, so a change here reaches both.
+
+        Steps: encode the context ONCE, threading the relative-position anchor (rel_anchor) so a rel-position
+        model gets the small within-window frame it was TRAINED on — NOT threading this was the bug that made
+        imagine_shared roll absolute positions through a relative encoder. Then optionally fan out to B*K action
+        variants (K>1: MPPI, encode-once shared across candidates), roll the latent spine (_rollout_from, p_tf=0,
+        no teacher forcing), decode `heads` (optionally chunked over time so long-horizon image decode doesn't
+        OOM), and — owm hook + norm given — replace the proprio decode with the physics rollout
+        (_physics_proprio_rollout; fp32, issue #14). Without dynamics_prior or without norm the proprio stays the
+        black-box decode. actions NORMALIZED (B*K, P-1+horizon, act_dim); action for step t is index P-1+t.
+        return_bag also returns the rolled latent bag under `_bag` (a language reward scores it decode-free)."""
+        uc = self.use_kv_cache if use_cache is None else use_cache
+        anchor = self.rel_anchor(ctx_obs) if self._rel_on() else None
         with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
-            bags = self.encode_state(ctx_obs)                                    # (B,P,n_state,d) — one encode
-            buf = [b.repeat_interleave(K, dim=0) for b in bags.unbind(1)]        # each (B*K,n_state,d)
-            bag = self._rollout_from(buf, actions, horizon, 0.0, None, 0, use_cache=self.use_kv_cache)
-            out = self.to_obs(bag, heads=heads)
-        out = {k: v.float() for k, v in out.items()}
+            bags = self.encode_state(ctx_obs, anchor)                            # (B,P,n_state,d) — ONE encode
+            if K != 1:
+                bags = bags.repeat_interleave(K, dim=0)                          # (B*K,P,...) fan out variants
+            bag = self._rollout_from(list(bags.unbind(dim=1)), actions, horizon, 0.0, None, 0, use_cache=uc)
+            anc = anchor if (anchor is None or K == 1) else anchor.repeat_interleave(K, dim=0)  # match B*K for decode
+            if decode_chunk and bag.ndim >= 2 and bag.shape[1] > decode_chunk:   # chunk decode over the time axis
+                parts = [self.to_obs(bag[:, s:s + decode_chunk], heads=heads, anchor=anc)
+                         for s in range(0, bag.shape[1], decode_chunk)]
+                out = {k: torch.cat([p[k] for p in parts], dim=1) for k in parts[0]}
+            else:
+                out = self.to_obs(bag, heads=heads, anchor=anc)
+        out = {k: v.float() for k, v in out.items()}                            # physics runs fp32, OUTSIDE autocast
+        if self.dynamics_prior is not None and norm is not None:
+            P = ctx_obs["proprio"].shape[1]
+            prev0 = norm.denorm_obs(ctx_obs["proprio"][:, -1])                  # (B,obs_dim) last context, ABSOLUTE
+            if K != 1:
+                prev0 = prev0.repeat_interleave(K, dim=0)                       # per-context -> B*K
+            out["proprio"] = self._physics_proprio_rollout(bag, prev0, actions, horizon, P, norm)
         if return_bag:
             out["_bag"] = bag.float()
         return out
 
-    @torch.no_grad()
     def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None,
-                     use_cache: bool | None = None, decode_chunk: int | None = None) -> dict[str, Tensor]:
-        """`heads` limits which modalities are decoded (e.g. ['proprio'] for cheap long-horizon rollouts —
-        the full latent bag, including image tokens, still rolls forward; we just skip decoding images).
-        use_cache: temporal KV-cache (default self.use_kv_cache; pass False for the parity A/B).
-        decode_chunk: if set, decode the rolled-out latent bag in chunks of this many timesteps. The rollout
-        is cheap latents; the image decode is the memory PEAK, so this bounds the decoder to
-        batch x decode_chunk frames instead of batch x horizon -> long-horizon image eval doesn't OOM
-        (PR #8 bug 2). None -> decode the whole bag at once (unchanged)."""
-        uc = self.use_kv_cache if use_cache is None else use_cache
-        # Relative-position: derive the anchor from THIS context (its first step = the window start) and thread
-        # it into the rollout's encode + the decode, so eval callers pass/receive ABSOLUTE obs unchanged.
-        anchor = self.rel_anchor(ctx_obs) if self._rel_on() else None
-        with torch.autocast(device_type=actions.device.type, dtype=torch.bfloat16, enabled=actions.is_cuda):
-            bag = self._rollout(ctx_obs, actions, horizon, 0.0, None, 0, use_cache=uc, anchor=anchor)
-            if decode_chunk and bag.ndim >= 2 and bag.shape[1] > decode_chunk:   # chunk decode over the time axis
-                parts = [self.to_obs(bag[:, s:s + decode_chunk], heads=heads, anchor=anchor)
-                         for s in range(0, bag.shape[1], decode_chunk)]
-                out = {k: torch.cat([p[k] for p in parts], dim=1) for k in parts[0]}
-            else:
-                out = self.to_obs(bag, heads=heads, anchor=anchor)
-        return {k: v.float() for k, v in out.items()}
+                     use_cache: bool | None = None, decode_chunk: int | None = None, norm=None) -> dict[str, Tensor]:
+        """Eval/single-sequence rollout = `_imagine` with K=1. `heads` limits which modalities decode (e.g.
+        ['proprio'] for cheap long-horizon rollouts). `decode_chunk` bounds the image decoder's peak memory over
+        long horizons. `norm` activates the physics-anchored proprio rollout (owm)."""
+        return self._imagine(ctx_obs, actions, horizon, K=1, heads=heads,
+                             use_cache=use_cache, decode_chunk=decode_chunk, norm=norm)
+
+    def imagine_shared(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int, heads=None,
+                       return_bag: bool = False, norm=None) -> dict[str, Tensor]:
+        """MPPI rollout = `_imagine` with encode-once K fan-out: encode B contexts ONCE (the expensive image
+        encode), expand to B*K, roll K action variants per context. ctx_obs (B,P,*); actions (B*K,P-1+H,act_dim).
+        return_bag also returns the rolled latent bag under `_bag`. `norm` MUST be passed for MPPI, else it scores
+        the mislearned black-box dynamics instead of the physics rollout."""
+        return self._imagine(ctx_obs, actions, horizon, K=K, heads=heads,
+                             use_cache=self.use_kv_cache, norm=norm, return_bag=return_bag)
 
     @torch.no_grad()
     def kvcache_report(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None) -> dict[str, float]:
