@@ -24,6 +24,12 @@ class RecordedConfig:
     dt: float = 1.0 / 30.0
     position_idx: list | None = None   # obs dims that are world POSITION (for physical_loss continuity)
     velocity_idx: list | None = None   # obs dims that are velocity; default = position block shifted by its length
+    # OWM-SPECIFIC physics prior (a = R(q)F/m, verified). OFF by default -> the model is byte-identical.
+    dynamics_prior: bool = False       # gate the owm chaser translational-dynamics prior (RecordedEnv hook)
+    quat_idx: list | None = None       # obs dims of the attitude quaternion [w,x,y,z] (ego-13: [6,7,8,9])
+    mass: float = 12000.0
+    raw_dt: float = 0.05               # per-substep dt (action is SUMMED over the subsample window)
+    dt_eff: float = 0.25               # subsampled-step duration = subsample * raw_dt
     # inert placeholders: train_world_model reads e.R / e.r / e.init_speed unconditionally (torus geometry
     # knobs for variations + LoggingCallback); nothing consumes them on a recorded run.
     R: float = 1.0
@@ -47,6 +53,26 @@ class RecordedEnv:
         # default: the velocity block immediately follows position (owm-iss ego state: pos [0,1,2], vel [3,4,5])
         self.velocity_idx = ([int(i) for i in vi] if vi is not None
                              else ([i + len(self.position_idx) for i in self.position_idx] if self.position_idx else None))
+        self.dynamics_prior_on = bool(getattr(cfg, "dynamics_prior", False))
+        qi = getattr(cfg, "quat_idx", None)
+        self.quat_idx = [int(i) for i in qi] if qi is not None else None
+        self.mass = float(getattr(cfg, "mass", 12000.0))
+        self.raw_dt = float(getattr(cfg, "raw_dt", 0.05))
+        self.dt_eff = float(getattr(cfg, "dt_eff", 0.25))
+
+    def make_dynamics_prior(self):
+        """OWM-SPECIFIC hook: return a callable(prev_obs_abs, action_raw)->physics next-obs (chaser a=R(q)F/m,
+        verified cos 0.996), or None when off / indices unset. Env-provided so the model stays generic and
+        byte-identical when this is None."""
+        if not self.dynamics_prior_on or self.position_idx is None or self.quat_idx is None:
+            return None
+        from .owm_physics import dynamics_prior
+        pos, vel, quat = self.position_idx, self.velocity_idx, self.quat_idx
+        mass, raw_dt, dt_eff = self.mass, self.raw_dt, self.dt_eff
+
+        def prior(prev_obs, action):
+            return dynamics_prior(prev_obs, action, pos, vel, quat, mass=mass, raw_dt=raw_dt, dt_eff=dt_eff)
+        return prior
 
     def physical_loss(self, obs_phys):
         """Kinematic continuity v = dp/dt on the recorded ego state (no analytic surface physics). Reuses the

@@ -110,7 +110,8 @@ class MultiModalSequenceModel(nn.Module):
                  mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
                  compile_rollout: bool = False, latent_norm: str | bool = "affine",
                  action_fourier_freqs: int = 0, action_squash: str = "none",
-                 relative_position: bool = False, position_idx=None, relative_scale=None):
+                 relative_position: bool = False, position_idx=None, relative_scale=None,
+                 dynamics_prior=None):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)
@@ -141,6 +142,24 @@ class MultiModalSequenceModel(nn.Module):
                 sc = sc.repeat(len(self._pos_idx))
             assert len(sc) == len(self._pos_idx), f"relative_scale {sc.shape} != position_idx {len(self._pos_idx)}"
             self.register_buffer("_rel_scale", sc)   # NORMALIZED-space per-dim std of the within-window displacement
+        # OWM PHYSICS PRIOR (RecordedEnv hook; default None -> BYTE-IDENTICAL). When a dynamics_prior callable is
+        # given, proprio prediction = physics(prev_obs, action) + residual_head(predicted proprio token). Codec /
+        # roundtrip / decode are UNCHANGED; this only ADDS one zero-init head (used by the physics loss in
+        # lit._step and by physics_proprio() for eval/MPPI). residual=0 at init -> prediction == the verified
+        # physics law, so the action-response is correct by construction.
+        self.dynamics_prior = dynamics_prior
+        if dynamics_prior is not None:
+            import torch.nn as _nn
+            self._proprio_dim = int(self.modalities["proprio"].dim)
+            _off = 0
+            for _nm, _nt in self.layout:
+                if _nm == "proprio":
+                    self._proprio_off = _off
+                    break
+                _off += _nt
+            self.residual_head = _nn.Sequential(_nn.Linear(d, d), _nn.SiLU(), _nn.Linear(d, self._proprio_dim))
+            _nn.init.zeros_(self.residual_head[-1].weight)
+            _nn.init.zeros_(self.residual_head[-1].bias)     # zero-init output -> pred == physics at init
         # action -> 1 token. action_fourier_freqs>0 prepends sin/cos features so SMALL action differences are
         # linearly separable (robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ
         # slightly). 0 = off = bit-identical to a plain _mlp.
@@ -363,6 +382,16 @@ class MultiModalSequenceModel(nn.Module):
     def _to_input(self, bag: Tensor, act: Tensor, levels=None) -> Tensor:  # (B,T,n_state,d),(B,T,2)->(B,T,n_input,d)
         bag = self._add_level_emb(bag, levels)                 # DF: condition the backbone on context noise levels
         return torch.cat([bag, self.act_enc(act).unsqueeze(-2)], dim=-2)
+
+    def physics_proprio(self, pred_bag: Tensor, prev_obs_abs: Tensor, act_raw: Tensor) -> Tensor:
+        """Physics-anchored proprio prediction in ABSOLUTE units: dynamics_prior(prev,act) + residual_head(token).
+        pred_bag (...,n_state,d); prev_obs_abs (...,obs_dim); act_raw (...,act_dim). Requires dynamics_prior set.
+        Physics runs in fp32 (absolute position = small displacement on a ~hundreds-of-m base; bf16 would quantize
+        it to ~1 m — issue #14). residual_head is the learned CW/perturbation correction (zero at init)."""
+        token = pred_bag[..., self._proprio_off, :]                       # (...,d) — proprio is 1 token
+        residual = self.residual_head(token).float()                     # (...,proprio_dim)
+        base = self.dynamics_prior(prev_obs_abs.float(), act_raw.float())  # (...,obs_dim) ABSOLUTE, fp32
+        return base + residual
 
     def physical_state(self, bag: Tensor, anchor: Tensor | None = None):
         """Proprio physical readout for the physical-loss variation, decoded with a FROZEN decoder (grad flows

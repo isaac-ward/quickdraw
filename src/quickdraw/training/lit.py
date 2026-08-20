@@ -154,6 +154,13 @@ class LitWorldModel(L.LightningModule):
         lt_kw = {"anchor": anchor} if anchor is not None else {}   # only reaches the flow loss_terms; non-flow untouched
         raw, w = (m.loss_terms(preds, future, obs, p_tf, act, pre_z=z_full, **lt_kw) if share
                   else m.loss_terms(preds, future, obs, p_tf, act, **lt_kw))   # pre_z: shared-encode fast path (flow only)
+        if getattr(m, "dynamics_prior", None) is not None:        # OWM physics-anchored proprio loss (hook ON only)
+            Pn, Fn = self.P, self.F                               # teacher-forced prev = true obs before each future step
+            prev_abs = self.norm.denorm_obs(obs["proprio"][:, Pn - 1:Pn - 1 + Fn])   # (B,F,obs_dim) ABSOLUTE
+            act_raw = self.norm.denorm_act(act[:, Pn - 1:Pn - 1 + Fn])               # (B,F,act_dim) raw force (N)
+            phys_norm = self.norm.norm_obs(m.physics_proprio(preds, prev_abs, act_raw))
+            raw["physics/proprio"] = F.mse_loss(phys_norm, future["proprio"])
+            w["physics/proprio"] = 1.0
         # recon_losses returns its OWN weights (same contract as loss_terms). It used to be reconstructed here
         # by parsing the key -- wts[k.split("/")[-1]] -- which mapped "roundtrip/image" to the IMAGE DECODE
         # weight, so ablating a head's decode recon with modalities.<i>.weight=0 silently also deleted that

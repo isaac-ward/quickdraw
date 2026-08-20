@@ -52,7 +52,11 @@ def env_cfg(cfg):
         return RecordedConfig(obs_dim=int(e.obs_dim), action_dim=int(e.action_dim),
                               dt=_recorded_dt(cfg, float(e.dt)),
                               position_idx=(list(e.position_idx) if e.get("position_idx", None) is not None else None),
-                              velocity_idx=(list(e.velocity_idx) if e.get("velocity_idx", None) is not None else None))
+                              velocity_idx=(list(e.velocity_idx) if e.get("velocity_idx", None) is not None else None),
+                              dynamics_prior=bool(e.get("dynamics_prior", False)),
+                              quat_idx=(list(e.quat_idx) if e.get("quat_idx", None) is not None else None),
+                              mass=float(e.get("mass", 12000.0)), raw_dt=float(e.get("raw_dt", 0.05)),
+                              dt_eff=float(e.get("dt_eff", 0.25)))
     raise ValueError(f"env_cfg: no config dataclass for environments.name={e.name!r}")
 
 
@@ -131,6 +135,26 @@ def apply_size_preset(cfg):
                 img[k] = v
 
 
+def _make_dynamics_prior(cfg):
+    """OWM-SPECIFIC physics prior callable (a=R(q)F/m), or None when off. Gated by environments.dynamics_prior;
+    None -> the model is byte-identical. The physics lives in environments/owm_physics.py (mirrors the
+    RecordedEnv.make_dynamics_prior hook)."""
+    e = cfg.get("environments", {}) or {}
+    if not (e.get("dynamics_prior", False) if hasattr(e, "get") else False):
+        return None
+    from ..environments.owm_physics import dynamics_prior as _dp
+    pos = list(e.position_idx)
+    vel = list(e.velocity_idx) if e.get("velocity_idx", None) is not None else [i + len(pos) for i in pos]
+    quat = list(e.quat_idx)
+    mass, raw_dt = float(e.get("mass", 12000.0)), float(e.get("raw_dt", 0.05))
+    # DERIVE dt_eff from subsample (audit finding #1): action is SUMMED over the subsample window so Δv uses
+    # raw_dt, but position integrates over the FULL subsampled-step duration = subsample*raw_dt. Hardcoding 0.25
+    # was only right for subsample=5; derive it so the physics can't silently drift if subsample changes.
+    sub = int(cfg.data.get("subsample", 1) or 1)
+    dt_eff = sub * raw_dt
+    return lambda prev, act: _dp(prev, act, pos, vel, quat, mass=mass, raw_dt=raw_dt, dt_eff=dt_eff)
+
+
 def build_model(cfg):
     """Dispatch on cfg.model.name: data-space (DSAR) or latent-space (LSAR + a collapse mechanism) or
     diffusion; if cfg.model.modalities is set, build the MULTIMODAL variant (token-bag spine)."""
@@ -175,7 +199,8 @@ def build_model(cfg):
                       # within-window displacement std (the rescale-to-unit-variance gain denominator).
                       relative_position=bool(m.get("relative_position", False)),
                       position_idx=(cfg.environments.get("position_idx", None) if m.get("relative_position", False) else None),
-                      relative_scale=(list(m.get("relative_scale")) if m.get("relative_scale", None) is not None else None))
+                      relative_scale=(list(m.get("relative_scale")) if m.get("relative_scale", None) is not None else None),
+                      dynamics_prior=_make_dynamics_prior(cfg))
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}
