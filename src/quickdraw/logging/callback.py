@@ -409,6 +409,13 @@ class LoggingCallback(L.Callback):
         # are therefore written at the END of this hook (below), once both windows have actually been measured.
         if torch.cuda.is_available():
             self._mem_trainval = (torch.cuda.max_memory_allocated() / 1e9, torch.cuda.max_memory_reserved() / 1e9)
+            # empty_cache() BEFORE the rebase (2026-08-20): reset_peak_memory_stats rebases the peak counters but
+            # NOT the reserved pool, so without this the eval window inherits training's pool and its "reserved"
+            # figure just re-reports it (measured: 87.5GB for a window whose real cost is 39.7GB). Releasing the
+            # cached blocks first makes the eval reserved number honest -- which is the PREREQUISITE for ever
+            # calibrating probe_eval against a real run, a comparison the design doc demanded and that was
+            # therefore never actually performed. With expandable_segments the pool does shrink. Costs ms.
+            torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
         t_eval = time.perf_counter()
         try:
@@ -474,7 +481,8 @@ class LoggingCallback(L.Callback):
             # identically (measured: train+val 63.7 and eval-routines 63.7 reserved, while allocated was 63.5 vs
             # 32.1). The reserved figures are kept for the FIRST window only, where they are honest.
             self.writer.scalars({"mem/peak_trainval_gb": ta, "mem/peak_trainval_reserved_gb": tr,
-                                 "mem/peak_evalroutines_gb": torch.cuda.max_memory_allocated() / 1e9},
+                                 "mem/peak_evalroutines_gb": torch.cuda.max_memory_allocated() / 1e9,
+                                 "mem/peak_evalroutines_reserved_gb": torch.cuda.max_memory_reserved() / 1e9},
                                 step=epoch)
 
     def on_validation_epoch_end(self, trainer, pl_module):

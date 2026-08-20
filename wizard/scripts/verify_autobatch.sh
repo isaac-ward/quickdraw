@@ -49,6 +49,11 @@ from hydra import initialize_config_dir, compose
 ov = sys.argv[1:]
 with initialize_config_dir(config_dir="/app/conf", version_base=None):
     cfg = compose(config_name="config", overrides=ov)
+# set_subsample BEFORE sizing, exactly as train_world_model.py does -- without it the loader returns
+# unsubsampled episode lengths and the resident frame-store estimate is 5x too large (measured), which
+# silently shrinks the chosen batch. This harness has now twice been the source of an invalid measurement.
+from quickdraw.data.dataset import set_subsample
+set_subsample(int(cfg.data.get("subsample", 1) or 1))
 from quickdraw.training.setup import autobatch_find
 b = autobatch_find(cfg, torch.device("cuda"), log=print)
 print(f"CHOSE data.batch={b}")

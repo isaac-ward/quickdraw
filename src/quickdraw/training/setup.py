@@ -239,7 +239,14 @@ def autobatch_find(cfg, device, log=print) -> int:
     SYNTHETIC batches (memory is shape- not value-dependent), probes real `rollout_train` fwd + decode + bwd,
     then frees. Probes the REAL training step (rollout_train -> recon + flow loss, backward, AND an AdamW
     step so optimizer states count) — the earlier synthetic pow(2) proxy under-counted the loss graph +
-    optimizer by ~12 GB and picked batches that OOM'd. Headroom still covers eval-phase spikes + allocator
+    optimizer by ~12 GB and picked batches that OOM'd.
+
+    The eval phase is PROBED and REPORTED (probe_eval) -- reported, NOT gated: it only warns, because eval
+    routines self-disable after two failures and refusing to start a run on an ESTIMATE is the worse trade.
+    Sizing therefore uses the TRAINING constraint alone, which is correct and measured: eval memory does not
+    depend on data.batch, the phases are sequential, and the freed training blocks are reused (2026-08-19: eval
+    after an 87.5GB train peak added NO new reservation). The margin held back is `data.autobatch_reserve_gb`
+    PLUS the GPU-resident dataset, which is subtracted explicitly below.
     Config: data.autobatch{,_reserve_gb,_max,_base}."""
     import gc
     # ONE ABSOLUTE MARGIN (2026-08-18), replacing `autobatch_headroom` (a fraction). The two reserves that used
@@ -254,10 +261,60 @@ def autobatch_find(cfg, device, log=print) -> int:
     cap = int(cfg.data.get("autobatch_max", 512))
     base = int(cfg.data.get("autobatch_base", 16))
     total = torch.cuda.get_device_properties(device).total_memory
-    budget = int(max(total * 0.25, total - reserve))     # floor at 25% of the card so a bad reserve cannot zero it
+
+    def _resident_frame_bytes():
+        """The image frame store MMWindowLoader parks on the GPU -- allocated AFTER this function has already
+        spent the card (train_world_model: autobatch_find at ~line 150, window_loaders at ~172).
+
+        This was the entire unexplained "probe vs real" gap that `autobatch_reserve_gb` was standing in for.
+        MEASURED 2026-08-19 on the 128px/4Hz config: probe 87.29GB allocated + 3.170GB resident = 90.46 against
+        a real ep1 peak of 90.29GB reserved -- residual ~0.17GB, i.e. there is no allocator drift to reserve
+        against at all. It is deterministic and computable, and it scales with dataset-hours x img_size**2, so a
+        FIXED reserve cannot cover it: at 20h/256px it is tens of GB while the knob stays put. Frames only (the
+        dominant term, 2.87 of 3.17GB); the ~0.3GB of window/index tensors stays inside the blind reserve."""
+        try:
+            from ..data.dataset import get_subsample, load_split_episodes
+            # This estimate rides on the PROCESS-GLOBAL frame stride, because the loader applies it. If the
+            # caller has not called set_subsample() yet, the lengths come back unsubsampled and the estimate is
+            # off by exactly that factor -- measured: 14.18GB instead of 2.83GB at subsample=5, i.e. the
+            # verification harness silently shrank the batch. Over-estimating is the SAFE direction, but say so.
+            _want, _have = int(cfg.data.get("subsample", 1) or 1), get_subsample()
+            if _have != _want:
+                log(f"[autobatch] WARNING: data.subsample={_want} but the process frame stride is {_have} "
+                    f"(set_subsample() not called yet) -- the resident frame-store estimate below is {_want/_have:.0f}x "
+                    f"too LARGE, so the chosen batch will be conservative. Call set_subsample() before sizing.")
+            imgs = [sp for sp in specs if getattr(sp, "kind", "vector") == "image"]
+            if not imgs:
+                return 0
+            n = 0
+            for split in ("train", "val"):
+                eps_ = load_split_episodes(resolve_data_root(cfg), split,
+                                           repo_id=cfg.data.get("repo_id", "torus"))
+                n += sum(len(o) for o, _ in eps_)          # subsampling is applied inside the loader
+            b = 0
+            for sp in imgs:
+                sz = getattr(sp, "img_size", 128)
+                hw = (sz, sz) if isinstance(sz, int) else tuple(int(x) for x in sz)
+                b += n * hw[0] * hw[1] * int(getattr(sp, "channels", 3))   # uint8
+            return b
+        except Exception as e:
+            log(f"[autobatch] could not size the resident frame store ({type(e).__name__}: {e}); "
+                f"falling back to the blind reserve alone")
+            return 0
+    # No floor on the budget (the `max(total*0.25, ...)` guard was deleted 2026-08-20): it only bound when the
+    # reserve exceeded 75% of the card, and when it bound it silently GRANTED more than the operator asked to
+    # hold back -- inverting the knob. A nonsensical reserve now makes every probe fail and the RuntimeError
+    # below fires, and that message already names autobatch_reserve_gb as the thing to lower.
     P, F = int(cfg.data.P), int(cfg.data.F); L = P + F
     de = int(cfg.model.get("detach_every", 16)); rf = float(cfg.model.get("recon_frac", 1.0))
     specs = _modality_specs(cfg); adim = int(cfg.model.get("action_dim", 2))
+    # AFTER specs: _resident_frame_bytes closes over it (defining the budget earlier raised NameError -- caught
+    # by running the verification, which reported "could not size the resident frame store" and silently fell
+    # back to the blind reserve, exactly the kind of quiet degradation this whole pass is about).
+    resident = _resident_frame_bytes()
+    budget = int(total - reserve - resident)
+    log(f"[autobatch] budget {budget/1e9:.1f}GB = card {total/1e9:.1f} - reserve {reserve/1e9:.1f} - "
+        f"resident frame store {resident/1e9:.2f} | allocator={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
     model = build_model(cfg).to(device).train()
     # The eager binary search sizes MEMORY, which is ~compile-independent (validation: 22.9 GB compiled vs eager),
     # so probe EAGER — else the compiled path recompiles at every probe batch size (~96 s each = thrash). If
@@ -298,9 +355,17 @@ def autobatch_find(cfg, device, log=print) -> int:
         raw, w = model.loss_terms(preds, future, obs, 0.0, act)
         return sum(w[k] * raw[k] for k in raw) + sum(rw[k] * recon[k] for k in recon)
 
-    def _seq_preds(obs, act):   # p_tf=0 AUTOREGRESSIVE rollout (the in-rollout epochs)
+    def _seq_preds(obs, act):   # p_tf=0 AUTOREGRESSIVE rollout (the in-rollout epochs, i.e. most of training)
+        # Uses the SHARED-ENCODE fast path, because that is what LitWorldModel._step actually runs at p_tf==0
+        # (lit.py: `share = (p_tf == 0.0) and hasattr(m, "flow") and all noise_std == 0` -> encode once, pass
+        # z_full[:, :P] as precomputed_ctx). Probing WITHOUT it modelled a step the trainer never executes and
+        # over-estimated: measured 2026-08-19, probe/real = 1.007 on bsp32mse but 1.32 on anch128 -- i.e. on a
+        # frozen-AE config it threw away a THIRD of the card. Guarded exactly as lit.py guards it.
+        share = hasattr(model, "flow") and all(model.modalities[k].noise_std == 0 for k in obs)
+        z_full = model.encode_state(obs) if share else None
         return model.rollout_train({k: v[:, :P] for k, v in obs.items()}, act[:, : L - 1],
-                                   {k: v[:, P:] for k, v in obs.items()}, 0.0, de)
+                                   {k: v[:, P:] for k, v in obs.items()}, 0.0, de,
+                                   precomputed_ctx=(z_full[:, :P] if share else None))
 
     def _par_preds(obs, act):   # p_tf=1 PARALLEL forward (epoch-0 regime: whole sequence in ONE pass — often the
         return model({k: v[:, :-1] for k, v in obs.items()}, act[:, :-1])[:, P - 1:]   # TRUE memory peak)
@@ -355,6 +420,7 @@ def autobatch_find(cfg, device, log=print) -> int:
         if not compiled_run:
             return b
         model.compile_rollout = True
+        last_ok = None                 # largest batch measured as FITTING on the compiled step
         # FIXED 2026-08-18. Two bugs: (1) it stepped down by a CONSTANT 8, which on the batch<=16 configs this
         # repo actually runs is a >=50% jump; (2) when `b - 8 < 1` it logged "over budget down to batch {b};
         # using {b}" and RETURNED b -- a batch it had just measured as NOT fitting. At b=8 that was the branch
@@ -364,6 +430,7 @@ def autobatch_find(cfg, device, log=print) -> int:
             log(f"[autobatch] compiled-confirm: probing batch {b} on the compiled step (one-time ~1-2 min compile)...")
             ok_, p_ = fits(b)
             if ok_:
+                last_ok = b
                 log(f"[autobatch] compiled-confirm OK: batch {b} ({(p_ or 0)/1e9:.1f}/{budget/1e9:.0f}GB compiled)")
                 return b
             if b <= 1:
@@ -379,8 +446,14 @@ def autobatch_find(cfg, device, log=print) -> int:
             log(f"[autobatch] compiled step over budget at {b} "
                 f"({(p_ or 0)/1e9:.1f}/{budget/1e9:.0f}GB) — stepping down to {nb}")
             b = nb
-        log(f"[autobatch] compiled-confirm exhausted its retries; using the last probed batch {b}")
-        return b
+        # Return the last batch that actually FIT, never the last one PROBED (2026-08-20). This path used to
+        # return `b` -- a batch just measured as over budget -- contradicting this function's own claim that
+        # "an over-budget batch is never returned". Reachable whenever 6 proportional step-downs do not converge.
+        if last_ok is not None:
+            log(f"[autobatch] compiled-confirm exhausted its retries; using the last batch that FIT ({last_ok})")
+            return last_ok
+        log("[autobatch] compiled-confirm exhausted its retries and NOTHING fit; falling back to batch 1")
+        return 1
 
     # ---- Step 4 (2026-08-18): PROBE THE INFERENCE PHASE ---------------------------------------------------
     # Until now eval memory was never measured -- it was covered by a headroom fraction, and the documented
@@ -388,7 +461,7 @@ def autobatch_find(cfg, device, log=print) -> int:
     # (epoch_peak - probe_peak, ~+4.5 GB) was NOT a measurement of eval at all: nothing reset the CUDA peak
     # counter, so the epoch peak was a process max that also included autobatch's own rejected probes.
     #
-    # KEY PROPERTY that makes this a GATE rather than a subtraction: eval memory does NOT depend on data.batch.
+    # KEY PROPERTY that makes this a REPORT rather than a subtraction: eval memory does NOT depend on data.batch.
     # It is fixed by the eval config (ood_horizon hardcodes n_ep=8 at routines.py:133, plus eval.horizon,
     # ae_floor_episodes, closed_loop_steps) and by the model. Training activations are freed before eval and the
     # allocator reuses those blocks, so the two phases do not add -- each must independently fit the budget.
@@ -404,42 +477,61 @@ def autobatch_find(cfg, device, log=print) -> int:
         return obs, torch.randn(B, T_ctx + H, adim, device=device)
 
     def probe_eval():
-        """Peak RESERVED bytes of one eval-shaped rollout+decode. Returns None if it cannot be measured."""
-        H = max(1, min(int(cfg.eval.get("horizon", 128) or 128), 256))   # capped: the routine itself clamps to
-        n_ep = 8                                                         #   episode length, which we cannot know here
+        """Peak bytes of the eval phase, by running the REAL entry point (`imagine_eval`) at the REAL shapes
+        (`ood_horizon_shapes`). Returns (reserved, allocated) or None / -1.0 on OOM.
+
+        REWRITTEN 2026-08-20. The previous version hand-rolled the rollout and diverged from the routine in five
+        ways -- no autocast, no decode_chunk, use_cache=False, a hardcoded n_ep=8, and a 256 horizon cap -- which
+        made it over-model open_loop by 2.4x (39.5GB vs the real 16.4GB) while not modelling closed_loop_16 at
+        all, which is where the real peak actually is. Its apparent agreement with a real run was coincidence.
+        Now it calls the same function the routine calls, per mode, and takes the max."""
         try:
-            torch.cuda.synchronize(device); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
-            with torch.no_grad():
-                obs, act = _synth_eval(n_ep, P, H)
-                bag = model._rollout(obs, act, H, 0.0, None, 0)
-                out = model.to_obs(bag, heads=[sp.name for sp in specs])
-                # hold pred AND a same-shape target, which is what image_curves does per timestep
-                held = [v.float() for v in out.values()]
-                _ = sum(float(torch.mean((v - torch.rand_like(v)) ** 2)) for v in held)
-            return torch.cuda.max_memory_reserved(device)
+            from ..data.dataset import load_split_episodes
+            from ..evaluation.routines import ood_horizon_shapes
+            from .setup import resolve_data_root                                    # noqa: F401 (same module)
+            img_heads = [sp.name for sp in specs if getattr(sp, "kind", "vector") == "image"]
+            # episode LENGTHS only -- the proprio loader reads no frames, so this is cheap (seconds)
+            ep_lens = [len(o) for o, _ in load_split_episodes(resolve_data_root(cfg), "val",
+                                                             repo_id=cfg.data.get("repo_id", "torus"))]
+            n_ep, H, modes, calls = ood_horizon_shapes(cfg, bool(img_heads), ep_lens, P)
+            dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None
+            heads = [sp.name for sp in specs]
+            worst, worst_name = (0, 0), "-"
+            for name, rows, hz in calls:
+                torch.cuda.synchronize(device); torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(device)
+                obs, act = _synth_eval(rows, P, hz)
+                with torch.no_grad():
+                    model.imagine_eval(obs, act, hz, heads=heads, decode_chunk=dc)
+                r = (torch.cuda.max_memory_reserved(device), torch.cuda.max_memory_allocated(device))
+                log(f"[autobatch] eval probe {name}: rows={rows} horizon={hz} -> "
+                    f"{r[0]/1e9:.1f}GB reserved / {r[1]/1e9:.1f}GB allocated")
+                del obs, act
+                if r[0] > worst[0]:
+                    worst, worst_name = r, name
+            log(f"[autobatch] eval probe WORST mode = {worst_name} at {worst[0]/1e9:.1f}GB reserved "
+                f"(n_ep={n_ep}, H={H}, decode_chunk={dc})")
+            return worst[0]
         except Exception as e:
             oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower()
-            log(f"[autobatch] eval probe {'OOM' if oom else 'skipped'} ({type(e).__name__}: {str(e)[:120]})")
+            log(f"[autobatch] eval probe {'OOM' if oom else 'skipped'} ({type(e).__name__}: {str(e)[:140]})")
             return -1.0 if oom else None
         finally:
             gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
 
     _ev = probe_eval()
     if _ev == -1.0:
-        log(f"[autobatch] WARNING: the eval phase OOM'd on its own, INDEPENDENT of data.batch. Training will "
-            f"still be sized, but expect eval routines to fail (they self-disable after 2 failures rather than "
-            f"killing the run). Shrink eval.horizon / eval.closed_loop_steps / eval.ae_floor_episodes, or turn "
-            f"off manifold.")
-    elif _ev is not None:
-        pct = 100.0 * _ev / budget
-        log(f"[autobatch] eval probe: {_ev/1e9:.1f}GB reserved ({pct:.0f}% of the {budget/1e9:.0f}GB budget) "
-            f"at n_ep=8, horizon={max(1, min(int(cfg.eval.get('horizon', 128) or 128), 256))}")
-        if _ev > budget:
-            # WARN, do not raise. The plan said raise, but eval failures no longer kill a run (a routine that
-            # fails twice self-disables), so blocking startup on an ESTIMATE is the worse trade: a mis-estimating
-            # probe would refuse to start runs that would have trained fine.
-            log("[autobatch] WARNING: the eval phase alone exceeds the budget. Training is sized independently, "
-                "so it will still run; eval routines may fail and self-disable.")
+        log("[autobatch] WARNING: the eval phase OOM'd on its own, INDEPENDENT of data.batch. Training will "
+            "still be sized (correctly -- eval cost does not depend on the batch), but expect eval routines to "
+            "fail and self-disable. Shrink eval.horizon / eval.closed_loop_steps / eval.ae_floor_episodes, or "
+            "turn off manifold.")
+    elif _ev is not None and _ev > budget:
+        # WARN, never raise: eval routines self-disable after two failures, so refusing to start a run on an
+        # ESTIMATE is the worse trade. Sizing ignores this number by design -- eval memory is batch-independent
+        # and the phases are sequential with block reuse (measured: eval after an 87.5GB train peak added no new
+        # reservation), so a smaller batch could not rescue an eval that genuinely does not fit.
+        log(f"[autobatch] WARNING: the eval phase ({_ev/1e9:.1f}GB) exceeds the {budget/1e9:.0f}GB budget on its "
+            f"own. Training is sized independently and will still run; eval routines may fail and self-disable.")
 
     # ---- Step 3 (2026-08-18): LINEAR-FIT SIZING, with the bisection below as fallback ---------------------
     # peak(B) = a*B + b. `b` is persistent (fp32 weights + grads + Adam m,v = 16 B/param); `a` is per-sample
