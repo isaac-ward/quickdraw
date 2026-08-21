@@ -55,6 +55,7 @@ class ModalitySpec:
     patch: int = 16
     num_tokens: int = 8
     ae_depth: int = 4
+    ae_bottleneck: int = 8   # conv-pyramid bottleneck target (px, short side); 8 = previous behaviour
     channels: int = 3
     # pretrained image AE (TAESD) — issue #12. pretrained=false -> the bespoke AE above (BIT-IDENTICAL default).
     pretrained: bool = False                     # master on/off for the pretrained-AE image trunk
@@ -158,6 +159,7 @@ class ImageModality(Modality):
         ae_cfg = VisionAEConfig(
             img_size=spec.img_size, patch=spec.patch, d=d, enc_depth=spec.ae_depth,
             dec_depth=spec.ae_depth, num_tokens=spec.num_tokens, channels=spec.channels,
+            bottleneck=int(getattr(spec, "ae_bottleneck", 8)),
             build_decoder=False)                   # encoder-only; the unified decode_head IS the decoder
         # `self.ae` is the encoder AND the cfg-holder the decode head reads (both variants expose .cfg + .encode()).
         self.ae = (ConvImageEncoder(ae_cfg, base=int(getattr(spec, "encode_base", 32)))

@@ -683,6 +683,128 @@ the orchestrator's own command line -- a plain `pkill -f watchdog.sh` killed one
 - No watchdog is running. The orchestrator relaunches from the queue but does NOT resume a crashed run from
   its checkpoint.
 
+## 17. THE 8×8 BOTTLENECK — why 14 runs could not move the AE floor (08-20/21)
+
+**The trigger.** The work was presented and the feedback was that *both* the AE floor and the dynamics
+look blurry. That is the same complaint §16's winner (`bsp32mse`) was supposed to have answered, so the
+question became: what is actually pinning the bespoke reconstruction floor at 18.7–20.4 dB?
+
+**The finding.** Both conv pyramids computed their level count from an *independent copy* of the same rule:
+
+```python
+# ConvImageEncoder  (models/vision.py, after a stride-2 stem)
+n_levels = max(1, int(math.log2(max(8, min(h0, w0)) // 8)))
+# ConditionalUNet   (models/vision.py:370, from FULL resolution — a second, separate copy)
+n_levels = max(1, int(math.log2(max(8, min(H,  W )) // 8)))
+```
+
+The `8` is a hardcoded **target**: the pyramid pools until the short side reaches ~8, *at every
+resolution*. 64px → 8×8. 128px → 8×8. 256px → 8×8. (192/384px → 12×12.) So the encoder discarded all
+spatial detail below 8×8 **before the `num_tokens` learned queries ever cross-attended the map**.
+
+**This retroactively explains every null result on the codec axis.** Four separate sweeps, all flat:
+
+| swept | range | effect on the AE floor |
+|---|---|---|
+| `num_tokens` | 8 → 64 (an **8× range of latent floats**) | none, 18.7–20.4 dB |
+| `decode_base` | 32 → 64 (2.3× total params) | none on the floor |
+| `ae_depth` | 4 → 6 | none |
+| `latent_loss_weight` | 10 → 30 | none |
+
+None of them touch the binding constraint, so none of them could have worked. It also **predicts that
+256px would have been a waste** — the pyramid would still land on 8×8, so we would have paid 4× the
+compute for the same bottleneck. (256px is out of the running anyway per the user, 08-21.)
+
+Consistent supporting evidence already in hand: the **best bespoke floor of the whole holiday program,
+21.26 dB, came from `decode_arch=vit`** — the one decoder with *no conv pyramid at all*.
+
+**The parameter split is also backwards for a world model.** On `bsp32mse` (6.373M total):
+
+| block | params | share |
+|---|---|---|
+| image decoder (U-Net) | 4.376M | 68.7% |
+| dynamics backbone | 1.063M | 16.7% |
+| flow denoiser | 0.485M | 7.6% |
+| image encoder | 0.403M | 6.3% |
+| | | **dynamics = 24.3%** |
+
+Two thirds of the model is a decoder that reads an 8×8 bottleneck. Rebalancing (`depth` 4→8,
+`flow_arch_depth` 2→4, `d` 128→192) is a separate, deferred experiment.
+
+### The knob (implemented 08-21)
+
+`ae_bottleneck` on `ModalitySpec` → `VisionAEConfig.bottleneck`, replacing the hardcoded `8` in **both**
+formulas. Default 8. Verified bit-identical:
+
+```
+bottleneck=None  total 6.373M | ae 0.403M | decode_head 4.376M | enc bott_hw (8, 8)
+bottleneck=8     total 6.373M | ae 0.403M | decode_head 4.376M | enc bott_hw (8, 8)   <- identical
+bottleneck=16    total 5.321M | ae 0.189M | decode_head 3.538M | enc bott_hw (16,16)
+```
+
+**Exposed as a shared TARGET, not as `n_levels`** (the user's first suggestion). The encoder pools
+*after* a stride-2 stem and the decoder pools from full resolution, so at 128px they need 3 and 4 levels
+respectively — one shared `n_levels` value would silently desynchronise them. A shared target cannot.
+
+**Note the confound, which runs in the favourable direction.** Raising the target removes one pyramid
+level, i.e. removes the deepest and widest channel block, so `bottleneck=16` has **fewer** parameters
+(5.321M vs 6.373M, and the AE proper drops 0.403M → 0.189M). A win is therefore unambiguous — spatial
+resolution beating channel width at 0.83× the params. A loss is ambiguous, and the follow-up would be
+`bottleneck=16` + `decode_base=64`.
+
+### The A/B — `bott_recon1` vs `bott_bott16` (08-21, RUNNING)
+
+`wizard/scripts/robocasa-bottleneck.sh`, `logs/robocasa-bottleneck/`, 25 epochs, both on `model=bsp32mse`
+at `data.subsample=5`.
+
+| arm | GPU | change | tests |
+|---|---|---|---|
+| `bott_recon1` | 0 | `model.recon_frac=1.0` | is the blur a shortage of **supervision**? 0.25 was inherited, never measured; `bsp32mse.yaml` names it as the most obvious untested sharpness lever |
+| `bott_bott16` | 1 | `+model.modalities.1.ae_bottleneck=16` | is the blur the **8×8 bottleneck**? 64× spatial reduction instead of 256× |
+
+**Based on `long` (decode_base 32), not `sharp` (64)** — the user asked why. `sharp` wins LPIPS by ~6%
+(0.303 vs 0.323) but costs 2.3× the params and 11% more wall-clock, and *loses* PSNR (best OL@+64 14.32
+vs 14.82). `decode_base` is believed orthogonal to the bottleneck, so `long` is the cheaper, faster base
+and keeps `decode_base` available as the follow-up lever if `bott16` loses.
+
+**Batch is PINNED at 8 with `autobatch=false`.** The baselines ran at batch 8 under the old
+(mis-measured, 35%-headroom) autobatch; the rewritten autobatch would now pick ~17 for this config, which
+is better engineering but halves steps-per-epoch — and the baselines peaked on LPIPS at **ep17**.
+Comparability to those baselines is the whole point of this A/B. This is the case
+`conf/data/torus.yaml` documents ("Set false for controlled A/Bs that need a FIXED batch"); the **recipe
+default stays `autobatch=true`**.
+
+**Baselines to beat** (both 50 ep, batch 8, subsample 5):
+
+| run | best LPIPS@+64 | best OL@+64 | best AE floor |
+|---|---|---|---|
+| `logs/holiday/train_world_model_2026_08_18_09_16_26_bsp32mse_long` | **0.323** @ep17 | **14.82 dB** @ep9 | 20.14 dB @ep13 |
+| `logs/holiday/train_world_model_2026_08_18_09_18_26_bsp32mse_sharp` | **0.303** @ep17 | 14.32 dB @ep2 | 19.83 dB @ep18 |
+
+Read it on `ae_floor` PSNR (did the **codec** get sharper) and LPIPS@+32/+64 (did the **rollout** get
+sharper). **Not** on `motion_ratio` alone — it is direction-blind and a *collapsed* model scores higher.
+
+### Multi-GPU: not set up, deliberately — `design/multigpu.md` (08-21)
+
+`devices=1` is pinned at `train_world_model.py:270` as a **guard**, not an oversight. Written up in full;
+the short version is that three things would produce a wrong-but-plausible run rather than an error:
+
+1. **`MMWindowLoader` is a hand-rolled iterator**, not a `DataLoader`, so Lightning cannot inject a
+   `DistributedSampler` — and `seed_everything` gives every rank the *same* `torch.randperm`. Both ranks
+   would train on **identical batches**, DDP would average a gradient with itself, and the run would be
+   mathematically identical to 1 GPU at 2× the power. Nothing raises.
+2. **Zero rank-awareness anywhere in `src/quickdraw`** (`grep global_rank|is_global_zero|world_size` is
+   empty). Both ranks would append to the same `metrics.jsonl`, run every eval routine twice, and race on
+   the same video/checkpoint paths.
+3. **Autobatch would hang, not OOM.** Per-rank batch is a *micro*-batch (effective = `batch × world_size`,
+   the only knob we have left with `accumulate_grad_batches` and `window_stride` both LOCKED), and if two
+   ranks probe *different* batches they run different step counts and deadlock in the next collective.
+
+**And it is the wrong trade today.** DDP buys wall-clock on one hypothesis; two cards buy two hypotheses
+in the same wall-clock. Every result in this record came from the second mode, and the binding constraint
+on this project is that effects are small against the ±0.8 dB noise floor — we need *more arms*, not
+faster arms. DDP becomes right when one config stops fitting (a much bigger decoder, 256px, F ≫ 64).
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
