@@ -1,6 +1,6 @@
 max_epochs: 50
 precision: bf16-mixed
-save_top_k: 2
+save_top_k: 8    # keep the top-8 epochs by checkpoint_monitor (was 2) so several are available for post-hoc
 checkpoint_monitor: null     # null -> best.ckpt tracks the env's checkpoint_metric under val/metric/proprio/
 #                              (recorded/default: pointwise_error, the BLACK-BOX decode error). Set to any
 #                              fully-qualified logged metric to override — e.g. val/loss/physics/proprio for a
