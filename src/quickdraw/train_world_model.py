@@ -206,8 +206,15 @@ def main(cfg):
     # (ood_horizon | ood_visual | ood_geometric | ood_dynamics | control), run every every_epochs
     # best.ckpt monitors the env's declared checkpoint metric (torus: manifold_distance_error, unchanged;
     # default: the generic pointwise_error) — must be a key of env.rollout_metrics.
+    # best.ckpt monitors THIS metric (min). Default: the env's declared checkpoint metric under
+    # val/metric/proprio/ (torus: manifold_distance_error; recorded/default: pointwise_error, the black-box
+    # decode error). Override with ANY fully-qualified logged metric via trainer.checkpoint_monitor — e.g.
+    # "val/loss/physics/proprio" for a physics-prior WM, where pointwise_error is a black-box red herring.
+    # BestCkptMirror prints the resolved rule to progress.log at fit start so the standard is never ambiguous.
+    ckpt_monitor = cfg.trainer.get("checkpoint_monitor", None) \
+        or f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}"
     ckpt_cb = ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
-                              monitor=f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}",
+                              monitor=ckpt_monitor,
                               mode="min", save_top_k=cfg.trainer.save_top_k, save_last=False)
     # save_last on the monitored callback only writes last.ckpt when Lightning ALSO saves a top-k file, so
     # once the monitored metric stops improving the newest weights stop being written — a collapsed run then

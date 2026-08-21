@@ -502,6 +502,16 @@ class BestCkptMirror(L.Callback):
         with open(self.path, "a") as f:
             f.write(line + "\n")
 
+    def on_fit_start(self, trainer, pl_module):
+        # State, ONCE and up front, the exact standard by which best.ckpt is chosen — so a reader never has to
+        # infer it from the "did not beat" lines (and never confuses it with the val_loss printed per epoch,
+        # which is val/loss/total, a DIFFERENT metric). Names the monitored key, direction, and retention.
+        self._emit(f"[best-ckpt] SELECTION RULE: best.ckpt = the epoch that MINIMIZES '{self.cb.monitor}' "
+                   f"(mode={self.cb.mode}, save_top_k={self.cb.save_top_k}). This is NOT the per-epoch 'val_loss' "
+                   f"(=val/loss/total). Every epoch outside the top-{self.cb.save_top_k} by this metric is "
+                   f"DISCARDED; last.ckpt is always the newest epoch. To rank by a different loss, set "
+                   f"trainer.checkpoint_monitor before the run.")
+
     def on_validation_end(self, trainer, pl_module):
         bp = self.cb.best_model_path
         if not bp:                                  # no monitored checkpoint yet (e.g. sanity check)
