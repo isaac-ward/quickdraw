@@ -47,9 +47,41 @@ DDP that is *correct* for parameter init (all ranks must start identical) and *f
 
 ---
 
-## 2. The three silent failures
+## 2. Measured first: where the wall-clock actually goes
 
-### 2.1 The loader cannot be sharded, and would not complain
+Every claim below about what DDP can buy rests on this decomposition. Measured on
+`logs/holiday/train_world_model_2026_08_18_09_16_26_bsp32mse_long`, epochs 4-20 (17 consecutive epochs,
+spread under 0.5%):
+
+| phase | per epoch | share | shardable by DDP? |
+|---|---|---|---|
+| **train loop** (4386 batches) | 1.343 h | **84.6%** | yes |
+| **val loop** (autoregressive rollout on 4004 val windows) | ~13.7 min | **14.4%** | yes — it is a *second* `MMWindowLoader` |
+| **eval routines** (`ood_horizon` 42 s + `ae_floor` 17 s) | 59 s | **1.0%** | no — rank-0 only |
+| epoch period | 1.588 h | 100% | |
+
+**This corrects a claim that was repeated several times in this project, including in the first draft of
+this document: "eval is ~50% of wall time".** That number came from the comment on
+`check_val_every_n_epoch` in `train_world_model.py`, which is about the **val rollout**, not the eval
+routines — and even that is 14.4%, not 50%. The comment is stale, probably from a proprio-only era when
+train epochs were far cheaper.
+
+Two consequences, both of which change the plan:
+
+1. **The 2-GPU ceiling is ~1.98x, not ~1.33x.** With train and val both sharded and only the eval
+   routines serialised on rank 0: `(0.846 + 0.144)/2 + 0.010 = 0.505`. So a `< 0.65x` wall-clock gate is
+   demanding but achievable; realistically expect 0.55-0.60x once NCCL and the straggler tax are paid.
+2. **Phase 2 ("shard the eval routines") is demoted to not-worth-doing.** It was justified on eval being
+   half the wall time. It is 1.0%. Amdahl caps the entire prize at 0.5% of an epoch, against
+   variable-length `all_gather` of per-episode results — the highest bug-density-per-benefit code in the
+   whole plan. **Do not do it.** What *does* need doing is sharding the **val** loader, which is the same
+   fix as the train loader (§3.1) applied to a second call site, and is 14.4%.
+
+---
+
+## 3. The three silent failures, in detail
+
+### 3.1 The loader cannot be sharded, and would not complain
 
 `MMWindowLoader` (`src/quickdraw/data/dataset.py:206`) is a **hand-rolled iterator**, not a
 `torch.utils.data.DataLoader`:
@@ -61,105 +93,166 @@ def __iter__(self):
         j = order[i: i + self.batch]
 ```
 
-Consequences under DDP:
+**Why Lightning cannot rescue this.** Lightning injects a `DistributedSampler` in
+`_update_dataloader`, which reconstructs the dataloader from its `__init__` args — it requires an actual
+`DataLoader` instance to read `.dataset`, `.sampler`, `.batch_size` off. Our object is *duck-typed*: it
+has `__iter__` and `__len__` and nothing else. Lightning accepts it as an iterable, wraps nothing,
+injects nothing, and **emits no warning**. There is no `isinstance` failure to trip over.
 
-* Lightning injects a `DistributedSampler` only into real `DataLoader`s. It cannot touch this. So
-  `self.N` is the **full** window count on **every** rank.
-* `torch.randperm` is seeded identically on every rank (§1), so rank 0 and rank 1 draw the **same
-  permutation** and therefore the **same batches**.
-* DDP then all-reduces (averages) two **identical** gradients. Averaging a value with itself is that
-  value. So the run is mathematically identical to a 1-GPU run at the same batch, at **2x the
-  electricity and 1x the throughput**.
-* Nothing raises. Loss curves look normal. This is the single most likely way to "add multi-GPU" and
-  believe it worked.
+**Why the result is silent rather than merely slow.** Three facts compose:
 
-Fix: shard by rank inside the loader. Because the store is GPU-resident and indexed by a device
-tensor, this is cheap and local — take the rank's stripe of the window index at construction:
+* `L.seed_everything(seed, workers=True)` (`train_world_model.py:101`) sets the *same* global seed on
+  every rank. The `workers=True` part seeds *DataLoader worker* processes with a rank-derived offset —
+  but this loader has no workers (the `fast_gpu` path is GPU-resident by design), and `torch.randperm`
+  runs in the **main** process off the plain global seed.
+* So rank 0 and rank 1 generate a **bit-identical permutation** and therefore identical batches.
+* DDP's gradient hook **averages** across ranks (`all_reduce(SUM)` then divide by `world_size`).
+  Averaging a tensor with an identical copy of itself returns that tensor.
+
+The run is therefore *mathematically identical* to a 1-GPU run at the same per-rank batch. Loss curves,
+metrics, checkpoints — all indistinguishable. **There is no signal anywhere in the metrics.** The only
+observable tell is that wall-clock per epoch barely moves, which is exactly the thing a person adding
+multi-GPU support is least likely to treat as a bug.
+
+**The fix is not just "stripe the windows" — that has two traps of its own.**
+
+*Trap A: unequal shards deadlock.* The obvious `torch.arange(rank, N, world_size)` gives rank 0 one more
+window than rank 1 whenever `N % world_size != 0`. Our train split is **35085 windows**, so 2 ranks get
+17543 and 17542. Whether that matters depends on the batch: at batch 17 both `ceil` to 1032 steps and it
+works *by luck*; at some other batch they differ by one step, and the rank with fewer steps enters the
+next epoch's first `all_reduce` while the other is still in the last backward — a **hang with no error
+message**. Never rely on the ceiling arithmetic. Truncate to a common length first:
 
 ```python
-# in MMWindowLoader.__init__, after self.N is known
-if world_size > 1:
-    keep = torch.arange(rank, self.N, world_size, device=device)   # contiguous-free, no padding
-    self.obs, self.act = self.obs[keep], self.act[keep]
-    if self.frames is not None: self.win_idx = self.win_idx[keep]
-    self.N = self.obs.shape[0]
+N_common = (self.N // world_size) * world_size     # drop <= world_size-1 windows of 35085
 ```
 
-Note this shards the **windows**, not the frame store — the frames stay fully replicated on both
-cards. That is deliberate: at 128px the store is ~2.8 GB, replicating it costs 2.8 GB per card
-(we have 80), and sharding it would break the global frame indexing that `win_idx` depends on.
-Sharding windows-only is the right trade here; it stops being right at 256px + long episodes.
+*Trap B: a fixed stripe is a fixed partition.* If the stripe is computed once in `__init__`, rank 0 sees
+the **same half of the dataset for all 40 epochs**. Per-rank shuffling reshuffles *within* the shard, so
+the gradient stays unbiased in expectation, but any systematic difference between the halves (and there
+is one — episodes are concatenated in order, so a stripe by index correlates with episode identity) never
+washes out across epochs. `DistributedSampler` avoids this by shuffling **globally with an epoch-keyed
+seed and then sharding**, so the assignment changes every epoch. Same shape here, and it is one line:
 
-### 2.2 Every callback and every eval routine would run on all ranks
+```python
+def __iter__(self):
+    g = torch.Generator(device=self.device).manual_seed(self.epoch)   # SAME seed on every rank
+    order = torch.randperm(self.N, generator=g, device=self.device) if self.shuffle else torch.arange(...)
+    order = order[:(self.N // self.world) * self.world][self.rank::self.world]   # global shuffle THEN shard
+    for i in range(0, order.numel(), self.batch):
+        ...
+```
 
-There is **zero rank-awareness anywhere in `src/quickdraw`**. Verified:
+Note the inversion: the seed must be **shared** (so every rank permutes identically) and the *shard*
+provides the difference — the exact opposite of the usual instinct to give each rank a different seed.
+Giving ranks different seeds re-creates the overlap problem, just non-deterministically.
+
+*What NOT to shard: the frame store.* `self.frames` is one concatenated `(N_total, H, W, 3)` uint8 tensor
+and `win_idx` holds **global** frame indices into it. Sharding it would require remapping every index per
+rank and would cut across episode boundaries. It is ~2.8 GB at 128px against 80 GB of card, so replicate
+it: shard **windows**, keep **frames** whole. This trade inverts at 256px (~11 GB) combined with long
+episodes, and that is the point at which this design needs revisiting.
+
+*Apply it twice.* Train and val are separate `MMWindowLoader` instances. Sharding only train leaves 14.4%
+of the epoch running redundantly on both ranks, and — worse — makes `val/loss` a full-split number on one
+rank and a full-split number on the other, i.e. correct but computed twice, which will look fine and
+quietly cap the speedup at 0.57x instead of 0.505x.
+
+### 3.2 Nothing in `src/quickdraw` knows what rank it is
+
+Verified — this returns only unrelated hits (the word "strategy" in `models/collapse.py`):
 
 ```
 grep -rn "global_rank\|is_global_zero\|world_size\|sync_dist\|all_gather" src/quickdraw/
 ```
 
-returns only unrelated hits (the word "strategy" in `models/collapse.py`). Nothing is gated.
+So under DDP *both* ranks run every callback. What that actually does, in order of how hard it is to
+notice:
 
-So under DDP, both ranks would run:
+* **`metrics.jsonl` is corrupted, not just duplicated.** `RunWriter` (`logging/writer.py:124`) appends
+  through Python's buffered writer. `O_APPEND` guarantees atomicity only for a single `write(2)` under
+  `PIPE_BUF`; an 8 KB buffered flush can split a JSON record across two syscalls, and the other rank's
+  flush can land in the gap. The result is unparseable lines *in the middle* of the file — which every
+  downstream reader (the watchdog's `last_epoch`, every analysis script) handles by `except: continue`,
+  so the corruption presents as **silently missing epochs**, not as an error.
+* **Every eval routine runs twice**, wasting the second card's 59 s. Cheap, but see the timeout trap
+  below — this is the section that becomes dangerous once you *stop* running it twice.
+* **Two writers race on the same video and figure paths.** Non-atomic, so a half-written mp4 is possible.
+* **`ModelCheckpoint` is internally rank-gated by Lightning; `BestCkptMirror` is ours and is not**
+  (`logging/callback.py:524`). It copies `best_model_path` → `best.ckpt` and appends to `progress.log`
+  from both ranks. Two concurrent copies of a multi-hundred-MB checkpoint to one destination path can
+  interleave and produce a **corrupt `best.ckpt`** — the one artifact whose loss costs the most.
 
-* `RunWriter` (`logging/writer.py:124`) — two processes appending to the **same**
-  `logs/.../metrics.jsonl`. Interleaved partial lines, i.e. a corrupt file, and every metric
-  duplicated at each step.
-* `LoggingCallback` — the eval block (ae_floor, ood_horizon, manifold, denoising_*) runs **twice**,
-  both times on the full eval split. Eval is already ~50% of wall time, so this alone cancels most of
-  the DDP speedup.
-* Video/figure encoding — two writers racing on the same output paths.
-* `ModelCheckpoint` x2 + `BestCkptMirror` — two processes writing `last.ckpt` / `best.ckpt` in the
-  same dir. Lightning normally rank-gates its own checkpoint writes; `BestCkptMirror` is **ours** and
-  is not gated.
-* `ProgressPrinter` — doubled `progress.log`.
+The fix is `if not trainer.is_global_zero: return` at the top of each hook in `LoggingCallback`,
+`ProgressPrinter` and `BestCkptMirror`, plus making `RunWriter` a no-op off rank 0.
 
-Fix: gate on `trainer.is_global_zero` at the top of each `on_*` hook in `LoggingCallback`,
-`ProgressPrinter` and `BestCkptMirror`, and make `RunWriter` a no-op on non-zero ranks. The metrics
-this produces are then **rank-0-only**, which for our eval routines is fine (they are full-split
-autoregressive rollouts, not per-batch averages) but for `train/loss` means we log rank 0's shard
-rather than the true mean — acceptable, and cheaper than plumbing `sync_dist=True` through a writer
-that does not use `self.log`.
+**The nuance is what that silently changes about the numbers.** Rank-0-gating means every logged
+train/val metric becomes **rank 0's shard**, not the global mean. For the eval routines that is exactly
+right (they are full-split autoregressive rollouts driven by their own episode lists, not per-batch
+reductions, so rank 0 computes the true value). For `train/loss` and `val/loss` it means a
+half-sample-size estimate — noisier, and *biased* if the shard is not representative, which is precisely
+what §3.1's epoch-keyed global shuffle exists to guarantee. The alternative is plumbing `sync_dist=True`
+through a writer that does not use `self.log` at all, which is real work for a cosmetic gain on a curve
+we read for trend, not for absolute value. **Take the rank-0 estimate, and note it in the record so
+nobody later compares a DDP `train/loss` against a single-GPU one and reads the extra noise as a result.**
 
-### 2.3 Autobatch would deadlock the run, not OOM it
+**The timeout trap, which only appears after you fix this.** Once eval is rank-0-only, rank 1 finishes
+the epoch and blocks in the first collective of the next one while rank 0 spends 59 s in eval. That is
+correct behaviour — but NCCL has a **collective timeout** (`ProcessGroupNCCL`, 10 min in the version
+Lightning configures by default), and when it expires it does not warn, it **aborts the job**. 59 s is
+comfortable; it will not stay 59 s. `eval.during_train.evals.control` and `action_distribution` are off
+on this dataset, `eval.horizon` is 128 of a possible 1024, and `ood_horizon` already scales with episode
+count. Any of those growing past 10 minutes turns a working run into a mysterious mid-training abort.
+**So raising `timeout=` on the process group is part of this fix, not an optimisation** — set it to
+something like 60 min, and treat the longest rank-0-only section as a budget you are spending.
 
-`autobatch_find` (`src/quickdraw/training/setup.py`) currently:
+### 3.3 Autobatch would hang the run rather than OOM it
 
-* runs **before** the Trainer exists, so before DDP process-group init;
-* probes on one device and budgets on `max_memory_reserved` minus `autobatch_reserve_gb` minus the
-  measured resident frame store;
-* sets a single `cfg.data.batch`.
+`autobatch_find` (`src/quickdraw/training/setup.py`) currently runs **before** the Trainer exists — so
+before the process group is initialised — probes on one device, budgets on `max_memory_reserved` minus
+`autobatch_reserve_gb` minus the measured resident frame store, and writes a single `cfg.data.batch`.
 
-Three problems, in increasing severity:
+Three problems, increasing in severity:
 
-1. **The DDP reducer is not in the budget.** DDP holds gradient buckets plus its own view of the
-   parameters. At 6.4M params that is ~50 MB — negligible here, but it is a real term that the
-   4 GB `autobatch_reserve_gb` currently absorbs by luck rather than by design.
-2. **The resident subtraction changes.** With windows sharded (§2.1) the per-rank window tensors
-   halve, so the budget genuinely grows. If we shard and *don't* re-measure, we leave VRAM on the
-   table — exactly the failure the autobatch work spent a week removing.
-3. **THE BLOCKER: ranks must agree on the number of steps.** If rank 0 probes batch 32 and rank 1
-   probes 30 (different fragmentation, a stray process, ECC-retired pages), the two ranks run a
-   different number of batches per epoch. The rank that finishes first waits forever in the next
-   all-reduce. That is a **hang with no error message**, the worst failure mode in this document.
+1. **The DDP reducer is not a budgeted term.** DDP allocates gradient buckets (and, transiently, a second
+   copy of the bucketed gradients during `all_reduce`). At 6.4M parameters in fp32 that is ~25 MB per
+   bucket set — genuinely negligible here, and currently absorbed by the 4 GB `autobatch_reserve_gb` *by
+   luck rather than by design*. It stops being negligible if the dynamics rebalance (`d` 128→192, deeper
+   backbone) lands, so it belongs in `_resident_frame_bytes`-style explicit accounting rather than in slop.
+2. **The resident subtraction changes sign-of-error.** Sharding windows (§3.1) halves the per-rank window
+   tensors, so the *real* budget grows. If we shard and do not re-measure, we systematically under-fill
+   the card — the precise failure the autobatch rewrite spent a week removing (45% → 90% utilisation).
+   The frame store, being deliberately unsharded, does **not** shrink, so this is not a simple halving.
+3. **THE BLOCKER: ranks must agree on the step count.** Nothing forces two ranks to probe the same batch.
+   They can legitimately differ — a stray process on one card, different fragmentation history, ECC-retired
+   pages, or simply the linear fit landing either side of a boundary (our two live arms just probed 7 and
+   17 for configs differing only in `recon_frac`, which shows how sharp that boundary is). Different
+   per-rank batch → different number of steps per epoch → the shorter rank enters a collective the longer
+   rank never reaches → **hang, no error, no OOM, no traceback**. The worst failure mode in this document,
+   because it presents identically to a slow epoch.
 
-Fix: keep the probe where it is (one rank, before init) and then **broadcast/min-reduce the result**.
-Concretely — probe on every rank independently, then `torch.distributed.all_reduce(b, op=MIN)` and use
-the min everywhere. Also, per-rank `data.batch` is a **micro**-batch under DDP: effective batch becomes
-`data.batch x world_size`. Since `accumulate_grad_batches=1` and `data.window_stride=1` are both
-LOCKED, DDP is the only knob we have that changes effective batch, and it changes it **silently** —
-so the resolved config must record `effective_batch` explicitly or every future A/B against a
-single-GPU baseline is confounded.
+   Fix: keep the probe exactly where it is and reduce it. Probe per-rank, then
+   `torch.distributed.all_reduce(b, op=ReduceOp.MIN)` and use the minimum on every rank. Cheap, and it
+   fails safe — the min always fits everywhere.
 
----
+**And one thing that is not a bug but will confound every future A/B.** Under DDP, `data.batch` is a
+**per-rank micro-batch**: effective batch is `data.batch x world_size`. With
+`accumulate_grad_batches=1` and `data.window_stride=1` both LOCKED, DDP is the *only* remaining knob that
+changes effective batch — and it changes it **implicitly, as a side effect of a device count**. So
+`config.resolved.yaml` must record `effective_batch` explicitly. Without that, six months from now a
+2-GPU run gets compared to a 1-GPU baseline at "the same batch 17" when one of them was really 34, and the
+learning-rate coupling shows up as an architecture result. This project has already retracted claims for
+smaller reasons.
 
-## 3. If we do it: the phases
+## 4. If we do it: the phases
 
-### Phase 1 — correct DDP (the only phase worth doing soon)
-1. Thread `rank`/`world_size` into `MMWindowLoader` and stripe the windows (§2.1).
-2. Rank-gate `RunWriter`, `LoggingCallback`, `ProgressPrinter`, `BestCkptMirror` (§2.2).
+### Phase 1 — correct DDP (the only phase worth doing)
+1. Thread `rank`/`world_size` into `MMWindowLoader`; global epoch-keyed shuffle THEN shard, truncated to
+   a common length; leave the frame store replicated. Apply to **both** the train and val loaders (§3.1).
+2. Rank-gate `RunWriter`, `LoggingCallback`, `ProgressPrinter`, `BestCkptMirror`, and raise the process
+   group `timeout` well past the longest rank-0-only section (§3.2).
 3. Min-reduce the autobatch result across ranks; log `effective_batch = batch x world_size` into
-   `config.resolved.yaml` (§2.3).
+   `config.resolved.yaml` (§3.3).
 4. Replace `devices=1` with `devices=cfg.trainer.get("devices", 1)` and
    `strategy="ddp_find_unused_parameters_false"` when `devices > 1`. Default stays 1, so every
    existing recipe and the whole watchdog/resume path are bit-identical.
@@ -172,13 +265,16 @@ require:
 * `logs/.../metrics.jsonl` from the 2-GPU run has **no duplicated steps** (the §2.2 tell);
 * `mem/peak_trainval_reserved_gb` on each rank is within ~1 GB of the 1-GPU run at the same
   per-rank batch (the §2.3 tell);
-* wall-clock per epoch is **< 0.65x** the 1-GPU run. Anything near 1.0x means §2.1 is still broken
-  and both ranks are chewing the same data.
+* wall-clock per epoch is **< 0.65x** the 1-GPU run. The measured floor is 0.505x (§2), so 0.55-0.60x is
+  a pass and anything near 1.0x means §3.1 is still broken and both ranks are chewing the same data.
+  0.75x specifically means the **val** loader was left unsharded.
 
-### Phase 2 — only if eval becomes the bottleneck
-Shard the eval routines by episode across ranks and gather. Worth it only because eval is ~50% of
-wall time; not worth it before Phase 1 is proven, and it needs `all_gather` of variable-length
-per-episode results, which is where most distributed bugs live.
+### Phase 2 — DO NOT DO (withdrawn)
+The plan was to shard the eval routines by episode and gather. It was justified on eval being ~50% of
+wall time. **Measured, it is 1.0%** (§2), so Amdahl caps the whole prize at half a percent of an epoch —
+against variable-length `all_gather` of per-episode results, the highest bug-density-per-benefit code in
+this document. Withdrawn. The 14.4% that *is* worth having is the **val** loader, which is Phase 1
+item 1 applied to a second call site, not a new phase.
 
 ### Phase 3 — never (for this model)
 FSDP, tensor/pipeline parallelism, ZeRO. 6.4M parameters. The activation memory that actually binds
@@ -186,7 +282,7 @@ our batch is the F=64 BPTT rollout, which sharding parameters does nothing for.
 
 ---
 
-## 4. Why two independent arms is currently better
+## 5. Why two independent arms is currently better
 
 DDP buys **wall-clock on one hypothesis**. Two cards buy **two hypotheses in the same wall-clock**.
 Every result in `wizard/records/robocasa-scene4-4h.md` came from the second mode, and the binding
