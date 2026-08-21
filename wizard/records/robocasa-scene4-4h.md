@@ -784,7 +784,7 @@ default stays `autobatch=true`**.
 Read it on `ae_floor` PSNR (did the **codec** get sharper) and LPIPS@+32/+64 (did the **rollout** get
 sharper). **Not** on `motion_ratio` alone — it is direction-blind and a *collapsed* model scores higher.
 
-### Multi-GPU: not set up, deliberately — `design/multigpu.md` (08-21)
+### Multi-GPU: not set up, deliberately — `design/distributed.md` (08-21)
 
 `devices=1` is pinned at `train_world_model.py:270` as a **guard**, not an oversight. Written up in full;
 the short version is that three things would produce a wrong-but-plausible run rather than an error:
