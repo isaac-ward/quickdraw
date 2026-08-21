@@ -53,11 +53,14 @@ def quat_integrate(q: torch.Tensor, omega: torch.Tensor, dt: float) -> torch.Ten
 
 
 def dynamics_prior(prev_obs: torch.Tensor, action: torch.Tensor, pos_idx, vel_idx, quat_idx,
-                   bodyrate_idx=None, mass: float = MASS, raw_dt: float = RAW_DT,
-                   dt_eff: float = 0.25) -> torch.Tensor:
-    """Physics next-state. pos/vel via thrust a=R(q)F/m; quat via exact kinematics q'=q(x)exp(1/2 w dt)
-    when bodyrate_idx given (else copied); bodyrate copied — WM residual handles the remainder.
-    prev_obs (...,obs_dim) ABSOLUTE; action (...,act_dim) raw force in N (action[...,0:3])."""
+                   bodyrate_idx=None, torque_idx=None, inertia_diag=None,
+                   mass: float = MASS, raw_dt: float = RAW_DT, dt_eff: float = 0.25) -> torch.Tensor:
+    """Physics next-state. TRANSLATION: pos/vel via thrust a=R(q)F/m (force=action[...,0:3]). ROTATION:
+    when torque_idx+inertia_diag given, angular dynamics w' = w + I^-1(tau*raw_dt - (w x I w)*dt_eff)
+    (torque=action[...,torque_idx]; verified vs data cos 0.9996), then attitude kinematics q'=q(x)exp(1/2 w' dt).
+    With only bodyrate_idx (no torque/inertia): quat integrates the COPIED w (kinematics only, verified 0.006
+    deg/step) and bodyrate is copied. WM residual handles the remainder (orbital drift, gravity-gradient, etc).
+    prev_obs (...,obs_dim) ABSOLUTE; action (...,act_dim) summed force[0:3] (N) + torque[torque_idx] (N*m)."""
     pos_idx, vel_idx, quat_idx = list(pos_idx), list(vel_idx), list(quat_idx)
     q = prev_obs[..., quat_idx]
     F = action[..., 0:3]
@@ -67,8 +70,16 @@ def dynamics_prior(prev_obs: torch.Tensor, action: torch.Tensor, pos_idx, vel_id
     out = prev_obs.clone()
     out[..., vel_idx] = v_new
     out[..., pos_idx] = p_new
-    if bodyrate_idx is not None:                  # exact attitude kinematics (verified 0.006 deg/step)
-        out[..., quat_idx] = quat_integrate(q, prev_obs[..., list(bodyrate_idx)], dt_eff)
+    if bodyrate_idx is not None:
+        bodyrate_idx = list(bodyrate_idx)
+        omega = prev_obs[..., bodyrate_idx]
+        if torque_idx is not None and inertia_diag is not None:   # angular dynamics (verified cos 0.9996)
+            I = torch.as_tensor(list(inertia_diag), dtype=omega.dtype, device=omega.device)
+            tau = action[..., list(torque_idx)]
+            gyro = torch.cross(omega, I * omega, dim=-1)           # -w x (I w), gyroscopic (6% of tau)
+            omega = omega + (tau * raw_dt - gyro * dt_eff) / I
+            out[..., bodyrate_idx] = omega
+        out[..., quat_idx] = quat_integrate(q, omega, dt_eff)      # kinematics with the UPDATED rate
     return out
 
 

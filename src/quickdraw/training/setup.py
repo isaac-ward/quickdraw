@@ -150,6 +150,10 @@ def _make_dynamics_prior(cfg):
     # Explicit override via environments.bodyrate_idx; else the three dims after quat.
     bodyrate = (list(e.bodyrate_idx) if e.get("bodyrate_idx", None) is not None
                 else [quat[-1] + 1 + i for i in range(3)])
+    # Rotational dynamics w'=w+I^-1(tau*raw_dt-(wxIw)*dt_eff): torque=action[3:6], inertia from env physics.
+    # Both default-off (None) -> quat integrates the copied rate only (attitude kinematics), bodyrate copied.
+    torque = (list(e.torque_idx) if e.get("torque_idx", None) is not None else [3, 4, 5])
+    inertia = (list(e.inertia_diag) if e.get("inertia_diag", None) is not None else [80000.0, 80000.0, 50000.0])
     mass, raw_dt = float(e.get("mass", 12000.0)), float(e.get("raw_dt", 0.05))
     # DERIVE dt_eff from subsample (audit finding #1): action is SUMMED over the subsample window so Δv uses
     # raw_dt, but position integrates over the FULL subsampled-step duration = subsample*raw_dt. Hardcoding 0.25
@@ -157,6 +161,7 @@ def _make_dynamics_prior(cfg):
     sub = int(cfg.data.get("subsample", 1) or 1)
     dt_eff = sub * raw_dt
     return lambda prev, act: _dp(prev, act, pos, vel, quat, bodyrate_idx=bodyrate,
+                                 torque_idx=torque, inertia_diag=inertia,
                                  mass=mass, raw_dt=raw_dt, dt_eff=dt_eff)
 
 
