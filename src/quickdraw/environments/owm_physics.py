@@ -16,6 +16,11 @@ import torch
 
 MASS = 12000.0
 RAW_DT = 0.05
+# Body-rate bound for the gyroscopic term. -w x (I w) is QUADRATIC in w, so in an autoregressive rollout an
+# untrained residual that pushes w up makes the term blow up -> NaN (observed: coop 40ep NaN'd at p_tf=0, ep1).
+# Real docking body rates are ~0.03 rad/s, so 1.0 rad/s (~57 deg/s) never binds real data but caps the runaway.
+# DEFAULT only — config-settable via `environments.rate_clamp` (setup passes it into dynamics_prior).
+RATE_CLAMP = 1.0
 
 
 def quat_rotate_wxyz(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -53,7 +58,7 @@ def quat_integrate(q: torch.Tensor, omega: torch.Tensor, dt: float) -> torch.Ten
 
 
 def dynamics_prior(prev_obs: torch.Tensor, action: torch.Tensor, pos_idx, vel_idx, quat_idx,
-                   bodyrate_idx=None, torque_idx=None, inertia_diag=None,
+                   bodyrate_idx=None, torque_idx=None, inertia_diag=None, rate_clamp: float = RATE_CLAMP,
                    mass: float = MASS, raw_dt: float = RAW_DT, dt_eff: float = 0.25) -> torch.Tensor:
     """Physics next-state. TRANSLATION: pos/vel via thrust a=R(q)F/m (force=action[...,0:3]). ROTATION:
     when torque_idx+inertia_diag given, angular dynamics w' = w + I^-1(tau*raw_dt - (w x I w)*dt_eff)
@@ -76,8 +81,9 @@ def dynamics_prior(prev_obs: torch.Tensor, action: torch.Tensor, pos_idx, vel_id
         if torque_idx is not None and inertia_diag is not None:   # angular dynamics (verified cos 0.9996)
             I = torch.as_tensor(list(inertia_diag), dtype=omega.dtype, device=omega.device)
             tau = action[..., list(torque_idx)]
+            omega = omega.clamp(-rate_clamp, rate_clamp)           # bound the QUADRATIC gyroscopic term (non-binding real data)
             gyro = torch.cross(omega, I * omega, dim=-1)           # -w x (I w), gyroscopic (6% of tau)
-            omega = omega + (tau * raw_dt - gyro * dt_eff) / I
+            omega = (omega + (tau * raw_dt - gyro * dt_eff) / I).clamp(-rate_clamp, rate_clamp)
             out[..., bodyrate_idx] = omega
         out[..., quat_idx] = quat_integrate(q, omega, dt_eff)      # kinematics with the UPDATED rate
     return out

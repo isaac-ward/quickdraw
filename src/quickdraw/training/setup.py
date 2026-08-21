@@ -154,6 +154,9 @@ def _make_dynamics_prior(cfg):
     # Both default-off (None) -> quat integrates the copied rate only (attitude kinematics), bodyrate copied.
     torque = (list(e.torque_idx) if e.get("torque_idx", None) is not None else [3, 4, 5])
     inertia = (list(e.inertia_diag) if e.get("inertia_diag", None) is not None else [80000.0, 80000.0, 50000.0])
+    # Body-rate clamp bounding the quadratic gyroscopic term in the AR rollout (see owm_physics.RATE_CLAMP).
+    # Config-settable via environments.rate_clamp; default 1.0 rad/s (~30x the ~0.03 data range -> non-binding).
+    rate_clamp = float(e.get("rate_clamp", 1.0))
     mass, raw_dt = float(e.get("mass", 12000.0)), float(e.get("raw_dt", 0.05))
     # DERIVE dt_eff from subsample (audit finding #1): action is SUMMED over the subsample window so Δv uses
     # raw_dt, but position integrates over the FULL subsampled-step duration = subsample*raw_dt. Hardcoding 0.25
@@ -161,7 +164,7 @@ def _make_dynamics_prior(cfg):
     sub = int(cfg.data.get("subsample", 1) or 1)
     dt_eff = sub * raw_dt
     return lambda prev, act: _dp(prev, act, pos, vel, quat, bodyrate_idx=bodyrate,
-                                 torque_idx=torque, inertia_diag=inertia,
+                                 torque_idx=torque, inertia_diag=inertia, rate_clamp=rate_clamp,
                                  mass=mass, raw_dt=raw_dt, dt_eff=dt_eff)
 
 
