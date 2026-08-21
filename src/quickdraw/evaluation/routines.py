@@ -112,8 +112,9 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
     probe rolled 256 steps for a routine that can only ever roll 119 -- the whole "91GB" false alarm), and
     modelled only open_loop when the real memory peak is closed_loop_16.
 
-    Returns (n_ep, H, modes, calls) where modes = [(name, every, horizon)] and calls = [(name, rows, horizon)]
-    is the per-imagine_eval-call shape, i.e. the memory-relevant unit (see rollout_regrounded's `cap`)."""
+    Returns (n_ep, H, cl_h, modes, calls) where modes = [(name, every, horizon)] and calls =
+    [(name, rows, horizon)] is the per-imagine_eval-call shape, i.e. the memory-relevant unit (see
+    rollout_regrounded's `cap`)."""
     n_ep = min(8 if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(ep_lens))
     H = min(int(cfg.eval.get("horizon", 2048)), min(ep_lens[:n_ep]) - P - 1)
     cl_steps = [int(x) for x in cfg.eval.get("closed_loop_steps", [1, 16])]
@@ -124,7 +125,7 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
         e = min(int(every), Hm)
         n_seg = -(-Hm // e)                                   # ceil
         calls.append((name, min(max(n_ep, 64), n_ep * n_seg), e))   # `cap = max(n_ep, 64)` in rollout_regrounded
-    return n_ep, H, modes, calls
+    return n_ep, H, cl_h, modes, calls
 
 
 def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
@@ -156,8 +157,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
-    n_ep, H, _modes_unused, _calls_unused = ood_horizon_shapes(cfg, bool(img_heads),
-                                                               [len(o) for o, _, _ in eps], P)
+    n_ep, H, cl_h, _modes, _calls = ood_horizon_shapes(cfg, bool(img_heads),
+                                                      [len(o) for o, _, _ in eps], P)
     eps = eps[:n_ep]
     n_plot = min(int(cfg.eval.get("n_plot", 2) or 2), n_ep)   # per-episode visuals; SAME episode indices (0..n_plot-1) across all modes
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
@@ -236,7 +237,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
                       title_fn=lambda i: f"{subroutine} #{i} H={Hm}", log=lambda msg: prog(50, msg))
         return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
 
-    modes = _modes_unused        # from ood_horizon_shapes above -- ONE definition, shared with probe_eval
+    modes = _modes               # from ood_horizon_shapes above -- ONE definition, shared with probe_eval
     prog(0, f"start: {n_ep} eps, H={H} (closed-loop H={cl_h}), heads={heads}, modes={[mn for mn, _, _ in modes]}")
     summary = {}
     for k, (name, every, Hm) in enumerate(modes):

@@ -493,7 +493,7 @@ def autobatch_find(cfg, device, log=print) -> int:
             # episode LENGTHS only -- the proprio loader reads no frames, so this is cheap (seconds)
             ep_lens = [len(o) for o, _ in load_split_episodes(resolve_data_root(cfg), "val",
                                                              repo_id=cfg.data.get("repo_id", "torus"))]
-            n_ep, H, modes, calls = ood_horizon_shapes(cfg, bool(img_heads), ep_lens, P)
+            n_ep, H, _cl_h, modes, calls = ood_horizon_shapes(cfg, bool(img_heads), ep_lens, P)
             dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None
             heads = [sp.name for sp in specs]
             worst, worst_name = (0, 0), "-"
