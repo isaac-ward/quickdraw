@@ -797,22 +797,36 @@ baseline's 1.588 h/ep. So the bottleneck arm finishes ~08-23 and the recon arm ~
 Read it on `ae_floor` PSNR (did the **codec** get sharper) and LPIPS@+32/+64 (did the **rollout** get
 sharper). **Not** on `motion_ratio` alone — it is direction-blind and a *collapsed* model scores higher.
 
-**EARLY READ (ep4-6, NOT a verdict).** Epoch-matched against `BASE long`, the bottleneck hypothesis is so
-far NULL and the `recon_frac` arm is not:
+**EARLY READ (through ep8, NOT a verdict).** Epoch-matched against `BASE long`. The ep4 snapshot read as
+NULL and that reading did not survive two more epochs — recorded here in both forms because the reversal is
+the point:
 
-| metric @ep4 | `bott_bott16` | `BASE long` |
-|---|---|---|
-| ae_floor PSNR mean | 19.47 | 19.48 |
-| ae_floor LPIPS@+64 | 0.296 | **0.259** |
-| OL LPIPS@+128 | 0.440 | 0.431 |
+| ae_floor PSNR mean | ep4 | ep5 | ep6 |
+|---|---|---|---|
+| `bott_bott16` | 19.47 | 19.59 | **19.71** |
+| `BASE long` | 19.48 | 19.41 | 19.51 |
 
-The floor tracks the baseline to within 0.01 dB and LPIPS is *worse*. Two caveats: it is ep4 of 40 and the
-baseline did not peak until ep13/ep17, and the epochs are not step-matched (batch 17 vs 8, so ep4 here is
-~ep2 of baseline gradient steps — against which it is slightly ahead on PSNR, slightly behind on LPIPS,
-i.e. the same non-separation). If this holds, the confound named above is the likely explanation: the
-added spatial resolution is roughly cancelling the 1.05M params lost with the dropped pyramid level, and
-the follow-up is `ae_bottleneck=16` PLUS `decode_base=64` to buy the capacity back — which is exactly why
-this A/B was based on `long` rather than `sharp`, keeping `decode_base` free as the next lever.
+At ep4 they were tied to 0.01 dB, which is what was first reported. By ep6 `bott16` is **+0.20 dB ahead and
+still rising monotonically**, while the baseline had already begun oscillating. So the 16x16 bottleneck is
+NOT behaving like the four earlier null levers (num_tokens, decode_base, ae_depth, latent_loss_weight) —
+but it took 6 epochs to distinguish, which is a useful calibration on how long any future codec lever
+needs before it can be called.
+
+**The LPIPS gap is the open question and the one that decides this.** `bott16` ae_floor LPIPS@+64 is 0.277
+at ep6 against the baseline's 0.248 — gaining PSNR while losing perceptual sharpness, the same
+distortion-perception split this project keeps hitting. Since the complaint that motivated the whole
+experiment was BLUR, LPIPS is the deciding metric, so the verdict waits for ep13-17 where the baseline
+peaked.
+
+Healthy otherwise: OL PSNR@+64 peaked 14.67 @ep5 against the baseline's 14.82 best; `ae_floor`
+motion_ratio climbing 0.50 -> 0.67; OL motion flat ~0.30, comparable to `bsp32mse`'s 0.331. No erosion.
+
+**A false alarm worth recording.** At ep7 `train/loss/total` dropped 0.270 -> 0.153 while val rose, which
+is the signature this dataset has collapsed on before (record §14: peaked ep2, collapsed ep4, 18.8 -> 9.1
+dB). It was noise: the series oscillates +-0.15 every epoch (0.272 0.434 0.369 0.267 0.399 0.276 0.270
+0.153 0.374) because `recon_frac=0.25` draws a random decode subset per step, and `val/loss/total` never
+left 0.457-0.468. **Do not read single-epoch train_loss moves on this config**; read `ae_floor` PSNR and
+LPIPS, which are computed on a fixed split.
 
 `bott_recon1` (ep0-2) is ahead of the baseline on open-loop PSNR@+64 at every matched epoch (12.36/14.34/
 13.78 vs 11.02/13.66/13.60) and behind on OL LPIPS@+128 (0.651/0.525/0.485 vs 0.622/0.491/0.479) — the
