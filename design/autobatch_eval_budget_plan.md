@@ -132,3 +132,63 @@ keeps the old bisection as a live fallback.
 `autobatch_find` runs only at process start, so landing this cannot disturb a run already training — but a
 launch DURING the edit would pick up half of it. Step 1 touches `logging/callback.py`, which IS imported at
 startup, so it must not land while a run is between epochs. Land while nothing is starting, or after A/B finish.
+
+---
+
+# OUTCOME (2026-08-21) — what actually happened when this was built and measured
+
+All four steps landed, then an adversarial audit found that **three of the headline numbers in this document
+were measured in the wrong allocator**: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` was set only in
+`train_world_model.py`, and `verify_autobatch.sh` imports `training.setup` directly, so it never got it. Under
+the real allocator:
+
+| claimed above | actually |
+|---|---|
+| fragmentation 2-11%, growing with batch | **0%** (0.1-0.3%) |
+| peak superlinear in batch, intercept -3.03 GB | **affine**, intercept +0.11 GB vs analytic 0.10 |
+| chosen batch 15 | **17** |
+
+The env var now lives in `quickdraw/__init__.py` so every caller measures what training uses.
+
+**The reserve was standing in for the dataset.** The "allocator growth over a full epoch" this plan sized
+`autobatch_reserve_gb` against does not exist. The probe-vs-real gap is entirely the GPU-resident frame store
+that `MMWindowLoader` parks on the card AFTER sizing spends it: probe 87.29 + resident 3.17 = 90.46 against a
+real 90.29 GB peak, residual 0.17. It is now measured and subtracted explicitly (and it scales with
+dataset-hours x img_size**2, so a fixed reserve could never have covered it -- tens of GB at 20h/256px).
+`autobatch_reserve_gb` 12 -> 4.
+
+**probe_eval was rewritten to CALL the real code**, not imitate it: `model.imagine_eval(..., decode_chunk=...)`
+at shapes from a new shared `routines.ood_horizon_shapes()`. The old version over-modelled `open_loop` by 2.4x
+(39.5 vs 16.4 GB) while never modelling `closed_loop_16`, which is the actual peak, and hardcoded `n_ep=8`
+(8x under on proprio-only) plus a 256 horizon cap where the routine clamps to 119.
+
+**Calibration, finally performed** (it was impossible before: the eval window's reserved figure re-reported
+training's pool until an `empty_cache()` was added before the rebase):
+
+```
+probe estimate, worst mode (closed_loop_16)   32.7 GB reserved
+measured eval-routines window                 37.0 GB reserved
+  probe 32.7 + resident 2.83 + persistent 0.10 = 35.6  ->  residual 1.4 GB
+eval_ae_floor measured ALONE                   8.0 GB reserved  (so omitting it from the probe is harmless)
+```
+
+**Utilisation, measured in the AR regime (the regime that matters -- epoch 0 is the cheaper parallel path):**
+
+| | peak memory | of ~100 GB | compute util |
+|---|---|---|---|
+| batch 8 (old sizer) | 44.9 GB | 45% | 61% |
+| batch 17 (new sizer) | 90.3 GB | 90% | 99% |
+
+Per-sample throughput 1.45x compiled (1.98x eager). Note the compile itself was already worth ~3.8x, so batch
+is the smaller lever.
+
+**Step 4's "eval-aware budgeting" was deliberately NOT implemented as designed.** Eval is reported, not gated:
+measured, running eval after an 87.5 GB training peak added NO new reservation, so a bigger batch does not steal
+eval's headroom and a smaller one could not rescue an eval that genuinely does not fit. Raising on an estimate
+would have blocked two healthy configs from starting.
+
+**Not verified:** no FULL epoch has been run at the chosen batch (longest was 100 train batches, which did reach
+the AR regime at 90.3 GB). The audit argues there is no per-epoch growth to find -- fixed shapes throughout, and
+the only other shape is the smaller final partial batch -- but that is an argument, not a measurement. Also
+tested on one dataset and three configs only, and the proprio-only path (n_ep=64) is fixed in code but never
+exercised.
