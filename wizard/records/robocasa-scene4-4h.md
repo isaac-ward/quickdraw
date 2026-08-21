@@ -754,7 +754,7 @@ resolution beating channel width at 0.83× the params. A loss is ambiguous, and 
 
 ### The A/B — `bott_recon1` vs `bott_bott16` (08-21, RUNNING)
 
-`wizard/scripts/robocasa-bottleneck.sh`, `logs/robocasa-bottleneck/`, 25 epochs, both on `model=bsp32mse`
+`wizard/scripts/robocasa-bottleneck.sh`, `logs/robocasa-bottleneck/`, 40 epochs, both on `model=bsp32mse`
 at `data.subsample=5`.
 
 | arm | GPU | change | tests |
@@ -767,12 +767,25 @@ at `data.subsample=5`.
 vs 14.82). `decode_base` is believed orthogonal to the bottleneck, so `long` is the cheaper, faster base
 and keeps `decode_base` available as the follow-up lever if `bott16` loses.
 
-**Batch is PINNED at 8 with `autobatch=false`.** The baselines ran at batch 8 under the old
-(mis-measured, 35%-headroom) autobatch; the rewritten autobatch would now pick ~17 for this config, which
-is better engineering but halves steps-per-epoch — and the baselines peaked on LPIPS at **ep17**.
-Comparability to those baselines is the whole point of this A/B. This is the case
-`conf/data/torus.yaml` documents ("Set false for controlled A/Bs that need a FIXED batch"); the **recipe
-default stays `autobatch=true`**.
+**Batch is left to autobatch, which is ON — and pinning it was RETRACTED.** The first plan pinned
+`data.batch=8` to match the baselines (they ran at 8 under the old mis-measured 35%-headroom finder). The
+user pushed back and was right: comparability was already broken by the epoch budget, and "they peaked at
+ep17" is an EPOCH count, not a step count, so a fixed batch never bought the step-for-step comparison
+claimed for it. So this doubles as the rewritten autobatch's first live outing, and it landed well:
+
+| arm | GB/sample | batch | reserved | frag |
+|---|---|---|---|---|
+| `bott_recon1` | 13.169 | **7** | 92.5/93 GB (99%) | 3% |
+| `bott_bott16` | — | **17** | 91.0/93 GB (98%) | 0% |
+
+Both confirmed on the COMPILED step, not just eager. Note `recon_frac=1.0` costs 13.2 GB/sample and lands
+*below* the baseline's batch 8, while `bott16` more than doubles it — the arms differ in batch by 2.4x.
+That is a confound BETWEEN the arms (not against the baselines), accepted rather than equalised because
+equalising means running both at 7 and idling half of GPU 1. `max_epochs` 25 -> 40 to compensate for the
+larger batch being fewer gradient steps per epoch.
+
+Measured cost: `bott_bott16` 0.86 h/ep (2064 batches), `bott_recon1` 2.11 h/ep (5013 batches) — against the
+baseline's 1.588 h/ep. So the bottleneck arm finishes ~08-23 and the recon arm ~08-25.
 
 **Baselines to beat** (both 50 ep, batch 8, subsample 5):
 
@@ -783,6 +796,28 @@ default stays `autobatch=true`**.
 
 Read it on `ae_floor` PSNR (did the **codec** get sharper) and LPIPS@+32/+64 (did the **rollout** get
 sharper). **Not** on `motion_ratio` alone — it is direction-blind and a *collapsed* model scores higher.
+
+**EARLY READ (ep4-6, NOT a verdict).** Epoch-matched against `BASE long`, the bottleneck hypothesis is so
+far NULL and the `recon_frac` arm is not:
+
+| metric @ep4 | `bott_bott16` | `BASE long` |
+|---|---|---|
+| ae_floor PSNR mean | 19.47 | 19.48 |
+| ae_floor LPIPS@+64 | 0.296 | **0.259** |
+| OL LPIPS@+128 | 0.440 | 0.431 |
+
+The floor tracks the baseline to within 0.01 dB and LPIPS is *worse*. Two caveats: it is ep4 of 40 and the
+baseline did not peak until ep13/ep17, and the epochs are not step-matched (batch 17 vs 8, so ep4 here is
+~ep2 of baseline gradient steps — against which it is slightly ahead on PSNR, slightly behind on LPIPS,
+i.e. the same non-separation). If this holds, the confound named above is the likely explanation: the
+added spatial resolution is roughly cancelling the 1.05M params lost with the dropped pyramid level, and
+the follow-up is `ae_bottleneck=16` PLUS `decode_base=64` to buy the capacity back — which is exactly why
+this A/B was based on `long` rather than `sharp`, keeping `decode_base` free as the next lever.
+
+`bott_recon1` (ep0-2) is ahead of the baseline on open-loop PSNR@+64 at every matched epoch (12.36/14.34/
+13.78 vs 11.02/13.66/13.60) and behind on OL LPIPS@+128 (0.651/0.525/0.485 vs 0.622/0.491/0.479) — the
+distortion-perception tradeoff again, pointing the way it always does on this problem, with the gaps
+converging as if `recon_frac` buys early-training speed rather than a different endpoint.
 
 ### Multi-GPU: not set up, deliberately — `design/distributed.md` (08-21)
 
