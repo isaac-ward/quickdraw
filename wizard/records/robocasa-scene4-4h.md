@@ -834,6 +834,30 @@ not `psnr_mean`. Like-for-like on `psnr_mean`, `long`'s best is **19.586 @ep10**
 real +0.45 dB gain rather than a wash against 20.14. Every comparison in this section is same-tag; the
 earlier number was not, and it made a win look like a tie.
 
+**`bott_bott16` EROSION — its useful life ended around e18-e19.** After plateauing from e14 it began a
+slow decline, visible in the eval metrics by e22-e23:
+
+| | e19 | e20 | e21 | e22 | e23 |
+|---|---|---|---|---|---|
+| OL LPIPS@+64 | 0.344 | 0.342 | 0.338 | 0.354 | **0.368** |
+| OL PSNR@+64 | 14.26 | 14.08 | 13.98 | 14.23 | **13.87** |
+| ae_floor psnr_mean | 20.07 | 20.04 | 19.83 | 19.89 | — |
+| val/loss/total | 0.510 | 0.534 | 0.562 | 0.634 | **0.728** |
+
+This is the §16 EROSION pattern, NOT the §14 hard collapse — one-step PSNR@+1 is still 16.88, nowhere near
+the 9.1 dB failure. And it is not an optimizer problem: `grad/num_nans` and `grad/num_infs` are 0,
+`grad/nonfinite_skipped` is 0, and `norm_preclip == norm_postclip` at 0.17-0.27, i.e. the clip never
+engages. `p_tf` is 0 throughout.
+
+Motion is the lone exception, still creeping up (0.447 @e23) while the codec metrics decline — the
+signature of the dynamics continuing to fit through an eroding codec, which is exactly what
+`latent_loss_weight=10` was raised to slow (§16). At a 16x16 bottleneck it evidently needs to be higher
+still: **`latent_loss_weight` > 10 is the natural companion knob to `ae_bottleneck` > 8**, and is untested.
+
+Practical consequence: read `bott16`'s numbers as its BESTS (floor 20.10 @e14, ae_floor LPIPS 0.227 @e18,
+OL LPIPS 0.338 @e21) — `best.ckpt` holds them — and treat epochs past ~e19 as actively harmful. The
+40-epoch schedule was too long for this arm.
+
 **`bott_recon1` — A RECORDED CLAIM HERE WAS WRONG AND IS NOW REVERSED.** At ep5 this section said
 "`recon_frac=1.0` looks like a straight loss ... the obvious kill candidate". That was a **methodological
 error**: `recon1`'s EARLY values were compared against the baselines' BEST-over-all-epochs values. Once
