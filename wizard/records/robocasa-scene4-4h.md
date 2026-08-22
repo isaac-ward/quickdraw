@@ -844,10 +844,31 @@ slow decline, visible in the eval metrics by e22-e23:
 | ae_floor psnr_mean | 20.07 | 20.04 | 19.83 | 19.89 | — |
 | val/loss/total | 0.510 | 0.534 | 0.562 | 0.634 | **0.728** |
 
-This is the §16 EROSION pattern, NOT the §14 hard collapse — one-step PSNR@+1 is still 16.88, nowhere near
-the 9.1 dB failure. And it is not an optimizer problem: `grad/num_nans` and `grad/num_infs` are 0,
-`grad/nonfinite_skipped` is 0, and `norm_preclip == norm_postclip` at 0.17-0.27, i.e. the clip never
-engages. `p_tf` is 0 throughout.
+At e23 this was characterised as the §16 EROSION pattern and "not the §14 hard collapse", on the grounds
+that one-step PSNR@+1 was still 16.88 and the gradients were clean (0 NaNs, 0 infs, 0 skipped, and
+`norm_preclip == norm_postclip` at 0.17-0.27, i.e. the clip never engaging). **That reading was right about
+the mechanism and WRONG about it being benign — by e32 it is a full collapse:**
+
+| | e28 | e29 | e30 | e31 | e32 |
+|---|---|---|---|---|---|
+| OL LPIPS@+64 | 0.333 | 0.645 | 0.515 | 0.724 | **0.734** |
+| OL PSNR@+64 | 14.20 | 12.46 | 13.49 | 12.21 | **11.56** |
+| ae_floor psnr_mean | 19.83 | 19.10 | 18.80 | **18.54** | — |
+| ae_floor LPIPS@+64 | 0.232 | 0.267 | 0.268 | **0.303** | — |
+| `grad/norm_preclip` | 0.43 | 3.88 | 1.04 | **18.33** | **17.05** |
+
+OL LPIPS has more than DOUBLED off its e21 best (0.338 -> 0.734) and OL PSNR@+64 has lost 2.7 dB. The floor
+is 1.56 dB below its e14 peak.
+
+**The mechanism is a gradient blow-up, and the e23 gradient reading has to be updated.** `norm_preclip` is
+18.33 at e31 — about **70x** the 0.17-0.27 seen at e23 — so the clip at 1.0 is now truncating essentially
+the whole gradient every step. There are still no NaNs or infs, so this is not numerical failure: the loss
+landscape is genuinely blowing up and the clip is all that prevents outright divergence while the model
+degrades. Onset is between e28 (0.43) and e29 (3.88), exactly where OL LPIPS jumped 0.333 -> 0.645.
+
+**LESSON: on this config `grad/norm_preclip` is the early-warning metric, not val_loss.** val_loss had been
+rising since e15 while every eval metric held flat, then oscillated +-0.3 for ten epochs — it never
+cleanly marked the turn. The gradient norm did, in one epoch.
 
 Motion is the lone exception, still creeping up (0.447 @e23) while the codec metrics decline — the
 signature of the dynamics continuing to fit through an eroding codec, which is exactly what
