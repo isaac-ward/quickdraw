@@ -880,13 +880,40 @@ the "losing" call was an artifact of the comparison, not the data.
 aggregations.** Both times it turned a win into an apparent loss. RULE: on this dataset, compare
 EPOCH-MATCHED and SAME-TAG, and quote best-over-epochs only against another best-over-epochs.
 
-**Revised standing picture — three levers, three different wins, and they look orthogonal:**
+**THE CLEAN FOUR-WAY AT e11** (epoch-matched, same-tag — the comparison rule this section had to learn
+twice). Every metric has a different winner, and the split is not arbitrary:
+
+| metric @e11 | `recon1` | `bott16` | `long` | `sharp` | winner |
+|---|---|---|---|---|---|
+| ae_floor psnr_mean | 19.59 | **19.97** | 19.41 | 19.44 | `bott16` |
+| ae_floor LPIPS@+64 | 0.213 | 0.241 | 0.216 | **0.173** | `sharp` |
+| OL PSNR@+64 | **14.33** | 14.06 | 14.22 | 14.13 | `recon1` |
+| OL LPIPS@+64 | 0.363 | 0.364 | 0.368 | **0.317** | `sharp` |
+| OL LPIPS@+128 | **0.332** | 0.363 | 0.384 | 0.353 | `recon1` |
+| OL motion_ratio mean | **0.488** | 0.375 | 0.413 | 0.446 | `recon1` |
+
+**A HORIZON CROSSOVER, which is the new mechanism-level finding.** `sharp` wins perceptual distance at
+horizon 64 (0.317 vs `recon1`'s 0.363) but LOSES it at horizon 128 (0.353 vs 0.332). So the two levers buy
+sharpness at DIFFERENT horizons, and the reason is mechanical: `recon_frac=1.0` supervises EVERY step of
+the rollout against its true frame, so its benefit should compound with horizon — which is exactly what a
+crossover between +64 and +128 looks like. `decode_base` buys a stronger decoder, which helps most where
+the latent is still accurate, i.e. early.
+
+**This matters for the standing goal** ("slightly sharper results that stay coherent for like 32-64 steps
+... and I want to make sure the movement is being modeled", user, throughout). `recon1` wins BOTH halves of
+that sentence at e11: long-horizon perceptual quality and motion (0.488 against 0.375-0.446, the highest
+any arm has reached at this epoch). `sharp`'s LPIPS win is real but concentrated at the short end.
+
+**Revised standing picture — four levers, four different wins, and they look orthogonal:**
+
+
 
 | lever | owns |
 |---|---|
 | `ae_bottleneck=16` | the reconstruction **floor** (+0.51 dB, stable, fewer params) |
-| `decode_base=64` | **sharpness** at an 8x8 bottleneck (LPIPS 0.142) |
-| `recon_frac=1.0` | **sharpness + motion** at matched epochs; the ONLY lever that moves motion UP |
+| `decode_base=64` | **SHORT-horizon** sharpness (ae_floor LPIPS 0.142; OL LPIPS@+64 0.303) |
+| `recon_frac=1.0` | **LONG-horizon** sharpness (OL LPIPS@+128) **+ motion** + rollout PSNR; also the only arm with NO codec erosion |
+| `latent_loss_weight` > 10 | UNTESTED companion to a raised bottleneck (see the erosion note above) |
 
 **FOLLOW-UP, STAGED AND NOT RUN** (`wizard/scripts/robocasa-bottleneck-2.sh`, needs a free GPU):
 `ae_bottleneck=16` **+** `decode_base=64`. `bott16` gains PSNR from resolution but loses LPIPS to the
