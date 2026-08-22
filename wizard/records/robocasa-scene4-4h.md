@@ -839,6 +839,39 @@ earlier number was not, and it made a win look like a tie.
 straight loss at 2.4x the cost per epoch (2.11 h/ep, batch 7). Let it reach ~ep10 to confirm, then it is
 the obvious kill candidate.
 
+**CONFIRMED AT ep17**, where both baselines hit their own LPIPS peak, so this is the like-for-like point.
+
+Floor — `bott16` wins durably, not on a lucky epoch: psnr_mean 20.02/20.10/20.02/20.04 across e13-e16
+(best **20.10 @e14**) against `long`'s 19.586 @e10 and `sharp`'s 19.499 @e15. **+0.51 dB over the best of
+15 prior runs**, stable on a multi-epoch plateau, on fewer parameters than either.
+
+LPIPS — `bott16` loses, and **the ep15 note that "the gap is narrowing" is WITHDRAWN**: it was three points
+of noise. `bott16` flatlined at 0.235 from e14 while `long` kept improving to 0.201, so the gap widened
+back out to 0.034:
+
+| ae_floor LPIPS@+64 | e14 | e15 | e16 | e17 | best |
+|---|---|---|---|---|---|
+| `bott_bott16` | 0.235 | 0.237 | 0.235 | — | 0.235 |
+| `BASE long` | 0.208 | 0.212 | 0.205 | 0.201 | 0.192 @e19 |
+| `BASE sharp` | 0.157 | 0.159 | 0.150 | 0.147 | **0.142 @e18** |
+
+Open-loop LPIPS@+64 best: 0.345 vs 0.323 vs **0.303**. Motion is genuinely worse on stable plateaus, not
+noise: 0.403 vs 0.471 vs **0.547** @e17. Open-loop PSNR@+64 is a three-way tie (14.79/14.82/14.32 best) —
+nobody wins the rollout on distortion.
+
+**THE STANDING CONCLUSION, which is the useful output of this whole section:**
+
+> `ae_bottleneck` dominates `decode_base` for the **reconstruction floor**.
+> `decode_base` dominates `ae_bottleneck` for **perceptual sharpness and motion**.
+> They are separate axes and each baseline wins its own.
+
+So the 8x8 bottleneck WAS the binding constraint on fidelity — real, +0.51 dB, on fewer params, after four
+levers found nothing — and it is NOT the answer to the blur complaint, because `sharp` is 37% better on
+perceptual distance (0.142 vs 0.235) and 36% better on motion, and `sharp` already exists. This makes the
+staged follow-up much better motivated than it was at ep13: the two effects now look INDEPENDENT rather
+than competing, so combining them is a real shot at winning both rather than a hope that one offsets the
+other.
+
 **FOLLOW-UP, STAGED AND NOT RUN** (`wizard/scripts/robocasa-bottleneck-2.sh`, needs a free GPU):
 `ae_bottleneck=16` **+** `decode_base=64`. `bott16` gains PSNR from resolution but loses LPIPS to the
 1.05M params the dropped level cost; `sharp` shows `decode_base=64` is worth ~0.05 LPIPS on its own.
