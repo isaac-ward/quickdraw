@@ -834,50 +834,51 @@ not `psnr_mean`. Like-for-like on `psnr_mean`, `long`'s best is **19.586 @ep10**
 real +0.45 dB gain rather than a wash against 20.14. Every comparison in this section is same-tag; the
 earlier number was not, and it made a win look like a tie.
 
-**`bott_recon1` is losing on everything** (6 epochs): OL PSNR@+64 peaked 14.34 @ep1 and has decayed to
-13.60; OL LPIPS 0.415-0.444, worse than every arm and every baseline. `recon_frac=1.0` looks like a
-straight loss at 2.4x the cost per epoch (2.11 h/ep, batch 7). Let it reach ~ep10 to confirm, then it is
-the obvious kill candidate.
+**`bott_recon1` — A RECORDED CLAIM HERE WAS WRONG AND IS NOW REVERSED.** At ep5 this section said
+"`recon_frac=1.0` looks like a straight loss ... the obvious kill candidate". That was a **methodological
+error**: `recon1`'s EARLY values were compared against the baselines' BEST-over-all-epochs values. Once
+epoch-matched — the way `bott16` was analysed — it leads on the metrics that actually matter here:
 
-**CONFIRMED AT ep17**, where both baselines hit their own LPIPS peak, so this is the like-for-like point.
+| epoch-matched, e7-e8 | `bott_recon1` | `BASE long` | `bott_bott16` |
+|---|---|---|---|
+| ae_floor LPIPS@+64 (e7) | **0.228** | 0.241 | 0.268 |
+| OL LPIPS@+64 (e8) | **0.373** | 0.374 | 0.387 |
+| OL motion_ratio mean (e8) | **0.440** | 0.378 | 0.341 |
+| ae_floor psnr_mean (e6) | 19.59 | 19.51 | **19.71** |
+| OL PSNR@+64 (e6) | 14.52 | 14.63 | 14.53 |
 
-Floor — `bott16` wins durably, not on a lucky epoch: psnr_mean 20.02/20.10/20.02/20.04 across e13-e16
-(best **20.10 @e14**) against `long`'s 19.586 @e10 and `sharp`'s 19.499 @e15. **+0.51 dB over the best of
-15 prior runs**, stable on a multi-epoch plateau, on fewer parameters than either.
+It leads on perceptual distance AND motion — precisely the two axes `bott16` lost and the two the original
+complaint was about — and its motion at e8 (0.440) already exceeds `bott16`'s best across 20 epochs
+(0.435). Even at ep5, epoch-matched, it was already ahead of `long` on LPIPS (0.415-0.444 vs 0.421-0.488);
+the "losing" call was an artifact of the comparison, not the data.
 
-LPIPS — `bott16` loses, and **the ep15 note that "the gap is narrowing" is WITHDRAWN**: it was three points
-of noise. `bott16` flatlined at 0.235 from e14 while `long` kept improving to 0.201, so the gap widened
-back out to 0.034:
+**This is the same error shape as the `20.14 dB` tag mixup recorded above: comparing across different
+aggregations.** Both times it turned a win into an apparent loss. RULE: on this dataset, compare
+EPOCH-MATCHED and SAME-TAG, and quote best-over-epochs only against another best-over-epochs.
 
-| ae_floor LPIPS@+64 | e14 | e15 | e16 | e17 | best |
-|---|---|---|---|---|---|
-| `bott_bott16` | 0.235 | 0.237 | 0.235 | — | 0.235 |
-| `BASE long` | 0.208 | 0.212 | 0.205 | 0.201 | 0.192 @e19 |
-| `BASE sharp` | 0.157 | 0.159 | 0.150 | 0.147 | **0.142 @e18** |
+**Revised standing picture — three levers, three different wins, and they look orthogonal:**
 
-Open-loop LPIPS@+64 best: 0.345 vs 0.323 vs **0.303**. Motion is genuinely worse on stable plateaus, not
-noise: 0.403 vs 0.471 vs **0.547** @e17. Open-loop PSNR@+64 is a three-way tie (14.79/14.82/14.32 best) —
-nobody wins the rollout on distortion.
-
-**THE STANDING CONCLUSION, which is the useful output of this whole section:**
-
-> `ae_bottleneck` dominates `decode_base` for the **reconstruction floor**.
-> `decode_base` dominates `ae_bottleneck` for **perceptual sharpness and motion**.
-> They are separate axes and each baseline wins its own.
-
-So the 8x8 bottleneck WAS the binding constraint on fidelity — real, +0.51 dB, on fewer params, after four
-levers found nothing — and it is NOT the answer to the blur complaint, because `sharp` is 37% better on
-perceptual distance (0.142 vs 0.235) and 36% better on motion, and `sharp` already exists. This makes the
-staged follow-up much better motivated than it was at ep13: the two effects now look INDEPENDENT rather
-than competing, so combining them is a real shot at winning both rather than a hope that one offsets the
-other.
+| lever | owns |
+|---|---|
+| `ae_bottleneck=16` | the reconstruction **floor** (+0.51 dB, stable, fewer params) |
+| `decode_base=64` | **sharpness** at an 8x8 bottleneck (LPIPS 0.142) |
+| `recon_frac=1.0` | **sharpness + motion** at matched epochs; the ONLY lever that moves motion UP |
 
 **FOLLOW-UP, STAGED AND NOT RUN** (`wizard/scripts/robocasa-bottleneck-2.sh`, needs a free GPU):
 `ae_bottleneck=16` **+** `decode_base=64`. `bott16` gains PSNR from resolution but loses LPIPS to the
 1.05M params the dropped level cost; `sharp` shows `decode_base=64` is worth ~0.05 LPIPS on its own.
-Combining them tests whether resolution and channel width are ADDITIVE, and it is the first config with a
-plausible shot at both. This is exactly why the A/B was based on `long` rather than `sharp` — it kept
-`decode_base` free as the next lever.
+Combining them tests whether resolution and channel width are ADDITIVE. This is exactly why the A/B was
+based on `long` rather than `sharp` — it kept `decode_base` free as the next lever.
+
+**CAVEAT ADDED after the `recon_frac` reversal above:** this is no longer obviously the best next config.
+`recon_frac=1.0` is orthogonal to both and is currently the strongest single signal on the actual
+complaint (sharpness AND motion). The config the evidence points at is
+`ae_bottleneck=16 + decode_base=64 + recon_frac=1.0`, but that stacks THREE levers at once and would be
+uninterpretable if it failed. Decide between "clean 2-lever test" and "stack everything" before launching.
+
+**Do NOT kill `bott_recon1`** — it is the most informative arm running and at 2.11 h/ep will not reach
+`long`'s ep17 LPIPS peak until ~08-23 22:00. `bott_bott16` is the arm that has said everything it has to
+say: plateaued on every metric from e14 with 20 epochs left. If a GPU is needed, stop that one.
 
 `bott_recon1` (ep0-2) is ahead of the baseline on open-loop PSNR@+64 at every matched epoch (12.36/14.34/
 13.78 vs 11.02/13.66/13.60) and behind on OL LPIPS@+128 (0.651/0.525/0.485 vs 0.622/0.491/0.479) — the
