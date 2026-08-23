@@ -936,6 +936,56 @@ any arm has reached at this epoch). `sharp`'s LPIPS win is real but concentrated
 | `recon_frac=1.0` | **LONG-horizon** sharpness (OL LPIPS@+128) **+ motion** + rollout PSNR; also the only arm with NO codec erosion |
 | `latent_loss_weight` > 10 | UNTESTED companion to a raised bottleneck (see the erosion note above) |
 
+### FINAL: `bott_bott16`, 40/40 epochs (08-23 04:00)
+
+| metric | best | final e39 | `long` best | `sharp` best |
+|---|---|---|---|---|
+| ae_floor psnr_mean | **20.100** @e14 | 11.98 | 19.586 | 19.499 |
+| ae_floor LPIPS@+64 | 0.227 @e18 | 0.719 | 0.192 | **0.142** |
+| OL PSNR@+64 | 14.789 @e9 | 11.60 | **14.817** | 14.323 |
+| OL LPIPS@+64 | 0.333 @e28 | 0.753 | 0.323 | **0.303** |
+| OL LPIPS@+128 | 0.336 @e16 | 0.754 | 0.333 | **0.310** |
+| OL motion mean | 0.492 @e29 | 0.373 | 0.516 | **0.571** |
+
+The collapse ran to completion: floor 20.10 -> 11.98 (**-8 dB**), every LPIPS above 0.7. The last 20 epochs
+were purely destructive. **It won exactly one metric — the AE reconstruction floor (+0.51 dB over the best
+of 15 prior runs) — and lost every rollout metric.** So the 8x8 bottleneck was a real binding constraint on
+CODEC FIDELITY, and relieving it does not improve the ROLLOUT, which is what the goal is about.
+
+**A CHECKPOINT-SELECTION PROBLEM WORTH FIXING BEFORE ANY OF THESE CKPTS ARE REUSED.** `best.ckpt` for this
+run is pinned to **e8** (`best monitor=0.53341`) — not e14 (floor peak), not e18 (ae_floor LPIPS peak), not
+e16/e28 (OL LPIPS peaks). The monitor is `val/metric/proprio/<env.checkpoint_metric>`, a **proprio** metric
+(`training/lit.py:190`, wired at `train_world_model.py:248`), so on this dataset `best.ckpt` selects for
+proprio quality and is **blind to every image metric this record judges on**. Not introduced by this batch,
+but it means "load best.ckpt and look at the images" silently gets e8. Either monitor an image metric on
+image-modality runs, or always select the epoch by hand from metrics.jsonl.
+
+### `bott_recon1` at ep17 of 40 (08-23 06:12) — the best ROLLOUT model measured on this dataset
+
+Its own trend is flat-or-improving with no sign of `bott16`'s e19 turn: OL LPIPS@+128 0.332 -> 0.308 across
+e12-e17, motion 0.481 -> 0.558 (peaking 0.564 @e15), ae_floor LPIPS pinned at 0.205-0.207, 1-step PSNR
+16.84-16.96. Gradient norms 0.25-0.32 and FALLING; val_loss flat at 0.467 for seventeen epochs.
+
+Best-vs-best (recon1 has 17 of 40 epochs; the other three are complete):
+
+| metric | `recon1` | `bott16` | `long` | `sharp` |
+|---|---|---|---|---|
+| ae_floor psnr_mean | 19.68 | **20.10** | 19.59 | 19.50 |
+| ae_floor LPIPS@+64 | 0.205 | 0.227 | 0.192 | **0.142** |
+| **OL PSNR@+64** | **14.99** | 14.79 | 14.82 | 14.32 |
+| OL LPIPS@+64 | 0.318 | 0.333 | 0.323 | **0.303** |
+| **OL LPIPS@+128** | **0.308** | 0.336 | 0.333 | 0.310 |
+| OL motion mean | 0.564 | 0.492 | 0.516 | **0.571** |
+
+`recon1` holds the best open-loop PSNR@+64 (14.99) and best long-horizon LPIPS (0.308) of ANY run here, and
+matched `sharp` on motion (0.564 vs 0.571) at e15 rather than e18.
+
+**THE PROPERTY THAT MATTERS MOST, and it is new:** `recon1`'s LPIPS is nearly FLAT ACROSS HORIZON —
+@+64 0.318 vs @+128 0.308, i.e. it gets *slightly better* at the longer horizon. Compare `sharp`
+0.303 -> 0.310 and `bott16` 0.333 -> 0.336, both degrading. Perceptual quality that does not decay from 64
+to 128 steps is precisely what "stay coherent for like 32-64 steps" asks for, and no other lever produces
+it. The e11 horizon crossover has narrowed but held.
+
 **FOLLOW-UP, STAGED AND NOT RUN** (`wizard/scripts/robocasa-bottleneck-2.sh`, needs a free GPU):
 `ae_bottleneck=16` **+** `decode_base=64`. `bott16` gains PSNR from resolution but loses LPIPS to the
 1.05M params the dropped level cost; `sharp` shows `decode_base=64` is worth ~0.05 LPIPS on its own.
