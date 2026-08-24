@@ -26,7 +26,14 @@ denoising_filmstrip_steps: 8   # K Euler steps for the denoising_filmstrip eval 
 # Two AXES for the filmstrip: `images` = how many DIFFERENT frames, each emitted as its OWN file
 # eval_flow/denoising_filmstrip_<i>; `seeds` = eps-noise ROWS within each file (the generative spread on one frame).
 denoising_filmstrip_images: 4  # number of different (episode, step) frames -> 4 separate files _0.._3
-denoising_filmstrip_seeds: 4   # number of eps-noise seeds = rows within each file -> shows the generative spread
+denoising_filmstrip_seeds: 4   # DEPRECATED (2026-08-24): the filmstrip's rows are now ROLLOUT HORIZONS, not eps
+#                                seeds. A well-conditioned flow converges to the same answer from any eps, so the
+#                                seed rows were near-duplicates. Kept only so old configs still compose.
+denoising_filmstrip_horizons: [1, 8, 16, 32, 64]   # ROWS: open-loop rollout depth at which to show the flow's
+#                                refinement. Reading DOWN tests whether refinement survives compounding; reading
+#                                ACROSS (k1..kK) tests whether it refines at all. Also logged as scalars
+#                                eval_flow/filmstrip/psnr/h<h>/k<k> -- trust those over the pictures, because the
+#                                intermediate latents are off-manifold for a decoder trained only on clean ones.
 
 # denoising eval (diffusion only): which trajectory + swarm angle it shows, and the multistep render cost
 denoising_seed: null       # null -> use the epoch step (a DIFFERENT trajectory/angle each eval); set an int to pin one
