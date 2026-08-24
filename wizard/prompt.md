@@ -29,6 +29,23 @@ Keep it tight — a handful of focused questions, not an interrogation.
 
 ---
 
+## Part 0 — Interview mode + goal (ASK FIRST, before Part A)
+
+**Q0 — mode.** *"Do you already know exactly what you want (model, data, size, stages), or should I guide you?"*
+- **"I know what I'm doing"** → give ONE free-text box: *"Describe the run — dataset/env, model + size, which
+  stages, anything you care about."* PARSE it, fill every unstated choice with the documented default, echo the
+  fully-resolved plan back for a SINGLE confirm, then skip to **Part D (compile)**. Still force-run the two steps
+  that are safety not preference: the dataset **inspection** (Part A — dims can't be guessed) and the Part D
+  **pre-flight**.
+- **"Guide me"** → the normal interview (Parts A–C).
+
+**Q1 — goal (REQUIRED, both modes).** *"What does success look like?"* Offer: image-prediction quality ·
+control/planning · OOD / anomaly detection · interpretability + language · fastest baseline · a specific metric
+target. Record it verbatim — it steers the defaults below AND the **Part E** recommendation. Do NOT skip it; the
+goal is the one input that makes the final recommendation specific rather than generic.
+
+---
+
 ## Part A — Data / Environment
 
 Ask: **"What are you bringing?"** One of three (this mirrors `docs/byo.md`):
@@ -98,10 +115,13 @@ camera.)
 Walk each choice, suggest the default, and **quote the learning** (exact numbers live in
 `conf/model/mm_flow.yaml`):
 
-- **Decode kind — vit-mse vs flow** — *default vit-mse.* The image is a deterministic render, so the
-  conditional mean IS the target: `decode_kind=mse` + `decode_arch=vit` slightly **beat** flow/U-Net on
-  every axis (val PSNR 18.9 vs 18.3, OOD pointwise 0.24 vs 0.32, control 4.12 vs 3.5). Pick flow only if
-  they specifically want a *generative* decoder (multimodal pixels).
+- **Decode objective — deterministic vs generative** (this is a MODELING objective, NOT an architecture
+  question — never ask the user about vit/unet/conv). Ask only: *do you want the single most-likely next frame,
+  or a generative/multimodal decoder?* *Default deterministic* (`decode_kind=mse`): the render is deterministic
+  so the conditional mean IS the target — it beat generative on every axis (val PSNR 18.9 vs 18.3, OOD pointwise
+  0.24 vs 0.32, control 4.12 vs 3.5). Pick generative (`decode_kind=flow`) only if they explicitly want multimodal
+  pixels. YOU (the wizard) then pick the architecture from the learnings (`decode_arch=unet` avoids the vit
+  patch-grid; `encode_arch=conv` edged vit) — the user never sees `decode_arch`/`encode_arch`.
 - **Action head — on/off** — *default OFF for the WM run.* The **joint** action head KILLS control
   (goals ~0 vs 3.88) and destabilizes the WM (NaN/collapse). If they want the MPPI action prior, train it
   **post-hoc** on the frozen checkpoint via `train_action_model` (which defaults `action_head.shortcut=false`
@@ -157,12 +177,9 @@ Ask which stages to include, and gate them on the env:
 stages that need a **steppable** env]. So: for recorded/data-only, everything through the **reward head** is
 available; only the control/steering stages are unavailable.
 
-**Interpret needs env-specific factors — scaffold them.** `eval_interpret` labels the latent space by the
-semantic factors + VLM prompt in `conf/interpret/<env>.yaml`; a new env/dataset has none. If the user wants
-interpret, **draft a starter `conf/interpret/<env>.yaml`** for them: copy `conf/interpret/pendulum.yaml` as
-the shape, then propose factors that fit *their* domain (from the dataset's task/camera — e.g. gripper
-open/closed, object present, region of the scene) with a VLM prompt describing what the frames show. Show it
-to the user to edit; it's the one interpret input that isn't automatic.
+Interpret factors (`conf/interpret/<env>.yaml`) are NOT an interview question. If interpret is in scope,
+scaffold a starter config LATER (at compile/hand-off), not mid-interview — copy `conf/interpret/pendulum.yaml`
+and propose domain factors + a VLM prompt for the user to edit. Don't interrupt the interview for it.
 
 ---
 
@@ -193,6 +210,30 @@ output — so the run is self-documenting and reproducible.
 
 Finally, report: the script + record paths, the model shape + param breakdown, the checker result, and the
 specific learnings you applied.
+
+---
+
+## Part E — Recommend, from the records AND the compatibility table (LAST, before hand-off)
+
+Once the script is compiled, turn the repo's hard-won evidence into a recommendation FOR THE USER'S GOAL (Q1).
+Read BOTH sources:
+- **`wizard/records/*.md`** — the numerical/anecdotal findings from real runs (what worked, with numbers + units).
+- The README **"Feature compatibility"** tables — which feature combinations are LEGAL and which are recommended
+  (use the numbered footnotes as the caveats).
+
+Then give the user three things:
+1. **Primary recommendation** — the incarnation you'd run for THIS goal, each choice backed by a record number or
+   a compat footnote. (e.g. control on owm → pick the checkpoint by `val/loss/physics/proprio`, NOT
+   `pointwise_error` [record: red herring for physics WMs]; categorical latent [Gaussian-KL collapsed, KL 32k vs
+   12.6]; bespoke AE, not TAESD.)
+2. **Alternative legal incarnations (2–3)** — from the compat matrix, each tagged with its footnote caveat and,
+   where we have one, a record datapoint. The TABLE gives the legal set; the RECORDS rank them for this goal.
+3. **"Maybe try some of this"** — advanced knobs the records suggest but that are NOT front-line interview
+   questions: the proprio **`prior`** (`physics` / kinematics-only / `identity` / `none`), categorical-vs-Gaussian
+   latent, the decode objective, size. Frame as experiments to consider, not defaults.
+
+This is the wizard turning the record + the legal-combination table into a targeted next step — not just handing
+over a script and stopping.
 
 ---
 

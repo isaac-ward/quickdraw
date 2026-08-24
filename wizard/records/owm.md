@@ -421,3 +421,59 @@ build the model WITH the hook (`+environments.dynamics_prior=true +environments.
 fp32 ctx obs, no outer bf16 autocast (#14); (5) I/O contract: ctx `(B,P,13)` normalized fp32, actions
 `(B·K,P-1+H,6)` normalized (action for step t at index P-1+t), returns normalized proprio → denorm → reward; (6)
 re-baseline from scratch (old numbers invalid).
+
+---
+
+## 08-24 — DreamerV3-style probabilistic latent heads (bimodal A/B), + B GAUSSIAN-KL COLLAPSE
+
+New modular prob-head component (`src/quickdraw/models/dist_heads.py` + `MultiModalDistribution` in `multimodal.py`,
+config name `mm_dist`): parameterizes an EXPLICIT distribution over the next JOINT latent bag (proprio+image, all
+n_state tokens), samples it, decodes — mutually exclusive with the flow head. Categorical (DreamerV3: 32×d/16 groups,
+unimix 1%, straight-through, balanced KL β_dyn 1.0/β_rep 0.1, free-bits 1 nat) is primary; Gaussian-KL (stochastic
+latent) and Gaussian-NLL (Ward-2026, deterministic latent) are siblings. Posterior conditions on the fused
+single-frame obs (action-excluded); prior from the transformer spine. Recon = **posterior-decode single term, no
+separate anchor** (modality `weight:0` drops predicted-bag decode; `latent_loss_weight:1` keeps `codec/roundtrip`
+= decode(sample(posterior(o_t)))→o_t). Physics-proprio override inherited unchanged. Smoked 41/41 (KV-parity
+Δ~1e-6) + 2 independent fable audits.
+
+**A/B (16ep coop, physics on, taesd image + ego-13 proprio, batch 26, compile):** A=categorical (GPU0),
+B=gaussian-KL (GPU1). Killed at ep3 for audits.
+
+| run | head | ep3 val total | kl/dyn raw | codec_proprio | status |
+|---|---|---|---|---|---|
+| **A** | categorical | 14.8 | **12.6** | 0.91 | HEALTHY |
+| **B** | gaussian-KL | 28213 | **32109** | 8.68 | **COLLAPSED** |
+
+**B collapse — CONFIRMED empirically (loaded ep3 ckpt + 1 val batch), NOT a units artifact:** ~99.97% of B's loss
+is the KL term. Posterior σ collapsed to the `min_std=0.1` floor (mean 0.103) AND posterior mean exploded to ±64
+(bf16 saturation) while the prior stayed moderate (σ~0.72, μ~14) → KL `(μq−μp)²/2σp²` runs away (bag std 4.9,
+|max| 62, **Inf grads**). ROOT CAUSES (2 audits): (1) `latent_norm:affine` does NOT normalize a POSTERIOR-SAMPLED
+bag — `_ln` is gated off for affine, whose premise (bag = invertible AE latent) is false for a net-output sample;
+(2) Gaussian posterior mean = unbounded `Linear(feats)`, no `max_std`, variance→floor; (3) 128-dim SUMMED KL vs
+mean-mse recon → ~2500:1 gradient imbalance. Categorical is IMMUNE (bounded simplex + unimix) — **this A/B
+reproduces DreamerV3's reason for choosing categorical over Gaussian for the WM latent.** Fix B before re-running:
+force LN on the sampled bag (or `latent_norm:layernorm`) + `max_std` + rescale dyn/rep to recon units.
+
+**Bugs found by the audits (this session):** (a) FIXED `multimodal.py:_physics_proprio_rollout` — bf16 (autocast)
+bag token fed to fp32 `residual_head` OUTSIDE autocast → dtype crash; only the STANDALONE eval path hit it (train/val
+run under Lightning autocast). Caught by running eval_ood_horizon on A's ep3 ckpt (first eval ever on mm_dist).
+(b) OPEN sibling: `physics_proprio` (dead code) has the same uncast token. (c) OPEN `eval_manifold.py:44` never
+`norm_act`s → silent garbage for ALL MM models on owm. (d) OPEN GaussianHead losses computed in bf16 while
+categorical's softmax is fp32 → a precision CONFOUND in the very A/B. (e) `p_tf_batch_granular` absent from both
+dist yamls → silently True (proven recipe locks false). (f) recon-posterior-decode decision verified in force to 4
+decimals. checkpoint_monitor=val/loss/physics/proprio confirmed wired.
+
+**Decode/physics UNIFICATION landed (08-24).** `physics/proprio` is no longer a bolt-on — it's `decode/proprio`
+with a per-modality `prior ∈ {none, identity, physics}` (env supplies the fn). Bit-identical verified
+(decode/proprio physics == old physics/proprio 2.494110, Δ<5e-7; smoke 41/41). Round-trip illegal in prior mode
+(build-time raise; encoder grounded by the decode loss). Legacy `dynamics_prior=true` configs byte-identical (dual
+path). Queued categorical dreamer runs (coop+noncoop, bespoke conv/unet AE 32 tok, layernorm, prior:physics FULL,
+decode/image ON = image-collapse fix, evals, 16ep). Loss terms: kl/dyn(1)+kl/rep(0.1)+decode/proprio(1,physics
+chain)+decode/image(1,absolute)+codec/roundtrip_image(1). No proprio round-trip, no standalone physics term.
+
+**PINNED — physics-rung sweep (later).** Measured: FULL 6-DOF physics leaves the residual ~nothing to learn
+(residual 0.4% of position, no error reduction). Test how much physics to give by toggling the prior rung, all
+else fixed: FULL (default) · kinematics-only (integrate v→p & ω→q; WM learns force→v AND τ→ω — the symmetric
+"less") · identity (obs=prev+residual; pure delta) · none (absolute). **SKIP translation-only** (boring +
+quat-norm hazard). Needs small config flags on the physics fn (rotational_dynamics / attitude_kinematics on/off)
+to build the reduced priors — not yet wired.
