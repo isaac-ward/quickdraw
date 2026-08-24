@@ -37,6 +37,19 @@ class VisionAEConfig:
     channels: int = 3
     mlp_ratio: float = 4.0
     build_decoder: bool = True  # False when a generative flow decode head replaces the mse decoder (no dead weight)
+    bottleneck: int = 8     # TARGET spatial size of the conv pyramid's bottleneck, for BOTH ConvImageEncoder and
+    #                         ConditionalUNet. 8 = the previous hardcoded value = bit-identical.
+    #                         WHY IT IS A KNOB (2026-08-21): both classes computed
+    #                         `n_levels = log2(short_side // 8)`, i.e. they pooled to 8x8 BY CONSTRUCTION at every
+    #                         resolution -- so the encoder discarded all spatial detail below 8x8 BEFORE the
+    #                         num_tokens queries ever saw it. That is why sweeping num_tokens 8->64 (an 8x range
+    #                         of latent floats), decode_base 32->64, ae_depth 4->6 and latent_loss_weight 10->30
+    #                         ALL left the bespoke reconstruction floor flat at 18.7-20.4 dB: none of them touch
+    #                         the binding constraint. Raising this to 16 makes the bottleneck 16x16 (a 64x spatial
+    #                         reduction at 128px instead of 256x) and gives the token budget something to carry.
+    #                         NOT exposed as `n_levels` directly: the encoder pools AFTER a stride-2 stem and the
+    #                         decoder pools from full resolution, so at 128px they use 3 and 4 levels respectively
+    #                         -- one shared n_levels would desynchronise them. A shared TARGET cannot.
 
 
 def _heads(x, heads):                                    # (B,N,d) -> (B,heads,N,hd)
@@ -329,7 +342,8 @@ class ConvImageEncoder(nn.Module):
         C, d, T = cfg.channels, cfg.d, cfg.num_tokens
         stem = 2                                                       # stride-2 stem: the full-res activation is
         h0, w0 = (s // stem for s in img_hw(cfg.img_size))             #   1/4 the memory (standard conv-encoder stem)
-        n_levels = max(1, int(math.log2(max(8, min(h0, w0)) // 8)))   # then pool to a ~8px bottleneck (short side)
+        bott = max(1, int(getattr(cfg, "bottleneck", 8)))              # target bottleneck (see VisionAEConfig)
+        n_levels = max(1, int(math.log2(max(bott, min(h0, w0)) // bott)))   # pool to ~bott px on the short side
         chs = [base * min(4, 2 ** i) for i in range(n_levels)]
         self.in_conv = nn.Conv2d(C, chs[0], 3, stride=stem, padding=1)
         prev, self.downs = chs[0], nn.ModuleList()
@@ -367,7 +381,8 @@ class ConditionalUNet(nn.Module):
         self.cfg = ae_cfg
         C, d, T = ae_cfg.channels, ae_cfg.d, ae_cfg.num_tokens
         H, W = img_hw(ae_cfg.img_size)
-        n_levels = max(1, int(math.log2(max(8, min(H, W)) // 8)))         # keep the bottleneck ~8px (128->4, 64->3, 32->2)
+        bott = max(1, int(getattr(ae_cfg, "bottleneck", 8)))              # SAME target as ConvImageEncoder
+        n_levels = max(1, int(math.log2(max(bott, min(H, W)) // bott)))    # bottleneck ~bott px (at bott=8: 128->4)
         chs = [base * min(4, 2 ** i) for i in range(n_levels)]            # e.g. 128px -> [base,2b,4b,4b]
         self.gdim = d
         self.t_proj = nn.Linear(time_dim, d)                  # time (flow); unused for mse (temb=None)

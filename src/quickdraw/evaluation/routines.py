@@ -101,6 +101,33 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
 
 
 @torch.no_grad()
+def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
+    """THE single definition of eval_ood_horizon's shapes. `eval_ood_horizon` and autobatch's `probe_eval` both
+    call this, so the memory probe CANNOT drift from the thing it is estimating.
+
+    Added 2026-08-20 after an audit found five separate divergences between the probe and this routine: the
+    probe hardcoded n_ep=8 (copying the literal below, so a PROPRIO-ONLY config -- which uses n_episodes, 64 by
+    default -- was under-modelled 8x), capped the horizon at an arbitrary 256 instead of applying the
+    episode-length clamp (on robocasa val, min length 128 means H is 119 for ANY configured horizon, so the
+    probe rolled 256 steps for a routine that can only ever roll 119 -- the whole "91GB" false alarm), and
+    modelled only open_loop when the real memory peak is closed_loop_16.
+
+    Returns (n_ep, H, cl_h, modes, calls) where modes = [(name, every, horizon)] and calls =
+    [(name, rows, horizon)] is the per-imagine_eval-call shape, i.e. the memory-relevant unit (see
+    rollout_regrounded's `cap`)."""
+    n_ep = min(8 if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(ep_lens))
+    H = min(int(cfg.eval.get("horizon", 2048)), min(ep_lens[:n_ep]) - P - 1)
+    cl_steps = [int(x) for x in cfg.eval.get("closed_loop_steps", [1, 16])]
+    cl_h = min(H, int(cfg.eval.get("closed_loop_horizon", 256) or H))
+    modes = [("open_loop", H, H)] + [(f"closed_loop_{x}_steps", x, cl_h) for x in cl_steps]
+    calls = []
+    for name, every, Hm in modes:
+        e = min(int(every), Hm)
+        n_seg = -(-Hm // e)                                   # ceil
+        calls.append((name, min(max(n_ep, 64), n_ep * n_seg), e))   # `cap = max(n_ep, 64)` in rollout_regrounded
+    return n_ep, H, cl_h, modes, calls
+
+
 def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     """The ONE long-horizon eval for every model (OOD: horizon >> trained). Held-out val episodes, decoding
     proprio (always) + any image head; the code generalizes over arbitrary trunks. Products are nested under
@@ -130,9 +157,9 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
-    n_ep = min(8 if img_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(eps))
+    n_ep, H, cl_h, _modes, _calls = ood_horizon_shapes(cfg, bool(img_heads),
+                                                      [len(o) for o, _, _ in eps], P)
     eps = eps[:n_ep]
-    H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
     n_plot = min(int(cfg.eval.get("n_plot", 2) or 2), n_ep)   # per-episode visuals; SAME episode indices (0..n_plot-1) across all modes
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
     pos, pos_explicit = _pos_idx(cfg, env=env)                              # world-xyz obs dims (#11; env hook / config)
@@ -210,9 +237,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
                       title_fn=lambda i: f"{subroutine} #{i} H={Hm}", log=lambda msg: prog(50, msg))
         return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
 
-    cl_steps = [int(x) for x in cfg.eval.get("closed_loop_steps", [1, 16])]
-    cl_h = min(H, int(cfg.eval.get("closed_loop_horizon", 256) or H))       # closed-loop modes roll only this many steps
-    modes = [("open_loop", H, H)] + [(f"closed_loop_{x}_steps", x, cl_h) for x in cl_steps]   # (name, every, horizon)
+    modes = _modes               # from ood_horizon_shapes above -- ONE definition, shared with probe_eval
     prog(0, f"start: {n_ep} eps, H={H} (closed-loop H={cl_h}), heads={heads}, modes={[mn for mn, _, _ in modes]}")
     summary = {}
     for k, (name, every, Hm) in enumerate(modes):
@@ -576,14 +601,29 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
 
 @torch.no_grad()
 def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
-    """denoising_filmstrip (diffusion ONLY; opt-in): watch the predicted next FRAME resolve over diffusion time.
-    Variant (b) — dynamics-side: the predict_next dynamics head is ALWAYS a flow, so it denoises the next
-    IMAGE tokens; decode each element of that latent ODE path through the (default MSE) image decoder. Emits
-    `denoising_filmstrip_<i>` — one FILE per image (`denoising_filmstrip_images`, each a DIFFERENT (episode,
-    step) frame); within each file rows = eps-noise seeds (`denoising_filmstrip_seeds`), cols = [GT | noise |
-    denoise step 1..K]. ENV-AGNOSTIC (no geometry/goals) -> the first eval_flow product usable on a recorded
-    dataset (#10). K is set LOCALLY (cfg.eval.denoising_filmstrip_steps) so a K=1 (shortcut) training config
-    still shows a real trajectory; eps ~ N(0,1) (not the eps=0 committed path) so the 'noise' panel is real noise."""
+    """denoising_filmstrip (diffusion ONLY; opt-in): does the LATENT flow's refinement actually do anything,
+    and does it still do it deep into a rollout?
+
+    REDESIGNED 2026-08-24 (user). The old layout was rows = eps-noise SEEDS at a fixed one-step-ahead
+    prediction. Two problems: (a) a well-conditioned flow converges to the same answer from any eps, so the
+    seed rows were near-duplicates carrying almost no information; (b) it only ever showed the EASY 1-step
+    case, and 1-step at 4 Hz is nearly the identity (record §13: the per-step change is a fraction of the
+    frame), so even a perfect prediction looked like the input.
+
+    NOW: rows = ROLLOUT HORIZON h (`denoising_filmstrip_horizons`), cols = [GT | noise | k1..kK]. One
+    open-loop chain is rolled from a single context step down the SAME episode, advancing with the committed
+    prediction (`predict_next`, exactly as the rollout does); at each requested h we branch off a noisy
+    `record_path` sample of that step's flow and decode every element of the latent ODE path. So reading DOWN
+    tests whether refinement survives compounding, and reading ACROSS tests whether it refines at all.
+
+    Each panel is annotated with its PSNR against the GT frame, and the whole (h, k) grid is logged as
+    scalars `eval_flow/filmstrip/psnr/h<h>/k<k>` — because the intermediate latents (z + partially-denoised
+    residual) are OFF-MANIFOLD for the image decoder, which is trained only on clean latents, so a k panel
+    can look arbitrary while still being quantitatively closer. Trust the numbers over the pictures; the
+    monotonicity of the k-curve is the actual answer to "is the flow refinement doing anything".
+
+    K is set LOCALLY (`denoising_filmstrip_steps`) so a K=1 (shortcut) training config still shows a real
+    trajectory; eps ~ N(0,1) (not the eps=0 committed path) so the 'noise' panel is real noise."""
     import numpy as _np
     import torch.nn.functional as F
 
@@ -598,70 +638,95 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     t0 = time.perf_counter()
     dev = device if isinstance(device, str) else device.type
     P, K = cfg.data.P, int(cfg.eval.get("denoising_filmstrip_steps", 8) or 8)   # LOCAL K (not the training value)
-    n_seeds = int(cfg.eval.get("denoising_filmstrip_seeds", 4) or 4)
+    hz = list(cfg.eval.get("denoising_filmstrip_horizons", None) or [1, 8, 16, 32, 64])
+    hz = sorted({int(h) for h in hz if int(h) >= 1})
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                     cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
-    n_images = int(cfg.eval.get("denoising_filmstrip_images", 4) or 4)   # separate FILES, each a different frame
+    n_images = int(cfg.eval.get("denoising_filmstrip_images", 4) or 4)   # separate FILES, each a different episode
     rng = _np.random.default_rng(seed)
     _ln = lambda x: F.layer_norm(x, (x.shape[-1],))
-    _plog(writer, f"[denoising_filmstrip @ep{step}] seed={seed} images={n_images} K={K} seeds={n_seeds} img={img_head}")
+    scalars = {}
+    _plog(writer, f"[denoising_filmstrip @ep{step}] seed={seed} images={n_images} K={K} horizons={hz} img={img_head}")
     for i in range(n_images):
-        o, a, im = eps_ds[int(rng.integers(len(eps_ds)))]           # a DIFFERENT (episode, step) per image
+        Hmax = max(hz)
+        for _try in range(8):                                    # need an episode long enough for the deepest row
+            o, a, im = eps_ds[int(rng.integers(len(eps_ds)))]
+            if len(o) > P + Hmax + 2:
+                break
+        else:
+            _plog(writer, f"[denoising_filmstrip @ep{step}] no val episode longer than P+{Hmax}+2 — skipping image {i}")
+            continue
         Tlen = len(o)
-        t_ctx = int(rng.integers(max(P, 1), max(P + 1, Tlen - 2)))  # a real context step; predict frame t_ctx+1
+        t_ctx = int(rng.integers(max(P, 1), max(P + 1, Tlen - Hmax - 2)))   # context ends here; predict t_ctx+1..+Hmax
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device),
                img_head: torch.from_numpy(im).float().div(255.0)[None].to(device)}
         act = norm.norm_act(torch.from_numpy(a)).float()[None].to(device)
-        g = torch.Generator(device=device).manual_seed(seed + i)   # reproducible eps rows, distinct per image
+        g = torch.Generator(device=device).manual_seed(seed + i)
         with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
-            z = m.encode_state(obs)                                 # (1, Tlen, n_state, d)
-            w = min(m.window, t_ctx + 1)
-            h = m.backbone(m._to_input(z[:, t_ctx - w + 1:t_ctx + 1], act[:, t_ctx - w + 1:t_ctx + 1]))[:, -1]  # (1,n_input,d)
-        z_bag = z[0, t_ctx].float()                                 # (n_state, d) carried tokens
-        # Route through m._cond so this NEVER hand-builds the flow's conditioning again. It used to slice
-        # h[0, :n_state, :] itself (width d), which broke the moment the conditioning gained channels: with the
-        # action slot + raw action embedding it is now 3*d, and the velocity net's first Linear expects
-        # d_x + time_dim + 3*d = 544 while this passed 288 -> "mat1 and mat2 shapes cannot be multiplied
-        # (9x288 and 544x128)", which killed two runs at ep1 (2026-08-12). _cond is the single source of truth
-        # for that width; any call site that reimplements it is a latent break.
-        h_state = m._cond(h, act[:, t_ctx])[0].float()               # (n_state, cond_width) FULL-bag cond. The
-        #   dynamics flow is JOINT over the whole bag — a transformer velocity ATTENDS across all n_state tokens
-        #   (it asserts token axis == n_state), so it must be sampled over the full bag and the image tokens read
-        #   off AFTER, exactly as predict_next does. (For the factorized mlp velocity the image tokens are
-        #   identical either way, so this unifies both arches.)
+            z = m.encode_state(obs)                              # (1, Tlen, n_state, d) CLEAN encoded episode
 
-        def decode_step(x_bag):                                     # full-bag flow output (n_state,d) -> (H,W,3)
-            nb = z_bag + x_bag if m.predict_residual else x_bag     # mirror predict_next EXACTLY: residual add,
-            if m.latent_norm:                                       #   then LN only for latent_norm=layernorm.
-                nb = _ln(nb)                                        #   affine/none leave the bag alone (the affine
-            #                                                         inverse is applied inside to_obs -> decode).
+        def decode_bag(prev_bag, x_bag):                          # residual x -> (H,W,3), mirrors predict_next EXACTLY
+            nb = prev_bag + x_bag if m.predict_residual else x_bag
+            if m.latent_norm:
+                nb = _ln(nb)
             return m.to_obs(nb[None, None], heads=[img_head])[img_head][0, 0].clamp(0, 1).float().cpu().numpy()
 
-        gt = (im[t_ctx + 1].astype(_np.float32) / 255.0)           # GT next frame
-        rows = []
-        for s in range(n_seeds):
-            e = torch.randn(m.n_state, m.d, generator=g, device=device)   # full-bag noise (was image-tokens only)
-            _, path = m.flow.sample(h_state, steps=K, deterministic=False, eps=e, record_path=True)  # K+1 bag states
-            rows.append([gt] + [decode_step(x) for x in path])     # [GT, noise(path0), step1..K]
-        col_titles = ["GT", "noise"] + [f"k{k}" for k in range(1, len(rows[0]) - 1)]
-        ncol = len(rows[0])
-        fig, axes = plt.subplots(n_seeds, ncol, figsize=(1.7 * ncol, 1.7 * n_seeds), squeeze=False)
-        for ri, row in enumerate(rows):
-            for ci, img_np in enumerate(row):
+        # ONE open-loop chain from t_ctx, advancing with the COMMITTED prediction. At each requested horizon we
+        # branch off a noisy record_path sample of that step's flow purely for the picture; the chain itself is
+        # never perturbed by it, so row h really is "the flow at rollout step h".
+        hist = z[:, :t_ctx + 1]                                   # (1, T0, n_state, d)
+        rows, row_labels = [], []
+        for hstep in range(1, Hmax + 1):
+            t = t_ctx + hstep - 1                                 # action index driving this transition
+            w = min(m.window, hist.shape[1])
+            with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
+                hb = m.backbone(m._to_input(hist[:, -w:], act[:, t - w + 1:t + 1]))[:, -1]   # (1,n_input,d)
+            h_state = m._cond(hb, act[:, t])                      # (1,n_state,cond_width) — NEVER hand-build this
+            prev = hist[0, -1].float()                            # (n_state,d) carried bag
+            if hstep in hz:
+                gt = (im[t_ctx + hstep].astype(_np.float32) / 255.0)
+                e = torch.randn(m.n_state, m.d, generator=g, device=device)
+                _, path = m.flow.sample(h_state[0].float(), steps=K, deterministic=False, eps=e, record_path=True)
+                panels = [gt] + [decode_bag(prev, x) for x in path]
+                # PSNR of every panel against GT (panel 0 is GT itself -> skipped in the scalars)
+                psnrs = [float("nan")] + [float(10.0 * _np.log10(1.0 / max(1e-10, float(((p - gt) ** 2).mean()))))
+                                          for p in panels[1:]]
+                rows.append((panels, psnrs))
+                row_labels.append(f"h={hstep}")
+                if i == 0:                                        # log the (h,k) grid from the FIRST image only
+                    for kk, ps in enumerate(psnrs[1:]):           # k=0 is the pure-noise panel
+                        scalars[f"eval_flow/filmstrip/psnr/h{hstep}/k{kk}"] = ps
+            with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
+                nb = m.predict_next(h_state, prev[None])          # (1,n_state,d) committed step
+            hist = torch.cat([hist, nb[:, None].to(hist.dtype)], dim=1)
+        if not rows:
+            continue
+        ncol = len(rows[0][0])
+        col_titles = ["GT", "noise"] + [f"k{k}" for k in range(1, ncol - 1)]
+        fig, axes = plt.subplots(len(rows), ncol, figsize=(1.7 * ncol, 1.85 * len(rows)), squeeze=False)
+        for ri, (panels, psnrs) in enumerate(rows):
+            for ci, img_np in enumerate(panels):
                 ax = axes[ri][ci]; ax.imshow(_np.clip(img_np, 0, 1)); ax.set_xticks([]); ax.set_yticks([])
                 if ri == 0:
                     ax.set_title(col_titles[ci], fontsize=9)
-            axes[ri][0].set_ylabel(f"eps {ri}", fontsize=8)
-        fig.suptitle(f"denoising filmstrip {i} — predicted next frame resolving over K={K} dynamics-flow steps "
-                     f"(t={t_ctx}, {img_head})", fontsize=10)
-        fig.supxlabel("diffusion time →", fontsize=9)   # cols GT | noise | k1..kK read left-to-right as diffusion time
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
+                if ci > 0:                                        # PSNR vs GT under every prediction panel
+                    ax.set_xlabel(f"{psnrs[ci]:.1f}", fontsize=7, labelpad=1)
+            axes[ri][0].set_ylabel(row_labels[ri], fontsize=9)
+        fig.suptitle(f"denoising filmstrip {i} — latent-flow refinement (cols: K={K} ODE steps) vs ROLLOUT "
+                     f"HORIZON (rows), one open-loop chain from t={t_ctx}, {img_head}\n"
+                     f"numbers under each panel = PSNR (dB) vs that row's GT", fontsize=9)
+        fig.supxlabel("flow refinement (diffusion time) \u2192        |        rows: deeper into the open-loop rollout \u2193",
+                      fontsize=8)
+        fig.tight_layout(rect=(0, 0.02, 1, 0.94))
         writer.figure(f"eval_flow/denoising_filmstrip_{i}", fig, step); plt.close(fig)
+    if scalars:
+        writer.scalars(scalars, step)
     if was:
         m.train()
-    _plog(writer, f"[denoising_filmstrip @ep{step}] done in {time.perf_counter() - t0:.1f}s ({n_images} images)")
+    _plog(writer, f"[denoising_filmstrip @ep{step}] done in {time.perf_counter() - t0:.1f}s "
+                  f"({n_images} images, horizons={hz})")
     return {}
 
 

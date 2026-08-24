@@ -92,7 +92,7 @@ COMMON=(
   data.root="$DATA" data.repo_id=robocasa-scene4-4h data.cam="$CAM"
   data.F=64
   data.subsample=5                    # <-- THE CHANGE. 20 Hz -> 4 Hz, actions aggregated across skipped frames
-  data.autobatch=true data.autobatch_headroom=0.35
+  data.autobatch=true
   environments=recorded environments.obs_dim=16 environments.action_dim=12
   'environments.position_idx=[7,8,9]'
   trainer.max_epochs=40

@@ -44,7 +44,7 @@ def main():
     # the seam that broke: products -> viz, WITH the third panel, at BOTH yscales
     w = _W()
     log_error_curves(w, "eval_ood_horizon/open_loop", c, 1, head="image",
-                     split_top={"psnr"}, split_bottom={"lpips"}, colors={"psnr": "red", "lpips": "purple"})
+                     split_top={"psnr"}, split_bottom={"lpips", "motion_ratio"}, colors={"psnr": "red", "lpips": "purple"})
     check("products->viz 3-panel path (linear AND log)", sum("error_vs_step_avg" in t for t in w.tags) == 2,
           f"{sum('error_vs_step_avg' in t for t in w.tags)} figures")
     check("per-metric _mean scalars emitted", all(any(f"{k}_mean" in t for t in w.tags) for k in c))
@@ -52,7 +52,7 @@ def main():
     # degradation: no lpips (2 panels) and proprio (1 panel) must still work
     w2 = _W()
     log_error_curves(w2, "r", {k: v for k, v in c.items() if k != "lpips"}, 1, head="image",
-                     split_top={"psnr"}, split_bottom={"lpips"})
+                     split_top={"psnr"}, split_bottom={"lpips", "motion_ratio"})
     check("products->viz without lpips", sum("error_vs_step_avg" in t for t in w2.tags) == 2)
     w3 = _W()
     log_error_curves(w3, "r", {"obs_error": np.linspace(1, 0.1, 12)}, 1, head="proprio")

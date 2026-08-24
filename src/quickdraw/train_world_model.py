@@ -6,10 +6,10 @@ import os
 import shutil
 import time
 
-# Bound CUDA-allocator fragmentation before torch initializes its allocator: eval_ood_horizon's U-Net image
-# decode makes a large allocation at long horizons, and expandable_segments lets the allocator reuse fragmented
-# reserved memory instead of OOMing (PR #8 bug 2). setdefault -> a launch-script -e override still wins.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# PYTORCH_CUDA_ALLOC_CONF now lives in quickdraw/__init__.py (the package chokepoint that already exists for
+# the BLAS thread caps), so that ANY entrypoint -- including a bare `from quickdraw.training.setup import
+# autobatch_find` -- probes the same allocator training uses. It used to be set here only, which silently made
+# every probe-only measurement invalid. Kept as a comment, not a duplicate setdefault, so there is one owner.
 
 import hydra
 import lightning as L
@@ -85,8 +85,20 @@ def _assert_summary_unique(summary_text, cfg, root=None) -> None:
                 "only for a deliberate exact rerun).")
 
 
+def _cli_overrides():
+    """The hydra task overrides the caller actually typed (so a resume can tell 'unset' from 'explicitly set')."""
+    try:
+        from hydra.core.hydra_config import HydraConfig
+        return list(HydraConfig.get().overrides.task)
+    except Exception:
+        return []
+
+
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
 def main(cfg):
+    # Seed FIRST, before anything draws a random number (model init happens in build_model far below, but the
+    # autobatch probe builds a throwaway model too). workers=True also seeds dataloader workers.
+    L.seed_everything(int(cfg.get("seed", 0) or 0), workers=True)
     torch.set_float32_matmul_precision("high")
     # Safety net for dynamo recompiles: the rollout/eval flex-attention paths can produce several mask
     # variants; a too-small cache (default 8) evicts and thrashes. The fixed-window rollout already
@@ -138,6 +150,33 @@ def main(cfg):
     if not resume and bool(cfg.data.get("autobatch", True)) and torch.cuda.is_available():
         cfg.data.batch = int(autobatch_find(cfg, torch.device("cuda"), log=lambda m: _startup_log(run_dir, m)))
         OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))  # record chosen batch
+    elif resume:
+        # A RESUME KEEPS ITS ORIGINAL BATCH -- which the comment above always claimed but nothing implemented
+        # (fixed 2026-08-18). autobatch is skipped on resume regardless of data.autobatch, so cfg.data.batch fell
+        # through to the CONFIG DEFAULT (1024 in conf/data/torus.yaml) while the run had actually trained at e.g.
+        # 8, and the resume OOM'd instantly. The chosen batch was already recorded in config.resolved.yaml by the
+        # branch above ("record chosen batch") -- it was written and never read back. Read it back.
+        # An explicit `data.batch=` on the resume command still wins: this only fills in when the caller did not
+        # say, which is exactly when guessing 1024 was doing damage.
+        _rc = os.path.join(run_dir, "checkpoints", "config.resolved.yaml")
+        # lstrip("+") because `+data.batch=17` and `++data.batch=17` are both legal hydra forms for a key that
+        # already exists, and a bare startswith() missed them -- silently overriding an EXPLICIT user batch with
+        # the saved one. Only the plain form was ever used in production, so this was safe by luck.
+        _explicit = any(str(o).lstrip("+").startswith("data.batch=") for o in _cli_overrides())
+        if not os.path.exists(_rc) and not _explicit:
+            # The resume path was not laid out as <run_dir>/checkpoints/<file>, so run_dir fell back to a NEW dir
+            # and there is no recorded batch to restore -- meaning cfg.data.batch is still the CONFIG DEFAULT
+            # (1024), which is the exact instant-OOM this branch exists to prevent. Say so instead of proceeding.
+            print(f"[train] resume WARNING: no config.resolved.yaml at {_rc}, so the batch this run trained at "
+                  f"could not be restored and data.batch is the config default ({cfg.data.batch}). This will "
+                  f"very likely OOM. Pass data.batch=<the value the run used> explicitly.", flush=True)
+        if os.path.exists(_rc) and not _explicit:
+            _saved = OmegaConf.load(_rc).data.get("batch", None)
+            if _saved is not None and int(_saved) != int(cfg.data.batch):
+                print(f"[train] resume: restoring data.batch={int(_saved)} from config.resolved.yaml "
+                      f"(was {int(cfg.data.batch)} from the config default -- autobatch does not re-probe on "
+                      f"resume, so without this the run would train at the wrong batch or OOM)", flush=True)
+                cfg.data.batch = int(_saved)
 
     _t = time.perf_counter()
     _startup_log(run_dir, "[startup] loading dataset (GPU-resident windows) + normalizer...")

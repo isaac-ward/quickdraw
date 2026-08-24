@@ -61,7 +61,7 @@ COMMON=(
   model.modalities.1.img_size=128
   data.root="$DATA" data.repo_id=robocasa-scene4-4h data.cam=robot0_agentview_left
   data.F=64
-  data.autobatch=true data.autobatch_headroom=0.35
+  data.autobatch=true
   environments=recorded environments.obs_dim=16 environments.action_dim=12
   'environments.position_idx=[7,8,9]'
   trainer.max_epochs=12

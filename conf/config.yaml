@@ -37,6 +37,18 @@ language:
     #                   over the reward plateau (the goal race keeps mppi.yaml's 0.3). beta_vel=0, so r_settle is n/a here.
 
 # short experiment summary -> run dir is logs/<timestamp>_<experiment> (override on CLI)
+# GLOBAL TRAINING SEED (added 2026-08-18). Before this there was NO seeding anywhere in the training path --
+# no seed_everything, no manual_seed -- so model init, data order and the flow's rollout sampling were all
+# fresh every launch. That is WHY the measured run-to-run spread was +-0.8 dB on open_loop psnr@+64 and +-0.03
+# on motion_ratio, which is LARGER than most effects we were trying to resolve: four A/Bs in one week landed
+# inside that floor and answered nothing.
+#   Seeding does NOT make runs bit-identical: GPU atomics in attention/scatter backward are nondeterministic and
+#   compound over ~4.4k steps/epoch. Getting bit-identity would need torch.use_deterministic_algorithms(True),
+#   which is likely to fail outright on the compiled FlexAttention path and would slow training -- deliberately
+#   NOT done. So this reduces variance by an amount that is still UNMEASURED; measure it by running the same
+#   config twice at the same seed and comparing, the way we measured the unseeded spread.
+#   To get a genuine 2-seed replicate, vary this (seed=0, seed=1) -- do not rely on launch-to-launch drift.
+seed: 0
 experiment: base
 
 # checkpoint path for the eval/control entrypoints (override on CLI)

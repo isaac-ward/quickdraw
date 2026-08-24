@@ -13,3 +13,11 @@ import os as _os
 
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     _os.environ.setdefault(_v, "8")
+
+# CUDA allocator, same reasoning: read ONCE when torch initializes its allocator, so it must be set before the
+# first torch import. It lived in train_world_model.py, which meant anything that imported training.setup
+# WITHOUT the entrypoint -- notably wizard/scripts/verify_autobatch.sh -- probed a DIFFERENT allocator than
+# training uses. Measured cost of that mismatch: reserved/allocated fragmentation read 2-11% instead of the
+# real 0.1-0.5%, peak-vs-batch looked SUPERLINEAR (fitted intercept -3.0GB vs the true +0.2GB) purely from
+# block-rounding, and the sizer chose batch 15 at 81.4GB where the real allocator supports 17 at 87.4GB.
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")

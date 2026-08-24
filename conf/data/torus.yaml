@@ -40,11 +40,28 @@ autobatch: true            # DEFAULT ON (2026-08-05): probe the AR step at start
                            #   largest that fits VRAM*(1-headroom). The AR step is dispatch-bound so bigger
                            #   batch is ~free throughput (accelerations.md Exp 8). Set false for controlled
                            #   A/Bs that need a FIXED batch. Resumes keep their original batch (never re-probed).
-autobatch_headroom: 0.25   # reserve fraction of VRAM for eval-phase spikes + near-ceiling allocator growth.
-                           #   Bumped 0.15->0.25 (2026-08-06): the probe now measures the REAL training loss +
-                           #   optimizer (faithful), but near the ceiling the allocator still fragments/grows over
-                           #   a full epoch (batch 112 probed 81GB then OOM'd at 93GB) — 0.25 leaves margin for
-                           #   that + eval. RAISE further if an eval OOMs (control/denoising spike above train).
+autobatch_reserve_gb: 4    # ABSOLUTE margin (GB) held back from VRAM. The budget is
+                           #     total - autobatch_reserve_gb - the GPU-RESIDENT FRAME STORE
+                           #   where the frame store is MEASURED and subtracted by autobatch_find, because
+                           #   MMWindowLoader parks it on the GPU AFTER sizing has already spent the card.
+                           #
+                           #   HISTORY, because two earlier rationales for this knob were wrong:
+                           #   * It began as `autobatch_headroom`, a FRACTION. Deleted 2026-08-18 (not aliased,
+                           #     so stale overrides fail loudly): a fraction of the card is the wrong shape for
+                           #     a fixed-size phenomenon, being 10GB on a 40GB card and 25GB on a 100GB one.
+                           #   * It was then justified as covering "allocator growth over a full epoch", sized
+                           #     at 12GB from a "batch 112 probed 81GB then OOM'd at 93GB" incident. An audit on
+                           #     2026-08-19 showed there is NO such growth: the probe-vs-real gap is entirely
+                           #     the resident frame store (probe 87.29 + resident 3.17 = 90.46 against a real
+                           #     90.29GB peak, residual 0.17GB), and that incident was most likely the same
+                           #     frame store under the old allocator. With the term now explicit, 12 -> 4.
+                           #   * Two other things it was said to cover are handled elsewhere: fragmentation is
+                           #     measured (the probe budgets on max_memory_RESERVED -- worth only ~0.2% with
+                           #     expandable_segments, not the 2-11% first reported, which was measured in the
+                           #     wrong allocator), and the eval phase is probed and REPORTED, not gated.
+                           #
+                           #   4GB covers the ~0.3GB of window/index tensors the frame-store estimate omits,
+                           #   plus slop. RAISE if a run OOMs late in an epoch; LOWER to fill the card further.
 autobatch_max: 512         # cap (memory usually binds first for image models; this bounds proprio-only runs).
 autobatch_base: 16         # smallest probe batch (assumed to fit).
 workers: 16    # image mp4-decode is CPU-heavy; too few workers starves the GPU (low util). 80 cores here.

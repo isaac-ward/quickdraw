@@ -305,6 +305,13 @@ class LoggingCallback(L.Callback):
 
     def on_train_epoch_start(self, trainer, pl_module):
         self._t_epoch = time.perf_counter()
+        # Start a CLEAN memory window for this epoch's TRAINING phase. Before 2026-08-18 nothing ever reset the
+        # CUDA peak counter, so mem/peak_gb was a monotonic PROCESS max that silently mixed autobatch's rejected
+        # probes (82.2 GB at batch 16 on one config), the sanity check, training and eval -- and was therefore
+        # useless for attributing memory to a phase or for sizing a budget.
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        self._mem_trainval = None   # cleared so a NON-eval epoch cannot log last epoch's stale split
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         if trainer.current_epoch == 0 and batch_idx == 0 and self._t_b0 is None:
@@ -395,6 +402,21 @@ class LoggingCallback(L.Callback):
         m = pl_module.model
         was_training = m.training
         m.eval()
+        # Close the TRAIN+VAL window, open the EVAL-ROUTINE one. NOTE THE ORDER (fixed 2026-08-19): Lightning
+        # runs the validation loop INSIDE the training epoch, so on_validation_epoch_end fires BEFORE this hook.
+        # My first attempt recorded the split here but LOGGED it there, so the value was always None and the
+        # split keys never appeared at all -- caught by a diagnostic run, not by reading the code. The scalars
+        # are therefore written at the END of this hook (below), once both windows have actually been measured.
+        if torch.cuda.is_available():
+            self._mem_trainval = (torch.cuda.max_memory_allocated() / 1e9, torch.cuda.max_memory_reserved() / 1e9)
+            # empty_cache() BEFORE the rebase (2026-08-20): reset_peak_memory_stats rebases the peak counters but
+            # NOT the reserved pool, so without this the eval window inherits training's pool and its "reserved"
+            # figure just re-reports it (measured: 87.5GB for a window whose real cost is 39.7GB). Releasing the
+            # cached blocks first makes the eval reserved number honest -- which is the PREREQUISITE for ever
+            # calibrating probe_eval against a real run, a comparison the design doc demanded and that was
+            # therefore never actually performed. With expandable_segments the pool does shrink. Costs ms.
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
         t_eval = time.perf_counter()
         try:
             for name in self.routines:
@@ -450,6 +472,18 @@ class LoggingCallback(L.Callback):
         finally:
             m.train(was_training)
         self._eval_cum += time.perf_counter() - t_eval
+        # Both windows are now measured: train+val (captured above) and the eval routines (the counter since).
+        if torch.cuda.is_available() and getattr(self, "_mem_trainval", None) is not None:
+            ta, tr = self._mem_trainval
+            # ALLOCATED is the only per-window-meaningful figure. reset_peak_memory_stats() rebases the peak
+            # counters, but the allocator's RESERVED pool does not shrink -- so max_memory_reserved() for the
+            # second window immediately reports the pool the first window already grew, and the two windows read
+            # identically (measured: train+val 63.7 and eval-routines 63.7 reserved, while allocated was 63.5 vs
+            # 32.1). The reserved figures are kept for the FIRST window only, where they are honest.
+            self.writer.scalars({"mem/peak_trainval_gb": ta, "mem/peak_trainval_reserved_gb": tr,
+                                 "mem/peak_evalroutines_gb": torch.cuda.max_memory_allocated() / 1e9,
+                                 "mem/peak_evalroutines_reserved_gb": torch.cuda.max_memory_reserved() / 1e9},
+                                step=epoch)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -472,7 +506,11 @@ class LoggingCallback(L.Callback):
         if self._compile_s is not None:
             metrics["time/compile_seconds"] = self._compile_s
         if torch.cuda.is_available():
-            metrics["mem/peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
+            metrics["mem/peak_gb"] = torch.cuda.max_memory_allocated() / 1e9          # this window only, not the process
+            metrics["mem/peak_reserved_gb"] = torch.cuda.max_memory_reserved() / 1e9  # RESERVED is what OOMs, not allocated
+            # mem/peak_* here covers TRAIN + VAL (the counter is reset at on_train_epoch_start and this hook
+            # fires before on_train_epoch_end). The train+val / eval-routine SPLIT is written by
+            # on_train_epoch_end instead, because only it runs after both windows exist.
         self.writer.scalars(metrics, step=epoch)
 
     def on_fit_end(self, trainer, pl_module):

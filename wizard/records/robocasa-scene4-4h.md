@@ -285,11 +285,16 @@ part. It now adds the routine to `_disabled`, logs one loud line + `eval/disable
   - **A naive resume OOMs instantly.** `train_world_model` skips autobatch on resume but nothing re-injects
     the chosen batch, so `data.batch` falls back to the config default of **1024** against a chosen 32. The
     watchdog reads the chosen value out of `config.resolved.yaml` and refuses to resume if it can't.
-  - **`last.ckpt` goes stale after a resume.** Lightning writes the rolling checkpoint as `last-v1.ckpt`
-    (then `-v2`) and leaves `last.ckpt` frozen at the pre-resume epoch, so resuming from the literal
-    `last.ckpt` would rewind to the previous resume's start and re-lose the same epochs every retry. Takes
-    the newest `last*.ckpt`. Not `epoch=*.ckpt` — those are top-k by val metric and can be stale (the dead
-    `tfz_act` held only `epoch=0` after dying in epoch 1).
+  - **`last.ckpt` goes stale after a resume.** ~~Lightning writes the rolling checkpoint as `last-v1.ckpt`
+    (then `-v2`) and leaves `last.ckpt` frozen at the pre-resume epoch.~~ **REFUTED 2026-08-19 by audit.**
+    That only happens when the run dir was MOVED or COPIED. `ModelCheckpoint` restores
+    `best_model_score`/`last_model_path` only if its `dirpath` EQUALS the one stored in the checkpoint
+    (lightning `model_checkpoint.py:556-572`); on a moved dir that state is lost, which is both why the
+    score read `nan` and why the version counter bumped to `-v1`. Measured IN PLACE: the rolling file is
+    REUSED (no `-v2`), `last.ckpt` is untouched, and the monitor restores as a real number (0.26734).
+    **The real lesson is the opposite one: pass the resume path ABSOLUTE and identical to the original, or
+    top-k and best-checkpoint tracking silently reset.** Taking the newest `last*.ckpt` is still kept as
+    cheap insurance. Not `epoch=*.ckpt` — those are top-k by val metric and can be stale.
   - Verified end-to-end: a resume of a **copy** of the dead run restored to epoch 1, wrote
     `epoch=1-step=7585.ckpt` (7582 + 3 limited batches — the step counter restores), exit 0. It also
     OOM'd `manifold` (8.07 GiB in one allocation, the largest of any routine) because the test shared a
@@ -677,6 +682,351 @@ the orchestrator's own command line -- a plain `pkill -f watchdog.sh` killed one
   lever without paying the 9 dB.
 - No watchdog is running. The orchestrator relaunches from the queue but does NOT resume a crashed run from
   its checkpoint.
+
+## 17. THE 8×8 BOTTLENECK — why 14 runs could not move the AE floor (08-20/21)
+
+**The trigger.** The work was presented and the feedback was that *both* the AE floor and the dynamics
+look blurry. That is the same complaint §16's winner (`bsp32mse`) was supposed to have answered, so the
+question became: what is actually pinning the bespoke reconstruction floor at 18.7–20.4 dB?
+
+**The finding.** Both conv pyramids computed their level count from an *independent copy* of the same rule:
+
+```python
+# ConvImageEncoder  (models/vision.py, after a stride-2 stem)
+n_levels = max(1, int(math.log2(max(8, min(h0, w0)) // 8)))
+# ConditionalUNet   (models/vision.py:370, from FULL resolution — a second, separate copy)
+n_levels = max(1, int(math.log2(max(8, min(H,  W )) // 8)))
+```
+
+The `8` is a hardcoded **target**: the pyramid pools until the short side reaches ~8, *at every
+resolution*. 64px → 8×8. 128px → 8×8. 256px → 8×8. (192/384px → 12×12.) So the encoder discarded all
+spatial detail below 8×8 **before the `num_tokens` learned queries ever cross-attended the map**.
+
+**This retroactively explains every null result on the codec axis.** Four separate sweeps, all flat:
+
+| swept | range | effect on the AE floor |
+|---|---|---|
+| `num_tokens` | 8 → 64 (an **8× range of latent floats**) | none, 18.7–20.4 dB |
+| `decode_base` | 32 → 64 (2.3× total params) | none on the floor |
+| `ae_depth` | 4 → 6 | none |
+| `latent_loss_weight` | 10 → 30 | none |
+
+None of them touch the binding constraint, so none of them could have worked. It also **predicts that
+256px would have been a waste** — the pyramid would still land on 8×8, so we would have paid 4× the
+compute for the same bottleneck. (256px is out of the running anyway per the user, 08-21.)
+
+Consistent supporting evidence already in hand: the **best bespoke floor of the whole holiday program,
+21.26 dB, came from `decode_arch=vit`** — the one decoder with *no conv pyramid at all*.
+
+**The parameter split is also backwards for a world model.** On `bsp32mse` (6.373M total):
+
+| block | params | share |
+|---|---|---|
+| image decoder (U-Net) | 4.376M | 68.7% |
+| dynamics backbone | 1.063M | 16.7% |
+| flow denoiser | 0.485M | 7.6% |
+| image encoder | 0.403M | 6.3% |
+| | | **dynamics = 24.3%** |
+
+Two thirds of the model is a decoder that reads an 8×8 bottleneck. Rebalancing (`depth` 4→8,
+`flow_arch_depth` 2→4, `d` 128→192) is a separate, deferred experiment.
+
+### The knob (implemented 08-21)
+
+`ae_bottleneck` on `ModalitySpec` → `VisionAEConfig.bottleneck`, replacing the hardcoded `8` in **both**
+formulas. Default 8. Verified bit-identical:
+
+```
+bottleneck=None  total 6.373M | ae 0.403M | decode_head 4.376M | enc bott_hw (8, 8)
+bottleneck=8     total 6.373M | ae 0.403M | decode_head 4.376M | enc bott_hw (8, 8)   <- identical
+bottleneck=16    total 5.321M | ae 0.189M | decode_head 3.538M | enc bott_hw (16,16)
+```
+
+**Exposed as a shared TARGET, not as `n_levels`** (the user's first suggestion). The encoder pools
+*after* a stride-2 stem and the decoder pools from full resolution, so at 128px they need 3 and 4 levels
+respectively — one shared `n_levels` value would silently desynchronise them. A shared target cannot.
+
+**Note the confound, which runs in the favourable direction.** Raising the target removes one pyramid
+level, i.e. removes the deepest and widest channel block, so `bottleneck=16` has **fewer** parameters
+(5.321M vs 6.373M, and the AE proper drops 0.403M → 0.189M). A win is therefore unambiguous — spatial
+resolution beating channel width at 0.83× the params. A loss is ambiguous, and the follow-up would be
+`bottleneck=16` + `decode_base=64`.
+
+### The A/B — `bott_recon1` vs `bott_bott16` (08-21, RUNNING)
+
+`wizard/scripts/robocasa-bottleneck.sh`, `logs/robocasa-bottleneck/`, 40 epochs, both on `model=bsp32mse`
+at `data.subsample=5`.
+
+| arm | GPU | change | tests |
+|---|---|---|---|
+| `bott_recon1` | 0 | `model.recon_frac=1.0` | is the blur a shortage of **supervision**? 0.25 was inherited, never measured; `bsp32mse.yaml` names it as the most obvious untested sharpness lever |
+| `bott_bott16` | 1 | `+model.modalities.1.ae_bottleneck=16` | is the blur the **8×8 bottleneck**? 64× spatial reduction instead of 256× |
+
+**Based on `long` (decode_base 32), not `sharp` (64)** — the user asked why. `sharp` wins LPIPS by ~6%
+(0.303 vs 0.323) but costs 2.3× the params and 11% more wall-clock, and *loses* PSNR (best OL@+64 14.32
+vs 14.82). `decode_base` is believed orthogonal to the bottleneck, so `long` is the cheaper, faster base
+and keeps `decode_base` available as the follow-up lever if `bott16` loses.
+
+**Batch is left to autobatch, which is ON — and pinning it was RETRACTED.** The first plan pinned
+`data.batch=8` to match the baselines (they ran at 8 under the old mis-measured 35%-headroom finder). The
+user pushed back and was right: comparability was already broken by the epoch budget, and "they peaked at
+ep17" is an EPOCH count, not a step count, so a fixed batch never bought the step-for-step comparison
+claimed for it. So this doubles as the rewritten autobatch's first live outing, and it landed well:
+
+| arm | GB/sample | batch | reserved | frag |
+|---|---|---|---|---|
+| `bott_recon1` | 13.169 | **7** | 92.5/93 GB (99%) | 3% |
+| `bott_bott16` | — | **17** | 91.0/93 GB (98%) | 0% |
+
+Both confirmed on the COMPILED step, not just eager. Note `recon_frac=1.0` costs 13.2 GB/sample and lands
+*below* the baseline's batch 8, while `bott16` more than doubles it — the arms differ in batch by 2.4x.
+That is a confound BETWEEN the arms (not against the baselines), accepted rather than equalised because
+equalising means running both at 7 and idling half of GPU 1. `max_epochs` 25 -> 40 to compensate for the
+larger batch being fewer gradient steps per epoch.
+
+Measured cost: `bott_bott16` 0.86 h/ep (2064 batches), `bott_recon1` 2.11 h/ep (5013 batches) — against the
+baseline's 1.588 h/ep. So the bottleneck arm finishes ~08-23 and the recon arm ~08-25.
+
+**Baselines to beat** (both 50 ep, batch 8, subsample 5):
+
+| run | best LPIPS@+64 | best OL@+64 | best AE floor |
+|---|---|---|---|
+| `logs/holiday/train_world_model_2026_08_18_09_16_26_bsp32mse_long` | **0.323** @ep17 | **14.82 dB** @ep9 | 20.14 dB @ep13 |
+| `logs/holiday/train_world_model_2026_08_18_09_18_26_bsp32mse_sharp` | **0.303** @ep17 | 14.32 dB @ep2 | 19.83 dB @ep18 |
+
+Read it on `ae_floor` PSNR (did the **codec** get sharper) and LPIPS@+32/+64 (did the **rollout** get
+sharper). **Not** on `motion_ratio` alone — it is direction-blind and a *collapsed* model scores higher.
+
+**RESULT AT ep13 — the 8x8 bottleneck WAS the binding constraint, and fixing it did NOT fix the blur.**
+
+The AE floor moved for the first time in 15 runs. Epoch-matched on `psnr_mean`:
+
+| ae_floor PSNR mean | e8 | e9 | e10 | e11 | e12 |
+|---|---|---|---|---|---|
+| `bott_bott16` (16x16, 5.32M) | 19.88 | 19.86 | 19.89 | 19.97 | **20.04** |
+| `BASE long` (8x8, 6.37M) | 19.45 | 19.50 | 19.59 | 19.41 | 19.52 |
+| `BASE sharp` (8x8, 14.83M) | 19.42 | 19.39 | 19.34 | 19.44 | 19.36 |
+
+Ahead at every matched epoch by +0.4 to +0.6 dB, **still rising monotonically** where both baselines have
+gone flat and begun oscillating, and doing it on **fewer parameters than either**. The confound registered
+in advance (a dropped pyramid level costs 1.05M params) therefore ran the favourable way, so this is the
+unambiguous case: spatial resolution beats channel width on this codec.
+
+**But LPIPS goes the other way, and LPIPS is the metric the complaint was about.**
+
+| ae_floor LPIPS@+64 | e8 | e10 | e12 |
+|---|---|---|---|
+| `bott_bott16` | 0.267 | 0.244 | 0.245 |
+| `BASE long` | 0.229 | 0.222 | **0.207** |
+| `BASE sharp` | 0.169 | 0.165 | **0.157** |
+
+Worse than `long` at every epoch and much worse than `sharp`. Same on OL LPIPS@+64 (0.363 vs 0.336 vs
+0.340 @e12). Motion is also lower and rising more slowly: 0.389 vs 0.437 and 0.480. OL PSNR@+64 ties
+`long` exactly (14.79 @e9 vs 14.82 @e9).
+
+So more spatial resolution buys PSNR and costs perceptual sharpness — the distortion-perception tradeoff
+again, pointing the way it has on every lever in this project. **`bott16` wins the metric the experiment
+was designed around and loses the one that motivated it.**
+
+**A CORRECTION TO THIS RECORD.** The baseline floor was quoted throughout as "20.14 dB @ep13" (including
+in the baselines table below). That figure is `ae_floor/image/psnr/@+1` — the ONE-STEP reconstruction —
+not `psnr_mean`. Like-for-like on `psnr_mean`, `long`'s best is **19.586 @ep10**. So `bott16`'s 20.04 is a
+real +0.45 dB gain rather than a wash against 20.14. Every comparison in this section is same-tag; the
+earlier number was not, and it made a win look like a tie.
+
+**`bott_bott16` EROSION — its useful life ended around e18-e19.** After plateauing from e14 it began a
+slow decline, visible in the eval metrics by e22-e23:
+
+| | e19 | e20 | e21 | e22 | e23 |
+|---|---|---|---|---|---|
+| OL LPIPS@+64 | 0.344 | 0.342 | 0.338 | 0.354 | **0.368** |
+| OL PSNR@+64 | 14.26 | 14.08 | 13.98 | 14.23 | **13.87** |
+| ae_floor psnr_mean | 20.07 | 20.04 | 19.83 | 19.89 | — |
+| val/loss/total | 0.510 | 0.534 | 0.562 | 0.634 | **0.728** |
+
+At e23 this was characterised as the §16 EROSION pattern and "not the §14 hard collapse", on the grounds
+that one-step PSNR@+1 was still 16.88 and the gradients were clean (0 NaNs, 0 infs, 0 skipped, and
+`norm_preclip == norm_postclip` at 0.17-0.27, i.e. the clip never engaging). **That reading was right about
+the mechanism and WRONG about it being benign — by e32 it is a full collapse:**
+
+| | e28 | e29 | e30 | e31 | e32 |
+|---|---|---|---|---|---|
+| OL LPIPS@+64 | 0.333 | 0.645 | 0.515 | 0.724 | **0.734** |
+| OL PSNR@+64 | 14.20 | 12.46 | 13.49 | 12.21 | **11.56** |
+| ae_floor psnr_mean | 19.83 | 19.10 | 18.80 | **18.54** | — |
+| ae_floor LPIPS@+64 | 0.232 | 0.267 | 0.268 | **0.303** | — |
+| `grad/norm_preclip` | 0.43 | 3.88 | 1.04 | **18.33** | **17.05** |
+
+OL LPIPS has more than DOUBLED off its e21 best (0.338 -> 0.734) and OL PSNR@+64 has lost 2.7 dB. The floor
+is 1.56 dB below its e14 peak.
+
+**The mechanism is a gradient blow-up, and the e23 gradient reading has to be updated.** `norm_preclip` is
+18.33 at e31 — about **70x** the 0.17-0.27 seen at e23 — so the clip at 1.0 is now truncating essentially
+the whole gradient every step. There are still no NaNs or infs, so this is not numerical failure: the loss
+landscape is genuinely blowing up and the clip is all that prevents outright divergence while the model
+degrades. Onset is between e28 (0.43) and e29 (3.88), exactly where OL LPIPS jumped 0.333 -> 0.645.
+
+**LESSON: on this config `grad/norm_preclip` is the early-warning metric, not val_loss.** val_loss had been
+rising since e15 while every eval metric held flat, then oscillated +-0.3 for ten epochs — it never
+cleanly marked the turn. The gradient norm did, in one epoch.
+
+Motion is the lone exception, still creeping up (0.447 @e23) while the codec metrics decline — the
+signature of the dynamics continuing to fit through an eroding codec, which is exactly what
+`latent_loss_weight=10` was raised to slow (§16). At a 16x16 bottleneck it evidently needs to be higher
+still: **`latent_loss_weight` > 10 is the natural companion knob to `ae_bottleneck` > 8**, and is untested.
+
+Practical consequence: read `bott16`'s numbers as its BESTS (floor 20.10 @e14, ae_floor LPIPS 0.227 @e18,
+OL LPIPS 0.338 @e21) — `best.ckpt` holds them — and treat epochs past ~e19 as actively harmful. The
+40-epoch schedule was too long for this arm.
+
+**`bott_recon1` — A RECORDED CLAIM HERE WAS WRONG AND IS NOW REVERSED.** At ep5 this section said
+"`recon_frac=1.0` looks like a straight loss ... the obvious kill candidate". That was a **methodological
+error**: `recon1`'s EARLY values were compared against the baselines' BEST-over-all-epochs values. Once
+epoch-matched — the way `bott16` was analysed — it leads on the metrics that actually matter here:
+
+| epoch-matched, e7-e8 | `bott_recon1` | `BASE long` | `bott_bott16` |
+|---|---|---|---|
+| ae_floor LPIPS@+64 (e7) | **0.228** | 0.241 | 0.268 |
+| OL LPIPS@+64 (e8) | **0.373** | 0.374 | 0.387 |
+| OL motion_ratio mean (e8) | **0.440** | 0.378 | 0.341 |
+| ae_floor psnr_mean (e6) | 19.59 | 19.51 | **19.71** |
+| OL PSNR@+64 (e6) | 14.52 | 14.63 | 14.53 |
+
+It leads on perceptual distance AND motion — precisely the two axes `bott16` lost and the two the original
+complaint was about — and its motion at e8 (0.440) already exceeds `bott16`'s best across 20 epochs
+(0.435). Even at ep5, epoch-matched, it was already ahead of `long` on LPIPS (0.415-0.444 vs 0.421-0.488);
+the "losing" call was an artifact of the comparison, not the data.
+
+**This is the same error shape as the `20.14 dB` tag mixup recorded above: comparing across different
+aggregations.** Both times it turned a win into an apparent loss. RULE: on this dataset, compare
+EPOCH-MATCHED and SAME-TAG, and quote best-over-epochs only against another best-over-epochs.
+
+**THE CLEAN FOUR-WAY AT e11** (epoch-matched, same-tag — the comparison rule this section had to learn
+twice). Every metric has a different winner, and the split is not arbitrary:
+
+| metric @e11 | `recon1` | `bott16` | `long` | `sharp` | winner |
+|---|---|---|---|---|---|
+| ae_floor psnr_mean | 19.59 | **19.97** | 19.41 | 19.44 | `bott16` |
+| ae_floor LPIPS@+64 | 0.213 | 0.241 | 0.216 | **0.173** | `sharp` |
+| OL PSNR@+64 | **14.33** | 14.06 | 14.22 | 14.13 | `recon1` |
+| OL LPIPS@+64 | 0.363 | 0.364 | 0.368 | **0.317** | `sharp` |
+| OL LPIPS@+128 | **0.332** | 0.363 | 0.384 | 0.353 | `recon1` |
+| OL motion_ratio mean | **0.488** | 0.375 | 0.413 | 0.446 | `recon1` |
+
+**A HORIZON CROSSOVER, which is the new mechanism-level finding.** `sharp` wins perceptual distance at
+horizon 64 (0.317 vs `recon1`'s 0.363) but LOSES it at horizon 128 (0.353 vs 0.332). So the two levers buy
+sharpness at DIFFERENT horizons, and the reason is mechanical: `recon_frac=1.0` supervises EVERY step of
+the rollout against its true frame, so its benefit should compound with horizon — which is exactly what a
+crossover between +64 and +128 looks like. `decode_base` buys a stronger decoder, which helps most where
+the latent is still accurate, i.e. early.
+
+**This matters for the standing goal** ("slightly sharper results that stay coherent for like 32-64 steps
+... and I want to make sure the movement is being modeled", user, throughout). `recon1` wins BOTH halves of
+that sentence at e11: long-horizon perceptual quality and motion (0.488 against 0.375-0.446, the highest
+any arm has reached at this epoch). `sharp`'s LPIPS win is real but concentrated at the short end.
+
+**Revised standing picture — four levers, four different wins, and they look orthogonal:**
+
+
+
+| lever | owns |
+|---|---|
+| `ae_bottleneck=16` | the reconstruction **floor** (+0.51 dB, stable, fewer params) |
+| `decode_base=64` | **SHORT-horizon** sharpness (ae_floor LPIPS 0.142; OL LPIPS@+64 0.303) |
+| `recon_frac=1.0` | **LONG-horizon** sharpness (OL LPIPS@+128) **+ motion** + rollout PSNR; also the only arm with NO codec erosion |
+| `latent_loss_weight` > 10 | UNTESTED companion to a raised bottleneck (see the erosion note above) |
+
+### FINAL: `bott_bott16`, 40/40 epochs (08-23 04:00)
+
+| metric | best | final e39 | `long` best | `sharp` best |
+|---|---|---|---|---|
+| ae_floor psnr_mean | **20.100** @e14 | 11.98 | 19.586 | 19.499 |
+| ae_floor LPIPS@+64 | 0.227 @e18 | 0.719 | 0.192 | **0.142** |
+| OL PSNR@+64 | 14.789 @e9 | 11.60 | **14.817** | 14.323 |
+| OL LPIPS@+64 | 0.333 @e28 | 0.753 | 0.323 | **0.303** |
+| OL LPIPS@+128 | 0.336 @e16 | 0.754 | 0.333 | **0.310** |
+| OL motion mean | 0.492 @e29 | 0.373 | 0.516 | **0.571** |
+
+The collapse ran to completion: floor 20.10 -> 11.98 (**-8 dB**), every LPIPS above 0.7. The last 20 epochs
+were purely destructive. **It won exactly one metric — the AE reconstruction floor (+0.51 dB over the best
+of 15 prior runs) — and lost every rollout metric.** So the 8x8 bottleneck was a real binding constraint on
+CODEC FIDELITY, and relieving it does not improve the ROLLOUT, which is what the goal is about.
+
+**A CHECKPOINT-SELECTION PROBLEM WORTH FIXING BEFORE ANY OF THESE CKPTS ARE REUSED.** `best.ckpt` for this
+run is pinned to **e8** (`best monitor=0.53341`) — not e14 (floor peak), not e18 (ae_floor LPIPS peak), not
+e16/e28 (OL LPIPS peaks). The monitor is `val/metric/proprio/<env.checkpoint_metric>`, a **proprio** metric
+(`training/lit.py:190`, wired at `train_world_model.py:248`), so on this dataset `best.ckpt` selects for
+proprio quality and is **blind to every image metric this record judges on**. Not introduced by this batch,
+but it means "load best.ckpt and look at the images" silently gets e8. Either monitor an image metric on
+image-modality runs, or always select the epoch by hand from metrics.jsonl.
+
+### `bott_recon1` at ep17 of 40 (08-23 06:12) — the best ROLLOUT model measured on this dataset
+
+Its own trend is flat-or-improving with no sign of `bott16`'s e19 turn: OL LPIPS@+128 0.332 -> 0.308 across
+e12-e17, motion 0.481 -> 0.558 (peaking 0.564 @e15), ae_floor LPIPS pinned at 0.205-0.207, 1-step PSNR
+16.84-16.96. Gradient norms 0.25-0.32 and FALLING; val_loss flat at 0.467 for seventeen epochs.
+
+Best-vs-best (recon1 has 17 of 40 epochs; the other three are complete):
+
+| metric | `recon1` | `bott16` | `long` | `sharp` |
+|---|---|---|---|---|
+| ae_floor psnr_mean | 19.68 | **20.10** | 19.59 | 19.50 |
+| ae_floor LPIPS@+64 | 0.205 | 0.227 | 0.192 | **0.142** |
+| **OL PSNR@+64** | **14.99** | 14.79 | 14.82 | 14.32 |
+| OL LPIPS@+64 | 0.318 | 0.333 | 0.323 | **0.303** |
+| **OL LPIPS@+128** | **0.308** | 0.336 | 0.333 | 0.310 |
+| OL motion mean | 0.564 | 0.492 | 0.516 | **0.571** |
+
+`recon1` holds the best open-loop PSNR@+64 (14.99) and best long-horizon LPIPS (0.308) of ANY run here, and
+matched `sharp` on motion (0.564 vs 0.571) at e15 rather than e18.
+
+**THE PROPERTY THAT MATTERS MOST, and it is new:** `recon1`'s LPIPS is nearly FLAT ACROSS HORIZON —
+@+64 0.318 vs @+128 0.308, i.e. it gets *slightly better* at the longer horizon. Compare `sharp`
+0.303 -> 0.310 and `bott16` 0.333 -> 0.336, both degrading. Perceptual quality that does not decay from 64
+to 128 steps is precisely what "stay coherent for like 32-64 steps" asks for, and no other lever produces
+it. The e11 horizon crossover has narrowed but held.
+
+**FOLLOW-UP, STAGED AND NOT RUN** (`wizard/scripts/robocasa-bottleneck-2.sh`, needs a free GPU):
+`ae_bottleneck=16` **+** `decode_base=64`. `bott16` gains PSNR from resolution but loses LPIPS to the
+1.05M params the dropped level cost; `sharp` shows `decode_base=64` is worth ~0.05 LPIPS on its own.
+Combining them tests whether resolution and channel width are ADDITIVE. This is exactly why the A/B was
+based on `long` rather than `sharp` — it kept `decode_base` free as the next lever.
+
+**CAVEAT ADDED after the `recon_frac` reversal above:** this is no longer obviously the best next config.
+`recon_frac=1.0` is orthogonal to both and is currently the strongest single signal on the actual
+complaint (sharpness AND motion). The config the evidence points at is
+`ae_bottleneck=16 + decode_base=64 + recon_frac=1.0`, but that stacks THREE levers at once and would be
+uninterpretable if it failed. Decide between "clean 2-lever test" and "stack everything" before launching.
+
+**Do NOT kill `bott_recon1`** — it is the most informative arm running and at 2.11 h/ep will not reach
+`long`'s ep17 LPIPS peak until ~08-23 22:00. `bott_bott16` is the arm that has said everything it has to
+say: plateaued on every metric from e14 with 20 epochs left. If a GPU is needed, stop that one.
+
+`bott_recon1` (ep0-2) is ahead of the baseline on open-loop PSNR@+64 at every matched epoch (12.36/14.34/
+13.78 vs 11.02/13.66/13.60) and behind on OL LPIPS@+128 (0.651/0.525/0.485 vs 0.622/0.491/0.479) — the
+distortion-perception tradeoff again, pointing the way it always does on this problem, with the gaps
+converging as if `recon_frac` buys early-training speed rather than a different endpoint.
+
+### Multi-GPU: not set up, deliberately — `design/distributed.md` (08-21)
+
+`devices=1` is pinned at `train_world_model.py:270` as a **guard**, not an oversight. Written up in full;
+the short version is that three things would produce a wrong-but-plausible run rather than an error:
+
+1. **`MMWindowLoader` is a hand-rolled iterator**, not a `DataLoader`, so Lightning cannot inject a
+   `DistributedSampler` — and `seed_everything` gives every rank the *same* `torch.randperm`. Both ranks
+   would train on **identical batches**, DDP would average a gradient with itself, and the run would be
+   mathematically identical to 1 GPU at 2× the power. Nothing raises.
+2. **Zero rank-awareness anywhere in `src/quickdraw`** (`grep global_rank|is_global_zero|world_size` is
+   empty). Both ranks would append to the same `metrics.jsonl`, run every eval routine twice, and race on
+   the same video/checkpoint paths.
+3. **Autobatch would hang, not OOM.** Per-rank batch is a *micro*-batch (effective = `batch × world_size`,
+   the only knob we have left with `accumulate_grad_batches` and `window_stride` both LOCKED), and if two
+   ranks probe *different* batches they run different step counts and deadlock in the next collective.
+
+**And it is the wrong trade today.** DDP buys wall-clock on one hypothesis; two cards buy two hypotheses
+in the same wall-clock. Every result in this record came from the second mode, and the binding constraint
+on this project is that effects are small against the ±0.8 dB noise floor — we need *more arms*, not
+faster arms. DDP becomes right when one config stops fitting (a much bigger decoder, 256px, F ≫ 64).
 
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
