@@ -135,13 +135,30 @@ def apply_size_preset(cfg):
                 img[k] = v
 
 
-def _make_dynamics_prior(cfg):
-    """OWM-SPECIFIC physics prior callable (a=R(q)F/m), or None when off. Gated by environments.dynamics_prior;
-    None -> the model is byte-identical. The physics lives in environments/owm_physics.py (mirrors the
-    RecordedEnv.make_dynamics_prior hook)."""
+def _proprio_prior_mode(cfg):
+    """The proprio modality's decode-PRIOR mode (none|identity|physics), the env-supplied selector for the unified
+    decode/physics path. Reads model.modalities.<proprio>.prior; falls back to 'physics' when the LEGACY
+    environments.dynamics_prior=true is set with no explicit prior field (backward compat)."""
     e = cfg.get("environments", {}) or {}
-    if not (e.get("dynamics_prior", False) if hasattr(e, "get") else False):
+    legacy = bool(e.get("dynamics_prior", False) if hasattr(e, "get") else False)
+    for m in (cfg.model.get("modalities", None) or []):
+        mm = (lambda k, v: m.get(k, v)) if hasattr(m, "get") else (lambda k, v: getattr(m, k, v))
+        if str(mm("name", "")) == "proprio":
+            p = str(mm("prior", "none") or "none")
+            return p if p != "none" else ("physics" if legacy else "none")
+    return "physics" if legacy else "none"
+
+
+def _make_dynamics_prior(cfg):
+    """The decode-prior callable f(prev_obs, action) -> next_obs for the proprio modality, or None. The ENV owns
+    the prior: 'physics' -> owm's a=R(q)F/m (environments/owm_physics.py); 'identity' -> copy prev (learned-delta
+    baseline); 'none' -> None (byte-identical). Generalizes the old environments.dynamics_prior gate."""
+    mode = _proprio_prior_mode(cfg)
+    if mode == "none":
         return None
+    if mode == "identity":
+        return lambda prev, act: prev.float()          # obs_next = prev + head(token); env supplies no physics
+    e = cfg.get("environments", {}) or {}
     from ..environments.owm_physics import dynamics_prior as _dp
     pos = list(e.position_idx)
     vel = list(e.velocity_idx) if e.get("velocity_idx", None) is not None else [i + len(pos) for i in pos]
@@ -224,6 +241,41 @@ def build_model(cfg):
         if df_scale > 0.0 and name not in ("mm_flow", "flow"):
             raise ValueError(f"variations.noise_injection.observations_encoded_pre_fusion (diffusion forcing) "
                              f"requires a flow model (model.name in mm_flow/flow); got {name!r}.")
+        # Fail fast on config knobs that only one model reads (otherwise silently ignored).
+        if cfg.get("collapse", None) is not None and name not in ("mm_lsar", "lsar"):
+            raise ValueError(f"model.collapse=... (a collapse-prevention strategy) is only used by the LSAR model "
+                             f"(model.name in mm_lsar/lsar); got {name!r}. DSAR is grounded by its data-space "
+                             f"re-encode and Flow by its reconstruction, so neither takes a collapse strategy. "
+                             f"Remove the collapse override or switch to mm_lsar.")
+        _ah = m.get("action_head", {}) or {}
+        _ah_on = bool(_ah.get("enabled", False) if hasattr(_ah, "get") else getattr(_ah, "enabled", False))
+        if _ah_on and name not in ("mm_flow", "flow"):
+            raise ValueError(f"model.action_head.enabled=true (the action-flow MPPI prior) is only wired on the "
+                             f"Flow model (model.name in mm_flow/flow); got {name!r}. TODO: we intend to port the "
+                             f"action-flow head to the other prediction mechanisms; until then, set "
+                             f"action_head.enabled=false here.")
+        # probabilistic prediction heads (parametric distribution over the next latent; design/models/
+        # probabilistic_heads.md). dist_head only means something for the mm_dist model -> fail fast elsewhere.
+        if m.get("dist_head", None) is not None and name != "mm_dist":
+            raise ValueError(f"model.dist_head=... (a parametric distribution head) is only used by the "
+                             f"probabilistic model (model.name=mm_dist); got {name!r}. Set model.name=mm_dist "
+                             f"or remove the dist_head override.")
+        if name == "mm_dist":
+            from ..models.multimodal import MultiModalDistribution
+            from ..models.dist_heads import make_dist_head
+            # ONE prediction mechanism: the parametric head is mutually exclusive with the flow/diffusion head.
+            if m.get("diffusion", None) is not None:
+                raise ValueError("model.name=mm_dist with a model.diffusion block: pick ONE prediction mechanism "
+                                 "(the parametric distribution head OR the rectified-flow/diffusion head). Remove "
+                                 "model.diffusion, or switch to model.name=mm_flow.")
+            cv = (cfg.get("variations") or {}).get("contraction", {}) or {}
+            cw = float((cv.get("weight", 0.0) if hasattr(cv, "get") else getattr(cv, "weight", 0.0)) or 0.0)
+            if cw > 0.0:   # the sample/argmax step has no double-backward Jacobian (same reason as the flow guard)
+                raise ValueError("variations.contraction is mutually exclusive with model.name=mm_dist: the "
+                                 "sampling/argmax step has no double-backward Jacobian for the power-iteration. "
+                                 "Disable contraction (weight=0).")
+            return MultiModalDistribution(**common, head=make_dist_head(m),
+                                          stochastic_eval=bool(m.get("stochastic_eval", True)))
         if name in ("mm_dsar", "dsar", "base"):
             return MultiModalDSAR(**common)
         if name in ("mm_lsar", "lsar"):

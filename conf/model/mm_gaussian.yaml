@@ -1,0 +1,45 @@
+name: mm_dist
+# Diagonal-Gaussian latent (design/models/probabilistic_heads.md). Same spine / encoders / decoders as
+# mm_flow — ONLY the prediction mechanism differs. loss=nll (Ward-2026): DETERMINISTIC latent, no posterior;
+# the prior is trained by the likelihood of the true next latent + latent_mse + KL-to-N(0,I). Set loss=kl for
+# the stochastic-latent PlaNet/Dreamer variant (posterior + balanced KL + free bits).
+dist_head: gaussian
+gaussian:
+  loss: nll              # nll (Ward-2026, deterministic latent) | kl (PlaNet/Dreamer, stochastic latent)
+  min_std: 0.1           # softplus(raw) + min_std floor on every predicted sigma
+  max_std: 2.0           # sigma CEILING — bounds the quadratic KL term's cheap escape (audit: unbounded sigma let KL run away)
+  dyn_scale: 1.0         # (kl mode) weight of KL(sg(post) || prior)
+  rep_scale: 0.1         # (kl mode) weight of KL(post || sg(prior))
+  free_nats: 1.0         # (kl mode) free-bits floor per token
+  kl_prior_scale: 0.05   # (nll mode) weight of KL(prior || N(0,I)) — Ward's 1/20, keeps sigma sane
+  latent_mse_scale: 2.0  # (nll mode) weight of ||mu - sg(e_next)||^2 — Ward's 2*L^z_recon
+stochastic_eval: true
+# ---- spine (identical to mm_flow) ----
+d: 128
+depth: 4
+heads: 8
+window: 32
+mlp_ratio: 4.0
+rope_theta: 10000.0
+action_dim: 2
+p_tf_start: 1.0
+p_tf_end: 0.0
+p_tf_warmup_epochs: 1
+p_tf_batch_granular: false   # LOCKED false (mm_flow.yaml) — batch-granular sits in the slow eager 0<p_tf<1 regime the whole warmup
+recon_frac: 0.25             # decode a 1/4 subset of the F rollout frames (image decode is the cost; physics proprio always full)
+detach_every: 32
+latent_norm: layernorm       # bespoke image encoder -> layernorm (also normalizes the sampled bag, which affine did NOT -> fixes the gaussian-KL blow-up)
+action_squash: none
+action_fourier_freqs: 0
+relative_position: false
+relative_scale: null
+grad_checkpoint: false
+compile_rollout: true        # compile the p_tf=0 AR rollout step (feasible epoch wall-clock at F=64)
+# LOSS TERMS (design: unified decode + physics prior). See mm_categorical.yaml. PROPRIO prior=physics ->
+# decode/proprio = physics(prev,act)+residual chain (no round-trip; latent_loss_weight=0). IMAGE prior=none ->
+# absolute decode/image (weight 1, prevents rolled-image collapse) + codec/roundtrip_image (bespoke codec anchor).
+# Plus the gaussian dist terms (kl mode: kl/dyn+kl/rep; nll mode: nll+latent_mse+kl/prior). owm dims via CLI.
+modalities:
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: mse, decode_param: x0, decode_arch: mlp, prior: physics, latent_loss_weight: 0.0}
+  - {name: image, kind: image, num_tokens: 32, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet,
+     prior: none, pretrained: false, latent_loss_weight: 1.0, encode_base: 32, decode_base: 32}

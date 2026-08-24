@@ -41,7 +41,7 @@ def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
         o, a, im = mm_eps[ei]
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device),
                img_head: torch.from_numpy(im).float().div(255.0)[None].to(device)}
-        act = torch.from_numpy(a).float()[None].to(device)
+        act = norm.norm_act(torch.from_numpy(a)).float()[None].to(device)   # NORMALIZE (every other routine does)
         pred = m(obs, act)                                   # (1,T,n_state,d)
         sel = pred[0, np.array(sorted(ts))]                  # (nt,n_state,d)
         latents.extend(sel.reshape(sel.shape[0], -1).cpu().numpy())            # flatten bag -> (n_state*d,)

@@ -143,10 +143,10 @@ class MultiModalSequenceModel(nn.Module):
             assert len(sc) == len(self._pos_idx), f"relative_scale {sc.shape} != position_idx {len(self._pos_idx)}"
             self.register_buffer("_rel_scale", sc)   # NORMALIZED-space per-dim std of the within-window displacement
         # OWM PHYSICS PRIOR (RecordedEnv hook; default None -> BYTE-IDENTICAL). When a dynamics_prior callable is
-        # given, proprio prediction = physics(prev_obs, action) + residual_head(predicted proprio token). Codec /
-        # roundtrip / decode are UNCHANGED; this only ADDS one zero-init head (used by the physics loss in
-        # lit._step and by physics_proprio() for eval/MPPI). residual=0 at init -> prediction == the verified
-        # physics law, so the action-response is correct by construction.
+        # given, proprio prediction = physics(prev_obs, action) + residual_head(predicted proprio token). This adds
+        # one zero-init head, driven by physics_proprio_chained (train, via the decode/proprio prior path or the
+        # legacy physics/proprio term) and _physics_proprio_rollout (eval/MPPI). residual=0 at init -> prediction
+        # == the verified physics law, so the action-response is correct by construction.
         self.dynamics_prior = dynamics_prior
         if dynamics_prior is not None:
             import torch.nn as _nn
@@ -160,6 +160,20 @@ class MultiModalSequenceModel(nn.Module):
             self.residual_head = _nn.Sequential(_nn.Linear(d, d), _nn.SiLU(), _nn.Linear(d, self._proprio_dim))
             _nn.init.zeros_(self.residual_head[-1].weight)
             _nn.init.zeros_(self.residual_head[-1].bias)     # zero-init output -> pred == physics at init
+        # UNIFIED decode/physics (design/models/probabilistic_heads.md): when the proprio modality declares a
+        # prior (identity|physics) the physics chain IS the proprio decode -> `decode/proprio` (no separate
+        # `physics/proprio` bolt-on, no `codec/roundtrip_proprio`). prior=="none" with dynamics_prior set is the
+        # LEGACY path (physics/proprio + roundtrip, byte-identical). A residual head can't do a context-free
+        # autoencode, so round-trip is illegal in prior mode: fail loudly rather than silently anchor nothing.
+        _pm = self.modalities["proprio"] if "proprio" in self.modalities else None
+        self._proprio_prior = str(getattr(_pm, "prior", "none") or "none")
+        if self._proprio_prior != "none" and float(getattr(self.modalities["proprio"], "latent_loss_weight", 0.0) or 0.0) > 0.0:
+            raise ValueError(
+                f"proprio modality has prior={self._proprio_prior!r} AND latent_loss_weight>0 (round-trip). A "
+                f"prior-mode head predicts a RESIDUAL on prev/physics, so it cannot do the context-free "
+                f"encode->decode round-trip the codec anchor needs. Set modalities.<proprio>.latent_loss_weight=0 "
+                f"(the encoder is grounded by the decode/proprio dynamics loss instead), or prior=none to keep the "
+                f"round-trip.")
         # action -> 1 token. action_fourier_freqs>0 prepends sin/cos features so SMALL action differences are
         # linearly separable (robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ
         # slightly). 0 = off = bit-identical to a plain _mlp.
@@ -320,13 +334,20 @@ class MultiModalSequenceModel(nn.Module):
         return out
 
     def recon_losses(self, bag: Tensor, targets: dict[str, Tensor],
-                     pre_z_targets: Tensor | None = None, anchor: Tensor | None = None) -> dict[str, Tensor]:
+                     pre_z_targets: Tensor | None = None, anchor: Tensor | None = None,
+                     prior: dict | None = None) -> dict[str, Tensor]:
         """Per-modality DECODE loss of the predicted token bag vs clean target obs.
 
         Returns (losses, weights) -- the SAME contract as loss_terms, so no caller infers a weight by parsing
         a key. Keys are ROLE-first and never encode the decode parameterization: `decode/<name>` for every
         modality (mse or flow), `decode/<name>_shortcut` for flow decoders with self-consistency, and
-        `codec/roundtrip_<name>` from roundtrip_losses. All values are RAW; weights are applied at the sum."""
+        `codec/roundtrip_<name>` from roundtrip_losses. All values are RAW; weights are applied at the sum.
+
+        `prior` (unified decode/physics): when a modality declares a decode PRIOR its `decode/<name>` is the
+        prior-anchored CHAINED prediction (env_fn(prev,act)+head(token), obs-space AR) rather than the stateless
+        per-frame decode -- so the old `physics/proprio` bolt-on IS this decode term. It runs on the FULL rollout
+        (a chain can't be frame-subsampled) so the caller passes it separately from the recon_frac-subset `bag`.
+        Bundle: {preds(B,F,n_state,d full), prev0_abs, true_future_abs, act_raw, p_tf, norm, target(normalized)}."""
         # decode_loss decodes the predicted bag (in the RELATIVE frame when the anchor is on) WITHOUT going
         # through to_obs, so it never de-relativizes -> its targets must be relativized to match. (roundtrip
         # below goes through to_obs, which DOES de-relativize, so it keeps the ABSOLUTE targets.)
@@ -334,6 +355,14 @@ class MultiModalSequenceModel(nn.Module):
         out, wts, off = {}, {}, 0
         for name, n in self.layout:
             mod = self.modalities[name]
+            if name == "proprio" and getattr(self, "_proprio_prior", "none") != "none" and prior is not None:
+                # PRIOR MODE: decode/proprio = the chained prior-anchored prediction (== the old physics/proprio).
+                phys_abs = self.physics_proprio_chained(prior["preds"], prior["prev0_abs"],
+                                                        prior["true_future_abs"], prior["act_raw"], prior["p_tf"])
+                out["decode/proprio"] = F.mse_loss(prior["norm"].norm_obs(phys_abs), prior["target"])
+                wts["decode/proprio"] = float(mod.weight)
+                off += n
+                continue
             main, sc = mod.decode_loss(bag[..., off:off + n, :], dtgt[name])
             out[f"decode/{name}"], wts[f"decode/{name}"] = main, float(mod.weight)
             if sc is not None:                                  # flow decoders only
@@ -382,16 +411,6 @@ class MultiModalSequenceModel(nn.Module):
     def _to_input(self, bag: Tensor, act: Tensor, levels=None) -> Tensor:  # (B,T,n_state,d),(B,T,2)->(B,T,n_input,d)
         bag = self._add_level_emb(bag, levels)                 # DF: condition the backbone on context noise levels
         return torch.cat([bag, self.act_enc(act).unsqueeze(-2)], dim=-2)
-
-    def physics_proprio(self, pred_bag: Tensor, prev_obs_abs: Tensor, act_raw: Tensor) -> Tensor:
-        """Physics-anchored proprio prediction in ABSOLUTE units: dynamics_prior(prev,act) + residual_head(token).
-        pred_bag (...,n_state,d); prev_obs_abs (...,obs_dim); act_raw (...,act_dim). Requires dynamics_prior set.
-        Physics runs in fp32 (absolute position = small displacement on a ~hundreds-of-m base; bf16 would quantize
-        it to ~1 m — issue #14). residual_head is the learned CW/perturbation correction (zero at init)."""
-        token = pred_bag[..., self._proprio_off, :]                       # (...,d) — proprio is 1 token
-        residual = self.residual_head(token).float()                     # (...,proprio_dim)
-        base = self.dynamics_prior(prev_obs_abs.float(), act_raw.float())  # (...,obs_dim) ABSOLUTE, fp32
-        return base + residual
 
     def physics_proprio_chained(self, pred_bag: Tensor, prev0_abs: Tensor, true_future_abs: Tensor,
                                 act_raw: Tensor, p_tf: float) -> Tensor:
@@ -644,7 +663,9 @@ class MultiModalSequenceModel(nn.Module):
         prev = prev0_abs.float()
         traj = []
         for t in range(horizon):
-            token = bag[:, t, self._proprio_off, :]
+            token = bag[:, t, self._proprio_off, :].float()   # bag is bf16 (autocast); residual_head is fp32 and
+            #                                                    this block runs OUTSIDE autocast (physics is fp32,
+            #                                                    issue #14), so match the Linear's dtype explicitly.
             cur = self.dynamics_prior(prev, acts_raw[:, P - 1 + t]) + self.residual_head(token).float()
             traj.append(cur)
             prev = cur
@@ -986,3 +1007,76 @@ class MultiModalFlow(MultiModalSequenceModel):
         backbone context h[t-1]. Returns NORMALIZED actions (..., action_dim); the caller denorms. For the
         eval_action_distribution routine + the MPPI proposal. Requires action_head_enabled."""
         return self.action_flow.sample(h_ctx, steps=self.sampling_steps, deterministic=deterministic, eps=eps)
+
+
+class MultiModalDistribution(MultiModalSequenceModel):
+    """Parametric-distribution prediction over the next latent (design/models/probabilistic_heads.md). The
+    spine's per-step context parameterizes an EXPLICIT distribution (categorical / diagonal Gaussian) via a
+    swappable DistributionHead; the prior is sampled and carried forward (latent-space AR). When the head
+    needs a posterior (categorical, Gaussian-KL), encode_state fuses the frame's observation tokens into a
+    posterior, samples it, and embeds the sample back to a d-dim bag -- so every decoder / roundtrip / rollout
+    path is inherited UNCHANGED (the bag stays (B,T,n_state,d)). Gaussian-NLL (Ward-2026) has no posterior:
+    the continuous encoder features are carried straight through and the distribution appears only at the
+    prior. Mutually exclusive with the flow head."""
+
+    def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
+                 grad_checkpoint: bool = False, compile_rollout: bool = False,
+                 latent_norm: str | bool = "affine", action_fourier_freqs: int = 0, action_squash: str = "none",
+                 head=None, stochastic_eval: bool = True, **kw):
+        super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
+                         rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
+                         compile_rollout=compile_rollout, latent_norm=latent_norm,
+                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash, **kw)
+        assert head is not None, "MultiModalDistribution requires a DistributionHead (build via make_dist_head)"
+        self.dist_head = head
+        self.dist_head.build(d, self.n_state)              # creates the head's nets; params serialize dist_head.*
+        # committed vs stochastic prediction at eval (the MultiModalFlow convention kvcache_report pins).
+        self.stochastic_eval = bool(stochastic_eval)
+        self.pred_obs_in_loss = True                       # decode grounds the encoder (as Flow); never a detached probe
+        self.lambda_pred_obs = 1.0
+
+    def _features(self, obs, anchor=None) -> Tensor:
+        """The CONTINUOUS per-modality encoder features e_t (the base encode_state), BEFORE the posterior
+        bottleneck. loss_terms needs these for the deterministic target / posterior input, so it must bypass
+        the sampling override below."""
+        return MultiModalSequenceModel.encode_state(self, obs, anchor)
+
+    def encode_state(self, obs, anchor=None) -> Tensor:
+        e = self._features(obs, anchor)
+        if not self.dist_head.needs_posterior:
+            return e                                       # Gaussian-NLL: deterministic passthrough (e_t IS z_t)
+        det = (not self.training) and (not self.stochastic_eval)
+        bag = self.dist_head.sample(self.dist_head.posterior(e), deterministic=det)
+        return _ln(bag) if self.latent_norm else bag
+
+    def predict_next(self, h_state: Tensor, prev_bag: Tensor) -> Tensor:
+        det = (not self.training) and (not self.stochastic_eval)
+        bag = self.dist_head.sample(self.dist_head.prior(h_state), deterministic=det)   # absolute, not a residual
+        return _ln(bag) if self.latent_norm else bag
+
+    def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None, pre_z: Tensor | None = None,
+                   anchor: Tensor | None = None):
+        """One teacher-forced parallel pass: encode the full window to continuous features, run the backbone
+        on the (posterior-sampled or deterministic) context, and score the prior that predicts frame t+1
+        against the posterior/target at t+1. Fully teacher-forced (Dreamer's dynamics KL is on the observed
+        sequence); the p_tf ramp affects only the rolled decode losses (recon_losses), as for Flow."""
+        assert act_seq is not None
+        e = self._features(obs, anchor)                    # (B,L,n_state,d) continuous encoder features
+        L = e.shape[1]
+        if self.dist_head.needs_posterior:
+            post_all = self.dist_head.posterior(e)         # per-frame posterior params (all L frames)
+            z = self.dist_head.sample(post_all, deterministic=False)
+            z = _ln(z) if self.latent_norm else z
+        else:
+            post_all, z = None, e
+        h = self.backbone(self._to_input(z[:, :L - 1], act_seq[:, :L - 1]))
+        prior = self.dist_head.prior(self._cond(h, act_seq[:, :L - 1]))                # predicts frames [1:]
+        if self.dist_head.needs_posterior:
+            post_tgt = {k: v[:, 1:] for k, v in post_all.items()}                      # posterior of true-next
+            return self.dist_head.losses(post_tgt, prior, target=None)
+        return self.dist_head.losses(None, prior, target=e[:, 1:])                     # NLL target = e_{t+1}
+
+    @torch.no_grad()
+    def collapse_diagnostics(self, obs) -> dict:
+        from .collapse import latent_diagnostics
+        return latent_diagnostics(self.encode_state(obs).reshape(-1, self.d).float())

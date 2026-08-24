@@ -147,14 +147,25 @@ class LitWorldModel(L.LightningModule):
         else:
             src, fut = recon_src, future
             z_tgt = z_full[:, P:] if share else None
-        recon, rw = m.recon_losses(src, fut, pre_z_targets=z_tgt, anchor=anchor)   # decode/<name>[_shortcut] + codec/roundtrip_<name>
+        # UNIFIED decode/physics: when proprio declares a prior, decode/proprio IS the chained prior-anchored
+        # prediction (the old `physics/proprio` term). It runs on the FULL rollout (chain -> not frac-subsampled),
+        # so pass it via the `prior` bundle rather than the recon_frac-subset `src`. prior=none -> legacy path below.
+        _uni = getattr(m, "_proprio_prior", "none") != "none" and getattr(m, "dynamics_prior", None) is not None
+        _prior = None
+        if _uni:
+            Pn, Fn = self.P, self.F
+            _prior = dict(preds=preds, p_tf=p_tf, norm=self.norm, target=future["proprio"],
+                          prev0_abs=self.norm.denorm_obs(obs["proprio"][:, Pn - 1]),         # (B,obs_dim) true ctx-last
+                          true_future_abs=self.norm.denorm_obs(future["proprio"]),           # (B,F,obs_dim) true future
+                          act_raw=self.norm.denorm_act(act[:, Pn - 1:Pn - 1 + Fn]))          # (B,F,act_dim) raw force (N)
+        recon, rw = m.recon_losses(src, fut, pre_z_targets=z_tgt, anchor=anchor, prior=_prior)   # decode/<name>[_shortcut] + codec/roundtrip_<name>
         # NOTE: do NOT decode here (to_obs) in train — recon_losses is the decode loss, and for flow decoders
         # to_obs would SAMPLE the ViT decoder every step (with grad) for nothing -> huge wasted memory (OOM). The
         # decoded sample is only needed for val metrics; computed there under no_grad.
         lt_kw = {"anchor": anchor} if anchor is not None else {}   # only reaches the flow loss_terms; non-flow untouched
         raw, w = (m.loss_terms(preds, future, obs, p_tf, act, pre_z=z_full, **lt_kw) if share
                   else m.loss_terms(preds, future, obs, p_tf, act, **lt_kw))   # pre_z: shared-encode fast path (flow only)
-        if getattr(m, "dynamics_prior", None) is not None:        # OWM physics-anchored proprio loss (hook ON only)
+        if getattr(m, "dynamics_prior", None) is not None and not _uni:   # LEGACY physics/proprio (prior=none)
             Pn, Fn = self.P, self.F
             # p_tf-respecting CHAINED physics rollout: prev0 = true ctx-last obs, then feed each step's own
             # prediction forward with prob (1-p_tf) — so the residual trains on the SAME compounding regime the
@@ -198,14 +209,24 @@ class LitWorldModel(L.LightningModule):
         if tag == "val":
             with torch.no_grad():
                 dec = m.to_obs(src, anchor=anchor)            # decode (mse) / 1-step sample (flow) — val metrics only; de-relativized -> ABSOLUTE
-                p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
+                # UNIFIED decode/physics: in prior mode the black-box proprio decoder is UNTRAINED (decode/proprio
+                # is the physics chain, no round-trip), so score the DEPLOYED prediction — the physics chain at
+                # p_tf=0 (fully AR) — not dec["proprio"] (audit-F4: the monitor must track what we deploy).
+                if _uni and _prior is not None:
+                    phys_abs = m.physics_proprio_chained(preds, _prior["prev0_abs"], _prior["true_future_abs"],
+                                                         _prior["act_raw"], 0.0)
+                    proprio_hat_norm = self.norm.norm_obs(phys_abs)
+                    p_hat = torch.nan_to_num(phys_abs.float(), nan=10.0, posinf=10.0, neginf=-10.0)
+                else:
+                    proprio_hat_norm = dec["proprio"]
+                    p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
                 p_true = self.norm.denorm_obs(future["proprio"])
                 # env-polymorphic rollout metrics (WorldEnv.rollout_metrics): torus returns its three errors
                 # (byte-identical tags/values to the old hardcoded calls); other envs return their own set.
                 metrics_fn = self.env.rollout_metrics if self.env is not None else default_rollout_metrics
                 for mk, mv in metrics_fn(p_hat, p_true).items():
                     self.log(f"val/metric/proprio/{mk}", mv.mean())
-                self.log("val/metric/proprio/obs_error", F.mse_loss(dec["proprio"], future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
+                self.log("val/metric/proprio/obs_error", F.mse_loss(proprio_hat_norm, future["proprio"]))  # decoded-proprio MSE (normalized) — comparable across decoders
                 for name, _ in m.layout:
                     if name == "proprio":
                         continue

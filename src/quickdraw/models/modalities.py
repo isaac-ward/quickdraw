@@ -71,6 +71,13 @@ class ModalitySpec:
     latent_loss_weight: float = 1.0              # weight of the adapter ROUND-TRIP loss ||up(down(g))-g||^2 (#12).
     #                              The ONLY term that supervises the adapter pair directly; decode_loss only ever
     #                              trains up() on the dynamics' predicted bag. 0 -> off.
+    prior: str = "none"                          # decode PRIOR (design: unified decode/physics). "none" -> the head
+    #                              predicts the obs outright (absolute, bit-identical default). "identity" ->
+    #                              obs_next = prev_obs + head(token) (learned delta). "physics" -> obs_next =
+    #                              env_fn(prev_obs, action) + head(token), chained AR (the env supplies env_fn).
+    #                              For prior != "none" the head is a zero-init RESIDUAL and round-trip is illegal
+    #                              (needs a context-free absolute decode) -> set latent_loss_weight=0. Only the
+    #                              VECTOR (proprio) modality supports a prior today; image is always "none".
 
 
 class Modality(nn.Module):
@@ -123,6 +130,7 @@ class VectorModality(Modality):
         self.noise_std = float(spec.noise_std)
         self.decode_kind = spec.decode_kind
         self.dim = spec.dim
+        self.prior = str(getattr(spec, "prior", "none") or "none")   # none|identity|physics (unified decode/physics)
         # ROUND-TRIP anchor weight (design/collapse.md): the roundtrip_losses gate reads this OFF THE MODULE, so
         # a vector modality must expose it too or the config value is silently dropped. Default 0.0 = no anchor
         # (unchanged behavior); set model.modalities.<i>.latent_loss_weight>0 to anchor the proprio codec floor.

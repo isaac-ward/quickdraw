@@ -1,0 +1,47 @@
+name: mm_dist
+# DreamerV3 categorical latent (design/models/probabilistic_heads.md). Bimodal proprio+image world model:
+# the spine context parameterizes a G x K categorical over the next JOINT latent (unimix floor, straight-through,
+# balanced KL + free bits). Proprio uses the PHYSICS decode prior (decode/proprio = physics(prev,act)+residual,
+# no round-trip); the IMAGE is a bespoke conv/unet AE with a normal absolute decode head (decode/image) + codec
+# round-trip. layernorm latent (bespoke encoder). TAESD is deliberately NOT the default.
+dist_head: categorical
+categorical:
+  groups: 16              # G one-hot groups per token
+  classes: 16            # K classes per group
+  unimix: 0.01           # 1% uniform floor mixed into every categorical (DreamerV3; no zero-probability class)
+  dyn_scale: 1.0         # weight of KL(sg(post) || prior) — trains the prior toward the posterior
+  rep_scale: 0.1         # weight of KL(post || sg(prior)) — trains the posterior toward the prior
+  free_nats: 1.0         # free-bits floor (nats/token) on each KL — DreamerV3's posterior-collapse guard
+  straight_through: true # forward = one-hot, backward = softmax grad (onehot + p - sg(p))
+stochastic_eval: true    # train and eval roll on the same distribution (matches mm_flow's convention)
+# ---- spine (identical to mm_flow) ----
+d: 128
+depth: 4
+heads: 8
+window: 32
+mlp_ratio: 4.0
+rope_theta: 10000.0
+action_dim: 2
+p_tf_start: 1.0
+p_tf_end: 0.0
+p_tf_warmup_epochs: 1
+p_tf_batch_granular: false   # LOCKED false (mm_flow.yaml) — batch-granular sits in the slow eager 0<p_tf<1 regime the whole warmup
+recon_frac: 0.25             # decode a 1/4 subset of the F rollout frames (image ViT/UNet decode is the cost; physics proprio always full)
+detach_every: 32
+latent_norm: layernorm       # bespoke (learned) image encoder -> layernorm, NOT affine (affine needs a frozen pretrained trunk)
+action_squash: none
+action_fourier_freqs: 0
+relative_position: false
+relative_scale: null
+grad_checkpoint: false
+compile_rollout: true        # compile the p_tf=0 AR rollout step (feasible epoch wall-clock at F=64)
+# LOSS TERMS (design: unified decode + physics prior).  PROPRIO: prior=physics -> decode/proprio =
+# physics(prev,action)+residual_head(token), chained AR (the old `physics/proprio` term, now a first-class decode);
+# no round-trip (a residual head can't do a context-free autoencode) -> latent_loss_weight MUST be 0, encoder
+# grounded by this decode loss.  IMAGE: prior=none -> absolute decode/image (weight 1) trains the ROLLED image
+# so it doesn't collapse, + codec/roundtrip_image (latent_loss_weight 1) grounds the bespoke codec.  Plus
+# kl/dyn + kl/rep over the joint latent.  (owm ego-13 dims/action come from CLI: model.action_dim, modalities.0.dim.)
+modalities:
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: mse, decode_param: x0, decode_arch: mlp, prior: physics, latent_loss_weight: 0.0}
+  - {name: image, kind: image, num_tokens: 32, img_size: 128, patch: 16, ae_depth: 4, weight: 1.0, decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet,
+     prior: none, pretrained: false, latent_loss_weight: 1.0, encode_base: 32, decode_base: 32}
