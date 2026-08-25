@@ -675,17 +675,23 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     case, and 1-step at 4 Hz is nearly the identity (record §13: the per-step change is a fraction of the
     frame), so even a perfect prediction looked like the input.
 
-    NOW: rows = ROLLOUT HORIZON h (`denoising_filmstrip_horizons`), cols = [GT | noise | k1..kK]. One
+    NOW: rows = ROLLOUT HORIZON h (`denoising_filmstrip_horizons`), cols = [GT | floor | noise | k1..kK]. One
     open-loop chain is rolled from a single context step down the SAME episode, advancing with the committed
     prediction (`predict_next`, exactly as the rollout does); at each requested h we branch off a noisy
     `record_path` sample of that step's flow and decode every element of the latent ODE path. So reading DOWN
     tests whether refinement survives compounding, and reading ACROSS tests whether it refines at all.
 
-    Each panel is annotated with its PSNR against the GT frame, and the whole (h, k) grid is logged as
-    scalars `eval_flow/filmstrip/psnr/h<h>/k<k>` — because the intermediate latents (z + partially-denoised
+    The `floor` column decodes the TRUE latent for that row's frame, so the grid separates the two error
+    sources by eye: floor-vs-GT is what the CODEC costs, kK-vs-floor is what the DYNAMICS costs. Only the
+    second is the deliverable.
+
+    NO numbers are drawn on the panels (2026-08-25, user: 45 of them is noise). The (h, k) PSNR grid, the
+    per-row floor PSNR, and the episode/t_ctx provenance go to `logs/epoch_<step>/eval_flow/
+    denoising_filmstrip_<i>.npz`; the first image's grid also goes to scalars `eval_flow/filmstrip/psnr/
+    h<h>/{k<k>,floor}`. Trust those over the pictures — the intermediate latents (z + partially-denoised
     residual) are OFF-MANIFOLD for the image decoder, which is trained only on clean latents, so a k panel
-    can look arbitrary while still being quantitatively closer. Trust the numbers over the pictures; the
-    monotonicity of the k-curve is the actual answer to "is the flow refinement doing anything".
+    can look arbitrary while still being quantitatively closer; the monotonicity of the k-curve is the
+    actual answer to "is the flow refinement doing anything".
 
     K is set LOCALLY (`denoising_filmstrip_steps`) so a K=1 (shortcut) training config still shows a real
     trajectory; eps ~ N(0,1) (not the eps=0 committed path) so the 'noise' panel is real noise."""
@@ -717,7 +723,8 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     for i in range(n_images):
         Hmax = max(hz)
         for _try in range(8):                                    # need an episode long enough for the deepest row
-            o, a, im = eps_ds[int(rng.integers(len(eps_ds)))]
+            ep_idx = int(rng.integers(len(eps_ds)))
+            o, a, im = eps_ds[ep_idx]
             if len(o) > P + Hmax + 2:
                 break
         else:
@@ -742,7 +749,7 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
         # branch off a noisy record_path sample of that step's flow purely for the picture; the chain itself is
         # never perturbed by it, so row h really is "the flow at rollout step h".
         hist = z[:, :t_ctx + 1]                                   # (1, T0, n_state, d)
-        rows, row_labels = [], []
+        rows, row_labels, grid = [], [], []
         for hstep in range(1, Hmax + 1):
             t = t_ctx + hstep - 1                                 # action index driving this transition
             w = min(m.window, hist.shape[1])
@@ -754,14 +761,23 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
                 gt = (im[t_ctx + hstep].astype(_np.float32) / 255.0)
                 e = torch.randn(m.n_state, m.d, generator=g, device=device)
                 _, path = m.flow.sample(h_state[0].float(), steps=K, deterministic=False, eps=e, record_path=True)
-                panels = [gt] + [decode_bag(prev, x) for x in path]
-                # PSNR of every panel against GT (panel 0 is GT itself -> skipped in the scalars)
+                # FLOOR: decode the TRUE latent for this row's frame -- the best this codec can do here, so
+                # every k panel reads against a REACHABLE target. k8-vs-floor is dynamics error, floor-vs-GT
+                # is codec error; without this column the two are indistinguishable by eye.
+                with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
+                    fl = m.to_obs(z[:, t_ctx + hstep][:, None], heads=[img_head])[img_head][0, 0]
+                floor = fl.clamp(0, 1).float().cpu().numpy()
+                panels = [gt, floor] + [decode_bag(prev, x) for x in path]
+                # PSNR of every panel against GT (panel 0 is GT itself -> nan). NOT drawn on the figure any
+                # more (45 numbers is noise) -- the grid goes to the .npz beside it, and to scalars.
                 psnrs = [float("nan")] + [float(10.0 * _np.log10(1.0 / max(1e-10, float(((p - gt) ** 2).mean()))))
                                           for p in panels[1:]]
                 rows.append((panels, psnrs))
                 row_labels.append(f"h={hstep}")
+                grid.append((hstep, psnrs[1], psnrs[2:]))         # (h, floor, [k0..kK])
                 if i == 0:                                        # log the (h,k) grid from the FIRST image only
-                    for kk, ps in enumerate(psnrs[1:]):           # k=0 is the pure-noise panel
+                    scalars[f"eval_flow/filmstrip/psnr/h{hstep}/floor"] = psnrs[1]
+                    for kk, ps in enumerate(psnrs[2:]):           # k=0 is the pure-noise panel
                         scalars[f"eval_flow/filmstrip/psnr/h{hstep}/k{kk}"] = ps
             with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
                 nb = m.predict_next(h_state, prev[None])          # (1,n_state,d) committed step
@@ -769,23 +785,31 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
         if not rows:
             continue
         ncol = len(rows[0][0])
-        col_titles = ["GT", "noise"] + [f"k{k}" for k in range(1, ncol - 1)]
+        col_titles = ["GT", "floor", "noise"] + [f"k{k}" for k in range(1, ncol - 2)]
         fig, axes = plt.subplots(len(rows), ncol, figsize=(1.7 * ncol, 1.85 * len(rows)), squeeze=False)
-        for ri, (panels, psnrs) in enumerate(rows):
+        for ri, (panels, _psnrs) in enumerate(rows):
             for ci, img_np in enumerate(panels):
                 ax = axes[ri][ci]; ax.imshow(_np.clip(img_np, 0, 1)); ax.set_xticks([]); ax.set_yticks([])
                 if ri == 0:
                     ax.set_title(col_titles[ci], fontsize=9)
-                if ci > 0:                                        # PSNR vs GT under every prediction panel
-                    ax.set_xlabel(f"{psnrs[ci]:.1f}", fontsize=7, labelpad=1)
             axes[ri][0].set_ylabel(row_labels[ri], fontsize=9)
         fig.suptitle(f"denoising filmstrip {i} — latent-flow refinement (cols: K={K} ODE steps) vs ROLLOUT "
                      f"HORIZON (rows), one open-loop chain from t={t_ctx}, {img_head}\n"
-                     f"numbers under each panel = PSNR (dB) vs that row's GT", fontsize=9)
+                     f"'floor' = decode(TRUE latent) — the codec's own limit for that frame; PSNRs in the .npz",
+                     fontsize=9)
         fig.supxlabel("flow refinement (diffusion time) \u2192        |        rows: deeper into the open-loop rollout \u2193",
                       fontsize=8)
         fig.tight_layout(rect=(0, 0.02, 1, 0.94))
         writer.figure(f"eval_flow/denoising_filmstrip_{i}", fig, step); plt.close(fig)
+        # the numbers that used to clutter the panels -> logs/epoch_<step>/eval_flow/denoising_filmstrip_<i>.npz.
+        # ep_idx/t_ctx are the provenance: seed=step by default, so each EPOCH draws a DIFFERENT frame and
+        # epoch-to-epoch PSNR moves for reasons unrelated to the model. Pin cfg.eval.denoising_seed to compare.
+        writer.array(f"eval_flow/denoising_filmstrip_{i}", step,
+                     horizons=_np.array([g[0] for g in grid], dtype=_np.int32),
+                     psnr_floor=_np.array([g[1] for g in grid], dtype=_np.float32),
+                     psnr_grid=_np.array([g[2] for g in grid], dtype=_np.float32),   # (n_rows, K+1): k0=noise
+                     k_index=_np.arange(K + 1, dtype=_np.int32),
+                     ep_idx=_np.int32(ep_idx), t_ctx=_np.int32(t_ctx), K=_np.int32(K), seed=_np.int32(seed))
     if scalars:
         writer.scalars(scalars, step)
     if was:
