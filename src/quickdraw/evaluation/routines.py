@@ -509,8 +509,18 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
 
     pos, _ = _pos_idx(cfg)                                          # world-xyz obs dims (#11; default [0,1,2])
 
-    def decode_xyz(z_t, x):                                          # proprio residual x -> physical position (committed = endpoint)
-        return norm.denorm_obs(dec.decode(_ln(z_t + x)[:, None, :].float()))[..., pos]
+    def decode_xyz(z_t, x):        # flow output x -> physical position (committed = the path's endpoint)
+        # MIRROR predict_next EXACTLY (multimodal.py:978-981), which this used to hardcode:
+        #   * `z_t + x` only under predict=residual. Under predict=absolute the flow emits the FULL next
+        #     latent, so adding the carried token gave a ~2x-magnitude off-manifold point and this whole
+        #     product (swarm quiver, spreads) was silently garbage.
+        #   * LN only when latent_norm is on. It used to LN unconditionally, which is ALREADY wrong for
+        #     latent_norm=affine runs even in residual mode -- affine's inverse is applied inside
+        #     to_obs/decode, so pre-LN'ing here double-normalises.
+        nb = (z_t + x) if getattr(m, "predict_residual", True) else x
+        if getattr(m, "latent_norm", False):
+            nb = _ln(nb)
+        return norm.denorm_obs(dec.decode(nb[:, None, :].float()))[..., pos]
 
     def step_data(t):                                               # per-step swarm geometry for the quiver
         w = min(W, t + 1)
