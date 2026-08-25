@@ -119,7 +119,11 @@ def latent_curves(z_pred, z_true):
     cos = torch.nn.functional.cosine_similarity(p_, t_, dim=-1).mean(0).cpu().numpy()   # (H,)
     dp = (p_[:, 1:] - p_[:, :-1]).norm(dim=-1)
     dt_ = (t_[:, 1:] - t_[:, :-1]).norm(dim=-1)
-    ratio = (dp / dt_.clamp_min(1e-12)).mean(0).cpu().numpy()
+    # AGGREGATE OVER EPISODES FIRST, THEN DIVIDE -- exactly as image_curves does for pixel motion_ratio.
+    # The first version took the MEAN OF PER-EPISODE RATIOS, so a single episode whose true latent barely
+    # moves sends the average to infinity: it logged latent_motion_ratio@+64 = 9.4e11 on a real run. The
+    # clamp only prevents NaN, not explosion. A ratio of means is bounded by the data.
+    ratio = (dp.mean(0) / dt_.mean(0).clamp_min(1e-12)).cpu().numpy()
     # t=0 has no delta -> repeat t=1, EXACTLY as image_curves does for motion_ratio (same panel, same convention)
     ratio = np.concatenate([ratio[:1], ratio]) if len(ratio) else np.ones(H)
     return {"latent_motion_ratio": ratio, "latent_cos": cos}
