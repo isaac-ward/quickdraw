@@ -130,7 +130,8 @@ class LitWorldModel(L.LightningModule):
         # loss consumes it. At p_tf>=1 there is NO rollout, so feeds stays None -- and that IS the correct
         # teacher-forced semantics for the dynamics loss, so no special-case gate is needed. design/flow.md.
         feeds = None
-        want_feeds = bool(getattr(m, "dynamics_follows_p_tf", False))
+        _q = getattr(m, "p_tf_dynamics", 1.0)          # probability the dynamics loss uses TRUTH
+        want_feeds = (_q is None) or (float(_q) < 1.0)  # None -> follows p_tf; <1 -> partial mixing
         # PHASE MARKERS (record_function is a no-op unless a torch.profiler is active). Added 2026-08-25:
         # NOTHING in this repo had ever measured the training step's phase breakdown -- every "X is N% of the
         # step" number, in design docs and audits alike, was inferred from epoch totals. These make one

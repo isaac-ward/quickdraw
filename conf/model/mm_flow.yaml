@@ -118,23 +118,30 @@ p_tf_batch_granular: false  # LOCKED false (2026-08-07). true = smooth p_tf ramp
 #                            a big dataset crawled (owm-iss: >5.6h and not even 25% vs ~30min at p_tf=1). Per-epoch
 #                            keeps warmup epochs at p_tf=1.0 (fast parallel), then hard-switches to p_tf=0.0
 #                            (compiled) — the hard 1->0 jump is a feature, not a bug, given the regime cost.
-dynamics_follows_p_tf: true   # Does the p_tf teacher-forcing schedule REACH the dynamics loss?
-#                               FALSE was the historical behaviour and it was a DEFECT: loss_terms received
-#                               the rollout (`pred_bag`) and never referenced it, computing dynamics/latent
-#                               on CLEAN encoder latents regardless of p_tf. So p_tf ramped 1->0, the DECODE
-#                               loss duly became autoregressive, and the transition function stayed
-#                               teacher-forced for the entire run -- it was never once asked to take a step
-#                               from a latent it produced itself. Measured consequence: the rolled-out latent
-#                               rotates ~82 degrees off course by h=64 (cos 0.98 -> 0.14) while UNDER-rotating
-#                               (latent_motion_ratio 0.95 -> 0.56), and flow refinement stops contributing
-#                               entirely at h=64.
-#                               TRUE conditions the loss on the rollout's own FEEDS -- what each step actually
-#                               STOOD ON -- so ONE schedule governs both losses. No new schedule, no new loss
-#                               term, no new weight; p_tf itself is untouched. At p_tf>=1 no rollout runs, so
-#                               there are no feeds and the context is clean, which IS correct teacher forcing.
-#                               Set FALSE to reproduce any run before 2026-08-25, or for the IWS ablation
-#                               quadrant (false + dynamics_detach_encoder: true). Full rationale, the per-class
-#                               2x2, and three audits: design/flow.md.
+p_tf_dynamics: 1.0            # Probability that the DYNAMICS loss conditions on the TRUTH (clean encoder
+#                               latents) rather than on the rollout's own feeds. The SAME quantity p_tf
+#                               denotes, for a different consumer: p_tf is the ROLLOUT's (and hence the decode
+#                               loss's); this is the dynamics loss's.
+#                                 1.0   always clean -- the historical behaviour, and the DEFECT. p_tf ramped
+#                                       1 -> 0, the decode loss duly became autoregressive, and the transition
+#                                       function stayed teacher-forced for the ENTIRE run: never once asked to
+#                                       step from a latent it had produced itself. Measured consequence: the
+#                                       rolled-out latent rotates ~82 degrees off course by h=64 and flow
+#                                       refinement contributes nothing at that depth.
+#                                 null  follow p_tf (so 0 after warmup). MEASURED: latent_cos@+32 2.1x better
+#                                       than the control for five epochs, then a rollout-Jacobian blow-up --
+#                                       grad/norm/flow 0.42 -> 1.3e7, ae_floor 19.1 -> 11.4, latent_cos
+#                                       NEGATIVE. Full substitution is too strong.
+#                                 0<q<1 the middle ground the evidence points at: diffusion forcing corrupts
+#                                       the same context isotropically at 0.1 strength and is BOTH stable and
+#                                       the best result measured, while full substitution collapses. Try 0.9.
+#                               WHY THIS IS A SEPARATE KNOB AND NOT JUST p_tf: p_tf is SHARED with the decode
+#                               loss, and that loss needs 0 -- it is the only autoregressive gradient in the
+#                               model, and recon_frac=1.0 (the largest measured win) exists to strengthen it.
+#                               Raising p_tf to weaken the dynamics corruption would cripple it.
+#                               Replaces the boolean `dynamics_follows_p_tf` (false == 1.0, true == null),
+#                               which is still accepted and translated loudly for old configs.
+#                               design/flow.md, record section 18.
 dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding the DYNAMICS (dynamics/latent) loss:
 #                           the dynamics gradient can't reshape the encoder (trained then only by decode/recon).
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.

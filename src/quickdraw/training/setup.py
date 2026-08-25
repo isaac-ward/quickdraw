@@ -244,17 +244,31 @@ def build_model(cfg):
         # dynamics_follows_p_tf: meaningful only where the dynamics loss CONDITIONS ON a context it can swap.
         # RAISE rather than silently ignore -- a user who sets this believes they changed the training regime
         # (same rule as the fail-fast block just below). See design/flow.md.
-        _dfp = m.get("dynamics_follows_p_tf", None)
+        # p_tf_dynamics: probability the DYNAMICS loss conditions on the truth. Accepts the LEGACY boolean
+        # `dynamics_follows_p_tf` so configs written before 2026-08-25 (and checkpoints adopted by
+        # run_standalone) rebuild what they trained under: false == 1.0 (always clean), true == None (follow
+        # p_tf). Translated loudly rather than silently, and the new key wins if both are present.
+        _p_tf_dyn = m.get("p_tf_dynamics", 1.0)
+        _legacy = m.get("dynamics_follows_p_tf", None)
+        if _legacy is not None and "p_tf_dynamics" not in m:
+            _p_tf_dyn = None if bool(_legacy) else 1.0
+            print(f"[config] legacy model.dynamics_follows_p_tf={_legacy} -> p_tf_dynamics="
+                  f"{_p_tf_dyn!r} (false==1.0 always-clean, true==None follow-p_tf)", flush=True)
+        if _p_tf_dyn is not None:
+            _p_tf_dyn = float(_p_tf_dyn)
+            if not 0.0 <= _p_tf_dyn <= 1.0:
+                raise ValueError(f"model.p_tf_dynamics must be in [0,1] or null; got {_p_tf_dyn}")
+        _dfp = None if (_p_tf_dyn is not None and _p_tf_dyn >= 1.0) else True
         if _dfp is not None:
             if name in ("mm_dsar", "dsar", "base"):
-                raise ValueError("model.dynamics_follows_p_tf has no meaning for mm_dsar: it has no dynamics "
-                                 "loss at all (loss_terms returns {}). Remove the key.")
-            if name in ("mm_lsar", "lsar") and not bool(_dfp):
-                raise ValueError("model.dynamics_follows_p_tf=false is not implementable for mm_lsar: its "
-                                 "dynamics loss scores the ROLLOUT'S OUTPUT against the encoded true future, "
-                                 "so there is no context to pin to clean latents -- 'false' would compare "
-                                 "encode(fut) against itself (identically zero). mm_lsar always follows p_tf "
-                                 "by construction; remove the key.")
+                raise ValueError("model.p_tf_dynamics has no meaning for mm_dsar: it has no dynamics loss at "
+                                 "all (loss_terms returns {}). Remove the key.")
+            if name in ("mm_lsar", "lsar"):
+                raise ValueError("model.p_tf_dynamics is not implementable for mm_lsar: its dynamics loss "
+                                 "scores the ROLLOUT'S OUTPUT against the encoded true future, so there is no "
+                                 "context to pin to clean latents -- pinning it would compare encode(fut) "
+                                 "against itself (identically zero). mm_lsar already follows p_tf by "
+                                 "construction; remove the key.")
         # Fail fast on config knobs that only one model reads (otherwise silently ignored).
         if cfg.get("collapse", None) is not None and name not in ("mm_lsar", "lsar"):
             raise ValueError(f"model.collapse=... (a collapse-prevention strategy) is only used by the LSAR model "
@@ -337,9 +351,9 @@ def build_model(cfg):
                                        action_head_shortcut=bool(ahg("shortcut", True)),
                                        action_head_detach_gradient=bool(ahg("detach_gradient", False)),
                                        dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)),
-                                       # default FALSE here (not the yaml's true): an old config adopted by
-                                       # run_standalone must rebuild the behaviour it TRAINED under.
-                                       dynamics_follows_p_tf=bool(m.get("dynamics_follows_p_tf", False)))
+                                       # default 1.0 (always-clean) so an old config adopted by
+                                       # run_standalone rebuilds the behaviour it TRAINED under.
+                                       p_tf_dynamics=_p_tf_dyn)
         raise ValueError(f"unknown model.name: {name!r}")
 
 

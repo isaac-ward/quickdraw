@@ -904,7 +904,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
-                 dynamics_detach_encoder: bool = False, dynamics_follows_p_tf: bool = False, **kw):
+                 dynamics_detach_encoder: bool = False, p_tf_dynamics: float | None = 1.0, **kw):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
@@ -953,13 +953,22 @@ class MultiModalFlow(MultiModalSequenceModel):
         # dynamics gradient cannot reshape the encoder. The encoder is then trained ONLY by the decode/recon loss
         # (which has no collapse shortcut) — the joint-training equivalent of IWS's frozen AE. See loss_terms.
         self.dynamics_detach_encoder = bool(dynamics_detach_encoder)
-        # dynamics_follows_p_tf: does the p_tf teacher-forcing schedule REACH the dynamics loss? FALSE (the
-        # historical behaviour) computes dynamics/latent on CLEAN encoder latents no matter what p_tf says, so
-        # the transition function stays teacher-forced for the whole run while the DECODE loss becomes
-        # autoregressive -- the two losses silently disagree about their starting point. TRUE conditions it on
-        # the rollout's own FEEDS, so ONE schedule governs both. Default False here (direct construction and
-        # old configs rebuild what they trained under); conf/model/mm_flow.yaml sets true. design/flow.md.
-        self.dynamics_follows_p_tf = bool(dynamics_follows_p_tf)
+        # p_tf_dynamics: the probability that the DYNAMICS loss conditions on the TRUTH (clean encoder
+        # latents) rather than on the rollout's own feeds. Exactly the same quantity p_tf denotes, for a
+        # different consumer -- p_tf is the ROLLOUT's (and so the decode loss's), this is the dynamics loss's.
+        #   1.0  = always clean. The historical behaviour, and the DEFECT: p_tf ramped 1 -> 0, the decode loss
+        #          duly became autoregressive, and the transition function stayed teacher-forced for the whole
+        #          run, never once asked to step from a latent it produced itself.
+        #   None = follow p_tf (so 0 after warmup). Measured: latent_cos@+32 2.1x better than the control for
+        #          five epochs, then a rollout-Jacobian blow-up -- grad/norm/flow 0.42 -> 1.3e7, ae_floor
+        #          19.1 -> 11.4, latent_cos NEGATIVE. Full substitution is too strong.
+        #   0<q<1 = the middle ground the dose-response curve points at: diffusion forcing corrupts the same
+        #          context isotropically at 0.1 strength and is both stable AND the best result measured, while
+        #          full substitution collapses. This is a STRENGTH knob, which p_tf cannot supply -- p_tf is
+        #          shared with the decode loss, and that loss NEEDS 0 (it is the only autoregressive gradient
+        #          in the model). Replaces the old `dynamics_follows_p_tf` bool: false == 1.0, true == None.
+        # design/flow.md, record section 18.
+        self.p_tf_dynamics = None if p_tf_dynamics is None else float(p_tf_dynamics)
         if self.action_head_enabled:
             self.action_flow = FlowField(action_dim, h_dim=d, hidden=(flow_hidden or d), cond="concat",
                                          shortcut=action_head_shortcut)
@@ -987,7 +996,9 @@ class MultiModalFlow(MultiModalSequenceModel):
         z = self.encode_state(obs, anchor) if pre_z is None else pre_z  # (B,L,n_state,d); pre_z = shared-encode (already relativized)
         L = z.shape[1]
         s = z[:, :-1]                                           # contexts (B,L-1,n_state,d)
-        if self.dynamics_follows_p_tf and feeds is not None:
+        # q = probability of conditioning on TRUTH. None -> track the rollout's own p_tf.
+        q_dyn = p_tf if self.p_tf_dynamics is None else self.p_tf_dynamics
+        if q_dyn < 1.0 and feeds is not None:
             # Condition on what each rollout step actually STOOD ON, so the p_tf schedule reaches this loss.
             # feeds[k] fed the step predicting future frame k+1, i.e. parallel-pass position P+k -> alignment
             # is by CONSTRUCTION, not shape inference. feeds[F-1] fed no step and is dropped. The first L-F
@@ -996,7 +1007,15 @@ class MultiModalFlow(MultiModalSequenceModel):
             # with it the target below. See design/flow.md.
             F_ = feeds.shape[1]
             if L - F_ >= 1 and F_ >= 2:
-                s = torch.cat([z[:, :L - F_], feeds[:, :F_ - 1]], dim=1)
+                tail = feeds[:, :F_ - 1]
+                if q_dyn > 0.0:
+                    # per (sample, position) Bernoulli, mirroring how p_tf mixes inside the rollout
+                    # (_rollout_from). Only drawn when 0 < q < 1, so q == 1.0 and q == 0.0 leave the RNG
+                    # stream untouched and stay bit-identical to not having this feature.
+                    keep_true = torch.rand(tail.shape[:2] + (1, 1), device=tail.device,
+                                           dtype=tail.dtype) < q_dyn
+                    tail = torch.where(keep_true, z[:, L - F_:-1], tail)
+                s = torch.cat([z[:, :L - F_], tail], dim=1)
         if self.dynamics_detach_encoder:                        # stop-grad: dynamics loss won't reshape the encoder
             s = s.detach()                                      #   (encoder trained only by decode/recon; anti-collapse)
         s_ref = s      # the contexts the target is measured FROM. Snapshotted BEFORE the DF block below
