@@ -1028,6 +1028,132 @@ in the same wall-clock. Every result in this record came from the second mode, a
 on this project is that effects are small against the ±0.8 dB noise floor — we need *more arms*, not
 faster arms. DDP becomes right when one config stops fitting (a much bigger decoder, 256px, F ≫ 64).
 
+## 18. THE DYNAMICS LOSS NEVER FOLLOWED p_tf — found, fixed, and the fix is LOSING (08-24/25)
+
+### The defect
+
+`MultiModalFlow` ran TWO forward computations. The rollout fed the **decode** loss; a second, fully
+teacher-forced parallel pass fed the **dynamics** loss and never saw the rollout — `loss_terms` received
+`pred_bag` and never referenced it. So `p_tf` ramped 1 -> 0, the decode loss duly became autoregressive, and
+**the transition function stayed teacher-forced for the entire run.** It was never once asked to step from a
+latent it produced itself. Full write-up: `design/flow.md`.
+
+Not unnoticed: `MultiModalDistribution.loss_terms` documents the same behaviour for itself and says "the
+p_tf ramp affects only the rolled decode losses ... **as for Flow**". A considered position, not an oversight.
+
+### What made it visible
+
+Two new metrics (commit `60dc373`), because every metric we had was either pixel-space (which saturates on a
+scene that is mostly right) or `motion_ratio`, which the repo documents as direction-blind:
+
+* `latent_cos` = cos(z_pred, z_true) per horizon — how far OFF COURSE the rollout is
+* `latent_motion_ratio` = per-step angular step size vs the truth
+
+On `bott_recon1`: cos 0.98 / 0.71 / 0.48 / 0.26 / **0.14** at h=1/8/16/32/64 — by 64 steps the latent is
+~orthogonal to the truth, ~82 degrees off, while UNDER-rotating (ratio 0.95 -> 0.56). Per-step error ~11
+degrees compounding as a random walk toward the 90-degree ceiling.
+
+Ruled out first, each by measurement rather than argument: KV-cache train/eval divergence (null, +-0.01 dB at
+every horizon), action off-by-one (clean, audited), `stochastic_eval` (refuted — DETERMINISTIC is worse, cos
+0.037 vs 0.128 @h64), `sampling_steps` (null for K>=2; K=1 badly broken), `latent_norm` (layernorm measured
+better than none), and the decoder (decoding TRUE latents gives LPIPS 0.19 vs 0.31 for predicted — the
+decoder renders sharply when handed a correct latent).
+
+### The fix and the A/B
+
+`model.dynamics_follows_p_tf` (commit `e9de2b0`): the dynamics loss conditions on the rollout's FEEDS — what
+each step actually STOOD ON — instead of clean latents, so one schedule governs both losses. No new loss
+term, no new schedule, no new weight; `p_tf` untouched. Feeds, not raw predictions, because at `p_tf>=1` no
+rollout runs, so there are no feeds and the context is clean, which IS teacher forcing — no special-case
+gate. Three audits caught four drafting errors (in-place view corruption of `z`, a DF-ordering trap, an
+inverted detach justification, a smoke caller passing a full-L tensor).
+
+`dfptf_on` vs `dfptf_off`, identical binaries, batch 27 both, 20 epochs.
+
+**THE MECHANISM FIRES.** `latent_cos@+32` 0.542 vs 0.256 (**2.1x**), `@+64` 0.221 vs 0.159 (**1.4x**), pixel
+`motion_ratio` 0.654 vs 0.341 (**1.9x**). The pre-registered falsification condition is cleared.
+
+**AND IT IS LOSING ON THE OUTCOME.** OL LPIPS is worse AND DIVERGING while the control improves:
+
+| e2 -> e3 | OL LPIPS@+64 | OL LPIPS@+128 | OL PSNR@+64 |
+|---|---|---|---|
+| dfptf ON | 0.496 -> **0.533** | 0.531 -> **0.570** | 13.77 -> 13.55 |
+| dfptf OFF | 0.450 -> 0.420 | 0.478 -> 0.438 | 13.89 -> 14.11 |
+
+Reading: **over-committing.** It moves 1.9x more but not accurately enough, and LPIPS punishes
+confident-but-wrong harder than hedging. Only 4 epochs, and at batch 27 both arms have 3.9x fewer gradient
+steps than any b7 run — but the direction is consistent and the gap is widening.
+
+### DIFFUSION FORCING IS THE BEST THING RUN SO FAR, and it is the gentler version of the same idea
+
+`df_recon1` (`variations.noise_injection.observations_encoded_pre_fusion.scale=0.1`) corrupts the SAME
+context, with isotropic noise instead of the model's own structured errors:
+
+| @e2, matched epochs | OL LPIPS@+64 | OL LPIPS@+128 | motion |
+|---|---|---|---|
+| **DF 0.1** (b7) | **0.419** | **0.450** | 0.362 |
+| recon1 plain (b7) | 0.474 | 0.485 | 0.278 |
+| dfptf OFF (b27) | 0.450 | 0.478 | 0.333 |
+| dfptf ON (b27) | 0.496 | 0.531 | 0.672 |
+
+So the corruption FAMILY works; the STRUCTURED, full-strength version overshoots. The obvious next
+experiments are the middle ground: partial feed mixing, or DF and the fix together. **`df_recon1` was killed
+at e2 to free a GPU and should be rerun** — it was winning.
+
+Cross-run note: the two controls land in the same place despite 4x different batch (`dfptf OFF` b27 vs
+`recon1 plain` b7 at e2: LPIPS@+128 0.478 vs 0.485, PSNR 13.89 vs 13.78), so cross-run comparison here is
+NOISIER than within-A/B, not useless. DF's 0.450 is a real target.
+
+### The filmstrip's "noise" panel is the PREDICTION plus noise, not GT plus noise
+
+`prev = hist[0, -1]` is the ROLLOUT's own latent at that horizon and `decode_bag` computes
+`LN(prev + x)`, so the `noise` column is `decode(LN(rollout_latent_at_h + unit Gaussian))`. GT never enters
+it. Three consequences, all of which look like bugs and are not:
+
+* blurry even at k=0 — `prev` is ALREADY wrong (~82 degrees off at h=64), so `decode(prev)` is blurry before
+  any noise is added;
+* blurrier with horizon — `prev` degrades with horizon; the row index IS the accumulated drift;
+* the k-steps never approach GT — the flow outputs a SMALL residual, so `LN(prev + x_k)` converges to
+  `decode(prev)`. **The refinement's ceiling is the rollout's own current state.** It can only undo the noise
+  it was handed; it cannot repair drift baked into `prev`, which the filmstrip holds fixed.
+
+So the k-gain (+1.2 to +2.0 dB at h<=32, **-0.16 dB at h=64**) measures how much injected noise the flow can
+undo — and at h=64 it undoes none, i.e. the velocity field is uninformative there. The filmstrip tests the
+flow's LOCAL FIELD, not rollout quality; rollout quality is `latent_cos` and OL LPIPS.
+
+### Instrumentation defects found and fixed along the way
+
+* `eval_ood_horizon` was the only eval routine without `@torch.no_grad()` — its latent pass built a full
+  autograd tape over a 128-step rollout every eval epoch (`c599869`).
+* `latent_cos` described a DIFFERENT TRAJECTORY than the LPIPS curves beside it: `latent_pass` rolled out a
+  second time, and with `stochastic_eval: true` each rollout draws fresh eps. Now reuses the same rollout's
+  bag (`c599869`).
+* `latent_motion_ratio` logged **9.4e11**: it took the mean of per-episode ratios, so one episode with a
+  near-zero true delta blew up the average. Now a ratio of means, as pixel `motion_ratio` always did
+  (`0c27d9c`). **Both live dfptf arms carry the broken version** — that curve is unusable for this A/B;
+  `latent_cos` is unaffected.
+
+### Throughput: decode chunk+checkpoint (`decode_chunk_train`)
+
+`recon_frac=1.0` cost 13.17 GB/sample -> batch 7. ~78% of per-sample memory is the DECODER, across TWO
+passes (the decode loss AND the roundtrip anchor — an adversarial audit caught that the first patch chunked
+only one, which would have landed at batch ~10 instead of ~29). Chunking the velocity FORWARD and catting
+outputs keeps ONE loss call, so there is no mean-of-means weighting to get wrong:
+
+    measured on recon_losses:  peak 7.716 -> 1.696 GB (-78.0%), loss equal to 6.6e-07 RELATIVE
+    live:                      13.169 -> 3.178 GB/sample, batch 7 -> 27, 5013 -> 1300 batches/epoch
+    epoch:                     ~6970s (val-adjusted b7) -> 5149s = ~26% faster
+
+Costs ~1.33x decode compute; ep0 (parallel path, no AR loop to amortise against) is 23% SLOWER per sample,
+and the win only appears once the dispatch-bound AR rollout amortises across 4x the samples.
+
+**First measured phase breakdown in this project** (`record_function` markers, `c599869`) — every prior "X is
+N% of the step" figure, in design docs and audits alike, was inferred from epoch totals:
+
+    qd/ar_rollout   63.5%   |   qd/recon_losses  31.0%   |   loss_terms 4.1%   |   shared_encode 1.3%
+
+which revises the AR rollout up from an inferred ~51% and decode down from an inferred ~40%.
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
