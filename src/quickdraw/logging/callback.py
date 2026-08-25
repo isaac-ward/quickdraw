@@ -484,6 +484,18 @@ class LoggingCallback(L.Callback):
                                  "mem/peak_evalroutines_gb": torch.cuda.max_memory_allocated() / 1e9,
                                  "mem/peak_evalroutines_reserved_gb": torch.cuda.max_memory_reserved() / 1e9},
                                 step=epoch)
+        # TRAIN-SIDE scalars every epoch, decoupled from the validation cadence -- the same decoupling the
+        # comment at the top of this method describes for the eval routines. They used to be forwarded ONLY in
+        # on_validation_epoch_end, so at check_val_every_n_epoch=4 every `grad/*`, `train/loss/*` and
+        # `schedules/*` was written on 1 epoch in 4. That cost us the dfptf collapse: the gradient blow-up
+        # happened between e5 and e6 and the first gradient reading after it was e7, so the 1.8e7 in the log
+        # is the AFTERMATH, not the event. val/* is deliberately excluded here -- at train-epoch end it holds
+        # a STALE value from the last validation, and writing it would silently flatten the val curve.
+        if not trainer.sanity_checking:
+            train_side = {k: v.item() for k, v in trainer.callback_metrics.items()
+                          if not k.startswith("val/")}
+            if train_side:
+                self.writer.scalars(train_side, step=epoch)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
