@@ -56,6 +56,13 @@ class ModalitySpec:
     num_tokens: int = 8
     ae_depth: int = 4
     ae_bottleneck: int = 8   # conv-pyramid bottleneck target (px, short side); 8 = previous behaviour
+    decode_chunk_train: int = 0   # >0: chunk the DECODE head's velocity forward into groups of this many
+    #                               frames and checkpoint each, so its intermediates are recomputed in
+    #                               backward instead of retained. 0 = OFF (bit-identical). The decoder is
+    #                               ~78% of per-sample training memory across TWO passes (the decode loss and
+    #                               the roundtrip anchor), so this is the one lever that buys real batch size
+    #                               -- everything else lives in the other 22%. ~1.33x decode compute.
+    #                               See design/decode_memory.md.
     channels: int = 3
     # pretrained image AE (TAESD) — issue #12. pretrained=false -> the bespoke AE above (BIT-IDENTICAL default).
     pretrained: bool = False                     # master on/off for the pretrained-AE image trunk
@@ -143,6 +150,7 @@ class VectorModality(Modality):
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
         self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
+                                     chunk=int(getattr(spec, "decode_chunk_train", 0) or 0),
                                      param=("x0" if no_noise else spec.decode_param),
                                      shortcut=(spec.decode_shortcut and not no_noise), no_noise=no_noise)
 
@@ -181,9 +189,12 @@ class ImageModality(Modality):
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         if self.decode_arch == "unet":
             self.decode_head = ImageUNetFlowHead(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
+                                                 chunk=int(getattr(spec, "decode_chunk_train", 0) or 0),
                                                  param=param, shortcut=sc, no_noise=no_noise)
         else:
-            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc, no_noise=no_noise)
+            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc,
+                                             no_noise=no_noise,
+                                             chunk=int(getattr(spec, "decode_chunk_train", 0) or 0))
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)

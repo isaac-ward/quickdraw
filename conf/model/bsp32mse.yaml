@@ -57,6 +57,14 @@ modalities:
      decode_arch: unet,        # ViT decoder measured much worse: motion 0.141, and it collapsed
      decode_base: 32,
      decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64,   # chunk+checkpoint the decode head's velocity forward, 64 frames at a time.
+     #                           The decoder is ~78% of per-sample training memory across TWO passes (the
+     #                           decode loss AND the roundtrip anchor), so this is the only lever that buys
+     #                           real batch size -- every other knob lives in the other 22%. MEASURED on
+     #                           recon_losses: peak 7.72 -> 1.70 GB (-78%) with the loss unchanged to 7e-7
+     #                           relative. Costs ~1.33x decode compute (the forward runs again in backward),
+     #                           which is second-order against the far larger batch a dispatch-bound AR step
+     #                           can then use. 0 = off/bit-identical. See design/decode_memory.md.
      latent_loss_weight: 10}   # round-trip anchor. DO NOT leave at 1.0: it was 1% of the objective against a
      #                               dynamics term 80x larger and the codec eroded 3.55 dB in 4 epochs, undoing
      #                               the benefit of subsampling. At 10 the erosion was 0.40 dB over 9 epochs.
