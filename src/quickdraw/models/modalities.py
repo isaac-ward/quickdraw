@@ -36,6 +36,16 @@ class ModalitySpec:
     decode_shortcut: bool = False  # flow decode (param=v): opt-in shortcut self-consistency -> K=1 sampling
     #                                (like the dynamics `diffusion.shortcut`; never default-on). Off -> plain flow, decode_steps.
     decode_steps: int = 6     # flow decode sampling steps (K). v: ODE steps (shortcut->1). x0: consistency refine steps (1 = direct)
+    decode_stochastic: bool = False  # flow decode ONLY: SAMPLE the obs (eps ~ N(0,1)) instead of committing the
+    #                           deterministic eps=0 point. OFF (default) makes decode_kind=flow a TRAINING-ONLY
+    #                           change: with param=x0 the committed decode is velocity(zeros, tau=1, cond),
+    #                           which is EXACTLY the no_noise/mse computation, so a flow decoder trained at
+    #                           great cost renders identically to an MSE one. ON is what actually buys
+    #                           SHARPNESS: an MSE decoder emits E[obs | tokens] (the conditional mean = blur),
+    #                           a sampled one emits a draw (sharp). The tradeoff is real and must be read on
+    #                           BOTH metrics -- a sample off a DRIFTED latent is a sharp WRONG frame, so PSNR
+    #                           falls while LPIPS may improve. Ignored by decode_kind=mse (no_noise returns
+    #                           before eps is ever drawn), so mse stays bit-identical.
     decode_param: str = "v"   # flow decode parameterization: "v" (velocity, integrate ODE — imprecise for images)
     #                           | "x0" (predict the clean obs directly — precise + in-range; use for image decode). See flow.py.
     decode_arch: str = "vit"  # IMAGE decoder architecture, ORTHOGONAL to decode_kind: "vit" (all-attention, patch
@@ -116,8 +126,11 @@ class Modality(nn.Module):
         1 step; v+shortcut -> K=1; v plain -> decode_steps. Same output shape for every kind/arch."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
-        steps = 1 if (self.decode_head.shortcut or self.decode_head.param == "x0") else self.decode_steps
-        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=True)
+        stoch = bool(getattr(self, "decode_stochastic", False)) and not self.decode_head.no_noise
+        # x0 collapses to ONE step only when committing: the k-loop's renoise is what injects the sampling
+        # noise, so a stochastic x0 decode needs the full decode_steps to be a sampler rather than one draw.
+        steps = 1 if (self.decode_head.shortcut or (self.decode_head.param == "x0" and not stoch)) else self.decode_steps
+        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=not stoch)
         return obs.reshape(*lead, *obs.shape[1:])
 
     def decode_loss(self, tok: Tensor, target: Tensor):
@@ -148,6 +161,7 @@ class VectorModality(Modality):
         from .multimodal import FourierMLP
         self.enc = FourierMLP(spec.dim, d, hidden, n_freq=int(getattr(spec, "fourier_freqs", 0) or 0))
         self.decode_steps = int(spec.decode_steps)
+        self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
         self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
                                      chunk=int(getattr(spec, "decode_chunk_train", 0) or 0),
@@ -186,6 +200,7 @@ class ImageModality(Modality):
                    if self.encode_arch == "conv" else ImageAutoencoder(ae_cfg))
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
+        self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         if self.decode_arch == "unet":
             self.decode_head = ImageUNetFlowHead(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
@@ -252,6 +267,7 @@ class PretrainedImageModality(Modality):
         self.noise_std = float(spec.noise_std)
         self.decode_kind = "mse"                   # pretrained path = the deterministic no_noise decode
         self.decode_steps = 1
+        self.decode_stochastic = False
         H, W = img_hw(spec.img_size)
         if spec.pretrained_init:                   # load the HF weights (the pretrained pixel prior)
             taesd = AutoencoderTiny.from_pretrained(spec.pretrained_name)
