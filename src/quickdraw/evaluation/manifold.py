@@ -142,7 +142,10 @@ def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device)
         z = m.encode_state(obs)                                    # (1, T, n_state, d)
         h_all = m.backbone(m._to_input(z, act))                    # one causal pass -> h at every step
         ts_a = np.array(sorted(ts))
-        h_pro, zt_pro = h_all[0, ts_a, 0, :], z[0, ts_a, 0, :]     # (nt, d) proprio-token conditioning + token
+        # Route through m._cond -- see the note in routines.py step_data. Hand-building this at width d
+        # crashed the velocity net (288 vs the 544 it wants) for every flow_arch=mlp config since 2026-08-12.
+        hc_all = m._cond(h_all, act)                               # (1, T, n_state, cond_width)
+        h_pro, zt_pro = hc_all[0, ts_a, 0, :], z[0, ts_a, 0, :]    # (nt, cond_width) cond + (nt, d) token
         eps = (torch.rand(len(ts_a), d, generator=g, device=device) * 2 - 1) * cube   # uniform hypercube noise
         _, path = m.flow.sample(h_pro, steps=K, deterministic=False, eps=eps, record_path=True)
         # MIRROR predict_next (multimodal.py:978-981) instead of hardcoding `_ln(zt_pro + x)`: the add

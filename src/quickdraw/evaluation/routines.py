@@ -526,7 +526,15 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
         w = min(W, t + 1)
         with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
             h = m.backbone(m._to_input(z[:, t - w + 1:t + 1], act[:, t - w + 1:t + 1]))[:, -1]   # (1, n_input, d)
-        h_t, z_t = h[:, 0, :].float(), z[:, t, 0, :].float()        # proprio-token conditioning + carried token
+        # Route through m._cond -- NEVER hand-build the conditioning. This used to be `h[:, 0, :]` (width d),
+        # which broke the moment the conditioning gained channels: with the action slot + the raw action
+        # embedding it is 3*d, so the velocity net's first Linear wanted d_x + time_dim + 3*d = 544 and got
+        # 288 -> "mat1 and mat2 shapes cannot be multiplied (1x288 and 544x128)". Same break that killed two
+        # runs at ep1 on 2026-08-12; the filmstrip was fixed then, this call site was missed and went
+        # unnoticed because flow_arch=transformer makes this routine self-skip. _cond is the single source of
+        # truth for that width.
+        hc = m._cond(h, act[:, t])                                 # (1, n_state, cond_width)
+        h_t, z_t = hc[:, 0, :].float(), z[:, t, 0, :].float()      # proprio-token conditioning + carried token
         ts_ = time.perf_counter()
         m.flow.sample(h_t, steps=K, deterministic=True)             # the committed readout (timed; matches rollout)
         sample_s = time.perf_counter() - ts_
