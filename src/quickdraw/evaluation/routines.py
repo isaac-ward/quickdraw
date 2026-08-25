@@ -20,7 +20,7 @@ from ..logging import viz
 from ..training.setup import eval_episodes, resolve_data_root
 import torch
 
-from .openloop import emit_horizon_readouts, eval_batched, image_curves, proprio_curves
+from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_curves, proprio_curves
 from .products import emit_openloop
 
 
@@ -209,7 +209,34 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
             out[h] = torch.cat([v[:, s, :min(every, Hm - s * every)] for s in range(n_seg)], dim=1)  # (n_ep,Hm,...)
         return out
 
-    def score_and_emit(out, subroutine, desc, Hm):
+    def latent_pass(Hm):
+        """LATENT-space curves for the OPEN-LOOP mode: roll the bag forward with the SAME _rollout the eval
+        decode path uses (so no reimplementation can drift from it), encode the GT future once, and compare.
+        Open-loop only — under re-grounding the latent is reset every `every` steps, so a horizon-indexed
+        drift curve would not mean what it says. Guarded: this is an add-on diagnostic and must never be able
+        to disable the whole ood_horizon routine (2 consecutive failures do that)."""
+        try:
+            ctx_l = {"proprio": pro0}
+            for h in img_heads:
+                ctx_l[h] = torch.stack([torch.from_numpy(im[:P]) for _, _, im in eps]).float().div(255.0).to(device)
+            idx = _np.clip(_np.arange(0, P + Hm - 1), 0, min(len(a) for _, a, _ in eps) - 1)   # same convention as rollout_regrounded
+            acts_l = torch.stack([norm.norm_act(torch.from_numpy(a[idx])) for _, a, _ in eps]).float().to(device)
+            anc = m.rel_anchor(ctx_l) if getattr(m, "_rel_on", lambda: False)() else None
+            gt = {"proprio": norm.norm_obs(p_true[:, :Hm])}
+            for h in img_heads:
+                gt[h] = itrue[h][:, :Hm]
+            with torch.autocast(device_type=(device if isinstance(device, str) else device.type),
+                                dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                bag = m._rollout(ctx_l, acts_l, Hm, 0.0, None, 0, use_cache=getattr(m, "use_kv_cache", False),
+                                 anchor=anc)
+                z_gt = m.encode_state(gt, anc)
+            return latent_curves(bag.float(), z_gt.float())
+        except Exception as e:                       # fail-soft but NOT silent (design/logging.md)
+            _plog(writer, f"[eval_ood_horizon @ep{step}] latent curves SKIPPED ({type(e).__name__}: {e}) — "
+                          f"the decoded-image products are unaffected")
+            return {}
+
+    def score_and_emit(out, subroutine, desc, Hm, lat=None):
         """Score (image_curves per head + proprio_curves) + emit (emit_openloop) a completed rollout under the
         `subroutine` tag (e.g. eval_ood_horizon/open_loop). Head nesting rides under it via product_tag. `Hm`
         is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H)."""
@@ -222,7 +249,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         images = {}
         for head in img_heads:
             ipred = out[head].clamp(0, 1)
-            images[head] = {"icurves": image_curves(ipred, itrue[head][:, :Hm]),
+            ic = image_curves(ipred, itrue[head][:, :Hm])
+            ic.update(lat or {})            # latent_motion_ratio / latent_cos ride the head's curve dict, so they
+            #                                 reach the SAME panel + the same @+x scalar readouts as motion_ratio
+            images[head] = {"icurves": ic,
                             "full_true": _np.stack([eps[i][2][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                             "ipred": ipred[:n_plot].cpu().numpy()}
             emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
@@ -248,7 +278,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
                 f"PREDICTED path, sharing the context then diverging at the fork." if every >= Hm else
                 f"Closed-loop rollout: the GROUND-TRUTH observation is re-injected as context every {every} steps "
                 f"(over a {Hm}-step horizon), so error resets each re-grounding instead of compounding.")
-        summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm))
+        lat = latent_pass(Hm) if every >= Hm else None      # open-loop only (see latent_pass)
+        summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm, lat=lat))
 
     if was:
         m.train()

@@ -91,6 +91,40 @@ def image_curves(pred, true):
     return out
 
 
+def latent_curves(z_pred, z_true):
+    """Per-timestep LATENT-space curves -> {latent_motion_ratio, latent_cos}, each a (H,) numpy array.
+    z_pred/z_true: (N, H, n_state, d) — the AR rollout's token bags and the ENCODER's bags for the same frames.
+
+    WHY THESE TWO, AND WHY BOTH (2026-08-24). Every metric we had was either pixel-space (which a mostly-right
+    frame passes) or `motion_ratio`, which the repo documents as direction-blind. Nothing measured the quantity
+    that actually degrades with horizon. Measured on bott_recon1: cos(pred,true) falls 0.98 -> 0.71 -> 0.48 ->
+    0.26 -> 0.14 at h=1/8/16/32/64, i.e. by 64 steps the rolled-out latent is ~orthogonal to the truth.
+
+    latent_motion_ratio is NOT the "magnitude" analogue of the pixel one. With latent_norm=layernorm every bag
+    is renormalized after the residual add (`predict_next`), so all latents sit on a sphere of radius sqrt(d)
+    and the distance between consecutive bags is the CHORD of the angle stepped: ||z_t - z_{t-1}|| =
+    2*sqrt(d)*sin(theta/2). So this ratio measures the per-step ANGULAR STEP SIZE against the true one.
+    1 = rotating the right amount per step, >1 = overshooting (self-inflicted drift), <1 = under-rotating
+    (creeping toward a frozen latent).
+
+    Neither number is sufficient alone, and they disambiguate OPPOSITE fixes:
+      ratio ~1 + cos decaying ~sqrt(h)  -> right step SIZE, random DIRECTION: an unbiased random walk. Points
+                                          at the OBJECTIVE (nothing supervises rollout direction), not capacity.
+      ratio >1 + cos decaying fast      -> overshooting; shrink the residual / take fewer, larger steps.
+      ratio <1 + cos staying high       -> under-rotating; needs MORE motion, the opposite intervention.
+    Reading only one of them cannot tell these apart, which is why both go on the motion_ratio panel."""
+    H = z_pred.shape[1]
+    p_ = z_pred.reshape(z_pred.shape[0], H, -1).float()      # flatten the (n_state,d) bag -> one vector per step
+    t_ = z_true.reshape(z_true.shape[0], H, -1).float()
+    cos = torch.nn.functional.cosine_similarity(p_, t_, dim=-1).mean(0).cpu().numpy()   # (H,)
+    dp = (p_[:, 1:] - p_[:, :-1]).norm(dim=-1)
+    dt_ = (t_[:, 1:] - t_[:, :-1]).norm(dim=-1)
+    ratio = (dp / dt_.clamp_min(1e-12)).mean(0).cpu().numpy()
+    # t=0 has no delta -> repeat t=1, EXACTLY as image_curves does for motion_ratio (same panel, same convention)
+    ratio = np.concatenate([ratio[:1], ratio]) if len(ratio) else np.ones(H)
+    return {"latent_motion_ratio": ratio, "latent_cos": cos}
+
+
 def emit_horizon_readouts(writer, routine, head, icurves, H, step):
     """Quarter-horizon `@+x` scalar readouts of a head's per-step curves (x in {q, 2q, 3q, H}, q=floor(0.25H)):
     one scalar per (stat, x) at `{routine}/{head}/{stat}/@+{x}` so the accuracy decay vs depth is trackable in

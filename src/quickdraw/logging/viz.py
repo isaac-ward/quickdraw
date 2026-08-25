@@ -67,6 +67,17 @@ CAPTIONS = {
         "change vs TRUE.  1 = right amount of motion; <1 = under-predicting motion / drifting toward a frozen "
         "scene; >1 = jitter. Separates 'blurry but moving' from 'sharp but static', which psnr/ssim/lpips all "
         "conflate  ·  BOTTOM panel, dimensionless, ideal = 1",
+    "latent_motion_ratio":
+        "latent_motion_ratio  ·  ‖ẑₜ − ẑₜ₋₁‖ / ‖zₜ − zₜ₋₁‖ over the token bag  ·  per-step ANGULAR step size of "
+        "the rollout vs the truth. With latent_norm=layernorm every bag is renormalized after the residual add, "
+        "so all latents lie on a sphere and this distance is the CHORD of the angle stepped — 1 = rotating the "
+        "right amount per step, >1 = overshooting, <1 = under-rotating toward a frozen latent. Direction-blind "
+        "on its own: read WITH latent_cos  ·  BOTTOM panel, dimensionless, ideal = 1  ·  OPEN-LOOP only",
+    "latent_cos":
+        "latent_cos  ·  cos(ẑₜ, zₜ) over the flattened token bag  ·  how far OFF COURSE the rollout is at "
+        "horizon t. 1 = on the true latent; 0 = orthogonal, which in high dimension means NO directional "
+        "information left. Decay ~√h is the signature of unbiased per-step error compounding as a random walk  ·  "
+        "BOTTOM panel, dimensionless, ideal = 1  ·  OPEN-LOOP only",
     "lpips":
         "lpips  ·  LPIPS = Σ_layers ‖w_l ⊙ (φ_l(x̂) − φ_l(x))‖² over a SqueezeNet feature stack φ  ·  PERCEPTUAL "
         "distance: unlike psnr/ssim/mse/l1 (all pixelwise) it separates a prediction BLURRED toward the dataset "

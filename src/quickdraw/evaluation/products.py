@@ -94,12 +94,17 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
         # [0,1] nor higher-is-better). psnr_frozen used to share the top panel and was removed 2026-08-18 --
         # it was a per-DATASET constant (10.89 dB at 128px, 10.76 at 256px), not a per-run metric.
         log_error_curves(writer, routine, d["icurves"], step, head=head,
-                         split_top={"psnr"}, split_bottom={"lpips", "motion_ratio"},   # both are UNBOUNDED
+                         split_top={"psnr"},
+                         split_bottom={"lpips", "motion_ratio",                # all UNBOUNDED
+                                       "latent_motion_ratio", "latent_cos"},   # latent pair: same panel as
+                         #   motion_ratio because they answer the same question one level down (open-loop only,
                          #   ABOVE, so they must not share the middle panel's [0,1] axis. Briefly moved lpips
                          #   to the middle on 2026-08-18 and REVERTED: the middle panel is bounded, and lpips
                          #   exceeds 1 exactly on the badly-wrong predictions that are the point of looking.
+                         #   so they are simply absent under closed-loop re-grounding).
                          colors={"psnr": "red", "lpips": "purple",
-                                 "motion_ratio": "green"})
+                                 "motion_ratio": "green",
+                                 "latent_motion_ratio": "olive", "latent_cos": "brown"})
     rich = wants_diagnostics(env)
     # Generic (geometry-free) proprio TRAJECTORY plots for a non-torus env — only when position_idx is EXPLICIT
     # (config/env hook, not the [0,1,2] guess) and 3D. torus keeps its richer atlas via log_torus_paths.

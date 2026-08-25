@@ -250,11 +250,23 @@ def main(cfg):
     # decode error). Override with ANY fully-qualified logged metric via trainer.checkpoint_monitor — e.g.
     # "val/loss/physics/proprio" for a physics-prior WM, where pointwise_error is a black-box red herring.
     # BestCkptMirror prints the resolved rule to progress.log at fit start so the standard is never ambiguous.
-    ckpt_monitor = cfg.trainer.get("checkpoint_monitor", None) \
-        or f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}"
+    # AUTO monitor: prefer the IMAGE metric when the model has an image modality. The old fallback was always
+    # the env's proprio metric, which on an image run picks best.ckpt blind to every image result (measured:
+    # bott_bott16 pinned best.ckpt to e8 while its floor peaked e14 and its perceptual distance e18). mse and
+    # NOT psnr because psnr = -10*log10(mse) -> minimising mse IS maximising psnr, while staying a min-metric.
+    _img = next((m for m in cfg.model.get("modalities", []) or [] if str(m.get("kind", "")) == "image"), None)
+    ckpt_monitor = cfg.trainer.get("checkpoint_monitor", None) or (
+        f"val/metric/{_img.get('name', 'image')}/mse" if _img is not None
+        else f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}")
+    # AUTO direction from the metric NAME. mode used to be hardcoded "min", so aiming checkpoint_monitor at a
+    # higher-is-better metric silently selected the WORST epoch. Override with trainer.checkpoint_mode.
+    _hi = ("psnr", "ssim", "acc", "accuracy", "reward", "r2", "return")
+    ckpt_mode = str(cfg.trainer.get("checkpoint_mode", None)
+                    or ("max" if ckpt_monitor.rsplit("/", 1)[-1].lower() in _hi else "min"))
+    assert ckpt_mode in ("min", "max"), f"trainer.checkpoint_mode must be min|max, got {ckpt_mode!r}"
     ckpt_cb = ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
                               monitor=ckpt_monitor,
-                              mode="min", save_top_k=cfg.trainer.save_top_k, save_last=False)
+                              mode=ckpt_mode, save_top_k=cfg.trainer.save_top_k, save_last=False)
     # save_last on the monitored callback only writes last.ckpt when Lightning ALSO saves a top-k file, so
     # once the monitored metric stops improving the newest weights stop being written — a collapsed run then
     # leaves NOTHING from after the collapse and the failure cannot be inspected (observed 2026-08-09: a run

@@ -78,7 +78,10 @@ res = {}
 def _ln(x):
     return torch.nn.functional.layer_norm(x, (x.shape[-1],))
 
-drift = {h: {"norm_ratio": [], "cos_true": [], "cos_frozen": [], "var_ratio": []} for h in HZ}
+# cos_frozen_true is THE baseline this probe was missing on its first run: how well a DO-NOTHING predictor
+# (emit the context latent forever) scores against the true latent. Without it, cos(pred,true)=0.138 at h=64
+# cannot be read -- it is only a failure if frozen does BETTER, and only a success if frozen does worse.
+drift = {h: {"norm_ratio": [], "cos_true": [], "cos_frozen": [], "cos_frozen_true": [], "var_ratio": []} for h in HZ}
 with torch.no_grad():
     for (ei, t0) in picks:
         o, a, im = eps_ds[ei]
@@ -103,16 +106,20 @@ with torch.no_grad():
                 drift[hstep]["norm_ratio"].append(float(p.norm() / tr.norm()))
                 drift[hstep]["cos_true"].append(float(torch.nn.functional.cosine_similarity(fl(p), fl(tr), 0)))
                 drift[hstep]["cos_frozen"].append(float(torch.nn.functional.cosine_similarity(fl(p), fl(z_ctx), 0)))
+                drift[hstep]["cos_frozen_true"].append(                       # DO-NOTHING baseline
+                    float(torch.nn.functional.cosine_similarity(fl(z_ctx), fl(tr), 0)))
                 drift[hstep]["var_ratio"].append(float(p.var() / tr.var()))
 print("\n=== TEST 1: LATENT DRIFT vs the encoder's own latents ===")
-print(f"{'h':>5}{'|pred|/|true|':>15}{'cos(pred,true)':>16}{'cos(pred,z_ctx)':>17}{'var ratio':>11}")
+print(f"{'h':>5}{'cos(pred,true)':>16}{'cos(FROZEN,true)':>18}{'gain':>8}"
+      f"{'cos(pred,z_ctx)':>17}{'|p|/|t|':>9}{'var':>7}")
 for h in HZ:
     d = drift[h]
     if not d["cos_true"]:
         continue
     res[f"drift_h{h}"] = {k: float(np.mean(v)) for k, v in d.items()}
-    print(f"{h:>5}{np.mean(d['norm_ratio']):>15.4f}{np.mean(d['cos_true']):>16.4f}"
-          f"{np.mean(d['cos_frozen']):>17.4f}{np.mean(d['var_ratio']):>11.4f}")
+    ct, cf = np.mean(d["cos_true"]), np.mean(d["cos_frozen_true"])
+    print(f"{h:>5}{ct:>16.4f}{cf:>18.4f}{ct - cf:>+8.4f}"
+          f"{np.mean(d['cos_frozen']):>17.4f}{np.mean(d['norm_ratio']):>9.4f}{np.mean(d['var_ratio']):>7.4f}")
 
 # ---------------- TEST 2: sampling_steps sweep ----------------
 lp = _lpips_net(dev)
@@ -151,6 +158,47 @@ for K in sweep:
     l = sweep[K]["lpips"]
     print(f"{K:>4}       " + "".join(f"{l.get(h, float('nan')):>9.4f}" for h in HZ))
 m.sampling_steps = K_ORIG
+
+# ---------------- TEST 3: does the rollout beat DO-NOTHING in PIXEL space? ----------------
+# TEST 1 says the learned dynamics is WORSE than the identity map in latent cosine at every horizon. The
+# pixel metrics have always been read as if the rollout adds value. Only one of those can be right, so
+# measure the do-nothing baseline through the SAME decode path: freeze the context latent and decode it at
+# every horizon (through the codec, so this is the model's own ceiling on "predict no change"), plus the
+# raw copy-the-last-frame baseline which needs no model at all.
+print("\n=== TEST 3: rollout vs DO-NOTHING, in pixel space ===")
+frz_p, frz_l, cpy_p, cpy_l, mdl_p, mdl_l = ({h: [] for h in HZ} for _ in range(6))
+m.sampling_steps = K_ORIG
+with torch.no_grad():
+    for (ei, t0) in picks:
+        o, a, im = eps_ds[ei]
+        ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[t0 - P + 1:t0 + 1])).float()[None].to(dev),
+               img_head: torch.from_numpy(im[t0 - P + 1:t0 + 1]).float().div(255.0)[None].to(dev)}
+        acts = norm.norm_act(torch.from_numpy(a[t0 - P + 1:t0 + HMAX])).float()[None].to(dev)
+        out = m.imagine_eval(ctx, acts, HMAX, heads=[img_head], decode_chunk=16)[img_head][0].clamp(0, 1)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            zc = m.encode_state(ctx)[:, -1:]                       # the frozen context bag
+            frz = m.to_obs(zc[:, :, None][:, 0], heads=[img_head])[img_head][0, 0].clamp(0, 1).float()
+        last = torch.from_numpy(im[t0].astype(np.float32) / 255.0).to(dev)
+        for h in HZ:
+            if t0 + h >= len(im):
+                continue
+            gt = torch.from_numpy(im[t0 + h].astype(np.float32) / 255.0).to(dev)
+            for tag, pr, dp, dl in (("m", out[h - 1], mdl_p, mdl_l), ("f", frz, frz_p, frz_l), ("c", last, cpy_p, cpy_l)):
+                dp[h].append(float(10 * torch.log10(1.0 / torch.clamp(((pr - gt) ** 2).mean(), min=1e-10))))
+                if lp is not None:
+                    dl[h].append(float(lp(pr.permute(2, 0, 1)[None].float(), gt.permute(2, 0, 1)[None].float())))
+hdr2 = "".join(f"{'h'+str(h):>9}" for h in HZ)
+print(f"{'':>22}{hdr2}")
+for nm, d in (("rollout   PSNR", mdl_p), ("frozen-latent PSNR", frz_p), ("copy-frame  PSNR", cpy_p)):
+    print(f"{nm:>22}" + "".join(f"{np.mean(d[h]):>9.2f}" if d[h] else f"{'-':>9}" for h in HZ))
+for nm, d in (("rollout  LPIPS", mdl_l), ("frozen-latent LPIPS", frz_l), ("copy-frame  LPIPS", cpy_l)):
+    print(f"{nm:>22}" + "".join(f"{np.mean(d[h]):>9.4f}" if d[h] else f"{'-':>9}" for h in HZ))
+res["pixel_baselines"] = {"rollout_psnr": {str(h): float(np.mean(v)) for h, v in mdl_p.items() if v},
+                          "frozen_psnr": {str(h): float(np.mean(v)) for h, v in frz_p.items() if v},
+                          "copy_psnr": {str(h): float(np.mean(v)) for h, v in cpy_p.items() if v},
+                          "rollout_lpips": {str(h): float(np.mean(v)) for h, v in mdl_l.items() if v},
+                          "frozen_lpips": {str(h): float(np.mean(v)) for h, v in frz_l.items() if v},
+                          "copy_lpips": {str(h): float(np.mean(v)) for h, v in cpy_l.items() if v}}
 res["sampling_sweep"] = {str(k): v for k, v in sweep.items()}
 res["default_K"] = K_ORIG
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
