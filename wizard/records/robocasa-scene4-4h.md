@@ -1028,7 +1028,7 @@ in the same wall-clock. Every result in this record came from the second mode, a
 on this project is that effects are small against the ±0.8 dB noise floor — we need *more arms*, not
 faster arms. DDP becomes right when one config stops fitting (a much bigger decoder, 256px, F ≫ 64).
 
-## 18. THE DYNAMICS LOSS NEVER FOLLOWED p_tf — found, fixed, and the fix is LOSING (08-24/25)
+## 18. THE DYNAMICS LOSS NEVER FOLLOWED p_tf — found, fixed, and the fix COLLAPSES (08-24/25)
 
 ### The defect
 
@@ -1073,7 +1073,42 @@ inverted detach justification, a smoke caller passing a full-L tensor).
 **THE MECHANISM FIRES.** `latent_cos@+32` 0.542 vs 0.256 (**2.1x**), `@+64` 0.221 vs 0.159 (**1.4x**), pixel
 `motion_ratio` 0.654 vs 0.341 (**1.9x**). The pre-registered falsification condition is cleared.
 
-**AND IT IS LOSING ON THE OUTCOME.** OL LPIPS is worse AND DIVERGING while the control improves:
+**AND THEN IT DESTROYS ITSELF.** The arm collapsed between e5 and e6 -- not a quality tradeoff, a
+TRAINING-STABILITY FAILURE:
+
+| | e5 (its best) | e6 | e7 |
+|---|---|---|---|
+| `grad/norm_preclip` | 0.709 @e3 | — | **1.84e+07** |
+| ae_floor psnr_mean | 19.1 | **11.4** | — |
+| OL LPIPS@+64 | 0.514 | 0.748 | 0.744 |
+| **latent_cos@+64** | **0.263** | **-0.055** | **-0.112** |
+
+Gradient norm to **18 million**, with num_nans/num_infs both 0 -- the clip at 1.0 laundering the blow-up,
+exactly as §17 documented for `bott16`. And `latent_cos` went NEGATIVE: the predicted latent points AWAY
+from the truth, worse than random. The control at e7 is untouched (grad 0.464, floor 19.4, train_loss 0.307
+vs 9.12, and OL LPIPS@+64 improving monotonically 0.676 -> 0.381 across e0-e6).
+
+**Up to e5 the fix worked**: latent_cos@+64 0.263 vs the control's 0.146, a 1.8x improvement. Then it went.
+
+This is the exact risk `design/flow.md` flagged in its own Decisions section -- "the target stops being a
+fixed function of the data (it moves with the model)" -- where I claimed p_tf's warmup would mitigate it.
+It did not: warmup is ONE epoch and the collapse came at six.
+
+**SO DROPPING THE `frac` MIXING KNOB WAS A MISTAKE.** It was removed on the argument that it was "redundant
+with p_tf". That was right about the SCHEDULE and wrong about the STRENGTH: p_tf controls WHEN you switch to
+hard mode, not HOW MUCH of the context is the model's own. Substituting all F-1 positions is too strong, and
+the evidence now converges from two directions:
+
+| context corruption | motion | OL LPIPS@+64 | stable? |
+|---|---|---|---|
+| none (control) | 0.333 | 0.450 | yes |
+| **DF, isotropic lambda=0.1** | 0.362 | **0.419** | yes |
+| **feeds, FULL strength** | 0.672 | 0.514 then collapse | **NO** |
+
+A dose-response curve whose optimum is well below full strength. The corruption FAMILY works; this dose does
+not. Next: a mixing FRACTION (a strength knob, not a schedule), DF and the fix together, or simply rerun DF.
+
+Earlier reading at e2-e3, kept because it was the first signal and it pointed the right way:
 
 | e2 -> e3 | OL LPIPS@+64 | OL LPIPS@+128 | OL PSNR@+64 |
 |---|---|---|---|
