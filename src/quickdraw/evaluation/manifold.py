@@ -154,8 +154,8 @@ def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device)
         # applied inside to_obs/decode). Without this the recovered-manifold cloud and its UMAP/TSNE
         # projections are silently nonsense in absolute mode.
         def _commit(x):
-            nb = (zt_pro + x) if getattr(m, "predict_residual", True) else x
-            return _ln(nb) if getattr(m, "latent_norm", False) else nb
+            nb = (zt_pro + x) if m.predict_residual else x
+            return _ln(nb) if m.latent_norm else nb
         decs = np.stack([norm.denorm_obs(dec.decode(_commit(x)[:, None, :].float())).float().cpu().numpy()
                          for x in path])                           # (K+1, nt, 6): decoded proprio along the ODE
         paths_phys.extend(np.transpose(decs, (1, 0, 2)))              # list of (K+1, obs_dim)

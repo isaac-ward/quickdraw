@@ -207,6 +207,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
             for h in heads:
                 segs[h].append(o_c[h])
             if want_bag and "_bag" in o_c:
+                # Rows are ordered (episode, segment). This plain cat is only correct while n_seg == 1, which
+                # `want_bag = open_loop` guarantees (open loop IS the single-segment mode). Asserted rather
+                # than assumed: with n_seg > 1 the bag would need the same reshape/slice `out[h]` gets below.
+                assert n_seg == 1, "latent curves assume the single-segment (open-loop) rollout"
                 bag_out = o_c["_bag"] if bag_out is None else torch.cat([bag_out, o_c["_bag"]], 0)
         out = {}
         for h in heads:
@@ -228,7 +232,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         drift curve would not mean what it says. Guarded: an add-on diagnostic must never be able to disable
         the whole ood_horizon routine (2 consecutive failures do that)."""
         try:
-            if bag is None:
+            if bag is None:      # LOUD: latent_cos is the primary metric for the dfptf experiments, and a
+                #                  silent {} here would make it vanish from the panel with no explanation.
+                _plog(writer, f"[eval_ood_horizon @ep{step}] latent curves SKIPPED: imagine_eval returned no "
+                              f"`_bag` (return_bag path). The decoded-image products are unaffected.")
                 return {}
             gt = {"proprio": norm.norm_obs(p_true[:, :Hm])}
             for h in img_heads:
@@ -517,8 +524,8 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
         #   * LN only when latent_norm is on. It used to LN unconditionally, which is ALREADY wrong for
         #     latent_norm=affine runs even in residual mode -- affine's inverse is applied inside
         #     to_obs/decode, so pre-LN'ing here double-normalises.
-        nb = (z_t + x) if getattr(m, "predict_residual", True) else x
-        if getattr(m, "latent_norm", False):
+        nb = (z_t + x) if m.predict_residual else x
+        if m.latent_norm:
             nb = _ln(nb)
         return norm.denorm_obs(dec.decode(nb[:, None, :].float()))[..., pos]
 

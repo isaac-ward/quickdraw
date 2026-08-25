@@ -306,8 +306,12 @@ class LitWorldModel(L.LightningModule):
         else:
             self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val,
                                 gradient_clip_algorithm=gradient_clip_algorithm)
-        self.log("grad/norm_preclip", pre)
-        self.log("grad/norm_postclip", _total_norm())
+        # reduce_fx="max", matching clip_ratio/num_nans/num_infs below. The DEFAULT mean diluted a single
+        # catastrophic step across ~1300 batches: the dfptf collapse logged an epoch-mean norm_preclip of
+        # 1.8e7 while the per-module grad/norm/* maxes were 1.3e7 -- so the headline number was BOTH late and
+        # smoothed, and could not be compared against its own per-module breakdown. A blow-up is a max event.
+        self.log("grad/norm_preclip", pre, reduce_fx="max")
+        self.log("grad/norm_postclip", _total_norm(), reduce_fx="max")
         # grad/clip_ratio = preclip / clip_val. ONE number: 1 means clipping never engaged, >>1 means the
         # gradient is being LAUNDERED -- clipping throws away the magnitude but keeps the DIRECTION, so the
         # optimizer takes a full-size confident step along whatever exploded. That degrades smoothly instead of
