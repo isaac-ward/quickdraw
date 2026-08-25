@@ -124,13 +124,19 @@ class LitWorldModel(L.LightningModule):
             if noisy:
                 print(f"[encode-share] input noise on {noisy} -> shared-encode fast path OFF; frames are "
                       f"re-encoded per loss site (slower). Set modalities.<i>.noise_std=0 to enable it.", flush=True)
+        # `feeds` = what each rollout step STOOD ON (the p_tf mix), requested only when the model's dynamics
+        # loss consumes it. At p_tf>=1 there is NO rollout, so feeds stays None -- and that IS the correct
+        # teacher-forced semantics for the dynamics loss, so no special-case gate is needed. design/flow.md.
+        feeds = None
+        want_feeds = bool(getattr(m, "dynamics_follows_p_tf", False))
         if p_tf >= 1.0:                                        # parallel teacher forcing
             preds = m({k: v[:, :-1] for k, v in obs_in.items()}, act[:, :-1], anchor)[:, P - 1:]
         else:                                                 # autoregressive rollout (TF source = noised input)
             ctx = {k: v[:, :P] for k, v in obs_in.items()}
-            preds = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf,
-                                    self.detach_every, precomputed_ctx=(z_full[:, :P] if share else None),
-                                    anchor=anchor)
+            out = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf,
+                                  self.detach_every, precomputed_ctx=(z_full[:, :P] if share else None),
+                                  anchor=anchor, return_feeds=want_feeds)
+            preds, feeds = out if want_feeds else (out, None)
         future = {k: v[:, P:] for k, v in obs.items()}         # CLEAN targets
         # EMA/JEPA heads: obs recon is a decoder-only probe (detach preds so it doesn't shape the encoder).
         recon_src = preds if getattr(m, "pred_obs_in_loss", True) else preds.detach()
@@ -163,6 +169,8 @@ class LitWorldModel(L.LightningModule):
         # to_obs would SAMPLE the ViT decoder every step (with grad) for nothing -> huge wasted memory (OOM). The
         # decoded sample is only needed for val metrics; computed there under no_grad.
         lt_kw = {"anchor": anchor} if anchor is not None else {}   # only reaches the flow loss_terms; non-flow untouched
+        if feeds is not None:
+            lt_kw["feeds"] = feeds                            # same optional-kwarg pattern as `anchor` above
         raw, w = (m.loss_terms(preds, future, obs, p_tf, act, pre_z=z_full, **lt_kw) if share
                   else m.loss_terms(preds, future, obs, p_tf, act, **lt_kw))   # pre_z: shared-encode fast path (flow only)
         if getattr(m, "dynamics_prior", None) is not None and not _uni:   # LEGACY physics/proprio (prior=none)

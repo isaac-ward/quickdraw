@@ -118,6 +118,23 @@ p_tf_batch_granular: false  # LOCKED false (2026-08-07). true = smooth p_tf ramp
 #                            a big dataset crawled (owm-iss: >5.6h and not even 25% vs ~30min at p_tf=1). Per-epoch
 #                            keeps warmup epochs at p_tf=1.0 (fast parallel), then hard-switches to p_tf=0.0
 #                            (compiled) — the hard 1->0 jump is a feature, not a bug, given the regime cost.
+dynamics_follows_p_tf: true   # Does the p_tf teacher-forcing schedule REACH the dynamics loss?
+#                               FALSE was the historical behaviour and it was a DEFECT: loss_terms received
+#                               the rollout (`pred_bag`) and never referenced it, computing dynamics/latent
+#                               on CLEAN encoder latents regardless of p_tf. So p_tf ramped 1->0, the DECODE
+#                               loss duly became autoregressive, and the transition function stayed
+#                               teacher-forced for the entire run -- it was never once asked to take a step
+#                               from a latent it produced itself. Measured consequence: the rolled-out latent
+#                               rotates ~82 degrees off course by h=64 (cos 0.98 -> 0.14) while UNDER-rotating
+#                               (latent_motion_ratio 0.95 -> 0.56), and flow refinement stops contributing
+#                               entirely at h=64.
+#                               TRUE conditions the loss on the rollout's own FEEDS -- what each step actually
+#                               STOOD ON -- so ONE schedule governs both losses. No new schedule, no new loss
+#                               term, no new weight; p_tf itself is untouched. At p_tf>=1 no rollout runs, so
+#                               there are no feeds and the context is clean, which IS correct teacher forcing.
+#                               Set FALSE to reproduce any run before 2026-08-25, or for the IWS ablation
+#                               quadrant (false + dynamics_detach_encoder: true). Full rationale, the per-class
+#                               2x2, and three audits: design/flow.md.
 dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding the DYNAMICS (dynamics/latent) loss:
 #                           the dynamics gradient can't reshape the encoder (trained then only by decode/recon).
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.

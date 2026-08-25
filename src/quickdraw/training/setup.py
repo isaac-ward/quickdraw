@@ -241,6 +241,20 @@ def build_model(cfg):
         if df_scale > 0.0 and name not in ("mm_flow", "flow"):
             raise ValueError(f"variations.noise_injection.observations_encoded_pre_fusion (diffusion forcing) "
                              f"requires a flow model (model.name in mm_flow/flow); got {name!r}.")
+        # dynamics_follows_p_tf: meaningful only where the dynamics loss CONDITIONS ON a context it can swap.
+        # RAISE rather than silently ignore -- a user who sets this believes they changed the training regime
+        # (same rule as the fail-fast block just below). See design/flow.md.
+        _dfp = m.get("dynamics_follows_p_tf", None)
+        if _dfp is not None:
+            if name in ("mm_dsar", "dsar", "base"):
+                raise ValueError("model.dynamics_follows_p_tf has no meaning for mm_dsar: it has no dynamics "
+                                 "loss at all (loss_terms returns {}). Remove the key.")
+            if name in ("mm_lsar", "lsar") and not bool(_dfp):
+                raise ValueError("model.dynamics_follows_p_tf=false is not implementable for mm_lsar: its "
+                                 "dynamics loss scores the ROLLOUT'S OUTPUT against the encoded true future, "
+                                 "so there is no context to pin to clean latents -- 'false' would compare "
+                                 "encode(fut) against itself (identically zero). mm_lsar always follows p_tf "
+                                 "by construction; remove the key.")
         # Fail fast on config knobs that only one model reads (otherwise silently ignored).
         if cfg.get("collapse", None) is not None and name not in ("mm_lsar", "lsar"):
             raise ValueError(f"model.collapse=... (a collapse-prevention strategy) is only used by the LSAR model "
@@ -322,7 +336,10 @@ def build_model(cfg):
                                        action_head_weight=float(ahg("weight", 1.0)),
                                        action_head_shortcut=bool(ahg("shortcut", True)),
                                        action_head_detach_gradient=bool(ahg("detach_gradient", False)),
-                                       dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)))
+                                       dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)),
+                                       # default FALSE here (not the yaml's true): an old config adopted by
+                                       # run_standalone must rebuild the behaviour it TRAINED under.
+                                       dynamics_follows_p_tf=bool(m.get("dynamics_follows_p_tf", False)))
         raise ValueError(f"unknown model.name: {name!r}")
 
 
@@ -438,7 +455,11 @@ def autobatch_find(cfg, device, log=print) -> int:
         act = torch.randn(B, L, adim, device=device)   # act_seq is length L (P+F): _par_preds does act[:, :-1] -> L-1
         return obs, act                                 #   (aligns with obs[:, :-1]); _seq_preds does act[:, :L-1]
 
-    def _loss_from_preds(preds, obs, act):
+    def _loss_from_preds(preds_and_feeds, obs, act):
+        # (preds, feeds) pair, NEVER a side-channel: probe() runs _seq_preds AND _par_preds, and a stashed
+        # `feeds` from the first would be backwarded through a graph the first backward already freed
+        # ("Trying to backward through the graph a second time"). Caught in smoke, 2026-08-25.
+        preds, feeds = preds_and_feeds
         # recon_losses (recon_frac subset, all-head decode) + loss_terms (flow) — the memory-relevant loss graph,
         # SHARED by the sequential (p_tf=0 rollout) and parallel (p_tf=1) probes. Mirrors LitWorldModel._step.
         future = {k: v[:, P:] for k, v in obs.items()}
@@ -450,7 +471,7 @@ def autobatch_find(cfg, device, log=print) -> int:
         else:
             src, futr = recon_src, future
         recon, rw = model.recon_losses(src, futr)
-        raw, w = model.loss_terms(preds, future, obs, 0.0, act)
+        raw, w = model.loss_terms(preds, future, obs, 0.0, act, **({"feeds": feeds} if feeds is not None else {}))
         return sum(w[k] * raw[k] for k in raw) + sum(rw[k] * recon[k] for k in recon)
 
     def _seq_preds(obs, act):   # p_tf=0 AUTOREGRESSIVE rollout (the in-rollout epochs, i.e. most of training)
@@ -461,12 +482,18 @@ def autobatch_find(cfg, device, log=print) -> int:
         # frozen-AE config it threw away a THIRD of the card. Guarded exactly as lit.py guards it.
         share = hasattr(model, "flow") and all(model.modalities[k].noise_std == 0 for k in obs)
         z_full = model.encode_state(obs) if share else None
-        return model.rollout_train({k: v[:, :P] for k, v in obs.items()}, act[:, : L - 1],
-                                   {k: v[:, P:] for k, v in obs.items()}, 0.0, de,
-                                   precomputed_ctx=(z_full[:, :P] if share else None))
+        # return_feeds when the model's dynamics loss consumes them, so the probe keeps MIRRORING _step:
+        # with dynamics_follows_p_tf on, the real step's loss graph includes the feeds-conditioned context.
+        # Probe-vs-real drift is exactly how this finder previously picked batches that OOM'd.
+        wf = bool(getattr(model, "dynamics_follows_p_tf", False))
+        out = model.rollout_train({k: v[:, :P] for k, v in obs.items()}, act[:, : L - 1],
+                                  {k: v[:, P:] for k, v in obs.items()}, 0.0, de,
+                                  precomputed_ctx=(z_full[:, :P] if share else None), return_feeds=wf)
+        return out if wf else (out, None)     # ALWAYS a (preds, feeds) pair -- see _loss_from_preds
 
     def _par_preds(obs, act):   # p_tf=1 PARALLEL forward (epoch-0 regime: whole sequence in ONE pass — often the
-        return model({k: v[:, :-1] for k, v in obs.items()}, act[:, :-1])[:, P - 1:]   # TRUE memory peak)
+        #                         TRUE memory peak). feeds=None: no rollout ran, so there is nothing to condition on.
+        return model({k: v[:, :-1] for k, v in obs.items()}, act[:, :-1])[:, P - 1:], None
 
     def _probe_path(obs, act, preds_fn):   # 2 iters (so Adam states allocate) of fwd-loss + bwd + step -> peak bytes
         torch.cuda.synchronize(device); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
@@ -477,7 +504,7 @@ def autobatch_find(cfg, device, log=print) -> int:
                 except Exception as e:                                     # value-sensitive path choked on synth data
                     if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower():
                         raise
-                    loss = preds_fn(obs, act).float().pow(2).mean()        # fall back to a pred-only estimate
+                    loss = preds_fn(obs, act)[0].float().pow(2).mean()     # fall back to a pred-only estimate
             loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
         # RESERVED, not allocated (2026-08-18). The allocator's reserved pool is what actually OOMs -- the gap is
         # fragmentation, and budgeting on `allocated` made that gap invisible and left it to be absorbed by a
