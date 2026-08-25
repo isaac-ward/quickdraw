@@ -128,6 +128,9 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
     return n_ep, H, cl_h, modes, calls
 
 
+@torch.no_grad()          # every sibling eval routine has this; ood_horizon did not, so its latent pass was
+#                           building a full autograd tape over a 128-step rollout every eval epoch and
+#                           discarding it. imagine_eval was already guarded internally; latent_pass was not.
 def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     """The ONE long-horizon eval for every model (OOD: horizon >> trained). Held-out val episodes, decoding
     proprio (always) + any image head; the code generalizes over arbitrary trunks. Products are nested under
@@ -170,7 +173,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     itrue = {h: torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
              for h in img_heads}
 
-    def rollout_regrounded(every, Hm):
+    def rollout_regrounded(every, Hm, want_bag=False):
         """Hm-step predicted obs (dict per head, (n_ep,Hm,...)), re-grounding on GT every `every` steps. Segment
         the horizon into ceil(Hm/every) chunks; segment s uses GT context obs[s*every:s*every+P] and actions
         a[s*every:s*every+P+every-1], rolls `every` steps via imagine_eval, keeps min(every, Hm-s*every), then
@@ -196,41 +199,45 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         acts = torch.stack(A).float().to(device)                           # (n_ep*n_seg, P+every-1, act_dim)
         rows = n_ep * n_seg
         cap = max(n_ep, 64)                                                 # per-call batch cap (open_loop: rows=n_ep -> ONE call)
-        segs = {h: [] for h in heads}
+        segs, bag_out = {h: [] for h in heads}, None
         for r0 in range(0, rows, cap):
             sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
-            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc, norm=norm)
+            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc, norm=norm,
+                                 return_bag=want_bag)
             for h in heads:
                 segs[h].append(o_c[h])
+            if want_bag and "_bag" in o_c:
+                bag_out = o_c["_bag"] if bag_out is None else torch.cat([bag_out, o_c["_bag"]], 0)
         out = {}
         for h in heads:
             v = torch.cat(segs[h], 0)                                       # (n_ep*n_seg, every, ...)
             v = v.reshape(n_ep, n_seg, *v.shape[1:])
             out[h] = torch.cat([v[:, s, :min(every, Hm - s * every)] for s in range(n_seg)], dim=1)  # (n_ep,Hm,...)
-        return out
+        return (out, bag_out) if want_bag else out
 
-    def latent_pass(Hm):
-        """LATENT-space curves for the OPEN-LOOP mode: roll the bag forward with the SAME _rollout the eval
-        decode path uses (so no reimplementation can drift from it), encode the GT future once, and compare.
-        Open-loop only — under re-grounding the latent is reset every `every` steps, so a horizon-indexed
-        drift curve would not mean what it says. Guarded: this is an add-on diagnostic and must never be able
-        to disable the whole ood_horizon routine (2 consecutive failures do that)."""
+    def latent_pass(Hm, bag):
+        """LATENT-space curves for the OPEN-LOOP mode, computed from THE ROLLOUT THAT WAS ALREADY RUN.
+
+        It used to roll a second time. That was wrong twice over: it doubled the rollout cost, and with
+        `stochastic_eval: true` (the default) the second rollout draws different eps -- so `latent_cos`
+        described a DIFFERENT sample than the psnr/lpips curves it is plotted beside, and pairing them
+        compared two draws. Now the bag comes back from the same `imagine_eval` call that produced the
+        images (`return_bag`), so every curve on the panel describes one trajectory.
+
+        Open-loop only -- under re-grounding the latent is reset every `every` steps, so a horizon-indexed
+        drift curve would not mean what it says. Guarded: an add-on diagnostic must never be able to disable
+        the whole ood_horizon routine (2 consecutive failures do that)."""
         try:
-            ctx_l = {"proprio": pro0}
-            for h in img_heads:
-                ctx_l[h] = torch.stack([torch.from_numpy(im[:P]) for _, _, im in eps]).float().div(255.0).to(device)
-            idx = _np.clip(_np.arange(0, P + Hm - 1), 0, min(len(a) for _, a, _ in eps) - 1)   # same convention as rollout_regrounded
-            acts_l = torch.stack([norm.norm_act(torch.from_numpy(a[idx])) for _, a, _ in eps]).float().to(device)
-            anc = m.rel_anchor(ctx_l) if getattr(m, "_rel_on", lambda: False)() else None
+            if bag is None:
+                return {}
             gt = {"proprio": norm.norm_obs(p_true[:, :Hm])}
             for h in img_heads:
                 gt[h] = itrue[h][:, :Hm]
+            anc = m.rel_anchor({"proprio": pro0}) if getattr(m, "_rel_on", lambda: False)() else None
             with torch.autocast(device_type=(device if isinstance(device, str) else device.type),
                                 dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
-                bag = m._rollout(ctx_l, acts_l, Hm, 0.0, None, 0, use_cache=getattr(m, "use_kv_cache", False),
-                                 anchor=anc)
                 z_gt = m.encode_state(gt, anc)
-            return latent_curves(bag.float(), z_gt.float())
+            return latent_curves(bag[:, :Hm].float(), z_gt.float())
         except Exception as e:                       # fail-soft but NOT silent (design/logging.md)
             _plog(writer, f"[eval_ood_horizon @ep{step}] latent curves SKIPPED ({type(e).__name__}: {e}) — "
                           f"the decoded-image products are unaffected")
@@ -273,12 +280,14 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     for k, (name, every, Hm) in enumerate(modes):
         prog(int(5 + 90 * k / len(modes)), f"mode {name} (re-ground every {every} steps, H={Hm})"
              if every < Hm else f"mode {name} (open-loop, no re-grounding, H={Hm})")
-        out = rollout_regrounded(every, Hm)
+        open_loop = every >= Hm
+        out = rollout_regrounded(every, Hm, want_bag=open_loop)
+        out, bag = out if open_loop else (out, None)
         desc = (f"Open-loop long-horizon rollout: a BLACK agent on the TRUE path and a GREY agent on the model's "
                 f"PREDICTED path, sharing the context then diverging at the fork." if every >= Hm else
                 f"Closed-loop rollout: the GROUND-TRUTH observation is re-injected as context every {every} steps "
                 f"(over a {Hm}-step horizon), so error resets each re-grounding instead of compounding.")
-        lat = latent_pass(Hm) if every >= Hm else None      # open-loop only (see latent_pass)
+        lat = latent_pass(Hm, bag) if open_loop else None      # open-loop only (see latent_pass)
         summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm, lat=lat))
 
     if was:

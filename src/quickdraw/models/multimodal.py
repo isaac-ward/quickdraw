@@ -730,12 +730,14 @@ class MultiModalSequenceModel(nn.Module):
         return out
 
     def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None,
-                     use_cache: bool | None = None, decode_chunk: int | None = None, norm=None) -> dict[str, Tensor]:
+                     use_cache: bool | None = None, decode_chunk: int | None = None, norm=None,
+                     return_bag: bool = False) -> dict[str, Tensor]:
         """Eval/single-sequence rollout = `_imagine` with K=1. `heads` limits which modalities decode (e.g.
         ['proprio'] for cheap long-horizon rollouts). `decode_chunk` bounds the image decoder's peak memory over
         long horizons. `norm` activates the physics-anchored proprio rollout (owm)."""
         return self._imagine(ctx_obs, actions, horizon, K=1, heads=heads,
-                             use_cache=use_cache, decode_chunk=decode_chunk, norm=norm)
+                             use_cache=use_cache, decode_chunk=decode_chunk, norm=norm,
+                             return_bag=return_bag)     # `_bag` = the rolled latents, for latent-space curves
 
     def imagine_shared(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int, heads=None,
                        return_bag: bool = False, norm=None) -> dict[str, Tensor]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import lightning as L
 import torch
+from torch.profiler import record_function   # NO-OP outside a profiler context; see design/decode_memory.md
 
 from ..environments.base import default_rollout_metrics
 from .schedules import linear_schedule
@@ -117,7 +118,8 @@ class LitWorldModel(L.LightningModule):
         # so z_full[:, sl] == encode(obs[:, sl]) exactly. noise_std>0 -> inputs differ from targets -> OFF.
         share = (p_tf == 0.0) and hasattr(m, "flow") and \
             (tag != "train" or all(m.modalities[k].noise_std == 0 for k in obs))
-        z_full = m.encode_state(obs_in, anchor) if share else None
+        with record_function("qd/shared_encode"):
+            z_full = m.encode_state(obs_in, anchor) if share else None
         if tag == "train" and not getattr(self, "_noise_share_noted", False):
             self._noise_share_noted = True
             noisy = [k for k in obs if m.modalities[k].noise_std > 0]
@@ -129,13 +131,19 @@ class LitWorldModel(L.LightningModule):
         # teacher-forced semantics for the dynamics loss, so no special-case gate is needed. design/flow.md.
         feeds = None
         want_feeds = bool(getattr(m, "dynamics_follows_p_tf", False))
+        # PHASE MARKERS (record_function is a no-op unless a torch.profiler is active). Added 2026-08-25:
+        # NOTHING in this repo had ever measured the training step's phase breakdown -- every "X is N% of the
+        # step" number, in design docs and audits alike, was inferred from epoch totals. These make one
+        # profiler run settle it. See design/decode_memory.md open question 1.
         if p_tf >= 1.0:                                        # parallel teacher forcing
-            preds = m({k: v[:, :-1] for k, v in obs_in.items()}, act[:, :-1], anchor)[:, P - 1:]
+            with record_function("qd/parallel_forward"):
+                preds = m({k: v[:, :-1] for k, v in obs_in.items()}, act[:, :-1], anchor)[:, P - 1:]
         else:                                                 # autoregressive rollout (TF source = noised input)
             ctx = {k: v[:, :P] for k, v in obs_in.items()}
-            out = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf,
-                                  self.detach_every, precomputed_ctx=(z_full[:, :P] if share else None),
-                                  anchor=anchor, return_feeds=want_feeds)
+            with record_function("qd/ar_rollout"):
+                out = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf,
+                                      self.detach_every, precomputed_ctx=(z_full[:, :P] if share else None),
+                                      anchor=anchor, return_feeds=want_feeds)
             preds, feeds = out if want_feeds else (out, None)
         future = {k: v[:, P:] for k, v in obs.items()}         # CLEAN targets
         # EMA/JEPA heads: obs recon is a decoder-only probe (detach preds so it doesn't shape the encoder).
@@ -164,15 +172,17 @@ class LitWorldModel(L.LightningModule):
                           prev0_abs=self.norm.denorm_obs(obs["proprio"][:, Pn - 1]),         # (B,obs_dim) true ctx-last
                           true_future_abs=self.norm.denorm_obs(future["proprio"]),           # (B,F,obs_dim) true future
                           act_raw=self.norm.denorm_act(act[:, Pn - 1:Pn - 1 + Fn]))          # (B,F,act_dim) raw force (N)
-        recon, rw = m.recon_losses(src, fut, pre_z_targets=z_tgt, anchor=anchor, prior=_prior)   # decode/<name>[_shortcut] + codec/roundtrip_<name>
+        with record_function("qd/recon_losses"):     # decode loss + roundtrip anchor = BOTH decoder passes
+            recon, rw = m.recon_losses(src, fut, pre_z_targets=z_tgt, anchor=anchor, prior=_prior)
         # NOTE: do NOT decode here (to_obs) in train — recon_losses is the decode loss, and for flow decoders
         # to_obs would SAMPLE the ViT decoder every step (with grad) for nothing -> huge wasted memory (OOM). The
         # decoded sample is only needed for val metrics; computed there under no_grad.
         lt_kw = {"anchor": anchor} if anchor is not None else {}   # only reaches the flow loss_terms; non-flow untouched
         if feeds is not None:
             lt_kw["feeds"] = feeds                            # same optional-kwarg pattern as `anchor` above
-        raw, w = (m.loss_terms(preds, future, obs, p_tf, act, pre_z=z_full, **lt_kw) if share
-                  else m.loss_terms(preds, future, obs, p_tf, act, **lt_kw))   # pre_z: shared-encode fast path (flow only)
+        with record_function("qd/loss_terms"):       # the SECOND backbone pass (parallel, teacher-forced)
+            raw, w = (m.loss_terms(preds, future, obs, p_tf, act, pre_z=z_full, **lt_kw) if share
+                      else m.loss_terms(preds, future, obs, p_tf, act, **lt_kw))   # pre_z: shared-encode path
         if getattr(m, "dynamics_prior", None) is not None and not _uni:   # LEGACY physics/proprio (prior=none)
             Pn, Fn = self.P, self.F
             # p_tf-respecting CHAINED physics rollout: prev0 = true ctx-last obs, then feed each step's own
