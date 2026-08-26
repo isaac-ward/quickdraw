@@ -323,11 +323,12 @@ class MultiModalSequenceModel(nn.Module):
         bag = torch.cat(toks, dim=-2)
         return _ln(bag) if self.latent_norm else bag
 
-    def to_obs(self, bag: Tensor, heads=None, anchor: Tensor | None = None) -> dict[str, Tensor]:
+    def to_obs(self, bag: Tensor, heads=None, anchor: Tensor | None = None, commit: bool = False) -> dict[str, Tensor]:
+        """`commit=True` -> deterministic decode even under decode_stochastic (see Modality.decode)."""
         out, off = {}, 0
         for name, n in self.layout:
             if heads is None or name in heads:                       # partial decode (e.g. proprio-only long rollouts)
-                out[name] = self.modalities[name].decode(bag[..., off:off + n, :])
+                out[name] = self.modalities[name].decode(bag[..., off:off + n, :], commit=commit)
             off += n
         if anchor is not None and "proprio" in out:
             out["proprio"] = self.absolutize_proprio(out["proprio"], anchor)   # back to ABSOLUTE (no-op if off)
@@ -396,7 +397,9 @@ class MultiModalSequenceModel(nn.Module):
         bag = self.encode_state(targets, anchor) if pre_z is None else pre_z   # REAL encode (LN incl.; relativizes
         #                          internally when anchor on). pre_z = the SAME encode from the shared-encode fast
         #                          path (_step), sliced -- bit-identical at noise_std=0 (design/accelerations P4).
-        rec = self.to_obs(bag, heads=heads, anchor=anchor)   # REAL decode, de-relativized -> ABSOLUTE (matches targets)
+        # commit=True: the anchor measures the CODEC, which is deterministic. Scoring a stochastic sample here
+        # would train its variance to zero (MSE of a sample = bias^2 + variance) at weight 10 -- see decode().
+        rec = self.to_obs(bag, heads=heads, anchor=anchor, commit=True)   # REAL decode, de-relativized -> ABSOLUTE
         # RAW mse + its weight, so the logged series is comparable across runs that sweep latent_loss_weight
         # (every sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec
         # panel rescale while the decode panels did not.

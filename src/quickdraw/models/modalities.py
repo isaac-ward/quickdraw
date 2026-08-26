@@ -121,12 +121,18 @@ class Modality(nn.Module):
         tok = self._encode(flat)
         return tok.reshape(*lead, self.n_tokens, tok.shape[-1])
 
-    def decode(self, tok: Tensor) -> Tensor:
-        """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape), a committed (deterministic) decode. mse/x0 ->
-        1 step; v+shortcut -> K=1; v plain -> decode_steps. Same output shape for every kind/arch."""
+    def decode(self, tok: Tensor, *, commit: bool = False) -> Tensor:
+        """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape). mse/x0 -> 1 step; v+shortcut -> K=1; v plain ->
+        decode_steps. Same output shape for every kind/arch.
+
+        `commit=True` forces the DETERMINISTIC decode even under decode_stochastic. Required by the codec
+        ROUND-TRIP anchor: it is an MSE against the target at weight 10, and E||x_hat - t||^2 =
+        ||E x_hat - t||^2 + Var(x_hat), so scoring a SAMPLE there trains the sampler's variance toward zero --
+        i.e. it would optimise away the very sharpness decode_stochastic exists to buy, at 10x the weight of
+        the decode loss. The anchor's job is to measure the codec, which is deterministic by definition."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
-        stoch = bool(getattr(self, "decode_stochastic", False)) and not self.decode_head.no_noise
+        stoch = bool(getattr(self, "decode_stochastic", False)) and not self.decode_head.no_noise and not commit
         # x0 collapses to ONE step only when committing: the k-loop's renoise is what injects the sampling
         # noise, so a stochastic x0 decode needs the full decode_steps to be a sampler rather than one draw.
         steps = 1 if (self.decode_head.shortcut or (self.decode_head.param == "x0" and not stoch)) else self.decode_steps
