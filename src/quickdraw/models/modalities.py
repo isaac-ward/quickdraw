@@ -48,9 +48,17 @@ class ModalitySpec:
     #                           before eps is ever drawn), so mse stays bit-identical.
     decode_param: str = "v"   # flow decode parameterization: "v" (velocity, integrate ODE — imprecise for images)
     #                           | "x0" (predict the clean obs directly — precise + in-range; use for image decode). See flow.py.
-    decode_arch: str = "vit"  # IMAGE decoder architecture, ORTHOGONAL to decode_kind: "vit" (all-attention, patch
-    #                           grid) | "unet" (conv U-Net, no patch grid -> smoother fields). Composes with both
-    #                           mse and flow (4 combos). Ignored by vector modalities. See vision.ConditionalUNet.
+    decode_arch: str = "vit"  # IMAGE decoder architecture. "unet" (conv U-Net; serves BOTH decode_kinds) |
+    #                           "up" (UP-ONLY conv decoder with a query-grid readout, models/decoders.py --
+    #                           decode_kind=mse ONLY, it has no analysis path so it cannot denoise) | "vit"
+    #                           (all-attention + patch grid; best floor on record but patch SEAMS -- the "ep24
+    #                           blocking"). Unknown values RAISE (they used to fall through to vit silently).
+    #                           WHY "up" EXISTS: in mse mode the U-Net's `x` is a ZERO tensor, so its 4-level
+    #                           analysis path convolves zeros -- measured skip interiors have spatial std
+    #                           EXACTLY 0.0 -- for 15.9% of the decoder's params and ~33% of its activations, at
+    #                           full resolution, TWICE per step. And the latent reached pixels only through
+    #                           Linear(T*d->512) plus cond.mean(1), a rank-640 choke on 4096 latent floats
+    #                           (84% invisible). See models/decoders.py for the full derivation.
     encode_arch: str = "vit"  # IMAGE encoder architecture: "vit" (ViT/Perceiver, ImageAutoencoder.encode) | "conv"
     #                           (ConvImageEncoder, mirrors the U-Net down-path). Pair conv<->unet for a symmetric
     #                           conv enc/dec. Both emit num_tokens tokens (same interface). Ignored by vectors.
@@ -208,14 +216,30 @@ class ImageModality(Modality):
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
+        # EXPLICIT dispatch with a RAISE on anything unknown. This used to be `if unet ... else vit`, so a
+        # typo'd or newly-added decode_arch SILENTLY built the ViT head and the run "tested" nothing at all.
+        _chunk = int(getattr(spec, "decode_chunk_train", 0) or 0)
         if self.decode_arch == "unet":
             self.decode_head = ImageUNetFlowHead(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
-                                                 chunk=int(getattr(spec, "decode_chunk_train", 0) or 0),
-                                                 param=param, shortcut=sc, no_noise=no_noise)
-        else:
+                                                 chunk=_chunk, param=param, shortcut=sc, no_noise=no_noise)
+        elif self.decode_arch == "up":
+            # UP-ONLY decoder (models/decoders.py): no analysis path, query-grid readout. DECODER ONLY -- it
+            # has no mechanism to denoise an image, so it cannot serve decode_kind=flow.
+            if not no_noise:
+                raise ValueError(
+                    "decode_arch='up' is a DECODER (tokens->image) and cannot serve decode_kind='flow', which "
+                    "needs a denoiser with an analysis path over its own noised input. Use decode_arch='unet' "
+                    "for flow, or decode_kind='mse' for 'up'. See models/decoders.py.")
+            from .decoders import TokenGridDecoder
+            self.decode_head = TokenGridDecoder(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
+                                                chunk=_chunk)
+        elif self.decode_arch == "vit":
             self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc,
-                                             no_noise=no_noise,
-                                             chunk=int(getattr(spec, "decode_chunk_train", 0) or 0))
+                                             no_noise=no_noise, chunk=_chunk)
+        else:
+            raise ValueError(f"unknown decode_arch={self.decode_arch!r} for image modality "
+                             f"{spec.name!r}; expected one of 'unet' (conv U-Net, serves mse AND flow), "
+                             f"'up' (up-only conv decoder, mse only), 'vit' (all-attention, patch grid)")
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)
