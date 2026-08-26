@@ -22,3 +22,14 @@ check_val_every_n_epoch: 4   # DECIDED (user, 2026-07-20): validate every 4 epoc
 accumulate_grad_batches: 1   # LOCKED at 1. NEVER use gradient accumulation (micro-batch + accum): Lightning SUMS
 #                              micro-batch grads -> ~Nx effective LR against the clip -> destabilized in-rollout
 #                              training into mean-collapse (2026-07-20). Always use a real batch that fits. DO NOT CHANGE.
+grad_diag_every: 25       # how often (in steps) to compute the EXPENSIVE gradient diagnostics — the 13
+#                           per-module grad/norm/* values and the nan/inf element COUNTS. 1 = every step =
+#                           the pre-2026-08-26 behaviour. These are LOGGING-ONLY (read once per epoch) but
+#                           cost ~5 passes over all ~163 grad tensors plus 2 forced GPU syncs PER STEP
+#                           (design/accelerations.md, earmarked item 5). PRESERVED at every step regardless:
+#                           the non-finite guard (it gates the optimizer step) and grad/norm_preclip (the
+#                           headline early-warning signal). Any non-finite step also computes the FULL
+#                           diagnostic whatever the sampling phase, so a blow-up is never missed and the
+#                           counts are still read pre-clip. The accepted cost is that a single-step FINITE
+#                           spike confined to one module can now fall between samples; collapses on this
+#                           dataset ramp over epochs, so ~44 samples/epoch resolves them.

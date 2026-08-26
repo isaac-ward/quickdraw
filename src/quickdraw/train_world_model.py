@@ -100,6 +100,15 @@ def main(cfg):
     # autobatch probe builds a throwaway model too). workers=True also seeds dataloader workers.
     L.seed_everything(int(cfg.get("seed", 0) or 0), workers=True)
     torch.set_float32_matmul_precision("high")
+    # cuDNN autotuning: on the FIRST occurrence of each conv input shape, benchmark every available algorithm
+    # and cache the winner, instead of picking by heuristic. Our shapes are STATIC after step 0 (fixed batch
+    # from autobatch, fixed F/window/img_size) and the step is conv-heavy -- the image decoder is ~78% of
+    # per-sample memory (design/decode_memory.md) and runs TWICE per step -- which is exactly the case this
+    # flag exists for. Algorithm SELECTION only: the convolution computed is the same, so the only numerical
+    # effect is float reassociation, on a par with set_float32_matmul_precision above. Costs a one-off probe
+    # per new shape, which is why it is only safe BECAUSE the shapes are static; a shape-varying workload
+    # would re-benchmark forever. See design/accelerations.md (earmarked 2026-08-26, item 6).
+    torch.backends.cudnn.benchmark = True
     # Safety net for dynamo recompiles: the rollout/eval flex-attention paths can produce several mask
     # variants; a too-small cache (default 8) evicts and thrashes. The fixed-window rollout already
     # holds the attention KERNEL to one shape; this just keeps any residual mask variants cached.
@@ -233,7 +242,10 @@ def main(cfg):
                         variations=cfg.get("variations"), dt=e.dt,
                         recon_frac=float(cfg.model.get("recon_frac", 1.0)),
                         lr_warmup_steps=int(cfg.optim.get("lr_warmup_steps", 0)), env=env,
-                        p_tf_batch_granular=bool(cfg.model.get("p_tf_batch_granular", True)))
+                        p_tf_batch_granular=bool(cfg.model.get("p_tf_batch_granular", True)),
+                        # sample the expensive grad diagnostics (per-module norms, nan/inf counts) instead of
+                        # running them every step; the non-finite guard and grad/norm_preclip stay per-step.
+                        grad_diag_every=int(cfg.trainer.get("grad_diag_every", 25) or 25))
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py). Lightning's own
     # logger is OFF; all logging flows through the writer via LoggingCallback.
