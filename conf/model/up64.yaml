@@ -1,0 +1,88 @@
+# =============================================================================================
+# up64 — bsp32mse with the UP-ONLY image decoder. Best-measured recipe on robocasa-scene4-4h as of
+# 2026-08-27. Select with `model=up64`. See wizard/records/robocasa-scene4-4h.md section 20 for the A/B.
+#
+# Inherits bsp32mse and changes ONLY the image decode head: `decode_arch: up` (models/decoders.py) replacing
+# the conditional U-Net, at base 64 so the two are PARAMETER-MATCHED (4,760,003 vs 4,375,875, 8.8% apart).
+#
+# WHY. The U-Net was serving two different jobs through one module and paying for both:
+#   1. In mse mode its `x` input is an all-ZERO tensor (flow.py no_noise branches), so its 4-level analysis
+#      path convolves zeros. Measured: skip-tensor INTERIOR spatial std is EXACTLY 0.000000 at levels 0-2; the
+#      only spatial structure is a zero-padding border halo, which engulfs the whole map by level 3. So the up
+#      path's sole absolute-position signal was a padding artifact. Cost: 693,888 params (15.9%) and ~33% of
+#      decoder activation volume, at FULL resolution, TWICE per step (decode loss + roundtrip anchor).
+#   2. The latent reached pixels through only `Linear(num_tokens*d=4096 -> 512)` (2,097,664 params = 48% of the
+#      decoder) plus `cond.mean(1)` (rank <=128) -- a rank-<=640 cut on 4,096 floats, so ~3,456 latent
+#      directions produced PIXEL-IDENTICAL images. That is a 6.4x compression INSIDE the decoder, tighter than
+#      ae_bottleneck or num_tokens, and it quantitatively explains section 17's nulls: at num_tokens=8 the bag
+#      is already 1,024 floats > 640, so the ENTIRE 8->64 sweep saturated the readout.
+# `up` fixes both: no analysis path, and a learned bott_hw x bott_hw query grid cross-attending the token bag
+# (readout 36x128 = 4,608 at 6x6, which MATCHES the latent) with attention-pooled global conditioning.
+#
+# MEASURED (96px, ae_bottleneck 6, param-matched, one variable, 18 epochs each):
+#   best raw OL LPIPS@+128   up@64 0.2429 (e12)   vs   unet@32 0.2688 (e13)
+#   best codec floor LPIPS   up@64 0.1432         vs   unet@32 0.1881
+#   epoch-matched @+128: up ahead in 6 CONSECUTIVE matched epochs e7-e12, margin 0.008 -> 0.067 (the sign
+#   ALTERNATED before e7, so this is a crossover, not a run of luck). Better at EVERY horizon; its curve
+#   DESCENDS past +32 where the control's flattens.
+#   And the floors DIVERGE -- the control's codec ERODES four epochs running (0.1889 -> 0.2138) while up@64's
+#   stays flat at ~0.145. That erosion is what the roundtrip anchor only SLOWS (0.40 dB per 9 epochs at
+#   weight 10), and it is the plausible causal route to the objective gap: the decode loss is the ONLY
+#   autoregressive gradient in the model and reaches the dynamics solely through the decoder's Jacobian, so a
+#   decoder that is not degrading feeds a better gradient back.
+#
+# HONEST CAVEATS, because they are easy to lose:
+#   * The 0.2429 was measured at 96px. It is NOT comparable to the 128px record of 0.2783 -- LPIPS is
+#     resolution-dependent and coarser frames are easier. A 128px `up` run is still owed.
+#   * Param-matched but NOT cost-matched: `up` has no down path, so it is cheaper per step and ran ~1 epoch
+#     ahead throughout. Epoch-matched comparison handles that; an equal-wall-clock comparison would flatter it.
+#   * Both arms ran p_tf_dynamics=1.0, which mm_flow.yaml calls "the DEFECT". Equally handicapped, so the
+#     comparison holds, but neither arm was at its best.
+#   * Per-epoch @+128 jitter is ~0.02-0.08 on this dataset. Judge on BEST-SO-FAR and on matched-epoch series,
+#     never on single epochs -- the A/B "reversed" twice under epoch-by-epoch reading before it settled.
+#
+# `decode_arch: up` is DECODER-ONLY and RAISES for decode_kind=flow: an up-only head has no mechanism to
+# denoise its own noised input. Use decode_arch=unet for flow decoding (and note record section 19.3 measured
+# flow decode BETTER than mse at converged budget on a frozen-encoder harness, so the U-Net is not dead).
+#
+# NOT covered here (a model config cannot hold them) -- pass on the CLI, see bsp32mse.md:
+#   data.subsample=<k>                       MUST be re-derived per dataset. 5 for 20 Hz robocasa -> 4 Hz.
+#   data.F=64                                rollout length
+#   model.action_dim / modalities.0.dim / environments.*   to match your dataset
+#   model.modalities.1.img_size + ae_bottleneck   PAIR THEM: the pyramid arithmetic truncates, so a target of
+#                                            8 at 96px silently gives 12x12. 96->6 and 128->8 are the matched
+#                                            pair (same level counts, same 256x spatial reduction).
+# =============================================================================================
+defaults:
+  - bsp32mse
+  - _self_
+
+recon_frac: 1.0            # bsp32mse ships 0.25; 1.0 is the largest measured single win on this dataset
+#                            (OL LPIPS@+128 0.374 -> 0.278) and every result quoted above used it.
+p_tf_warmup_epochs: 1      # the record holder used 1, not the stock 4 -- the decode loss goes autoregressive
+#                            three epochs earlier, and recon_frac=1.0 exists to strengthen that gradient.
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them, so inheriting bsp32mse and editing one
+  # entry is impossible -- and being explicit is what makes the recipe auditable.
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  #   proprio is left as flow deliberately. With decode_param=x0 the committed decode collapses to ONE step
+  #   (modalities.py forces it), so `flow` is BIT-IDENTICAL to `mse` at inference -- measured max abs
+  #   difference 0.0. Only the training objective differs. And the two pathologies above have no analogue: the
+  #   head is an ~18.6k-param MLP reading a SINGLE token, with no dense flatten and no analysis path. Nothing
+  #   to redesign, and switching it would add an unmeasured variable for no gain.
+  - {name: image, kind: image, weight: 1.0, img_size: 128,
+     pretrained: false,
+     num_tokens: 32,
+     encode_arch: conv,
+     encode_base: 32,        # NOTE: never actually swept. Record line 628 says it existed only as a dataclass
+     #                         default until it was exposed, then was never tested. "Encoder capacity is
+     #                         measured-null" is FOLKLORE -- only num_tokens 8->64 is a genuine null.
+     decode_kind: mse,       # required by decode_arch=up (which raises for flow)
+     decode_arch: up,        # <-- THE CHANGE. models/decoders.py: TokenGridReadout -> mid -> 4x
+     #                         (upsample + FiLM ResBlock) -> out. No down path, no skips.
+     decode_base: 64,        # 64 (not 32) so `up` is param-matched to the U-Net it replaces. up@32 is
+     #                         1,515,907 params -- a fine cheap variant, but it was NOT what won the A/B.
+     decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64, # still the only lever that buys real batch size; see design/decode_memory.md
+     latent_loss_weight: 10} # round-trip anchor. DO NOT lower: at 1.0 the codec eroded 3.55 dB in 4 epochs.
