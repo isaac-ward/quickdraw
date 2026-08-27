@@ -1189,6 +1189,292 @@ N% of the step" figure, in design docs and audits alike, was inferred from epoch
 
 which revises the AR rollout up from an inferred ~51% and decode down from an inferred ~40%.
 
+## 19. ABSOLUTE vs RESIDUAL, on a generative decoder — and the collapse diagnosed by probe, not by run (08-25/26)
+
+Two runs of ~10 h each were spent on collapses before anything was measured about the mechanism. This section
+is mostly about the ~10 GPU-MINUTES that replaced the third.
+
+### 19.1 What §18 left: two changes, one failure mode
+
+`dynamics_follows_p_tf=true` (§18) and `predict: absolute` both produced the SAME triad, two epochs apart:
+
+| | latent_cos@+64 pre | grad/norm/flow | floor PSNR | latent_cos after |
+|---|---|---|---|---|
+| §18 dfptf (e5→e6) | 2.1× control | 0.42 → 1.3e7 | 19.1 → 11.4 | NEGATIVE |
+| `abs_pred` (e2→e3) | 0.261 (2.0× control) | 0.341 → **108.9** | 18.35 → **8.94** | **−0.056** |
+
+And the same FINGERPRINT: `grad/norm/{flow,backbone,encode_*,act_enc}` all `inf`, while `decode_image` (5.75)
+and `decode_proprio` (4.00) stayed FINITE. Everything inside the recurrent path, nothing outside it.
+
+`abs_pred` was WINNING when it died — epoch-matched against its control at e0/e1/e2 it took every open-loop
+metric, with a **3× smaller dynamics penalty** (0.028 vs 0.083 at e1) on a *worse* floor, which is exactly the
+profile the standing goal prefers. Its latent_cos advantage also WIDENED with depth (1.4× at +32, 2.1× at +64,
+3.3× at +96), the signature of re-deriving the state rather than accumulating increments.
+
+### 19.2 The Jacobian probe — 4 GPU-minutes that killed the planned fix
+
+`_oneoff_jacobian_probe.py` power-iterates the per-step operator norm ‖∂bag_{h+1}/∂bag_h‖ over 32 rollout
+steps. `_oneoff_jacobian_init.py` does the same on FRESH weights, same seed, only `predict` differing.
+
+| | mean | max | min |
+|---|---|---|---|
+| residual e3 (trained) | **0.9918** | 1.0258 | 0.9654 |
+| residual e11 (trained) | **0.9687** | 1.2544 | 0.9088 |
+| absolute e3 (trained, post-collapse) | 1.6246 | **11.1942** | 0.0980 |
+| residual **at init** | 0.7978 | 0.9086 | — |
+| absolute **at init** | **0.2507** | 0.3002 | — |
+
+**Absolute is MORE contractive at init, not less.** That refutes the structural story that had been driving the
+plan ("absolute drops the identity skip → `J` instead of `I + J` → less contractive by construction"). The 11×
+gains are LEARNED, within three epochs. The real difference is an ANCHOR: residual's map is pinned near unit
+gain by construction — 3% spread at e3, still pinned at e11 — and training can only perturb it. Absolute's is
+free, and it drifted.
+
+**This killed `detach_every=16`, which was to have been the anti-collapse lever in both arms.** `detach_every`
+bounds the LENGTH of the gradient chain. Residual doesn't need it (per-step gain 0.97–0.99 → the 32-step
+product CONTRACTS: measured amplification 0.59 at e3, 0.41 at e11 — which is also why `mm_flow.yaml:150` found
+32 stable and 16 not). Absolute isn't helped by it either: **halving how many steps you cross does not fix one
+step whose gain is 11.19.** Reverted to the validated 32.
+
+Corollary for instrumentation: `abs_pred` had NO pre-collapse checkpoint (val every 4 epochs → first save at
+e3, post-mortem), so the trained-absolute row above cannot separate cause from consequence. Hence
+`check_val_every_n_epoch=1` in §19.4.
+
+### 19.3 The generative decoder — a prior "null" that was a CONVERGENCE artifact
+
+`bsp32mse.yaml:52` records `decode_kind=flow` as buying "~nothing on sharpness (LPIPS 0.385 vs 0.390), cost
+1.1 dB of PSNR". `_oneoff_decode_kind.py` retested it properly: frozen trained encoder → identical real
+latents → two fresh decode heads, same seed, same data, same steps.
+
+| steps | mse LPIPS | flow committed | flow sampled |
+|---|---|---|---|
+| 1200 | **0.2537** | 0.2852 | 0.3328 |
+| 3600 | 0.0922 | **0.0839** | 0.0883 |
+| 6000 | 0.0604 (31.04 dB) | **0.0505 (32.43 dB)** | 0.0547 (32.10 dB) |
+
+**Flow is not worse, it is SLOWER** — it crosses mse between 2400 and 3600 steps and finishes 16% better on
+LPIPS and +1.4 dB. The harder objective (denoise at every τ, not only τ=1) costs convergence speed and buys
+quality. The old null is explained: that run was at `recon_frac=0.25`, i.e. a QUARTER of the decode gradient
+steps — almost certainly still pre-crossover.
+
+**But `decode_stochastic` must be OFF, and its sign FLIPS with budget.** At 500 steps sampling beat committing
+(0.5507 vs 0.6475 LPIPS) — the distortion–perception tradeoff, and the entire reason the flag was written. At
+6000 it LOSES on both (0.0547 vs 0.0505, 32.10 vs 32.43 dB). The tradeoff only pays when `p(obs|tokens)` has
+real spread; a converged head on a good code is nearly a point mass, so sampling adds noise around an accurate
+mean. **This does not reverse in open loop** — a drifted latent makes the mean WRONG, not UNCERTAIN, and
+sampling in pixel space explores around the wrong point rather than toward the true frame.
+
+Caveat, because the numbers look far too good: 6000 × batch 16 over 192 frames is ~500 passes over a tiny set,
+so both heads are MEMORISING and LPIPS 0.05 is nowhere near the real floor (~0.24). It is a capacity/
+convergence comparison, not a generalisation one. The sampled-vs-committed half is the sturdier result — same
+weights, same data, only the decode path differs.
+
+Two more things this line of work found:
+- **`decode_kind=flow` was a NO-OP at inference before `decode_stochastic` existed** (`21786e2`). `decode()`
+  hardcoded `deterministic=True` and, for `param=x0`, `steps=1`; that makes the first iteration
+  `velocity(zeros, τ=1, cond)` — literally the `no_noise`/mse line. Measured max|difference| **0.0**.
+- **The flag then leaked into the TRAINING objective** (`5b09034`), via `roundtrip_losses → to_obs → decode`
+  at `latent_loss_weight: 10`. Since `E‖x̂−t‖² = ‖E x̂−t‖² + Var(x̂)`, scoring a SAMPLE there trains the
+  sampler's variance toward ZERO — the anchor would have cancelled the sharpness at 10× the weight of the loss
+  that wanted it. Fixed with `commit=True`; the anchor measures the CODEC, which is deterministic by definition.
+
+**No reweighting.** The mse/flow raw-loss ratio moved 0.839 (@500) → 1.210 (@6000), so it is not a stable
+property of the objective. `model.modalities.1.weight` stays 1.0. (This retires the concern — raised in the
+adversarial audit and endorsed here — that swapping `decode_kind` silently reweights the only autoregressive
+gradient in the model.)
+
+### 19.4 The pair (`absres_*`, launched 08-26 00:37, RUNNING)
+
+Shared: 128px, `ae_bottleneck` 8, `recon_frac` 1.0, **`detach_every` 32**, generative conv U-Net flow decoder
+(`decode_kind=flow decode_arch=unet decode_param=x0 decode_steps=6 decode_base=32`), `decode_stochastic` FALSE,
+`p_tf_dynamics` 1.0, **`check_val_every_n_epoch=1`**. Autobatch chose **27 for both arms**.
+
+| arm | GPU | `model.diffusion.predict` |
+|---|---|---|
+| `absres_residual` | 0 | residual — the control |
+| `absres_absolute` | 1 | absolute |
+
+ONE variable. **This pair is NOT expected to prevent the collapse** — nothing in it anchors the step map, and
+`detach_every` was just shown to be the wrong lever. It is expected to REPRODUCE it with per-epoch checkpoints,
+so the Jacobian of a HEALTHY absolute model (e1/e2) can finally be measured against the residual arm's.
+
+Pre-registered expectations, so the read is scored rather than rationalised:
+- **Both arms:** floor LPIPS 0.20–0.22 (old control 0.237), floor PSNR 20–20.5 (old 19.3), arriving by e0 —
+  the real run feeds the decode head 27×64 = 1728 frames/step, clearing §19.3's crossover budget in ~30 steps.
+  *Floor WORSE than 0.237 by e2 ⇒ the probe did not transfer and `bsp32mse.yaml:52` was right.*
+- **Residual:** penalty ~0.10, unchanged — the decoder should move floor and OL together. *Penalty < 0.08 ⇒ the
+  decoder is helping the DYNAMICS, via cleaner gradients through `recon_frac=1.0`. That would be new.*
+- **Absolute:** beats residual on every OL metric at e0–e2 (latent_cos@+64 ~0.30 vs ~0.14, penalty ~0.03 vs
+  ~0.10), then collapses at ~e3. *Surviving past e5 ⇒ the generative decoder changed the gradient landscape,
+  and a ~0.03 penalty held to e8 is the largest win here since `recon_frac=1.0`.*
+
+### 19.5 Instrumentation added this round
+
+- **Filmstrip FLOOR column** (`868a35f`) — each row now decodes the TRUE latent for its frame, so codec error
+  (floor↔GT) and dynamics error (kK↔floor) separate BY EYE, per horizon, ON THE SAME FRAME. Previously an OL
+  number could only be compared against a floor averaged over DIFFERENT frames. Panel PSNR text removed (45
+  numbers is noise); the grid + `ep_idx`/`t_ctx` provenance go to `logs/epoch_<step>/eval_flow/
+  denoising_filmstrip_<i>.npz`.
+- **`seed = step` is a TRAP for cross-epoch reads.** Each epoch draws a different episode and `t_ctx`, so the
+  control's h=64 reading 16.99 (e2) → 13.71 (e11) is two different scenes, NOT degradation. Same-epoch
+  cross-run comparisons ARE matched. Pin `eval.denoising_seed` to make a within-run series comparable.
+- **`p_tf_dynamics`** (`46dca7b`) — the boolean became a probability, the strength knob §18 concluded was
+  needed. 1.0 bit-identical to the historical always-clean path (verified: 1.108671 either way), null/0.0 the
+  full substitution that collapsed (1.866729), 0.9 in between (1.129133). RNG only drawn for 0<q<1.
+
+## 20. THE DECODER WAS THE PROBLEM AFTER ALL — `decode_arch="up"` wins the objective (08-26/27)
+
+Two measured pathologies in the mse image decoder, one rewrite, and a result that reversed twice before
+settling. Also the session's methodological low point, recorded because it cost three probes.
+
+### 20.1 The two pathologies
+
+`vision.ConditionalUNet` served BOTH `decode_kind: mse` (a tokens->image DECODER) and `decode_kind: flow` (an
+image DENOISER) through one `velocity(x, temb, cond, demb)`. Consequences, measured on CPU at the live geometry:
+
+**(a) THE DOWN PATH CONVOLVES ZEROS.** In mse mode `x` is an all-zero tensor (`flow.py` no_noise branches in
+both `loss` and `_sample`). Skip-tensor INTERIOR spatial std is **EXACTLY 0.000000** at levels 0-2; the only
+spatial structure is a zero-padding border halo, which engulfs the whole map by level 3 (std 0.207). So the up
+path's sole absolute-position signal was a padding artifact -- the StyleGAN3 / Xu et al. 2021 "positional
+information hidden in padding" pathology. Cost: **693,888 params (15.9% of 4,373,763)** and **~33% of decoder
+activation volume**, at FULL resolution, TWICE per step (decode loss + roundtrip anchor).
+
+**(b) A RANK-640 CHOKE ON A 4,096-FLOAT LATENT.** Exactly two routes from `cond` to pixels:
+`cond_to_spatial = Linear(4096 -> 512)` (**2,097,664 params = 48.0% of the decoder**) reshaped to a 2x2 map and
+nearest-upsampled to the bottleneck, plus `g = cond.mean(1)` (rank <=128, the token MEAN, the ONLY per-block
+conditioning every FiLM block receives). **640 of 4,096 floats = 15.6% visible**; ~3,456 latent directions
+produce PIXEL-IDENTICAL images.
+
+**(b) quantitatively explains section 17's nulls.** At `num_tokens=8` the bag is already 1,024 floats > 640, so
+the ENTIRE 8->64 sweep saturated the readout -- predicted null, observed null (floor flat 18.7-20.4 dB). And
+`ae_depth` 4->6's null was TRIVIAL: `modalities.py:200-216` routes that knob to the ViT paths only, so for the
+conv arm it never reached the decoder at all.
+
+### 20.2 The fix (`c7801d2`, models/decoders.py)
+
+`decode_arch: "up"` -- UP ONLY, no analysis path, no skips. `TokenGridReadout` (learned bott_hw x bott_hw query
+grid cross-attending the token bag + a ViTBlock mixer) replaces the dense flatten; `TokenPool` (attention
+pooling) replaces `cond.mean(1)`. Readout bandwidth **36x128 = 4,608 vs 640**, which MATCHES the 4,096-float
+latent. Params **1,515,907 @base32 / 4,760,003 @base64** vs the U-Net's 4,373,763.
+
+The mid self-attention is LOAD-BEARING, not decoration: `grid_q` is content-INDEPENDENT, so before its keys
+learn slot discrimination the attention is near-uniform and every cell receives approximately the token MEAN --
+the module would momentarily reproduce the pathology it exists to remove.
+
+**WIRING LANDMINE FIXED.** The dispatch was `if unet ... else vit`, so `decode_arch: "up"` would have SILENTLY
+built the ViT head and the run would have tested nothing. Now explicit with a RAISE on unknowns (4 of
+`smoke/up_decoder.py`'s 14 checks assert those raises).
+
+**THE PRIOR "ViT DECODER FAILED" RECORD IS EVIDENTIALLY ROTTEN.** `bsp32mse.yaml:57` blames "motion 0.141, and
+it collapsed". The run logs say `bsp32vit` posted the best bespoke floor of the program and then died at **e15
+from a RECURRENT-PATH gradient explosion** -- inf on flow/backbone/encoders, BOTH decoders finite at ~1.9 --
+the same fingerprint as bott16 and predict=absolute, neither of which had a ViT decoder. The 0.141 is epoch 7's
+single lowest value of a metric the record itself calls direction-blind. That comment should be rewritten; it
+nearly killed this line of work.
+
+### 20.3 THE RESULT — `dec_unet32` vs `dec_up64`, 96px, PARAM-MATCHED (4,375,875 vs 4,760,003, 8.8% apart)
+
+Epoch-matched raw **OL LPIPS@+128**, gap = unet minus up (positive = up better):
+
+| ep | unet@32 | up@64 | gap |
+|---|---|---|---|
+| 3 | 0.3712 | 0.3770 | −0.006 |
+| 6 | **0.2957** | 0.3203 | −0.025 |
+| 7 | 0.3036 | 0.2954 | +0.008 |
+| 8 | 0.2878 | 0.2744 | +0.013 |
+| 9 | 0.3121 | 0.2587 | +0.053 |
+| 10 | 0.3065 | 0.2503 | +0.056 |
+| 11 | 0.3206 | 0.2536 | +0.067 |
+| 12 | 0.2935 | **0.2429** | +0.051 |
+
+**Six consecutive matched epochs for up@64, margin growing 0.008 -> 0.067.** Before e7 the sign ALTERNATED, so
+this is a crossover, not a run of luck. Best-so-far @+128: **unet 0.2878 (e8), up 0.2429 (e12)**.
+
+Horizon curves at e11 -- up@64 is better at EVERY horizon and its curve DESCENDS past +32 while the control's
+flattens:
+
+|  | +1 | +8 | +16 | +32 | +64 | +96 | +128 |
+|---|---|---|---|---|---|---|---|
+| unet@32 | 0.222 | 0.379 | 0.354 | 0.329 | 0.314 | 0.394 | 0.321 |
+| up@64 | 0.191 | 0.333 | 0.304 | 0.279 | 0.273 | 0.320 | **0.254** |
+
+**And the floors DIVERGE — the control's codec is eroding:**
+
+    unet@32  e7:0.1889 e8:0.1924 e9:0.2067 e10:0.2138 e11:0.2116     <- WORSE for four epochs
+    up@64    e7:0.1563 e8:0.1499 e9:0.1475 e10:0.1452 e11:0.1465     <- flat, 0.065 better
+
+That is the codec-erosion signature the roundtrip anchor only SLOWS (measured elsewhere at 0.40 dB per 9 epochs
+at weight 10). The plausible causal chain for the objective gap: a decoder that is not degrading feeds a better
+autoregressive gradient back into the dynamics via the decode loss, which `design/flow.md` notes is the only
+autoregressive gradient in the model and reaches the dynamics solely through the decoder's Jacobian.
+
+**CAVEATS, on the record before the number gets tempting:**
+- **0.2429 at 96px is NOT better than 0.2783 at 128px.** LPIPS is resolution-dependent and coarser frames are
+  easier. Nothing at 96px can challenge the record; only a 128px `up` run can.
+- Param-matched but NOT cost-matched: up@64 has no down path, so it is cheaper per step and ran ~1 epoch ahead
+  throughout. Epoch-matched comparison handles this; an equal-wall-clock comparison would flatter it.
+- Both arms ran `p_tf_dynamics: 1.0`, which `mm_flow.yaml:125` calls "the DEFECT". Equally handicapped, so the
+  comparison holds, but neither arm is at its best.
+
+### 20.4 THE METHODOLOGICAL FAILURE — three probes that could not answer the question
+
+Before the A/B, three frozen-encoder probes were run (`_oneoff_decoder_ab.py`): load the record holder, FREEZE
+its encoder, train fresh decode heads. All three said up LOST -- floor 0.3649 vs 0.3156, @+128 0.5490 vs
+0.5005, and the ordering held to 14k steps so it was not a convergence artifact. Conclusion drawn at the time:
+"the readout-rank hypothesis is not supported; trunk capacity dominates."
+
+**The user identified the flaw: that encoder was CO-TRAINED with the U-Net being replaced.** Measured on the
+checkpoint (`_oneoff_latent_rank.py`):
+
+    effective rank        participation ratio 29.5 | 90% of variance in 90 comps | 99% in 509 comps (of 4,096)
+    readout subspace      REAL 53.23% of variance captured | RANDOM same-dim 15.75% | concentration 3.38x
+
+99% of the latent's variance sits in **509 dims, INSIDE the 640 the U-Net already reads**, and the encoder put
+3.4x more variance in that specific subspace than chance. So there was nothing outside the readout for extra
+bandwidth to find: **the probes had no statistical power against the hypothesis they were built to test.**
+
+The adversarial audit upheld this with one correction worth keeping: the encoder is NOT gradient-free in the
+null directions -- `dynamics_detach_encoder: false` means the dynamics context path and the AR recon chain are
+both full-rank at the encoder. What is absent is only PIXEL gradient. And it noted that the information ceiling
+alone predicts up ~= unet, not up LOSING -- so the frozen result did contain a real signal about trunk size,
+data starvation (570 frames), and the U-Net getting the padding-halo positional prior for free while `grid_q`
+must learn it.
+
+**Lesson:** a frozen-encoder A/B cannot evaluate a decoder whose whole claim is that the encoder would use it
+differently. Only co-training tests that. Three probes and ~2 GPU-hours went to a rigged question.
+
+### 20.5 Also corrected this session
+
+- **"DF at 0.1 is stable AND the best result measured" — WRONG, repeated for hours.** Record line 97: "**DF at
+  0.1 does not help.** Trails on one-step at every epoch, LPIPS a wash." `mm_flow.yaml:56-59`: keep DF
+  scale=0.0 off, "the anti-collapse lever is in-rollout, not DF". `df_recon1` only ever reached e2 at 0.4499.
+  The source of the error was a section-18 table where DF 0.1 topped ONE latent column (0.419/0.450), promoted
+  to a global claim and then reused as a premise.
+- **"Encoder capacity is measured-null three times over" — WRONG.** Only `num_tokens` 8->64 is a genuine
+  encoder-capacity null. `ae_depth` never reaches the conv encoder. **`encode_base` has NEVER been swept** --
+  record line 628 says it existed only as a dataclass default until it was exposed, then never tested.
+- **`latent_loss_weight` is a PIXEL mse** (`multimodal.py:406`), not a latent loss, despite the name.
+- **`latent_norm=layernorm` provides essentially NO anti-collapse**: per-token non-affine LN forbids only a
+  within-token-constant vector; a time-constant or constant-direction bag passes untouched.
+- **`model.d` is NOT a dynamics knob.** It is the token width, so it changes the latent size, the decoder's
+  conditioning width and the encoder output. The isolated dynamics knobs are `flow_hidden` (currently defaults
+  to d=128; 512 gives a **13.7x** flow head, 484,928 -> 6,651,584, touching nothing else), `flow_arch_depth`,
+  `depth`, and `window`. `heads` is capped at 8: head_dim 128/16 = 8 violates the compiled rollout's
+  >=16-and-power-of-2 constraint.
+
+### 20.6 Queue
+
+1. **Phase-shifted subsampling** — at `subsample=5` frames 1-4, 6-9, 11-14 are DISCARDED ENTIRELY and windows
+   slide only over phase 0. Emitting all 5 phases gives **7.3x the windows at exactly 4 Hz** (35,085 ->
+   255,774 measured at stride 1), same per-step motion, same real-time horizon, fully comparable to history --
+   and free, because more data means fewer epochs for equal gradient steps. ~15 lines in `_subsample_episodes`.
+   Motivation: `bott_recon1` ended at train 0.0398 vs val 0.5015, a 12x gap on 3.6 h of video.
+2. **`flow_hidden=512`** on top of (1) — the only isolated dynamics-capacity knob, and it should be near-free
+   in wall-clock because the throughput audit measured the step at ~24 TFLOP/s = **2.5% of H100 bf16 peak**,
+   i.e. serialization-bound. Width is parallel work; depth is serial. WIDEN, DO NOT DEEPEN.
+3. **128px with `decode_arch: up`** — the only run that can be scored against 0.2783.
+4. `p_tf_dynamics=0.9` — cheap, fold into any of the above.
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
