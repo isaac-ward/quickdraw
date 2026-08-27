@@ -49,9 +49,17 @@
 #   data.subsample=<k>                       MUST be re-derived per dataset. 5 for 20 Hz robocasa -> 4 Hz.
 #   data.F=64                                rollout length
 #   model.action_dim / modalities.0.dim / environments.*   to match your dataset
-#   model.modalities.1.img_size + ae_bottleneck   PAIR THEM: the pyramid arithmetic truncates, so a target of
-#                                            8 at 96px silently gives 12x12. 96->6 and 128->8 are the matched
-#                                            pair (same level counts, same 256x spatial reduction).
+#
+# PAIR img_size WITH ae_bottleneck. `ae_bottleneck` is a TARGET, not a guarantee: both pyramids size themselves
+# with n_levels = int(log2(short_side // bottleneck)) and int() TRUNCATES, so a ratio that is not a power of 2
+# lands silently somewhere else. The two verified-exact settings:
+#     img_size 128  ->  ae_bottleneck 8   (the DEFAULT -- nothing to set)   enc 3 lvls 8px, dec 4 lvls 8px
+#     img_size  96  ->  ae_bottleneck 6   (MUST be set explicitly)          enc 3 lvls 6px, dec 4 lvls 6px
+# Both are a 256x spatial reduction with identical level counts, so 96/6 is the exact structural analogue of
+# 128/8 and results transfer. THE TRAP: at 96px the DEFAULT of 8 truncates to a 12x12 bottleneck -- a 64x
+# reduction, one fewer level per side, a materially LESS compressed codec than requested, with no warning. At
+# 128px a 6 truncates back to 8, so 128 is forgiving and 96 is not. All measurements in this file were taken at
+# 96px / bottleneck 6.
 # =============================================================================================
 defaults:
   - bsp32mse

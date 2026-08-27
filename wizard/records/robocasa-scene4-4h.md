@@ -689,6 +689,24 @@ the orchestrator's own command line -- a plain `pkill -f watchdog.sh` killed one
 look blurry. That is the same complaint §16's winner (`bsp32mse`) was supposed to have answered, so the
 question became: what is actually pinning the bespoke reconstruction floor at 18.7–20.4 dB?
 
+> **READ THIS BEFORE SETTING `ae_bottleneck` (added 2026-08-27).** It is a **TARGET, not a guarantee**, and it
+> must be **PAIRED WITH `img_size`**. Both pyramids size themselves with
+> `n_levels = int(log2(short_side // bottleneck))` (`vision.py:346` encoder, after a stride-2 stem; `:385`
+> decoder, from full resolution) and `int()` **TRUNCATES**, so any ratio that is not a power of 2 lands
+> silently somewhere else:
+>
+> | img_size | ae_bottleneck | encoder | decoder | actual |
+> |---|---|---|---|---|
+> | **128** | **8** (the default) | 3 lvls → 8px | 4 lvls → 8px | **8×8, EXACT** |
+> | **96** | **6** | 3 lvls → 6px | 4 lvls → 6px | **6×6, EXACT** |
+> | 96 | 8 (the default) | 2 lvls → 12px | 3 lvls → 12px | **12×12 — a 64× reduction, not 256×** |
+> | 128 | 6 | 3 lvls → 8px | 4 lvls → 8px | truncates back to 8×8 |
+>
+> **128/8 and 96/6 are the matched pair** — same level counts, same 256× spatial reduction — so results
+> transfer between those two resolutions. **At 96px the DEFAULT of 8 silently builds a materially less
+> compressed codec** (one fewer level per side), with no warning of any kind. 128px is forgiving; 96px is not.
+> Every §20 measurement was taken at 96px with `ae_bottleneck: 6` for exactly this reason.
+
 **The finding.** Both conv pyramids computed their level count from an *independent copy* of the same rule:
 
 ```python

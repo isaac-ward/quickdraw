@@ -73,7 +73,19 @@ class ModalitySpec:
     patch: int = 16
     num_tokens: int = 8
     ae_depth: int = 4
-    ae_bottleneck: int = 8   # conv-pyramid bottleneck target (px, short side); 8 = previous behaviour
+    ae_bottleneck: int = 8   # conv-pyramid bottleneck TARGET in px on the short side (8 = pre-2026-08-21
+    #                          behaviour). It is a TARGET, not a guarantee: both pyramids size themselves with
+    #                          `n_levels = int(log2(short_side // bottleneck))`, and int() TRUNCATES, so any
+    #                          img_size/bottleneck ratio that is not a power of 2 SILENTLY lands somewhere else.
+    #                          PAIR IT WITH img_size. The two verified-exact settings on this project:
+    #                              img_size 128 -> ae_bottleneck 8   enc 3 lvls -> 8px,  dec 4 lvls -> 8px
+    #                              img_size  96 -> ae_bottleneck 6   enc 3 lvls -> 6px,  dec 4 lvls -> 6px
+    #                          Both give a 256x spatial reduction with the same level counts, so 96/6 is the
+    #                          exact structural analogue of 128/8 and results transfer between them.
+    #                          THE TRAP: at 96px the DEFAULT of 8 truncates to a 12x12 bottleneck -- a 64x
+    #                          reduction, i.e. a materially LESS compressed codec than requested, with one
+    #                          fewer level on each side. Nothing warns you. (At 128px, 6 truncates back to 8,
+    #                          so 128 is forgiving and 96 is not.) See models/vision.py VisionAEConfig.
     decode_chunk_train: int = 0   # >0: chunk the DECODE head's velocity forward into groups of this many
     #                               frames and checkpoint each, so its intermediates are recomputed in
     #                               backward instead of retained. 0 = OFF (bit-identical). The decoder is

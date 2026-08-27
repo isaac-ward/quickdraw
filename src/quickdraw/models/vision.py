@@ -50,6 +50,18 @@ class VisionAEConfig:
     #                         NOT exposed as `n_levels` directly: the encoder pools AFTER a stride-2 stem and the
     #                         decoder pools from full resolution, so at 128px they use 3 and 4 levels respectively
     #                         -- one shared n_levels would desynchronise them. A shared TARGET cannot.
+    #
+    #                         IT IS A TARGET, NOT A GUARANTEE -- pair it with img_size. Both pyramids compute
+    #                         `n_levels = int(log2(short_side // bottleneck))` (:346 encoder, after a stride-2
+    #                         stem; :385 decoder, from full resolution) and int() TRUNCATES, so any
+    #                         img_size/bottleneck ratio that is not a power of 2 lands SILENTLY somewhere else:
+    #                             img 128, bott  8 -> enc 3 lvls  8px, dec 4 lvls  8px   EXACT (the default)
+    #                             img  96, bott  6 -> enc 3 lvls  6px, dec 4 lvls  6px   EXACT
+    #                             img  96, bott  8 -> enc 2 lvls 12px, dec 3 lvls 12px   TRUNCATED, a 64x
+    #                                                 reduction instead of 256x, one fewer level per side
+    #                             img 128, bott  6 -> truncates back to 8px (128 is forgiving; 96 is not)
+    #                         128/8 and 96/6 are the matched pair: same level counts, same 256x reduction, so
+    #                         results transfer between resolutions. 96 with the DEFAULT 8 is a different codec.
 
 
 def _heads(x, heads):                                    # (B,N,d) -> (B,heads,N,hd)
