@@ -115,7 +115,7 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
     Returns (n_ep, H, cl_h, modes, calls) where modes = [(name, every, horizon)] and calls =
     [(name, rows, horizon)] is the per-imagine_eval-call shape, i.e. the memory-relevant unit (see
     rollout_regrounded's `cap`)."""
-    n_ep = min(8 if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(ep_lens))
+    n_ep = min(max(8, int(cfg.eval.get("n_plot", 2) or 2)) if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(ep_lens))
     H = min(int(cfg.eval.get("horizon", 2048)), min(ep_lens[:n_ep]) - P - 1)
     cl_steps = [int(x) for x in cfg.eval.get("closed_loop_steps", [1, 16])]
     cl_h = min(H, int(cfg.eval.get("closed_loop_horizon", 256) or H))
@@ -155,8 +155,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         _plog(writer, f"[eval_ood_horizon @ep{step}] {pct:3d}% — {what}")
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+    eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"), img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    if cfg.eval.get("longest", False):
+        eps = sorted(eps, key=lambda e: -len(e[0]))   # longest (full-dock) episodes first — presentation
     n_ep, H, cl_h, _modes, _calls = ood_horizon_shapes(cfg, bool(img_heads),
                                                       [len(o) for o, _, _ in eps], P)
     eps = eps[:n_ep]
@@ -282,8 +284,10 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
         _plog(writer, f"[eval_ae_floor @ep{step}] {pct:3d}% — {what}")
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+    eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"), img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    if cfg.eval.get("longest", False):
+        eps = sorted(eps, key=lambda e: -len(e[0]))   # longest (full-dock) episodes first — presentation
     n_ep = min(int(cfg.eval.get("ae_floor_episodes", 2) or 2), len(eps))
     eps = eps[:n_ep]
     H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
@@ -394,7 +398,7 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     m.eval()
     t0 = time.perf_counter()
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"), img_size=img_size,
                                     cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
     _, latents, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
                                                 stride=1, seed=0, device=device)
@@ -449,7 +453,7 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     P, W, d, K, n_swarm = cfg.data.P, m.window, m.d, m.sampling_steps, 16
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"), img_size=img_size,
                                     cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     # per-eval variety: a seed drives WHICH trajectory + the swarm angle, so a bad-looking eval won't recur (the
     # next eval shows a different one from a different angle) yet stays reproducible. Defaults to the epoch `step`.
@@ -567,7 +571,7 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     #                                       (RecordedConfig has inert R/r=1.0, so R-is-not-None can't gate this; #11)
     pos, _ = _pos_idx(cfg); K, P = m.sampling_steps, cfg.data.P
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"), img_size=img_size,
                                     cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
     _plog(writer, f"[denoising_aggregate @ep{step}] seed={seed} pooling val contexts, K={K}...")
@@ -641,7 +645,7 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     hz = list(cfg.eval.get("denoising_filmstrip_horizons", None) or [1, 8, 16, 32, 64])
     hz = sorted({int(h) for h in hz if int(h) >= 1})
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"), img_size=img_size,
                                     cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
     n_images = int(cfg.eval.get("denoising_filmstrip_images", 4) or 4)   # separate FILES, each a different episode
@@ -760,7 +764,7 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     P, H, fps = cfg.data.P, int(ic["clip_len"]), round(1.0 / ecfg.dt)
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+    eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"), img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
 
     # ---- sample N clips (episode, t0): P context frames + H imagined steps ----
@@ -995,7 +999,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     except Exception:
         pass
     a_max = getattr(ecfg, "a_max", None)   # torus-only histogram x-limit knob; None -> viz derives it from the data
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
+    eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"), img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     n_ep = min(int(cfg.eval.get("action_dist_episodes", 64) or 64), len(eps))   # default 64 = full val split (max distinct contexts)
     eps = eps[:n_ep]
