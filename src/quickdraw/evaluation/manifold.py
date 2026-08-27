@@ -142,12 +142,23 @@ def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device)
         z = m.encode_state(obs)                                    # (1, T, n_state, d)
         h_all = m.backbone(m._to_input(z, act))                    # one causal pass -> h at every step
         ts_a = np.array(sorted(ts))
-        h_pro, zt_pro = h_all[0, ts_a, 0, :], z[0, ts_a, 0, :]     # (nt, d) proprio-token conditioning + token
+        # Route through m._cond -- see the note in routines.py step_data. Hand-building this at width d
+        # crashed the velocity net (288 vs the 544 it wants) for every flow_arch=mlp config since 2026-08-12.
+        hc_all = m._cond(h_all, act)                               # (1, T, n_state, cond_width)
+        h_pro, zt_pro = hc_all[0, ts_a, 0, :], z[0, ts_a, 0, :]    # (nt, cond_width) cond + (nt, d) token
         eps = (torch.rand(len(ts_a), d, generator=g, device=device) * 2 - 1) * cube   # uniform hypercube noise
         _, path = m.flow.sample(h_pro, steps=K, deterministic=False, eps=eps, record_path=True)
-        decs = np.stack([norm.denorm_obs(dec.decode(_ln(zt_pro + x)[:, None, :].float())).float().cpu().numpy()
+        # MIRROR predict_next (multimodal.py:978-981) instead of hardcoding `_ln(zt_pro + x)`: the add
+        # applies only under predict=residual (absolute emits the FULL next latent), and the LN only when
+        # latent_norm is on (unconditional LN is already wrong for latent_norm=affine, whose inverse is
+        # applied inside to_obs/decode). Without this the recovered-manifold cloud and its UMAP/TSNE
+        # projections are silently nonsense in absolute mode.
+        def _commit(x):
+            nb = (zt_pro + x) if m.predict_residual else x
+            return _ln(nb) if m.latent_norm else nb
+        decs = np.stack([norm.denorm_obs(dec.decode(_commit(x)[:, None, :].float())).float().cpu().numpy()
                          for x in path])                           # (K+1, nt, 6): decoded proprio along the ODE
         paths_phys.extend(np.transpose(decs, (1, 0, 2)))              # list of (K+1, obs_dim)
-        latents.extend(_ln(zt_pro + path[-1]).float().cpu().numpy())   # committed proprio token, (d,)
+        latents.extend(_commit(path[-1]).float().cpu().numpy())        # committed proprio token, (d,)
     paths_phys, latents = np.stack(paths_phys), np.stack(latents)
     return paths_phys, latents, n_avail

@@ -36,11 +36,29 @@ class ModalitySpec:
     decode_shortcut: bool = False  # flow decode (param=v): opt-in shortcut self-consistency -> K=1 sampling
     #                                (like the dynamics `diffusion.shortcut`; never default-on). Off -> plain flow, decode_steps.
     decode_steps: int = 6     # flow decode sampling steps (K). v: ODE steps (shortcut->1). x0: consistency refine steps (1 = direct)
+    decode_stochastic: bool = False  # flow decode ONLY: SAMPLE the obs (eps ~ N(0,1)) instead of committing the
+    #                           deterministic eps=0 point. OFF (default) makes decode_kind=flow a TRAINING-ONLY
+    #                           change: with param=x0 the committed decode is velocity(zeros, tau=1, cond),
+    #                           which is EXACTLY the no_noise/mse computation, so a flow decoder trained at
+    #                           great cost renders identically to an MSE one. ON is what actually buys
+    #                           SHARPNESS: an MSE decoder emits E[obs | tokens] (the conditional mean = blur),
+    #                           a sampled one emits a draw (sharp). The tradeoff is real and must be read on
+    #                           BOTH metrics -- a sample off a DRIFTED latent is a sharp WRONG frame, so PSNR
+    #                           falls while LPIPS may improve. Ignored by decode_kind=mse (no_noise returns
+    #                           before eps is ever drawn), so mse stays bit-identical.
     decode_param: str = "v"   # flow decode parameterization: "v" (velocity, integrate ODE — imprecise for images)
     #                           | "x0" (predict the clean obs directly — precise + in-range; use for image decode). See flow.py.
-    decode_arch: str = "vit"  # IMAGE decoder architecture, ORTHOGONAL to decode_kind: "vit" (all-attention, patch
-    #                           grid) | "unet" (conv U-Net, no patch grid -> smoother fields). Composes with both
-    #                           mse and flow (4 combos). Ignored by vector modalities. See vision.ConditionalUNet.
+    decode_arch: str = "vit"  # IMAGE decoder architecture. "unet" (conv U-Net; serves BOTH decode_kinds) |
+    #                           "up" (UP-ONLY conv decoder with a query-grid readout, models/decoders.py --
+    #                           decode_kind=mse ONLY, it has no analysis path so it cannot denoise) | "vit"
+    #                           (all-attention + patch grid; best floor on record but patch SEAMS -- the "ep24
+    #                           blocking"). Unknown values RAISE (they used to fall through to vit silently).
+    #                           WHY "up" EXISTS: in mse mode the U-Net's `x` is a ZERO tensor, so its 4-level
+    #                           analysis path convolves zeros -- measured skip interiors have spatial std
+    #                           EXACTLY 0.0 -- for 15.9% of the decoder's params and ~33% of its activations, at
+    #                           full resolution, TWICE per step. And the latent reached pixels only through
+    #                           Linear(T*d->512) plus cond.mean(1), a rank-640 choke on 4096 latent floats
+    #                           (84% invisible). See models/decoders.py for the full derivation.
     encode_arch: str = "vit"  # IMAGE encoder architecture: "vit" (ViT/Perceiver, ImageAutoencoder.encode) | "conv"
     #                           (ConvImageEncoder, mirrors the U-Net down-path). Pair conv<->unet for a symmetric
     #                           conv enc/dec. Both emit num_tokens tokens (same interface). Ignored by vectors.
@@ -56,6 +74,13 @@ class ModalitySpec:
     num_tokens: int = 8
     ae_depth: int = 4
     ae_bottleneck: int = 8   # conv-pyramid bottleneck target (px, short side); 8 = previous behaviour
+    decode_chunk_train: int = 0   # >0: chunk the DECODE head's velocity forward into groups of this many
+    #                               frames and checkpoint each, so its intermediates are recomputed in
+    #                               backward instead of retained. 0 = OFF (bit-identical). The decoder is
+    #                               ~78% of per-sample training memory across TWO passes (the decode loss and
+    #                               the roundtrip anchor), so this is the one lever that buys real batch size
+    #                               -- everything else lives in the other 22%. ~1.33x decode compute.
+    #                               See design/decode_memory.md.
     channels: int = 3
     # pretrained image AE (TAESD) — issue #12. pretrained=false -> the bespoke AE above (BIT-IDENTICAL default).
     pretrained: bool = False                     # master on/off for the pretrained-AE image trunk
@@ -104,13 +129,22 @@ class Modality(nn.Module):
         tok = self._encode(flat)
         return tok.reshape(*lead, self.n_tokens, tok.shape[-1])
 
-    def decode(self, tok: Tensor) -> Tensor:
-        """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape), a committed (deterministic) decode. mse/x0 ->
-        1 step; v+shortcut -> K=1; v plain -> decode_steps. Same output shape for every kind/arch."""
+    def decode(self, tok: Tensor, *, commit: bool = False) -> Tensor:
+        """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape). mse/x0 -> 1 step; v+shortcut -> K=1; v plain ->
+        decode_steps. Same output shape for every kind/arch.
+
+        `commit=True` forces the DETERMINISTIC decode even under decode_stochastic. Required by the codec
+        ROUND-TRIP anchor: it is an MSE against the target at weight 10, and E||x_hat - t||^2 =
+        ||E x_hat - t||^2 + Var(x_hat), so scoring a SAMPLE there trains the sampler's variance toward zero --
+        i.e. it would optimise away the very sharpness decode_stochastic exists to buy, at 10x the weight of
+        the decode loss. The anchor's job is to measure the codec, which is deterministic by definition."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
-        steps = 1 if (self.decode_head.shortcut or self.decode_head.param == "x0") else self.decode_steps
-        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=True)
+        stoch = bool(getattr(self, "decode_stochastic", False)) and not self.decode_head.no_noise and not commit
+        # x0 collapses to ONE step only when committing: the k-loop's renoise is what injects the sampling
+        # noise, so a stochastic x0 decode needs the full decode_steps to be a sampler rather than one draw.
+        steps = 1 if (self.decode_head.shortcut or (self.decode_head.param == "x0" and not stoch)) else self.decode_steps
+        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=not stoch)
         return obs.reshape(*lead, *obs.shape[1:])
 
     def decode_loss(self, tok: Tensor, target: Tensor):
@@ -141,8 +175,10 @@ class VectorModality(Modality):
         from .multimodal import FourierMLP
         self.enc = FourierMLP(spec.dim, d, hidden, n_freq=int(getattr(spec, "fourier_freqs", 0) or 0))
         self.decode_steps = int(spec.decode_steps)
+        self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
         self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
+                                     chunk=int(getattr(spec, "decode_chunk_train", 0) or 0),
                                      param=("x0" if no_noise else spec.decode_param),
                                      shortcut=(spec.decode_shortcut and not no_noise), no_noise=no_noise)
 
@@ -178,12 +214,32 @@ class ImageModality(Modality):
                    if self.encode_arch == "conv" else ImageAutoencoder(ae_cfg))
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
+        self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
+        # EXPLICIT dispatch with a RAISE on anything unknown. This used to be `if unet ... else vit`, so a
+        # typo'd or newly-added decode_arch SILENTLY built the ViT head and the run "tested" nothing at all.
+        _chunk = int(getattr(spec, "decode_chunk_train", 0) or 0)
         if self.decode_arch == "unet":
             self.decode_head = ImageUNetFlowHead(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
-                                                 param=param, shortcut=sc, no_noise=no_noise)
+                                                 chunk=_chunk, param=param, shortcut=sc, no_noise=no_noise)
+        elif self.decode_arch == "up":
+            # UP-ONLY decoder (models/decoders.py): no analysis path, query-grid readout. DECODER ONLY -- it
+            # has no mechanism to denoise an image, so it cannot serve decode_kind=flow.
+            if not no_noise:
+                raise ValueError(
+                    "decode_arch='up' is a DECODER (tokens->image) and cannot serve decode_kind='flow', which "
+                    "needs a denoiser with an analysis path over its own noised input. Use decode_arch='unet' "
+                    "for flow, or decode_kind='mse' for 'up'. See models/decoders.py.")
+            from .decoders import TokenGridDecoder
+            self.decode_head = TokenGridDecoder(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
+                                                chunk=_chunk)
+        elif self.decode_arch == "vit":
+            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc,
+                                             no_noise=no_noise, chunk=_chunk)
         else:
-            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc, no_noise=no_noise)
+            raise ValueError(f"unknown decode_arch={self.decode_arch!r} for image modality "
+                             f"{spec.name!r}; expected one of 'unet' (conv U-Net, serves mse AND flow), "
+                             f"'up' (up-only conv decoder, mse only), 'vit' (all-attention, patch grid)")
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)
@@ -241,6 +297,7 @@ class PretrainedImageModality(Modality):
         self.noise_std = float(spec.noise_std)
         self.decode_kind = "mse"                   # pretrained path = the deterministic no_noise decode
         self.decode_steps = 1
+        self.decode_stochastic = False
         H, W = img_hw(spec.img_size)
         if spec.pretrained_init:                   # load the HF weights (the pretrained pixel prior)
             taesd = AutoencoderTiny.from_pretrained(spec.pretrained_name)

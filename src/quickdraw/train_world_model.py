@@ -100,6 +100,15 @@ def main(cfg):
     # autobatch probe builds a throwaway model too). workers=True also seeds dataloader workers.
     L.seed_everything(int(cfg.get("seed", 0) or 0), workers=True)
     torch.set_float32_matmul_precision("high")
+    # cuDNN autotuning: on the FIRST occurrence of each conv input shape, benchmark every available algorithm
+    # and cache the winner, instead of picking by heuristic. Our shapes are STATIC after step 0 (fixed batch
+    # from autobatch, fixed F/window/img_size) and the step is conv-heavy -- the image decoder is ~78% of
+    # per-sample memory (design/decode_memory.md) and runs TWICE per step -- which is exactly the case this
+    # flag exists for. Algorithm SELECTION only: the convolution computed is the same, so the only numerical
+    # effect is float reassociation, on a par with set_float32_matmul_precision above. Costs a one-off probe
+    # per new shape, which is why it is only safe BECAUSE the shapes are static; a shape-varying workload
+    # would re-benchmark forever. See design/accelerations.md (earmarked 2026-08-26, item 6).
+    torch.backends.cudnn.benchmark = True
     # Safety net for dynamo recompiles: the rollout/eval flex-attention paths can produce several mask
     # variants; a too-small cache (default 8) evicts and thrashes. The fixed-window rollout already
     # holds the attention KERNEL to one shape; this just keeps any residual mask variants cached.
@@ -120,8 +129,11 @@ def main(cfg):
         _assert_summary_unique(summary_text, cfg)   # run-note gate + the config.resolved.yaml re-write below.
     # Frame stride, set ONCE before anything loads episodes (autobatch below loads data too). Applied inside
     # the loaders so the training windows and every eval routine cannot end up at different rates.
-    from .data.dataset import set_obs_keep, set_subsample
+    from .data.dataset import set_obs_keep, set_subsample, set_subsample_all_phases
     set_subsample(int(cfg.data.get("subsample", 1) or 1))
+    # Emit all `subsample` phase offsets as separate TRAIN episodes -- ~s x the windows at the SAME frame rate,
+    # using the frames the decimation otherwise throws away. Off = bit-identical. See set_subsample_all_phases.
+    set_subsample_all_phases(bool(cfg.data.get("subsample_all_phases", False)))
     set_obs_keep(cfg.data.get("obs_keep", None))   # process-wide obs subset -> applied inside every loader + normalizer
     if not data_exists(cfg):
         raise FileNotFoundError(
@@ -233,7 +245,10 @@ def main(cfg):
                         variations=cfg.get("variations"), dt=e.dt,
                         recon_frac=float(cfg.model.get("recon_frac", 1.0)),
                         lr_warmup_steps=int(cfg.optim.get("lr_warmup_steps", 0)), env=env,
-                        p_tf_batch_granular=bool(cfg.model.get("p_tf_batch_granular", True)))
+                        p_tf_batch_granular=bool(cfg.model.get("p_tf_batch_granular", True)),
+                        # sample the expensive grad diagnostics (per-module norms, nan/inf counts) instead of
+                        # running them every step; the non-finite guard and grad/norm_preclip stay per-step.
+                        grad_diag_every=int(cfg.trainer.get("grad_diag_every", 25) or 25))
 
     # one writer -> local run folder + wandb, identically (see logging/writer.py). Lightning's own
     # logger is OFF; all logging flows through the writer via LoggingCallback.
@@ -250,11 +265,23 @@ def main(cfg):
     # decode error). Override with ANY fully-qualified logged metric via trainer.checkpoint_monitor — e.g.
     # "val/loss/physics/proprio" for a physics-prior WM, where pointwise_error is a black-box red herring.
     # BestCkptMirror prints the resolved rule to progress.log at fit start so the standard is never ambiguous.
-    ckpt_monitor = cfg.trainer.get("checkpoint_monitor", None) \
-        or f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}"
+    # AUTO monitor: prefer the IMAGE metric when the model has an image modality. The old fallback was always
+    # the env's proprio metric, which on an image run picks best.ckpt blind to every image result (measured:
+    # bott_bott16 pinned best.ckpt to e8 while its floor peaked e14 and its perceptual distance e18). mse and
+    # NOT psnr because psnr = -10*log10(mse) -> minimising mse IS maximising psnr, while staying a min-metric.
+    _img = next((m for m in cfg.model.get("modalities", []) or [] if str(m.get("kind", "")) == "image"), None)
+    ckpt_monitor = cfg.trainer.get("checkpoint_monitor", None) or (
+        f"val/metric/{_img.get('name', 'image')}/mse" if _img is not None
+        else f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}")
+    # AUTO direction from the metric NAME. mode used to be hardcoded "min", so aiming checkpoint_monitor at a
+    # higher-is-better metric silently selected the WORST epoch. Override with trainer.checkpoint_mode.
+    _hi = ("psnr", "ssim", "acc", "accuracy", "reward", "r2", "return")
+    ckpt_mode = str(cfg.trainer.get("checkpoint_mode", None)
+                    or ("max" if ckpt_monitor.rsplit("/", 1)[-1].lower() in _hi else "min"))
+    assert ckpt_mode in ("min", "max"), f"trainer.checkpoint_mode must be min|max, got {ckpt_mode!r}"
     ckpt_cb = ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
                               monitor=ckpt_monitor,
-                              mode="min", save_top_k=cfg.trainer.save_top_k, save_last=False)
+                              mode=ckpt_mode, save_top_k=cfg.trainer.save_top_k, save_last=False)
     # save_last on the monitored callback only writes last.ckpt when Lightning ALSO saves a top-k file, so
     # once the monitored metric stops improving the newest weights stop being written — a collapsed run then
     # leaves NOTHING from after the collapse and the failure cannot be inspected (observed 2026-08-09: a run

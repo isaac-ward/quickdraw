@@ -37,8 +37,15 @@ class TransportHead(nn.Module):
     implement `velocity`. The base owns the time (and shortcut step-size) embeddings + loss/sample/consistency."""
 
     def __init__(self, *, param: str = "v", shortcut: bool = False, event_dims: int = 1,
-                 n_freq: int = 16, time_dim: int = 32, no_noise: bool = False):
+                 n_freq: int = 16, time_dim: int = 32, no_noise: bool = False, chunk: int = 0):
         super().__init__()
+        # chunk: split the velocity forward over the leading (M = B*T) dim and CHECKPOINT each piece, so the
+        # decoder's intermediate activations are recomputed during backward instead of all being retained.
+        # 0 = OFF (default, bit-identical). See design/decode_memory.md: the decoder is ~78% of per-sample
+        # memory, split across TWO passes (this loss, and the roundtrip anchor via _sample), so both routes
+        # below go through _chunked_velocity. OPT-IN PER HEAD, never a global default: FlowField is also the
+        # DYNAMICS head (multimodal.py:925) and the ACTION head (:962), whose memory profile is different.
+        self.chunk = int(chunk or 0)
         # no_noise: the DEGENERATE case = a deterministic decoder (decode_kind="mse"). SAME network as the flow
         # head, trained/used WITHOUT the noise curriculum: predict the clean target from x=0 (tau=1), L2 loss, one
         # step. This unifies mse + flow onto one net per arch — mse is just "flow with no noise". Forces param="x0".
@@ -84,6 +91,24 @@ class TransportHead(nn.Module):
             return torch.sigmoid(torch.randn(shape, device=device, dtype=dtype))
         return torch.rand(shape, device=device, dtype=dtype)   # uniform (default)
 
+    def _chunked_velocity(self, x: Tensor, temb: Tensor, cond: Tensor, demb: Tensor | None) -> Tensor:
+        """`velocity` over the leading dim in chunks, each checkpointed. Exact: velocity is per-element on
+        dim 0 (the arch mixes only over dim -2), so cat-of-chunks reproduces the whole-batch result to fp
+        tolerance. Falls back to a single call when off, when the batch already fits, or under no_grad --
+        checkpointing without a backward is pure overhead, which is what `sample()` does at eval.
+        preserve_rng_state=False is safe: nothing inside any velocity path draws randomness (tau/eps are
+        sampled OUTSIDE, in `loss`), so the backward recompute is deterministic."""
+        c = self.chunk
+        if not c or x.shape[0] <= c or not torch.is_grad_enabled():
+            return self.velocity(x, temb, cond, demb)
+        outs = []
+        for i in range(0, x.shape[0], c):
+            sl = slice(i, i + c)
+            outs.append(torch.utils.checkpoint.checkpoint(
+                self.velocity, x[sl], temb[sl], cond[sl], None if demb is None else demb[sl],
+                use_reentrant=False, preserve_rng_state=False))
+        return torch.cat(outs, 0)
+
     # ---- training ----
     def loss(self, cond: Tensor, target: Tensor, *, time_sampling: str = "uniform") -> tuple[Tensor, Tensor | None]:
         """param="v": rectified flow-matching ||net - (eps-target)||^2 (+ shortcut self-consistency).
@@ -91,16 +116,16 @@ class TransportHead(nn.Module):
         ts = self._tau_shape(target)
         if self.no_noise:                             # mse decode: deterministic cond->target, no noise curriculum
             x0 = torch.zeros_like(target)
-            return F.mse_loss(self.velocity(x0, self._temb(target.new_ones(ts)), cond, None), target), None
+            return F.mse_loss(self._chunked_velocity(x0, self._temb(target.new_ones(ts)), cond, None), target), None
         tau = self._sample_time(ts, target.device, target.dtype, time_sampling)
         eps = torch.randn_like(target)
         x_tau = (1.0 - tau) * target + tau * eps      # straight (rectified) path
         if self.param == "x0":                        # net predicts the CLEAN target directly
-            x0_hat = self.velocity(x_tau, self._temb(tau), cond, None)
+            x0_hat = self._chunked_velocity(x_tau, self._temb(tau), cond, None)
             return F.mse_loss(x0_hat, target), None
         u = eps - target                              # velocity along the straight path (regression target)
         demb = self._demb(torch.zeros_like(tau)) if self.shortcut else None   # flow-matching = the d->0 field
-        v = self.velocity(x_tau, self._temb(tau), cond, demb)
+        v = self._chunked_velocity(x_tau, self._temb(tau), cond, demb)
         l_flow = F.mse_loss(v, u)
         return (l_flow, self._consistency(cond, target)) if self.shortcut else (l_flow, None)
 
@@ -118,7 +143,7 @@ class TransportHead(nn.Module):
             x2 = x - v1 * d
             v2 = self.velocity(x2, self._temb(tau - d), cond, self._demb(d))
             s_target = 0.5 * (v1 + v2)
-        v_2d = self.velocity(x, self._temb(tau), cond, self._demb(2.0 * d))  # the large step, with grad
+        v_2d = self._chunked_velocity(x, self._temb(tau), cond, self._demb(2.0 * d))  # the large step, with grad
         return F.mse_loss(v_2d, s_target)
 
     # ---- inference: integrate the ODE ----
@@ -128,7 +153,8 @@ class TransportHead(nn.Module):
         committed prediction. `event_shape`/`lead` let heads with different target shapes reuse this."""
         ts = tuple(lead) + (1,) * self.event_dims
         if self.no_noise:                             # mse decode: one deterministic cond->target prediction (x=0, tau=1)
-            out = self.velocity(cond.new_zeros(tuple(lead) + tuple(event_shape)), self._temb(cond.new_ones(ts)), cond, None)
+            out = self._chunked_velocity(cond.new_zeros(tuple(lead) + tuple(event_shape)),
+                                         self._temb(cond.new_ones(ts)), cond, None)
             return (out, [out]) if record_path else out
         if eps is None:
             shp = tuple(lead) + tuple(event_shape)
@@ -138,7 +164,7 @@ class TransportHead(nn.Module):
         if self.param == "x0":                        # consistency-style: predict x0, optionally renoise + refine
             for k in range(steps):
                 tau = cond.new_full(ts, 1.0 - k / steps)
-                x0_hat = self.velocity(x, self._temb(tau), cond, None)      # direct clean-target prediction
+                x0_hat = self._chunked_velocity(x, self._temb(tau), cond, None)   # direct clean-target prediction
                 if record_path:
                     path.append(x0_hat)
                 if k < steps - 1:                     # renoise to a lower level and refine (0 noise if deterministic)
@@ -195,7 +221,7 @@ class FlowField(TransportHead):
 
     def __init__(self, dz: int, h_dim: int, hidden: int, *, cond: str = "concat", param: str = "v",
                  shortcut: bool = False, n_freq: int = 16, time_dim: int = 32, no_noise: bool = False,
-                 arch: str = "mlp", n_tokens: int = 0, depth: int = 2, heads: int = 4):
+                 arch: str = "mlp", n_tokens: int = 0, depth: int = 2, heads: int = 4, chunk: int = 0):
         """`arch` selects how the velocity net sees the OTHER tokens being denoised at the same time.
 
           mlp          (default, bit-identical to every run before 2026-08-10) a per-token MLP. Token k's
@@ -211,7 +237,8 @@ class FlowField(TransportHead):
                        power-of-2 constraint does not apply -- N is ~10, attention over it is negligible."""
         if cond != "concat":
             raise NotImplementedError(f"FlowField cond={cond!r} not implemented; use 'concat' (adaln is a future upgrade).")
-        super().__init__(param=param, shortcut=shortcut, event_dims=1, n_freq=n_freq, time_dim=time_dim, no_noise=no_noise)
+        super().__init__(param=param, shortcut=shortcut, event_dims=1, n_freq=n_freq, time_dim=time_dim,
+                         no_noise=no_noise, chunk=chunk)
         self.dz = dz
         self.arch = str(arch).lower()
         if self.arch not in ("mlp", "transformer"):
@@ -256,8 +283,9 @@ class ImageFlowHead(TransportHead):
     Reuses vision.ViTBlock/CrossAttn + linear (de)patchify (own weights, separate from the AE)."""
 
     def __init__(self, ae_cfg, *, depth: int = 4, param: str = "v", shortcut: bool = False, n_freq: int = 16,
-                 time_dim: int = 32, no_noise: bool = False):
-        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim, no_noise=no_noise)
+                 time_dim: int = 32, no_noise: bool = False, chunk: int = 0):
+        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim,
+                         no_noise=no_noise, chunk=chunk)
         from .vision import CrossAttn, ViTBlock, img_hw
         c = ae_cfg
         self.cfg = c
@@ -311,8 +339,9 @@ class ImageUNetFlowHead(TransportHead):
     ImageFlowHead does. No patch grid -> smooth color fields don't block (see the ep24 ViT-decode blocking)."""
 
     def __init__(self, ae_cfg, *, base: int = 32, param: str = "v", shortcut: bool = False,
-                 n_freq: int = 16, time_dim: int = 32, no_noise: bool = False):
-        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim, no_noise=no_noise)
+                 n_freq: int = 16, time_dim: int = 32, no_noise: bool = False, chunk: int = 0):
+        super().__init__(param=param, shortcut=shortcut, event_dims=3, n_freq=n_freq, time_dim=time_dim,
+                         no_noise=no_noise, chunk=chunk)
         from .vision import ConditionalUNet
         self.cfg = ae_cfg
         self.unet = ConditionalUNet(ae_cfg, base=base, time_dim=time_dim)

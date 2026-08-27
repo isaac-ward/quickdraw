@@ -89,6 +89,28 @@ def get_subsample() -> int:
     return _SUBSAMPLE
 
 
+_SUBSAMPLE_ALL_PHASES = False
+
+
+def set_subsample_all_phases(v: bool) -> None:
+    """data.subsample_all_phases: emit ALL `s` phase offsets of the decimation as separate TRAIN episodes.
+
+    At stride s the decimation keeps frames 0, s, 2s, ... and DISCARDS every other frame ENTIRELY -- and since
+    windows then slide over the DECIMATED sequence, every training window shares phase 0. At s=5 that means
+    80% of the dataset is never seen by anything. Emitting all s phases (0,s,2s.. AND 1,1+s,.. AND ...) gives
+    ~s x the training windows at EXACTLY the same frame rate: same per-step motion (the s=5 delta is 1.35x the
+    codec error floor; record section 13), same real-time horizon, so every number stays comparable to runs
+    without it. Not the same as subsample=1, which changes the RATE -- at 20 Hz the per-step motion is 0.61x
+    the codec floor, i.e. below our own reconstruction error, and a matched real-time horizon needs 4x more
+    autoregressive steps.
+
+    TRAIN ONLY, deliberately: adding phases to VAL would change which episodes the eval routines sample and
+    silently shift every metric, breaking comparability with prior runs. Off = bit-identical.
+    """
+    global _SUBSAMPLE_ALL_PHASES
+    _SUBSAMPLE_ALL_PHASES = bool(v)
+
+
 _OBS_KEEP = None
 _OBS_KEEP_USED = False
 
@@ -133,21 +155,27 @@ def _subsample_episodes(eps, tag: str):
         return eps
     acts = np.concatenate([e[1] for e in eps], 0)
     hold = [d for d in range(acts.shape[1]) if len(np.unique(acts[:, d])) <= 2]
+    # PHASE OFFSETS: normally just [0] -- frames 1..s-1 of every group are discarded and never seen. With
+    # data.subsample_all_phases (TRAIN only) emit all s of them as separate episodes: ~s x the windows at the
+    # SAME rate. See set_subsample_all_phases.
+    all_phases = _SUBSAMPLE_ALL_PHASES and "/train" in tag
+    phases = range(s) if all_phases else (0,)
     out, dropped = [], 0
     for ep in eps:
-        o, a = ep[0], ep[1]
-        n = len(o) // s
-        if n < 2:                                     # too short to yield even one transition
-            dropped += 1
-            continue
-        grp = a[:n * s].reshape(n, s, -1)
-        aa = grp.sum(axis=1)
-        if hold:
-            aa[:, hold] = grp[:, -1, hold]            # last raw action in the group, not the sum
-        out.append((o[:n * s:s], aa) + tuple(x[:n * s:s] for x in ep[2:]))
-    print(f"[subsample] {tag}: stride {s} | {len(eps)} eps {len(acts)} frames -> {len(out)} eps "
-          f"{sum(len(e[0]) for e in out)} frames | actions SUMMED except take-last on dims {hold} "
-          f"| {dropped} eps dropped as too short", flush=True)
+        for ph in phases:
+            o, a = ep[0][ph:], ep[1][ph:]
+            n = len(o) // s
+            if n < 2:                                 # too short to yield even one transition
+                dropped += 1
+                continue
+            grp = a[:n * s].reshape(n, s, -1)
+            aa = grp.sum(axis=1)
+            if hold:
+                aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the sum
+            out.append((o[:n * s:s], aa) + tuple(x[ph:][:n * s:s] for x in ep[2:]))
+    print(f"[subsample] {tag}: stride {s}{f' x {s} PHASES' if all_phases else ''} | {len(eps)} eps "
+          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions SUMMED except "
+          f"take-last on dims {hold} | {dropped} eps dropped as too short", flush=True)
     return out
 
 

@@ -463,3 +463,93 @@ dedicated H100 — only `compile_rollout` differs.
   the real training loop at scale. The only slow part is the eager warmup (~4 epochs, p_tf>0) — inherent, since
   compile applies only to the steady p_tf=0 rollout. A second dataset (robocasa recorded, d=128/F=64/batch=32)
   independently measured **3.90 → 0.67 s/batch (5.8×)**.
+
+---
+
+## EARMARKED (2026-08-26) — throughput audit findings, not yet implemented
+
+Adversarial audit of the whole training path against wall-clock. Ranked. Nothing here is done; this section
+exists so the ideas are not lost. Every item verified against the code at the file:line given.
+
+**MEASURED PHASE SPLIT of the 88.4-min cycle at 128px / batch 27 / F=64** (from
+`logs/train_world_model_2026_08_26_00_37_24_absres_absolute/progress.log`, steady epochs 8-10):
+
+| phase | time | share |
+|---|---|---|
+| train epoch (1300 batches @ 3.74 s) | 81.2 min | **91.9%** |
+| validation (149 AR batches @ 2.3 s, EVERY epoch) | 5.75 min | 6.5% |
+| all eval routines (ood_horizon 43 s + filmstrip 27.5 s + ae_floor 18 s) | ~1.5 min | 1.7% |
+
+**EVALS ARE 1.7%. DO NOT CUT THEM** — they produce the only metrics the objective is judged on. Every earlier
+guess that evals were a large share (including mine) was wrong.
+
+Framing that decides which levers pay: total step ~90 TFLOP in 3.74 s = **~24 TFLOP/s, ~2.5% of H100 bf16
+peak**. The step is SERIALIZATION/LATENCY-bound, not FLOP-bound. Levers that reduce serial depth or widen the
+batch pay; levers that shave FLOPs at fixed serialization underdeliver.
+
+### 1. [~30-60% of epoch; NUMERICALLY EXACT; medium effort] Compose grad_checkpoint WITH compile_rollout
+`multimodal.py:590-596` — `if compiled: ... elif self.grad_checkpoint and self.training:`. They are MUTUALLY
+EXCLUSIVE; the compiled path silently ignores checkpointing. Per-sample memory is 2.83 GB and, after the
+decode double-chunking (`decode_memory.md`), that residual is dominated by the rollout's F x W saved-for-
+backward activations -- exactly what checkpointing removes. Fix: wrap the compiled `step_fn` in
+`torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`, `preserve_rng_state=True` (train-time sampling
+IS stochastic, `predict_next` at :990). Batch 27 -> ~100 at the same footprint; in a latency-bound regime
+s/batch rises only ~10-22% for 2-4x batch (Exp 5/8), so epoch time drops ~2-3x.
+GATE BEFORE BELIEVING IT: one 2-point s/batch-vs-batch probe (protocol in `rollout_throughput.md`). If this
+config is nearer compute-bound than Exp 9's was, the gain shrinks toward nil. Also changes optimizer
+steps/epoch -- a hyperparameter change to declare in any A/B, not a numerics bug.
+
+### 2. [~5-6% of every cycle; FREE] Validation runs the EAGER rollout
+`multimodal.py:577` — `compiled = self.compile_rollout and p_tf == 0.0 and self.training`. Val has
+`self.training == False`, so all 149 val batches/epoch run eager, where FlexAttention is UNFUSED and
+materialises the full scores matrix (the UserWarning in every log). Val also ignores the KV-cache
+(`_rollout` defaults `use_cache=False`) although `_rollout_cached` is inference-only by design, documented to
+match numerically, and its divergence is measured NULL every run (`kvcache_report`, +-0.01 dB).
+Fix: allow the compiled step when `not torch.is_grad_enabled()` too, or route val through `use_cache=True`.
+Touches val-metric fp noise only, never the training loss. Cheapest real win on the list.
+
+### 3. [~5-10% of the step; CHANGES THE ROLLOUT NUMERICALLY, but measured null on quality] sampling_steps 6 -> 2
+The flow sampler runs `sampling_steps=6` sequential velocity evals of the depth-2 transformer INSIDE each of
+the 64 rollout steps (`flow.py` `_sample` loop, `multimodal.py:990`). `_oneoff_latent_drift.py:30` already
+measured: "Everything K>=2 is within noise ... K=1 is BADLY broken at depth (2.5 dB below K=2)". K=2 keeps the
+multi-step mechanism K=1 lacks and cuts the serial critical path 3x at the sampler.
+Needs one epoch-matched A/B on OL LPIPS@+64/@+128 first -- the null was measured on a different config.
+
+### 4. [largest structural item; NUMERICALLY EXACT mod fp order; large effort] Grad-carrying KV-cache in the TRAIN rollout
+`_rollout_from` stacks the last W=32 positions and runs the backbone over all of them at EVERY step, reading
+out only `[:, -1]` (`multimodal.py:583-602`, `_rollout_step:512`) -- O(F*W) instead of O(F), ~32x redundant
+backbone FLOPs and most of the per-step activation memory. The inference path `_rollout_cached` (:626) already
+proves per-step incremental attention reproduces the parallel path exactly. Needs autograd through the KV ring
+buffer + detach_every semantics + compile. In a latency-bound regime the wall-clock win is smaller than the
+FLOP win; its real value is the memory reduction, i.e. the same batch unlock as item 1.
+
+### 5. [~1-2%; FREE] Per-step gradient instrumentation
+`lit.py:265-330` — `_total_norm()` twice (pre+post clip), per-module sq-sums over all 163 `named_parameters`,
+`isnan().sum()` + `isinf().sum()` per grad, then `bool(...)` / `float(...)` which FORCE a GPU sync every step.
+The nonfinite skip-guard must stay per-step (it gates the update); the 13 per-module norms and the nan/inf
+COUNTS can run every N steps or only when the guard trips. Logging-only change.
+
+### 6. [~0-3%; FREE] `torch.backends.cudnn.benchmark = True` is NOT SET
+Grep over `src/` finds only `set_float32_matmul_precision("high")` (`train_world_model.py:102`). Shapes are
+static after the first step and the decode is conv-heavy, which is exactly the case cudnn autotuning is for.
+One line next to the matmul-precision call. Algorithm-selection only (fp reassociation), no semantic change.
+
+### Verified NON-issues (do not spend time here)
+Eval routines (1.7%, protected). Block-mask caching (`transformer.py:_PAD_MASK_CACHE` is properly cached, no
+per-step `create_block_mask`). Recompile thrash (cache_size_limit 256, ~25 pad variants, none visible in logs).
+Decode memory (already solved: double chunk + checkpoint, batch 7 -> 27). Dataloading (fully GPU-resident, pure
+GPU gather, precomputed normalisation -- nothing to do). TF32 and `expandable_segments` already on.
+
+### Open uncertainty worth one profiler run
+The compiled rollout's claimed ~6x win is INVISIBLE in epoch timings: epoch 0 (eager, p_tf ramp) ran 3.11
+s/batch and steady compiled epochs run 3.74 s/batch. Best explanation is that epoch-0 backward is cheaper
+because per-sample teacher-forcing coins truncate the BPTT graphs, so the comparison is confounded -- but
+NOTHING on record verifies the compiled step delivers on THIS config (Exp 9's numbers came from another).
+Every phase share above is FORWARD-ONLY. One profiler run with backward attribution retires this.
+
+### Measured for the record, 2026-08-26: 96px vs 128px
+`img_size` 96 (with `ae_bottleneck: 6`, the exact structural analogue of 8 at 128px -- same 3 enc / 4 dec
+levels, same 256x spatial reduction) gives **2763 s/epoch vs 5213 s at 128px = 1.9x faster**, batch 27 -> 32.
+Better than the 0.56 pixel ratio alone because the smaller frames also buy batch. COST: LPIPS is
+resolution-dependent, so no 96px number is comparable to the 128px record (0.2783) -- 96px ranks arms against
+each other only.

@@ -323,11 +323,12 @@ class MultiModalSequenceModel(nn.Module):
         bag = torch.cat(toks, dim=-2)
         return _ln(bag) if self.latent_norm else bag
 
-    def to_obs(self, bag: Tensor, heads=None, anchor: Tensor | None = None) -> dict[str, Tensor]:
+    def to_obs(self, bag: Tensor, heads=None, anchor: Tensor | None = None, commit: bool = False) -> dict[str, Tensor]:
+        """`commit=True` -> deterministic decode even under decode_stochastic (see Modality.decode)."""
         out, off = {}, 0
         for name, n in self.layout:
             if heads is None or name in heads:                       # partial decode (e.g. proprio-only long rollouts)
-                out[name] = self.modalities[name].decode(bag[..., off:off + n, :])
+                out[name] = self.modalities[name].decode(bag[..., off:off + n, :], commit=commit)
             off += n
         if anchor is not None and "proprio" in out:
             out["proprio"] = self.absolutize_proprio(out["proprio"], anchor)   # back to ABSOLUTE (no-op if off)
@@ -396,7 +397,9 @@ class MultiModalSequenceModel(nn.Module):
         bag = self.encode_state(targets, anchor) if pre_z is None else pre_z   # REAL encode (LN incl.; relativizes
         #                          internally when anchor on). pre_z = the SAME encode from the shared-encode fast
         #                          path (_step), sliced -- bit-identical at noise_std=0 (design/accelerations P4).
-        rec = self.to_obs(bag, heads=heads, anchor=anchor)   # REAL decode, de-relativized -> ABSOLUTE (matches targets)
+        # commit=True: the anchor measures the CODEC, which is deterministic. Scoring a stochastic sample here
+        # would train its variance to zero (MSE of a sample = bias^2 + variance) at weight 10 -- see decode().
+        rec = self.to_obs(bag, heads=heads, anchor=anchor, commit=True)   # REAL decode, de-relativized -> ABSOLUTE
         # RAW mse + its weight, so the logged series is comparable across runs that sweep latent_loss_weight
         # (every sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec
         # panel rescale while the decode panels did not.
@@ -546,17 +549,19 @@ class MultiModalSequenceModel(nn.Module):
     # ---- shared autoregressive rollout (token-bag analogue of SequenceWorldModel._rollout) ----
     def _rollout(self, ctx_obs: dict[str, Tensor], actions: Tensor, horizon: int, p_tf: float,
                  true_future: dict[str, Tensor] | None, detach_every: int, use_cache: bool = False,
-                 anchor: Tensor | None = None) -> Tensor:
+                 anchor: Tensor | None = None, return_feeds: bool = False) -> Tensor:
         bag_buf = list(self.encode_state(ctx_obs, anchor).unbind(dim=1))     # P bags of (B,n_state,d)
         # Only encode the true future when teacher forcing can actually USE it (p_tf>0). At p_tf==0 — the
         # steady AR regime (most of training) AND all of val — tf_future is never read (see the `p_tf > 0.0`
         # guard at the mix below), so encoding F frames + retaining their adapter graph is pure waste.
         # SAME anchor as the context (the window's first-step position) so ctx and future share the frame.
         tf_future = self.encode_state(true_future, anchor) if (true_future is not None and p_tf > 0.0) else None
-        return self._rollout_from(bag_buf, actions, horizon, p_tf, tf_future, detach_every, use_cache=use_cache)
+        return self._rollout_from(bag_buf, actions, horizon, p_tf, tf_future, detach_every, use_cache=use_cache,
+                                  return_feeds=return_feeds)
 
     def _rollout_from(self, bag_buf, actions: Tensor, horizon: int, p_tf: float,
-                      tf_future: Tensor | None, detach_every: int, use_cache: bool = False) -> Tensor:
+                      tf_future: Tensor | None, detach_every: int, use_cache: bool = False,
+                      return_feeds: bool = False) -> Tensor:
         """Rollout from a PRE-ENCODED context (list of P bags). Lets callers encode the context once and
         roll many action variants from it (MPPI: encode the image context once, share across K candidates).
         use_cache: temporal KV-cache path (inference only) — see `_rollout_cached`."""
@@ -565,6 +570,7 @@ class MultiModalSequenceModel(nn.Module):
             return self._rollout_cached(list(bag_buf), actions, horizon)
         W = self.window
         bag_buf = list(bag_buf)
+        P0 = len(bag_buf)          # return_feeds: bag_buf[P0+k] is what the step predicting frame k+1 STOOD ON
         B = bag_buf[0].shape[0]
         # Compiled per-step path is opt-in AND only for the steady AR regime (p_tf==0, training). Teacher-forcing
         # (p_tf>0, warmup) is a data-dependent branch -> stays eager; the graph captures the p_tf==0 step only.
@@ -604,7 +610,16 @@ class MultiModalSequenceModel(nn.Module):
             if detach_every and ((h + 1) % detach_every == 0):
                 s_feed = s_feed.detach()
             bag_buf.append(s_feed)
-        return torch.stack(preds, dim=1)                            # (B,horizon,n_state,d)
+        preds = torch.stack(preds, dim=1)                           # (B,horizon,n_state,d)
+        if not return_feeds:
+            return preds
+        # FEEDS = the p_tf mix each step actually stood on, so a dynamics loss conditioned on them inherits
+        # the p_tf schedule instead of being pinned teacher-forced (design/flow.md). ATTACHED on purpose: a
+        # detached context would only ever teach a one-step correction and would never train COMPOUNDING,
+        # which is the whole defect. The graph is already retained for the decode loss, so the marginal cost
+        # is ~zero -- autograd accumulates into nodes that backward already traverses. detach_every still
+        # truncates the reach, exactly as it does for the decode loss.
+        return preds, torch.stack(bag_buf[P0:], dim=1)              # (B,horizon,n_state,d)
 
     def _rollout_cached(self, bag_buf, actions: Tensor, horizon: int) -> Tensor:
         """Autoregressive rollout with a temporal KV-cache (INFERENCE only — no grad, no teacher forcing).
@@ -632,13 +647,18 @@ class MultiModalSequenceModel(nn.Module):
         return torch.stack(preds, dim=1)                             # (B,horizon,n_state,d)
 
     def rollout_train(self, ctx_obs, actions, true_future: dict, p_tf: float, detach_every: int = 8,
-                      precomputed_ctx: Tensor | None = None, anchor: Tensor | None = None) -> Tensor:
+                      precomputed_ctx: Tensor | None = None, anchor: Tensor | None = None,
+                      return_feeds: bool = False) -> Tensor:
+        """return_feeds -> (preds, feeds): feeds[k] is what the step predicting future frame k+1 STOOD ON
+        (the p_tf teacher-forcing mix). Used by dynamics_follows_p_tf; see design/flow.md."""
         horizon = next(iter(true_future.values())).shape[1]
         if precomputed_ctx is not None:                       # shared-encode fast path (_step, p_tf==0 only):
             assert p_tf == 0.0, "precomputed_ctx is the p_tf==0 shared encode (no teacher forcing)"  # ctx already
             return self._rollout_from(list(precomputed_ctx.unbind(dim=1)),           # LN'd + relativized already
-                                      actions, horizon, 0.0, None, detach_every)      # (encoded with anchor in _step)
-        return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every, anchor=anchor)
+                                      actions, horizon, 0.0, None, detach_every,      # (encoded with anchor in _step)
+                                      return_feeds=return_feeds)
+        return self._rollout(ctx_obs, actions, horizon, p_tf, true_future, detach_every, anchor=anchor,
+                             return_feeds=return_feeds)
 
     def _physics_proprio_rollout(self, bag: Tensor, prev0_abs: Tensor, actions: Tensor,
                                  horizon: int, P: int, norm) -> Tensor:
@@ -713,12 +733,14 @@ class MultiModalSequenceModel(nn.Module):
         return out
 
     def imagine_eval(self, ctx_obs: dict, actions: Tensor, horizon: int, heads=None,
-                     use_cache: bool | None = None, decode_chunk: int | None = None, norm=None) -> dict[str, Tensor]:
+                     use_cache: bool | None = None, decode_chunk: int | None = None, norm=None,
+                     return_bag: bool = False) -> dict[str, Tensor]:
         """Eval/single-sequence rollout = `_imagine` with K=1. `heads` limits which modalities decode (e.g.
         ['proprio'] for cheap long-horizon rollouts). `decode_chunk` bounds the image decoder's peak memory over
         long horizons. `norm` activates the physics-anchored proprio rollout (owm)."""
         return self._imagine(ctx_obs, actions, horizon, K=1, heads=heads,
-                             use_cache=use_cache, decode_chunk=decode_chunk, norm=norm)
+                             use_cache=use_cache, decode_chunk=decode_chunk, norm=norm,
+                             return_bag=return_bag)     # `_bag` = the rolled latents, for latent-space curves
 
     def imagine_shared(self, ctx_obs: dict, actions: Tensor, horizon: int, K: int, heads=None,
                        return_bag: bool = False, norm=None) -> dict[str, Tensor]:
@@ -885,7 +907,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
-                 dynamics_detach_encoder: bool = False, **kw):
+                 dynamics_detach_encoder: bool = False, p_tf_dynamics: float | None = 1.0, **kw):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
@@ -934,6 +956,22 @@ class MultiModalFlow(MultiModalSequenceModel):
         # dynamics gradient cannot reshape the encoder. The encoder is then trained ONLY by the decode/recon loss
         # (which has no collapse shortcut) — the joint-training equivalent of IWS's frozen AE. See loss_terms.
         self.dynamics_detach_encoder = bool(dynamics_detach_encoder)
+        # p_tf_dynamics: the probability that the DYNAMICS loss conditions on the TRUTH (clean encoder
+        # latents) rather than on the rollout's own feeds. Exactly the same quantity p_tf denotes, for a
+        # different consumer -- p_tf is the ROLLOUT's (and so the decode loss's), this is the dynamics loss's.
+        #   1.0  = always clean. The historical behaviour, and the DEFECT: p_tf ramped 1 -> 0, the decode loss
+        #          duly became autoregressive, and the transition function stayed teacher-forced for the whole
+        #          run, never once asked to step from a latent it produced itself.
+        #   None = follow p_tf (so 0 after warmup). Measured: latent_cos@+32 2.1x better than the control for
+        #          five epochs, then a rollout-Jacobian blow-up -- grad/norm/flow 0.42 -> 1.3e7, ae_floor
+        #          19.1 -> 11.4, latent_cos NEGATIVE. Full substitution is too strong.
+        #   0<q<1 = the middle ground the dose-response curve points at: diffusion forcing corrupts the same
+        #          context isotropically at 0.1 strength and is both stable AND the best result measured, while
+        #          full substitution collapses. This is a STRENGTH knob, which p_tf cannot supply -- p_tf is
+        #          shared with the decode loss, and that loss NEEDS 0 (it is the only autoregressive gradient
+        #          in the model). Replaces the old `dynamics_follows_p_tf` bool: false == 1.0, true == None.
+        # design/flow.md, record section 18.
+        self.p_tf_dynamics = None if p_tf_dynamics is None else float(p_tf_dynamics)
         if self.action_head_enabled:
             self.action_flow = FlowField(action_dim, h_dim=d, hidden=(flow_hidden or d), cond="concat",
                                          shortcut=action_head_shortcut)
@@ -955,14 +993,37 @@ class MultiModalFlow(MultiModalSequenceModel):
         return _ln(out) if self.latent_norm else out
 
     def loss_terms(self, pred_bag, future_obs, obs, p_tf, act_seq=None, pre_z: Tensor | None = None,
-                   anchor: Tensor | None = None):
+                   anchor: Tensor | None = None, feeds: Tensor | None = None):
         """Teacher-forced rectified-flow loss over the bag (mirrors models/diffusion.py)."""
         assert act_seq is not None
         z = self.encode_state(obs, anchor) if pre_z is None else pre_z  # (B,L,n_state,d); pre_z = shared-encode (already relativized)
         L = z.shape[1]
         s = z[:, :-1]                                           # contexts (B,L-1,n_state,d)
+        # q = probability of conditioning on TRUTH. None -> track the rollout's own p_tf.
+        q_dyn = p_tf if self.p_tf_dynamics is None else self.p_tf_dynamics
+        if q_dyn < 1.0 and feeds is not None:
+            # Condition on what each rollout step actually STOOD ON, so the p_tf schedule reaches this loss.
+            # feeds[k] fed the step predicting future frame k+1, i.e. parallel-pass position P+k -> alignment
+            # is by CONSTRUCTION, not shape inference. feeds[F-1] fed no step and is dropped. The first L-F
+            # positions are the given context frames the model never predicted, so they stay clean.
+            # torch.cat, NEVER in-place: `s` is a VIEW of `z`, and writing through it would corrupt `z` and
+            # with it the target below. See design/flow.md.
+            F_ = feeds.shape[1]
+            if L - F_ >= 1 and F_ >= 2:
+                tail = feeds[:, :F_ - 1]
+                if q_dyn > 0.0:
+                    # per (sample, position) Bernoulli, mirroring how p_tf mixes inside the rollout
+                    # (_rollout_from). Only drawn when 0 < q < 1, so q == 1.0 and q == 0.0 leave the RNG
+                    # stream untouched and stay bit-identical to not having this feature.
+                    keep_true = torch.rand(tail.shape[:2] + (1, 1), device=tail.device,
+                                           dtype=tail.dtype) < q_dyn
+                    tail = torch.where(keep_true, z[:, L - F_:-1], tail)
+                s = torch.cat([z[:, :L - F_], tail], dim=1)
         if self.dynamics_detach_encoder:                        # stop-grad: dynamics loss won't reshape the encoder
             s = s.detach()                                      #   (encoder trained only by decode/recon; anti-collapse)
+        s_ref = s      # the contexts the target is measured FROM. Snapshotted BEFORE the DF block below
+        #                overwrites `s` with its noised version -- otherwise the residual target would absorb
+        #                the diffusion-forcing noise, silently redefining DF. Aliases z[:, :-1] when off.
         levels = None
         if self.df_scale > 0.0 and self.training:               # diffusion forcing: noise the context + tell the backbone
             levels = torch.rand(s.shape[:-2] + (1,), device=s.device, dtype=s.dtype) * self.df_scale  # (B,L-1,1)
@@ -973,7 +1034,11 @@ class MultiModalFlow(MultiModalSequenceModel):
                 s = _ln(s)                                       # renormalized back onto the sphere
         h = self.backbone(self._to_input(s, act_seq[:, :L - 1], levels=levels))
         h_state = self._cond(h, act_seq[:, :L - 1])            # (B,L-1,n_state,d) or 2d if concat_action
-        target = (z[:, 1:] - z[:, :-1]).detach() if self.predict_residual else z[:, 1:].detach()  # target off CLEAN z
+        # The residual target is defined RELATIVE TO THE CONTEXT it will be added to (`predict_next` does
+        # `next = prev + d`), so it must follow `s_ref`. With dynamics_follows_p_tf off this is byte-for-byte
+        # the previous expression; on, it becomes `z[t+1] - what_the_step_stood_on` -- the correction back
+        # onto the true trajectory. Absolute mode never referenced the context and is unchanged.
+        target = (z[:, 1:] - s_ref).detach() if self.predict_residual else z[:, 1:].detach()  # off CLEAN z
         l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
         raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function
         if l_cons is not None:

@@ -20,7 +20,7 @@ from ..logging import viz
 from ..training.setup import eval_episodes, resolve_data_root
 import torch
 
-from .openloop import emit_horizon_readouts, eval_batched, image_curves, proprio_curves
+from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_curves, proprio_curves
 from .products import emit_openloop
 
 
@@ -128,6 +128,9 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
     return n_ep, H, cl_h, modes, calls
 
 
+@torch.no_grad()          # every sibling eval routine has this; ood_horizon did not, so its latent pass was
+#                           building a full autograd tape over a 128-step rollout every eval epoch and
+#                           discarding it. imagine_eval was already guarded internally; latent_pass was not.
 def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     """The ONE long-horizon eval for every model (OOD: horizon >> trained). Held-out val episodes, decoding
     proprio (always) + any image head; the code generalizes over arbitrary trunks. Products are nested under
@@ -172,7 +175,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     itrue = {h: torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
              for h in img_heads}
 
-    def rollout_regrounded(every, Hm):
+    def rollout_regrounded(every, Hm, want_bag=False):
         """Hm-step predicted obs (dict per head, (n_ep,Hm,...)), re-grounding on GT every `every` steps. Segment
         the horizon into ceil(Hm/every) chunks; segment s uses GT context obs[s*every:s*every+P] and actions
         a[s*every:s*every+P+every-1], rolls `every` steps via imagine_eval, keeps min(every, Hm-s*every), then
@@ -198,20 +201,58 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         acts = torch.stack(A).float().to(device)                           # (n_ep*n_seg, P+every-1, act_dim)
         rows = n_ep * n_seg
         cap = max(n_ep, 64)                                                 # per-call batch cap (open_loop: rows=n_ep -> ONE call)
-        segs = {h: [] for h in heads}
+        segs, bag_out = {h: [] for h in heads}, None
         for r0 in range(0, rows, cap):
             sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
-            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc, norm=norm)
+            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc, norm=norm,
+                                 return_bag=want_bag)
             for h in heads:
                 segs[h].append(o_c[h])
+            if want_bag and "_bag" in o_c:
+                # Rows are ordered (episode, segment). This plain cat is only correct while n_seg == 1, which
+                # `want_bag = open_loop` guarantees (open loop IS the single-segment mode). Asserted rather
+                # than assumed: with n_seg > 1 the bag would need the same reshape/slice `out[h]` gets below.
+                assert n_seg == 1, "latent curves assume the single-segment (open-loop) rollout"
+                bag_out = o_c["_bag"] if bag_out is None else torch.cat([bag_out, o_c["_bag"]], 0)
         out = {}
         for h in heads:
             v = torch.cat(segs[h], 0)                                       # (n_ep*n_seg, every, ...)
             v = v.reshape(n_ep, n_seg, *v.shape[1:])
             out[h] = torch.cat([v[:, s, :min(every, Hm - s * every)] for s in range(n_seg)], dim=1)  # (n_ep,Hm,...)
-        return out
+        return (out, bag_out) if want_bag else out
 
-    def score_and_emit(out, subroutine, desc, Hm):
+    def latent_pass(Hm, bag):
+        """LATENT-space curves for the OPEN-LOOP mode, computed from THE ROLLOUT THAT WAS ALREADY RUN.
+
+        It used to roll a second time. That was wrong twice over: it doubled the rollout cost, and with
+        `stochastic_eval: true` (the default) the second rollout draws different eps -- so `latent_cos`
+        described a DIFFERENT sample than the psnr/lpips curves it is plotted beside, and pairing them
+        compared two draws. Now the bag comes back from the same `imagine_eval` call that produced the
+        images (`return_bag`), so every curve on the panel describes one trajectory.
+
+        Open-loop only -- under re-grounding the latent is reset every `every` steps, so a horizon-indexed
+        drift curve would not mean what it says. Guarded: an add-on diagnostic must never be able to disable
+        the whole ood_horizon routine (2 consecutive failures do that)."""
+        try:
+            if bag is None:      # LOUD: latent_cos is the primary metric for the dfptf experiments, and a
+                #                  silent {} here would make it vanish from the panel with no explanation.
+                _plog(writer, f"[eval_ood_horizon @ep{step}] latent curves SKIPPED: imagine_eval returned no "
+                              f"`_bag` (return_bag path). The decoded-image products are unaffected.")
+                return {}
+            gt = {"proprio": norm.norm_obs(p_true[:, :Hm])}
+            for h in img_heads:
+                gt[h] = itrue[h][:, :Hm]
+            anc = m.rel_anchor({"proprio": pro0}) if getattr(m, "_rel_on", lambda: False)() else None
+            with torch.autocast(device_type=(device if isinstance(device, str) else device.type),
+                                dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                z_gt = m.encode_state(gt, anc)
+            return latent_curves(bag[:, :Hm].float(), z_gt.float())
+        except Exception as e:                       # fail-soft but NOT silent (design/logging.md)
+            _plog(writer, f"[eval_ood_horizon @ep{step}] latent curves SKIPPED ({type(e).__name__}: {e}) — "
+                          f"the decoded-image products are unaffected")
+            return {}
+
+    def score_and_emit(out, subroutine, desc, Hm, lat=None):
         """Score (image_curves per head + proprio_curves) + emit (emit_openloop) a completed rollout under the
         `subroutine` tag (e.g. eval_ood_horizon/open_loop). Head nesting rides under it via product_tag. `Hm`
         is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H)."""
@@ -224,7 +265,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         images = {}
         for head in img_heads:
             ipred = out[head].clamp(0, 1)
-            images[head] = {"icurves": image_curves(ipred, itrue[head][:, :Hm]),
+            ic = image_curves(ipred, itrue[head][:, :Hm])
+            ic.update(lat or {})            # latent_motion_ratio / latent_cos ride the head's curve dict, so they
+            #                                 reach the SAME panel + the same @+x scalar readouts as motion_ratio
+            images[head] = {"icurves": ic,
                             "full_true": _np.stack([eps[i][2][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                             "ipred": ipred[:n_plot].cpu().numpy()}
             emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
@@ -245,12 +289,15 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     for k, (name, every, Hm) in enumerate(modes):
         prog(int(5 + 90 * k / len(modes)), f"mode {name} (re-ground every {every} steps, H={Hm})"
              if every < Hm else f"mode {name} (open-loop, no re-grounding, H={Hm})")
-        out = rollout_regrounded(every, Hm)
+        open_loop = every >= Hm
+        out = rollout_regrounded(every, Hm, want_bag=open_loop)
+        out, bag = out if open_loop else (out, None)
         desc = (f"Open-loop long-horizon rollout: a BLACK agent on the TRUE path and a GREY agent on the model's "
                 f"PREDICTED path, sharing the context then diverging at the fork." if every >= Hm else
                 f"Closed-loop rollout: the GROUND-TRUTH observation is re-injected as context every {every} steps "
                 f"(over a {Hm}-step horizon), so error resets each re-grounding instead of compounding.")
-        summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm))
+        lat = latent_pass(Hm, bag) if open_loop else None      # open-loop only (see latent_pass)
+        summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm, lat=lat))
 
     if was:
         m.train()
@@ -473,14 +520,32 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
 
     pos, _ = _pos_idx(cfg)                                          # world-xyz obs dims (#11; default [0,1,2])
 
-    def decode_xyz(z_t, x):                                          # proprio residual x -> physical position (committed = endpoint)
-        return norm.denorm_obs(dec.decode(_ln(z_t + x)[:, None, :].float()))[..., pos]
+    def decode_xyz(z_t, x):        # flow output x -> physical position (committed = the path's endpoint)
+        # MIRROR predict_next EXACTLY (multimodal.py:978-981), which this used to hardcode:
+        #   * `z_t + x` only under predict=residual. Under predict=absolute the flow emits the FULL next
+        #     latent, so adding the carried token gave a ~2x-magnitude off-manifold point and this whole
+        #     product (swarm quiver, spreads) was silently garbage.
+        #   * LN only when latent_norm is on. It used to LN unconditionally, which is ALREADY wrong for
+        #     latent_norm=affine runs even in residual mode -- affine's inverse is applied inside
+        #     to_obs/decode, so pre-LN'ing here double-normalises.
+        nb = (z_t + x) if m.predict_residual else x
+        if m.latent_norm:
+            nb = _ln(nb)
+        return norm.denorm_obs(dec.decode(nb[:, None, :].float()))[..., pos]
 
     def step_data(t):                                               # per-step swarm geometry for the quiver
         w = min(W, t + 1)
         with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
             h = m.backbone(m._to_input(z[:, t - w + 1:t + 1], act[:, t - w + 1:t + 1]))[:, -1]   # (1, n_input, d)
-        h_t, z_t = h[:, 0, :].float(), z[:, t, 0, :].float()        # proprio-token conditioning + carried token
+        # Route through m._cond -- NEVER hand-build the conditioning. This used to be `h[:, 0, :]` (width d),
+        # which broke the moment the conditioning gained channels: with the action slot + the raw action
+        # embedding it is 3*d, so the velocity net's first Linear wanted d_x + time_dim + 3*d = 544 and got
+        # 288 -> "mat1 and mat2 shapes cannot be multiplied (1x288 and 544x128)". Same break that killed two
+        # runs at ep1 on 2026-08-12; the filmstrip was fixed then, this call site was missed and went
+        # unnoticed because flow_arch=transformer makes this routine self-skip. _cond is the single source of
+        # truth for that width.
+        hc = m._cond(h, act[:, t])                                 # (1, n_state, cond_width)
+        h_t, z_t = hc[:, 0, :].float(), z[:, t, 0, :].float()      # proprio-token conditioning + carried token
         ts_ = time.perf_counter()
         m.flow.sample(h_t, steps=K, deterministic=True)             # the committed readout (timed; matches rollout)
         sample_s = time.perf_counter() - ts_
@@ -614,17 +679,23 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     case, and 1-step at 4 Hz is nearly the identity (record §13: the per-step change is a fraction of the
     frame), so even a perfect prediction looked like the input.
 
-    NOW: rows = ROLLOUT HORIZON h (`denoising_filmstrip_horizons`), cols = [GT | noise | k1..kK]. One
+    NOW: rows = ROLLOUT HORIZON h (`denoising_filmstrip_horizons`), cols = [GT | floor | noise | k1..kK]. One
     open-loop chain is rolled from a single context step down the SAME episode, advancing with the committed
     prediction (`predict_next`, exactly as the rollout does); at each requested h we branch off a noisy
     `record_path` sample of that step's flow and decode every element of the latent ODE path. So reading DOWN
     tests whether refinement survives compounding, and reading ACROSS tests whether it refines at all.
 
-    Each panel is annotated with its PSNR against the GT frame, and the whole (h, k) grid is logged as
-    scalars `eval_flow/filmstrip/psnr/h<h>/k<k>` — because the intermediate latents (z + partially-denoised
+    The `floor` column decodes the TRUE latent for that row's frame, so the grid separates the two error
+    sources by eye: floor-vs-GT is what the CODEC costs, kK-vs-floor is what the DYNAMICS costs. Only the
+    second is the deliverable.
+
+    NO numbers are drawn on the panels (2026-08-25, user: 45 of them is noise). The (h, k) PSNR grid, the
+    per-row floor PSNR, and the episode/t_ctx provenance go to `logs/epoch_<step>/eval_flow/
+    denoising_filmstrip_<i>.npz`; the first image's grid also goes to scalars `eval_flow/filmstrip/psnr/
+    h<h>/{k<k>,floor}`. Trust those over the pictures — the intermediate latents (z + partially-denoised
     residual) are OFF-MANIFOLD for the image decoder, which is trained only on clean latents, so a k panel
-    can look arbitrary while still being quantitatively closer. Trust the numbers over the pictures; the
-    monotonicity of the k-curve is the actual answer to "is the flow refinement doing anything".
+    can look arbitrary while still being quantitatively closer; the monotonicity of the k-curve is the
+    actual answer to "is the flow refinement doing anything".
 
     K is set LOCALLY (`denoising_filmstrip_steps`) so a K=1 (shortcut) training config still shows a real
     trajectory; eps ~ N(0,1) (not the eps=0 committed path) so the 'noise' panel is real noise."""
@@ -656,7 +727,8 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     for i in range(n_images):
         Hmax = max(hz)
         for _try in range(8):                                    # need an episode long enough for the deepest row
-            o, a, im = eps_ds[int(rng.integers(len(eps_ds)))]
+            ep_idx = int(rng.integers(len(eps_ds)))
+            o, a, im = eps_ds[ep_idx]
             if len(o) > P + Hmax + 2:
                 break
         else:
@@ -681,7 +753,7 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
         # branch off a noisy record_path sample of that step's flow purely for the picture; the chain itself is
         # never perturbed by it, so row h really is "the flow at rollout step h".
         hist = z[:, :t_ctx + 1]                                   # (1, T0, n_state, d)
-        rows, row_labels = [], []
+        rows, row_labels, grid = [], [], []
         for hstep in range(1, Hmax + 1):
             t = t_ctx + hstep - 1                                 # action index driving this transition
             w = min(m.window, hist.shape[1])
@@ -693,14 +765,23 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
                 gt = (im[t_ctx + hstep].astype(_np.float32) / 255.0)
                 e = torch.randn(m.n_state, m.d, generator=g, device=device)
                 _, path = m.flow.sample(h_state[0].float(), steps=K, deterministic=False, eps=e, record_path=True)
-                panels = [gt] + [decode_bag(prev, x) for x in path]
-                # PSNR of every panel against GT (panel 0 is GT itself -> skipped in the scalars)
+                # FLOOR: decode the TRUE latent for this row's frame -- the best this codec can do here, so
+                # every k panel reads against a REACHABLE target. k8-vs-floor is dynamics error, floor-vs-GT
+                # is codec error; without this column the two are indistinguishable by eye.
+                with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
+                    fl = m.to_obs(z[:, t_ctx + hstep][:, None], heads=[img_head])[img_head][0, 0]
+                floor = fl.clamp(0, 1).float().cpu().numpy()
+                panels = [gt, floor] + [decode_bag(prev, x) for x in path]
+                # PSNR of every panel against GT (panel 0 is GT itself -> nan). NOT drawn on the figure any
+                # more (45 numbers is noise) -- the grid goes to the .npz beside it, and to scalars.
                 psnrs = [float("nan")] + [float(10.0 * _np.log10(1.0 / max(1e-10, float(((p - gt) ** 2).mean()))))
                                           for p in panels[1:]]
                 rows.append((panels, psnrs))
                 row_labels.append(f"h={hstep}")
+                grid.append((hstep, psnrs[1], psnrs[2:]))         # (h, floor, [k0..kK])
                 if i == 0:                                        # log the (h,k) grid from the FIRST image only
-                    for kk, ps in enumerate(psnrs[1:]):           # k=0 is the pure-noise panel
+                    scalars[f"eval_flow/filmstrip/psnr/h{hstep}/floor"] = psnrs[1]
+                    for kk, ps in enumerate(psnrs[2:]):           # k=0 is the pure-noise panel
                         scalars[f"eval_flow/filmstrip/psnr/h{hstep}/k{kk}"] = ps
             with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
                 nb = m.predict_next(h_state, prev[None])          # (1,n_state,d) committed step
@@ -708,23 +789,31 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
         if not rows:
             continue
         ncol = len(rows[0][0])
-        col_titles = ["GT", "noise"] + [f"k{k}" for k in range(1, ncol - 1)]
+        col_titles = ["GT", "floor", "noise"] + [f"k{k}" for k in range(1, ncol - 2)]
         fig, axes = plt.subplots(len(rows), ncol, figsize=(1.7 * ncol, 1.85 * len(rows)), squeeze=False)
-        for ri, (panels, psnrs) in enumerate(rows):
+        for ri, (panels, _psnrs) in enumerate(rows):
             for ci, img_np in enumerate(panels):
                 ax = axes[ri][ci]; ax.imshow(_np.clip(img_np, 0, 1)); ax.set_xticks([]); ax.set_yticks([])
                 if ri == 0:
                     ax.set_title(col_titles[ci], fontsize=9)
-                if ci > 0:                                        # PSNR vs GT under every prediction panel
-                    ax.set_xlabel(f"{psnrs[ci]:.1f}", fontsize=7, labelpad=1)
             axes[ri][0].set_ylabel(row_labels[ri], fontsize=9)
         fig.suptitle(f"denoising filmstrip {i} — latent-flow refinement (cols: K={K} ODE steps) vs ROLLOUT "
                      f"HORIZON (rows), one open-loop chain from t={t_ctx}, {img_head}\n"
-                     f"numbers under each panel = PSNR (dB) vs that row's GT", fontsize=9)
+                     f"'floor' = decode(TRUE latent) — the codec's own limit for that frame; PSNRs in the .npz",
+                     fontsize=9)
         fig.supxlabel("flow refinement (diffusion time) \u2192        |        rows: deeper into the open-loop rollout \u2193",
                       fontsize=8)
         fig.tight_layout(rect=(0, 0.02, 1, 0.94))
         writer.figure(f"eval_flow/denoising_filmstrip_{i}", fig, step); plt.close(fig)
+        # the numbers that used to clutter the panels -> logs/epoch_<step>/eval_flow/denoising_filmstrip_<i>.npz.
+        # ep_idx/t_ctx are the provenance: seed=step by default, so each EPOCH draws a DIFFERENT frame and
+        # epoch-to-epoch PSNR moves for reasons unrelated to the model. Pin cfg.eval.denoising_seed to compare.
+        writer.array(f"eval_flow/denoising_filmstrip_{i}", step,
+                     horizons=_np.array([g[0] for g in grid], dtype=_np.int32),
+                     psnr_floor=_np.array([g[1] for g in grid], dtype=_np.float32),
+                     psnr_grid=_np.array([g[2] for g in grid], dtype=_np.float32),   # (n_rows, K+1): k0=noise
+                     k_index=_np.arange(K + 1, dtype=_np.int32),
+                     ep_idx=_np.int32(ep_idx), t_ctx=_np.int32(t_ctx), K=_np.int32(K), seed=_np.int32(seed))
     if scalars:
         writer.scalars(scalars, step)
     if was:

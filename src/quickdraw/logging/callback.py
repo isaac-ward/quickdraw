@@ -484,6 +484,18 @@ class LoggingCallback(L.Callback):
                                  "mem/peak_evalroutines_gb": torch.cuda.max_memory_allocated() / 1e9,
                                  "mem/peak_evalroutines_reserved_gb": torch.cuda.max_memory_reserved() / 1e9},
                                 step=epoch)
+        # TRAIN-SIDE scalars every epoch, decoupled from the validation cadence -- the same decoupling the
+        # comment at the top of this method describes for the eval routines. They used to be forwarded ONLY in
+        # on_validation_epoch_end, so at check_val_every_n_epoch=4 every `grad/*`, `train/loss/*` and
+        # `schedules/*` was written on 1 epoch in 4. That cost us the dfptf collapse: the gradient blow-up
+        # happened between e5 and e6 and the first gradient reading after it was e7, so the 1.8e7 in the log
+        # is the AFTERMATH, not the event. val/* is deliberately excluded here -- at train-epoch end it holds
+        # a STALE value from the last validation, and writing it would silently flatten the val curve.
+        if not trainer.sanity_checking:
+            train_side = {k: v.item() for k, v in trainer.callback_metrics.items()
+                          if not k.startswith("val/")}
+            if train_side:
+                self.writer.scalars(train_side, step=epoch)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -544,7 +556,8 @@ class BestCkptMirror(L.Callback):
         # State, ONCE and up front, the exact standard by which best.ckpt is chosen — so a reader never has to
         # infer it from the "did not beat" lines (and never confuses it with the val_loss printed per epoch,
         # which is val/loss/total, a DIFFERENT metric). Names the monitored key, direction, and retention.
-        self._emit(f"[best-ckpt] SELECTION RULE: best.ckpt = the epoch that MINIMIZES '{self.cb.monitor}' "
+        _dir = "MAXIMIZES" if str(getattr(self.cb, "mode", "min")) == "max" else "MINIMIZES"
+        self._emit(f"[best-ckpt] SELECTION RULE: best.ckpt = the epoch that {_dir} '{self.cb.monitor}' "
                    f"(mode={self.cb.mode}, save_top_k={self.cb.save_top_k}). This is NOT the per-epoch 'val_loss' "
                    f"(=val/loss/total). Every epoch outside the top-{self.cb.save_top_k} by this metric is "
                    f"DISCARDED; last.ckpt is always the newest epoch. To rank by a different loss, set "

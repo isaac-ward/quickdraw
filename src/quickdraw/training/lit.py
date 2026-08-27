@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import lightning as L
 import torch
+from torch.profiler import record_function   # NO-OP outside a profiler context; see design/decode_memory.md
 
 from ..environments.base import default_rollout_metrics
 from .schedules import linear_schedule
@@ -31,7 +32,8 @@ class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
                  lr: float, weight_decay: float, detach_every: int = 8, variations=None, dt: float = 1.0 / 60.0,
-                 recon_frac: float = 1.0, lr_warmup_steps: int = 0, env=None, p_tf_batch_granular: bool = True):
+                 recon_frac: float = 1.0, lr_warmup_steps: int = 0, env=None, p_tf_batch_granular: bool = True,
+                 grad_diag_every: int = 25):
         super().__init__()
         self.model = model
         self.norm = normalizer
@@ -43,6 +45,11 @@ class LitWorldModel(L.LightningModule):
         self.p_tf_batch_granular = bool(p_tf_batch_granular)   # True -> ramp p_tf across batches (fractional epoch)
         self.lr, self.weight_decay, self.detach_every = lr, weight_decay, detach_every
         self.lr_warmup_steps = int(lr_warmup_steps)
+        # How often to compute the EXPENSIVE half of the gradient instrumentation (per-module norms, nan/inf
+        # counts, post-clip norm). 1 = every step = the historical behaviour. See configure_gradient_clipping:
+        # the per-STEP half (total pre-clip norm + the non-finite guard) is unchanged, because the guard gates
+        # the optimizer step and the pre-clip norm is the headline early-warning signal.
+        self.grad_diag_every = max(1, int(grad_diag_every))
         # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
         self.variations = make_variation_suite(variations)
         # physical-loss warmup: ramp its weight 0 -> 1 over warmup_epochs (same linear schedule as p_tf;
@@ -117,20 +124,34 @@ class LitWorldModel(L.LightningModule):
         # so z_full[:, sl] == encode(obs[:, sl]) exactly. noise_std>0 -> inputs differ from targets -> OFF.
         share = (p_tf == 0.0) and hasattr(m, "flow") and \
             (tag != "train" or all(m.modalities[k].noise_std == 0 for k in obs))
-        z_full = m.encode_state(obs_in, anchor) if share else None
+        with record_function("qd/shared_encode"):
+            z_full = m.encode_state(obs_in, anchor) if share else None
         if tag == "train" and not getattr(self, "_noise_share_noted", False):
             self._noise_share_noted = True
             noisy = [k for k in obs if m.modalities[k].noise_std > 0]
             if noisy:
                 print(f"[encode-share] input noise on {noisy} -> shared-encode fast path OFF; frames are "
                       f"re-encoded per loss site (slower). Set modalities.<i>.noise_std=0 to enable it.", flush=True)
+        # `feeds` = what each rollout step STOOD ON (the p_tf mix), requested only when the model's dynamics
+        # loss consumes it. At p_tf>=1 there is NO rollout, so feeds stays None -- and that IS the correct
+        # teacher-forced semantics for the dynamics loss, so no special-case gate is needed. design/flow.md.
+        feeds = None
+        _q = getattr(m, "p_tf_dynamics", 1.0)          # probability the dynamics loss uses TRUTH
+        want_feeds = (_q is None) or (float(_q) < 1.0)  # None -> follows p_tf; <1 -> partial mixing
+        # PHASE MARKERS (record_function is a no-op unless a torch.profiler is active). Added 2026-08-25:
+        # NOTHING in this repo had ever measured the training step's phase breakdown -- every "X is N% of the
+        # step" number, in design docs and audits alike, was inferred from epoch totals. These make one
+        # profiler run settle it. See design/decode_memory.md open question 1.
         if p_tf >= 1.0:                                        # parallel teacher forcing
-            preds = m({k: v[:, :-1] for k, v in obs_in.items()}, act[:, :-1], anchor)[:, P - 1:]
+            with record_function("qd/parallel_forward"):
+                preds = m({k: v[:, :-1] for k, v in obs_in.items()}, act[:, :-1], anchor)[:, P - 1:]
         else:                                                 # autoregressive rollout (TF source = noised input)
             ctx = {k: v[:, :P] for k, v in obs_in.items()}
-            preds = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf,
-                                    self.detach_every, precomputed_ctx=(z_full[:, :P] if share else None),
-                                    anchor=anchor)
+            with record_function("qd/ar_rollout"):
+                out = m.rollout_train(ctx, act[:, : L - 1], {k: v[:, P:] for k, v in obs_in.items()}, p_tf,
+                                      self.detach_every, precomputed_ctx=(z_full[:, :P] if share else None),
+                                      anchor=anchor, return_feeds=want_feeds)
+            preds, feeds = out if want_feeds else (out, None)
         future = {k: v[:, P:] for k, v in obs.items()}         # CLEAN targets
         # EMA/JEPA heads: obs recon is a decoder-only probe (detach preds so it doesn't shape the encoder).
         recon_src = preds if getattr(m, "pred_obs_in_loss", True) else preds.detach()
@@ -158,13 +179,17 @@ class LitWorldModel(L.LightningModule):
                           prev0_abs=self.norm.denorm_obs(obs["proprio"][:, Pn - 1]),         # (B,obs_dim) true ctx-last
                           true_future_abs=self.norm.denorm_obs(future["proprio"]),           # (B,F,obs_dim) true future
                           act_raw=self.norm.denorm_act(act[:, Pn - 1:Pn - 1 + Fn]))          # (B,F,act_dim) raw force (N)
-        recon, rw = m.recon_losses(src, fut, pre_z_targets=z_tgt, anchor=anchor, prior=_prior)   # decode/<name>[_shortcut] + codec/roundtrip_<name>
+        with record_function("qd/recon_losses"):     # decode loss + roundtrip anchor = BOTH decoder passes
+            recon, rw = m.recon_losses(src, fut, pre_z_targets=z_tgt, anchor=anchor, prior=_prior)
         # NOTE: do NOT decode here (to_obs) in train — recon_losses is the decode loss, and for flow decoders
         # to_obs would SAMPLE the ViT decoder every step (with grad) for nothing -> huge wasted memory (OOM). The
         # decoded sample is only needed for val metrics; computed there under no_grad.
         lt_kw = {"anchor": anchor} if anchor is not None else {}   # only reaches the flow loss_terms; non-flow untouched
-        raw, w = (m.loss_terms(preds, future, obs, p_tf, act, pre_z=z_full, **lt_kw) if share
-                  else m.loss_terms(preds, future, obs, p_tf, act, **lt_kw))   # pre_z: shared-encode fast path (flow only)
+        if feeds is not None:
+            lt_kw["feeds"] = feeds                            # same optional-kwarg pattern as `anchor` above
+        with record_function("qd/loss_terms"):       # the SECOND backbone pass (parallel, teacher-forced)
+            raw, w = (m.loss_terms(preds, future, obs, p_tf, act, pre_z=z_full, **lt_kw) if share
+                      else m.loss_terms(preds, future, obs, p_tf, act, **lt_kw))   # pre_z: shared-encode path
         if getattr(m, "dynamics_prior", None) is not None and not _uni:   # LEGACY physics/proprio (prior=none)
             Pn, Fn = self.P, self.F
             # p_tf-respecting CHAINED physics rollout: prev0 = true ctx-last obs, then feed each step's own
@@ -254,42 +279,61 @@ class LitWorldModel(L.LightningModule):
         def _total_norm():
             gs = [g.norm() for g in grads]
             return torch.norm(torch.stack(gs)) if gs else torch.zeros((), device=self.device)
-        # pre-clip inf/nan COUNTS: localize a blow-up (kind + extent) BEFORE clipping mangles it — norm-clipping
-        # turns a single inf into an all-NaN grad, so these must be read here. Counts, not fractions: one inf is
-        # fatal but ~2e-7 as a fraction of ~5M elements, so it would round away; a count shows it as "1".
-        n_nan = sum(torch.isnan(g).sum() for g in grads) if grads else 0
-        n_inf = sum(torch.isinf(g).sum() for g in grads) if grads else 0
-        # per-module grad norms (pre-clip): the "WHERE" axis — localize which subnetwork blows up first. Grouped
-        # so the decode head (differs between mse/flow runs) is separable from the shared trunk: encode_<mod>,
-        # decode_<mod>, backbone (dynamics context), flow (latent-dynamics head).
-        module_sq = {}
-        for name, p in self.named_parameters():
-            if p.grad is None:
-                continue
-            parts = name.split(".")
-            if "decode_head" in parts and "modalities" in parts:
-                key = "decode_" + parts[parts.index("modalities") + 1]
-            elif "modalities" in parts:
-                key = "encode_" + parts[parts.index("modalities") + 1]
-            elif len(parts) > 1 and parts[0] == "model":
-                key = parts[1]
-            else:
-                key = parts[0]
-            module_sq[key] = module_sq.get(key, 0.0) + p.grad.detach().float().pow(2).sum()
         pre = _total_norm()
+        # non-finite guard: computed EVERY step because it gates the optimizer step (see below). This
+        # bool() is a forced GPU sync and is unavoidable for that reason.
+        skipped = not bool(torch.isfinite(pre))
+        # The EXPENSIVE half — per-module norms over all ~163 grad tensors, plus isnan/isinf counts over every
+        # element, plus a second full-norm pass — is LOGGING ONLY, so it is sampled every `grad_diag_every`
+        # steps (design/accelerations.md item 5: ~5 passes over every grad tensor and 2 more forced syncs, every
+        # step, for numbers read once per epoch). Two properties are preserved exactly:
+        #   * ANY non-finite step computes the full diagnostic regardless of the sampling phase, so a blow-up is
+        #     never missed and the counts are still read PRE-clip (norm-clipping turns one inf into all-NaN).
+        #   * grad/norm_preclip stays PER-STEP, so the headline early-warning signal keeps full resolution; only
+        #     the "WHICH MODULE" axis is sampled. A collapse ramps over epochs (0.37 -> 0.60 -> 1.02 -> 22.4 on
+        #     the absres absolute arm), so ~44 samples/epoch at 1097 batches resolves it comfortably; a
+        #     single-step finite spike in ONE module could now be missed, which is the accepted cost.
+        want_diag = skipped or (int(self.global_step) % self.grad_diag_every == 0)
+        n_nan = n_inf = 0
+        module_sq = {}
+        if want_diag:
+            # Counts, not fractions: one inf is fatal but ~2e-7 as a fraction of ~5M elements, so it would
+            # round away; a count shows it as "1".
+            n_nan = sum(torch.isnan(g).sum() for g in grads) if grads else 0
+            n_inf = sum(torch.isinf(g).sum() for g in grads) if grads else 0
+            # per-module grad norms (pre-clip): the "WHERE" axis. Grouped so the decode head (differs between
+            # mse/flow runs) is separable from the shared trunk: encode_<mod>, decode_<mod>, backbone
+            # (dynamics context), flow (latent-dynamics head).
+            for name, p in self.named_parameters():
+                if p.grad is None:
+                    continue
+                parts = name.split(".")
+                if "decode_head" in parts and "modalities" in parts:
+                    key = "decode_" + parts[parts.index("modalities") + 1]
+                elif "modalities" in parts:
+                    key = "encode_" + parts[parts.index("modalities") + 1]
+                elif len(parts) > 1 and parts[0] == "model":
+                    key = parts[1]
+                else:
+                    key = parts[0]
+                module_sq[key] = module_sq.get(key, 0.0) + p.grad.detach().float().pow(2).sum()
         # non-finite guard: a single inf/nan grad makes norm-clipping compute a NaN total-norm and scale EVERY
         # grad to NaN, which then poisons AdamW's state permanently (unet_flow died this way ~ep2). Skip the
         # step instead — zero the grads so optimizer.step() is a harmless no-op — and count skips so a
         # SYSTEMATIC problem (vs a rare transient batch) is visible in grad/nonfinite_skipped.
-        skipped = not bool(torch.isfinite(pre))
         if skipped:
             for g in grads:
                 g.zero_()
         else:
             self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val,
                                 gradient_clip_algorithm=gradient_clip_algorithm)
-        self.log("grad/norm_preclip", pre)
-        self.log("grad/norm_postclip", _total_norm())
+        # reduce_fx="max", matching clip_ratio/num_nans/num_infs below. The DEFAULT mean diluted a single
+        # catastrophic step across ~1300 batches: the dfptf collapse logged an epoch-mean norm_preclip of
+        # 1.8e7 while the per-module grad/norm/* maxes were 1.3e7 -- so the headline number was BOTH late and
+        # smoothed, and could not be compared against its own per-module breakdown. A blow-up is a max event.
+        self.log("grad/norm_preclip", pre, reduce_fx="max")
+        if want_diag:
+            self.log("grad/norm_postclip", _total_norm(), reduce_fx="max")
         # grad/clip_ratio = preclip / clip_val. ONE number: 1 means clipping never engaged, >>1 means the
         # gradient is being LAUNDERED -- clipping throws away the magnitude but keeps the DIRECTION, so the
         # optimizer takes a full-size confident step along whatever exploded. That degrades smoothly instead of
@@ -300,11 +344,12 @@ class LitWorldModel(L.LightningModule):
             self.log("grad/clip_ratio", pre / max(float(gradient_clip_val), 1e-12), reduce_fx="max")
         # reduce_fx=max -> the epoch value is the WORST step (mean would dilute one spike across 1000s of clean
         # steps into ~0); nonfinite_skipped uses sum -> total # of skipped steps this epoch.
-        self.log("grad/num_nans", float(n_nan), reduce_fx="max")
-        self.log("grad/num_infs", float(n_inf), reduce_fx="max")
-        self.log("grad/nonfinite_skipped", float(skipped), reduce_fx="sum")
-        for key, sq in module_sq.items():
-            self.log(f"grad/norm/{key}", sq.sqrt(), reduce_fx="max")   # worst-step per-module norm
+        self.log("grad/nonfinite_skipped", float(skipped), reduce_fx="sum")   # every step: cheap, no sync
+        if want_diag:
+            self.log("grad/num_nans", float(n_nan), reduce_fx="max")
+            self.log("grad/num_infs", float(n_inf), reduce_fx="max")
+            for key, sq in module_sq.items():
+                self.log(f"grad/norm/{key}", sq.sqrt(), reduce_fx="max")   # worst-SAMPLED-step per-module norm
 
     def training_step(self, batch, batch_idx):
         self._batch_idx = batch_idx   # for _cur_p_tf's fractional-epoch (batch-granular) teacher-forcing ramp
