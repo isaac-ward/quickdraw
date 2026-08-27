@@ -89,3 +89,16 @@ splits:
   eval_ood_geometric: {n_traj: 64, steps: 256, seed: 4, coloring: hsv, env: {R: 1.1, r: 0.08}}
   # OOD dynamics = much SLOWER physics (base is fast now): 5x friction + ~3.3x mass (action range unchanged)
   eval_ood_dynamics:  {n_traj: 64, steps: 256, seed: 5, coloring: hsv, env: {gamma: 0.5, mass: 2.0}}
+subsample_all_phases: false   # emit ALL `subsample` phase offsets as separate TRAIN episodes. At stride s the
+#                               decimation keeps frames 0,s,2s.. and DISCARDS the rest ENTIRELY; windows then
+#                               slide over the decimated sequence so every window shares phase 0 -- at s=5,
+#                               80% of the dataset is never seen by anything. This emits phases 0..s-1 as
+#                               separate episodes: ~s x the TRAIN windows at EXACTLY the same frame rate, so
+#                               per-step motion (1.35x the codec floor at 4 Hz, record section 13) and the
+#                               real-time horizon are unchanged and every metric stays comparable to runs
+#                               without it. NOT the same as subsample=1, which changes the RATE: at 20 Hz the
+#                               per-step motion is 0.61x the codec floor -- BELOW our own reconstruction error
+#                               -- and a matched real-time horizon needs 4x more autoregressive steps.
+#                               TRAIN ONLY: adding phases to val would change which episodes the eval routines
+#                               sample and silently shift every metric. Pair with trainer.limit_train_batches
+#                               to hold epochs (and wall-clock) constant, so the ONLY change is repetition.
