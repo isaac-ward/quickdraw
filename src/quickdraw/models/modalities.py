@@ -69,7 +69,11 @@ class ModalitySpec:
     #                              (mode PROJECTED: dense tokens, no idle decode width, but NO identity guarantee).
     fourier_freqs: int = 0                       # VECTOR modalities: sin/cos feature bands prepended to the
     #                                              encoder input (0 = off, bit-identical). See models/features.py.
-    latent_loss_weight: float = 1.0              # weight of the adapter ROUND-TRIP loss ||up(down(g))-g||^2 (#12).
+    latent_loss_weight: float | None = None      # weight of the adapter ROUND-TRIP loss ||up(down(g))-g||^2 (#12).
+    #                        None -> per-class default: image 1.0 (unchanged), vector 0.0 (OFF — bit-identical;
+    #                        set explicitly, e.g. +model.modalities.0.latent_loss_weight=1, to give a vector
+    #                        encoder the encode->decode anchor. Added 2026-08-21: xtcav run-3 arm 1d/1e left the
+    #                        proprio encoder gradient-free because nothing set this attr on VectorModality).
     #                              The ONLY term that supervises the adapter pair directly; decode_loss only ever
     #                              trains up() on the dynamics' predicted bag. 0 -> off.
 
@@ -121,6 +125,8 @@ class VectorModality(Modality):
     def __init__(self, spec: ModalitySpec, d: int, hidden: int = 64):
         super().__init__()
         self.name, self.n_tokens, self.weight = spec.name, 1, spec.weight
+        _llw = getattr(spec, "latent_loss_weight", None)     # None -> 0.0 = roundtrip OFF (bit-identical for
+        self.latent_loss_weight = 0.0 if _llw is None else float(_llw)   # every pre-existing vector run)
         self.noise_std = float(spec.noise_std)
         self.decode_kind = spec.decode_kind
         self.dim = spec.dim
@@ -250,7 +256,8 @@ class PretrainedImageModality(Modality):
         self.down_adapter = GridToTokens(lat_ch, (gh, gw), spec.num_tokens, d, heads, depth, dense)
         up = TokensToGrid(lat_ch, (gh, gw), spec.num_tokens, d, heads, depth, dense)
         self.adapter_info = self.down_adapter.info          # mode/L/M/per/identity_at_init — reported at build
-        self.latent_loss_weight = float(getattr(spec, "latent_loss_weight", 1.0))
+        _llw = getattr(spec, "latent_loss_weight", 1.0)
+        self.latent_loss_weight = float(1.0 if _llw is None else _llw)   # None (new spec default) -> 1.0, as before
         self.decode_head = PretrainedImageHead(taesd=self.taesd, up_adapter=up, img_size=spec.img_size,
                                                channels=spec.channels)
         self.decode_head._owner = (self,)          # tuple -> NOT a registered submodule (no cycle in state_dict)

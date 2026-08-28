@@ -200,7 +200,7 @@ def build_model(cfg):
             dfg = (lambda k, v: d.get(k, v)) if hasattr(d, "get") else (lambda k, v: getattr(d, k, v))
             ah = m.get("action_head", {}) or {}                # action-distribution prior (opt-in)
             ahg = (lambda k, v: ah.get(k, v)) if hasattr(ah, "get") else (lambda k, v: getattr(ah, k, v))
-            return MultiModalFlow(**common, sampling_steps=int(dfg("sampling_steps", 6)),
+            mdl = MultiModalFlow(**common, sampling_steps=int(dfg("sampling_steps", 6)),
                                        shortcut=bool(dfg("shortcut", False)), predict=str(dfg("predict", "residual")),
                                        stochastic_eval=bool(dfg("stochastic_eval", True)),   # matches the
                                        #   class default + conf/model/mm_flow.yaml: train and eval roll on the
@@ -217,6 +217,9 @@ def build_model(cfg):
                                        # rebuilding it with True doubles the flow's h_dim and the checkpoint
                                        # fails to load with a size mismatch. New runs get True from mm_flow.yaml.
                                        concat_action_embedding=bool(dfg("concat_action_embedding", False)),
+                                       # FALLBACK 0.0 on purpose (old configs predate the act_null param;
+                                       # 0.0 -> inert, and the zero-init param loads as strict=False safe).
+                                       action_dropout=float(dfg("action_dropout", 0.0)),
                                        lambda_flow=m.get("lambda_flow", 1.0),
                                        lambda_consistency=m.get("lambda_consistency", 1.0),
                                        df_scale=df_scale, df_granularity=df_granularity,
@@ -225,6 +228,26 @@ def build_model(cfg):
                                        action_head_shortcut=bool(ahg("shortcut", True)),
                                        action_head_detach_gradient=bool(ahg("detach_gradient", False)),
                                        dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)))
+            # model.pred_obs_in_loss=false -> lit._step detaches preds before the recon loss (the existing
+            # EMA/JEPA "decoder-only probe" path): the recon loss then trains ONLY the decode heads, and the
+            # flow/backbone train purely by velocity matching. Added 2026-08-20 (xtcav run-3 arms 1a-1c):
+            # the recon gradient BACK THROUGH flow.sample's ODE unroll blew up the transformer flow head at
+            # every lr/unroll-depth tried (grad/norm/flow 2->5 within ~10 epochs, the flow.py:159 signature).
+            # Default True = bit-identical.
+            mdl.pred_obs_in_loss = bool(m.get("pred_obs_in_loss", True))
+            # flip-step loss weighting (xtcav run 7, record §8.7). flip_zero_z = the z-scored image of
+            # PHYSICAL S=0 under this dataset's action stats (sign(z - z0) = physical polarity sign).
+            mdl.flip_loss_weight = float(dfg("flip_loss_weight", 0.0))
+            mdl.flip_loss_alpha = float(dfg("flip_loss_alpha", 0.0))   # v6 balanced loss (record §8.16)
+            mdl.flip_dim = int(dfg("flip_dim", 1))
+            assert not (mdl.flip_loss_weight > 0.0 and mdl.flip_loss_alpha > 0.0), \
+                "flip_loss_weight (legacy per-step) and flip_loss_alpha (balanced) are mutually exclusive"
+            if mdl.flip_loss_weight > 0.0 or mdl.flip_loss_alpha > 0.0:
+                nrm = normalizer(cfg)
+                mdl.flip_zero_z = float((0.0 - nrm.a_mean[mdl.flip_dim]) / nrm.a_std[mdl.flip_dim])
+                print(f"[flip-loss] weight={mdl.flip_loss_weight} alpha={mdl.flip_loss_alpha} "
+                      f"dim={mdl.flip_dim} zero_z={mdl.flip_zero_z:.4f}", flush=True)
+            return mdl
         raise ValueError(f"unknown model.name: {name!r}")
 
 
@@ -670,12 +693,18 @@ def window_loaders(cfg, norm: Normalizer):
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
+        bfrac = float(cfg.data.get("boundary_frac", 0.0) or 0.0) if split == "train" else 0.0  # enrich TRAIN only; val stays honest
+        bsd = cfg.data.get("boundary_sign_dim", None)            # v5 extra triggers (record §8.1), train-only
+        bkw = dict(boundary_sign_dim=(int(bsd) if bsd is not None and split == "train" else None),
+                   boundary_delta=float(cfg.data.get("boundary_delta", 0.0) or 0.0))
         if img is not None:
             eps = load_split_episodes_mm(root, split, img_size=img.img_size, cam=cam, repo_id=repo)
-            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, image_head=img.name, stride=stride)
+            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, image_head=img.name,
+                                            stride=stride, boundary_frac=bfrac, **bkw)
         else:                                                    # proprio-only: (obs, act) pairs, no camera frames
             eps = load_split_episodes(root, split, repo_id=repo)
-            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
+            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride,
+                                            boundary_frac=bfrac, **bkw)
     return loaders
 
 
@@ -711,6 +740,12 @@ def load_checkpoint(model, path: str):
         for _pre in ("act_enc", "enc"):
             k = re.sub(rf"(^|\.)({_pre})\.(\d+)\.", rf"\1\2.net.\3.", k)
         clean[k] = v
+    # v5 migration (2026-08-26): pre-run-6 checkpoints predate the trained-CFG null-action embedding.
+    # act_null is zero-init and INERT at action_dropout=0 (never referenced outside the dynamics-loss
+    # dropout branch), so seeding it with zeros reproduces the old model bit-exactly.
+    for _n, _p in model.named_parameters():
+        if _n.endswith("act_null") and _n not in clean:
+            clean[_n] = torch.zeros_like(_p)
     inc = model.load_state_dict(clean, strict=False)
     # strict=False is REQUIRED (buffers like lat_mean/lat_std are absent from older checkpoints), but silently
     # discarding IncompatibleKeys is how a partly-RANDOM model gets evaluated as if it were trained. Missing

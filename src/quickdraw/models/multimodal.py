@@ -298,9 +298,12 @@ class MultiModalSequenceModel(nn.Module):
         Base = no-op (bit-identical for DSAR/LSAR and for the flow model with DF off)."""
         return bag
 
-    def _to_input(self, bag: Tensor, act: Tensor, levels=None) -> Tensor:  # (B,T,n_state,d),(B,T,2)->(B,T,n_input,d)
+    def _to_input(self, bag: Tensor, act: Tensor, levels=None, act_emb: Tensor | None = None) -> Tensor:
+        # (B,T,n_state,d),(B,T,A)->(B,T,n_input,d). act_emb: optional PRE-COMPUTED action embedding (the
+        # trained-CFG dropout path passes the nulled embedding so both injection sites stay coherent).
         bag = self._add_level_emb(bag, levels)                 # DF: condition the backbone on context noise levels
-        return torch.cat([bag, self.act_enc(act).unsqueeze(-2)], dim=-2)
+        a = self.act_enc(act) if act_emb is None else act_emb
+        return torch.cat([bag, a.unsqueeze(-2)], dim=-2)
 
     def physical_state(self, bag: Tensor):
         """Proprio 6-vec for the physical-loss variation, decoded with a FROZEN decoder (grad flows to the
@@ -326,8 +329,9 @@ class MultiModalSequenceModel(nn.Module):
         Returns the next state bag (B,*,n_state,d)."""
         raise NotImplementedError
 
-    def _cond(self, h_bag: Tensor, act: Tensor | None = None) -> Tensor:
+    def _cond(self, h_bag: Tensor, act: Tensor | None = None, act_emb: Tensor | None = None) -> Tensor:
         """Backbone output (+ the raw action) -> the per-token conditioning the dynamics consumes.
+        act_emb: optional pre-computed action embedding (trained-CFG dropout path; overrides act_enc(act)).
 
         Up to three channels per state token, concatenated on the feature axis:
           h_state   h_bag[..., :n_state, :]                   the state slots (always)
@@ -354,8 +358,9 @@ class MultiModalSequenceModel(nn.Module):
         parts = [h_state]
         if getattr(self, "use_action_slot", False):
             parts.append(h_bag[..., self.n_state : self.n_state + 1, :].expand_as(h_state))
-        if getattr(self, "concat_action_embedding", False) and act is not None:
-            parts.append(self.act_enc(act).unsqueeze(-2).expand_as(h_state))
+        if getattr(self, "concat_action_embedding", False) and (act is not None or act_emb is not None):
+            a = self.act_enc(act) if act_emb is None else act_emb
+            parts.append(a.unsqueeze(-2).expand_as(h_state))
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
     def readout(self, h_bag: Tensor, prev_bag: Tensor, act: Tensor | None = None) -> Tensor:
@@ -689,7 +694,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = True, time_sampling: str = "uniform", flow_hidden: int = 0,
                  flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
-                 concat_action_embedding: bool = True,
+                 concat_action_embedding: bool = True, action_dropout: float = 0.0,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
@@ -718,6 +723,14 @@ class MultiModalFlow(MultiModalSequenceModel):
                               arch=flow_arch, n_tokens=self.n_state, depth=flow_arch_depth, heads=flow_arch_heads)
         self.pred_obs_in_loss = True
         self.lambda_pred_obs = 1.0
+        # ---- trained CFG / action dropout (opt-in; 0.0 -> inert / bit-identical). Record §8.1 (xtcav run 6):
+        # with probability p per (sample, step), the action EMBEDDING is replaced by a learned null token in
+        # the dynamics loss — coherently at BOTH injection sites (_to_input's backbone token AND _cond's raw
+        # concat channel; the action-slot channel is derived from the nulled token, so it nulls with it).
+        # This trains a genuine unconditional branch for inference-time guidance v = v_u + w*(v_c - v_u)
+        # (P3 showed inference-only guidance saturates without one). Train-only; eval/rollout untouched.
+        self.action_dropout = float(action_dropout)
+        self.act_null = nn.Parameter(torch.zeros(d))
         # ---- diffusion forcing (opt-in; df_scale=0 -> everything below is inert / bit-identical) ----
         # noise the ENCODED context tokens at independent per-timestep levels (train only), and CONDITION the
         # backbone on those levels via a learned level embedding (added to the state tokens in _to_input). At
@@ -779,11 +792,56 @@ class MultiModalFlow(MultiModalSequenceModel):
             s = (1.0 - lv) * s + lv * eps                        # noised context
             if self.latent_norm:
                 s = _ln(s)                                       # renormalized back onto the sphere
-        h = self.backbone(self._to_input(s, act_seq[:, :L - 1], levels=levels))
-        h_state = self._cond(h, act_seq[:, :L - 1])            # (B,L-1,n_state,d) or 2d if concat_action
+        a_ctx = act_seq[:, :L - 1]
+        a_emb = self.act_enc(a_ctx)                             # (B,L-1,d)
+        if self.training and self.action_dropout > 0.0:        # trained CFG: one mask per (sample, step),
+            m = (torch.rand(a_emb.shape[:-1], device=a_emb.device) < self.action_dropout).unsqueeze(-1)
+            a_emb = torch.where(m, self.act_null.to(a_emb), a_emb)   # shared by BOTH injection sites below
+        h = self.backbone(self._to_input(s, a_ctx, levels=levels, act_emb=a_emb))
+        h_state = self._cond(h, a_ctx, act_emb=a_emb)          # (B,L-1,n_state,d) or 2d if concat_action
         target = (z[:, 1:] - z[:, :-1]).detach() if self.predict_residual else z[:, 1:].detach()  # target off CLEAN z
-        l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
+        # ---- flip-step importance weighting (xtcav run 7, record §8.7; flip_loss_weight=0 -> inert). ----
+        # Steps whose action flips the sign of the polarity dim (physical sign via the z-image of physical
+        # zero, flip_zero_z) get weight flip_loss_weight in the dynamics loss. Off-anchor steps (S at
+        # physical 0) are excluded via the dead-band. Probes (§8.7): the flip map is learnable by this very
+        # architecture from ~59 flips once flips carry ~25-30% of the loss mass; window-level enrichment
+        # cannot deliver that (76% natural coverage -> k=0, and 15:1 in-window dilution).
+        w_step = None
+        flw = float(getattr(self, "flip_loss_weight", 0.0))
+        alpha = float(getattr(self, "flip_loss_alpha", 0.0))    # v6 (record §8.16): per-group BALANCED loss
+        flip = None
+        if (flw > 0.0 or alpha > 0.0) and self.training:
+            fd = int(getattr(self, "flip_dim", 1))
+            z0 = float(getattr(self, "flip_zero_z", 0.0))
+            sgn = a_ctx[..., fd] - z0                           # (B, L-1); sign = physical sign of S
+            prev = torch.cat([sgn[:, :1], sgn[:, :-1]], dim=1)  # step 0 compares with itself (no flip)
+            dead = 0.05                                         # z-units; off anchors sit AT z0
+            flip = (sgn * prev < 0) & (sgn.abs() > dead) & (prev.abs() > dead)
+            if alpha > 0.0:
+                # composition-invariant two-group balance: L = alpha*mean(flip) + (1-alpha)*mean(rest).
+                # Per-BATCH weight w_b = alpha*n_nf/((1-alpha)*n_f) through the Sum-w-normalized flow loss
+                # yields exactly that convex combination; per-batch counts (NOT EMA) bound every batch's
+                # flip influence at alpha — the structural anti-collapse guarantee (§8.14A/§8.16).
+                n_f = flip.sum()
+                if n_f > 0:
+                    n_nf = flip.numel() - n_f
+                    w_b = alpha * n_nf.float() / ((1.0 - alpha) * n_f.float())
+                    w_step = torch.where(flip, w_b.to(sgn), sgn.new_ones(()))
+                # n_f == 0 -> w_step stays None (plain mean; measured P(empty batch) ~ 4.8% on combined)
+            else:                                               # legacy constant per-step weight (run 7)
+                w_step = torch.where(flip, sgn.new_full((), flw), sgn.new_ones(()))
+        l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling, weights=w_step)
         raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function
+        # group-loss telemetry (weight 0 = logged, never trained on): the §8.16 collapse early-warning
+        # (alarm if EMA of flip/nonflip rises >1.5x its post-build minimum) + realized-share verification.
+        if w_step is not None and getattr(self.flow, "_last_per", None) is not None:
+            per = self.flow._last_per.mean(dim=tuple(range(2, self.flow._last_per.ndim)))  # (B, L-1)
+            lf, lnf = per[flip].mean(), per[~flip].mean()
+            mass_f = (w_step * per)[flip].sum()
+            raw["dynamics/flip_group_loss"], w["dynamics/flip_group_loss"] = lf, 0.0
+            raw["dynamics/nonflip_group_loss"], w["dynamics/nonflip_group_loss"] = lnf, 0.0
+            raw["dynamics/flip_realized_share"], w["dynamics/flip_realized_share"] = \
+                mass_f / (w_step * per).sum().clamp_min(1e-8), 0.0
         if l_cons is not None:
             raw["dynamics/latent_shortcut"], w["dynamics/latent_shortcut"] = l_cons, self.lambda_consistency
         if self.action_head_enabled and L >= 3:

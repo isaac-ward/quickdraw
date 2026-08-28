@@ -85,9 +85,15 @@ class TransportHead(nn.Module):
         return torch.rand(shape, device=device, dtype=dtype)   # uniform (default)
 
     # ---- training ----
-    def loss(self, cond: Tensor, target: Tensor, *, time_sampling: str = "uniform") -> tuple[Tensor, Tensor | None]:
+    def loss(self, cond: Tensor, target: Tensor, *, time_sampling: str = "uniform",
+             weights: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         """param="v": rectified flow-matching ||net - (eps-target)||^2 (+ shortcut self-consistency).
-        param="x0": ||net(x_tau,tau) - target||^2 — predict the clean target directly. Returns (L_main, L_shortcut|None)."""
+        param="x0": ||net(x_tau,tau) - target||^2 — predict the clean target directly. Returns (L_main, L_shortcut|None).
+        weights: optional per-LEAD-position importance weights (shape = target lead dims, e.g. (B, L-1));
+        the loss becomes a weighted mean over lead positions (event dims still plain-averaged), normalized
+        by sum(weights). weights=None is the bit-identical old path; all-ones weights are numerically
+        equivalent to it only up to float-summation order (~1e-7). Added for the xtcav run-7 flip-step
+        weighting (record §8.7); v-param path only."""
         ts = self._tau_shape(target)
         if self.no_noise:                             # mse decode: deterministic cond->target, no noise curriculum
             x0 = torch.zeros_like(target)
@@ -101,7 +107,18 @@ class TransportHead(nn.Module):
         u = eps - target                              # velocity along the straight path (regression target)
         demb = self._demb(torch.zeros_like(tau)) if self.shortcut else None   # flow-matching = the d->0 field
         v = self.velocity(x_tau, self._temb(tau), cond, demb)
-        l_flow = F.mse_loss(v, u)
+        if weights is None:
+            l_flow = F.mse_loss(v, u)
+        else:
+            per = (v - u).pow(2).mean(dim=tuple(range(target.ndim - self.event_dims, target.ndim)))
+            w = weights.to(per)
+            assert w.shape == per.shape[:w.ndim], \
+                f"flow.loss weights shape {w.shape} incompatible with lead shape {per.shape}"
+            while w.ndim < per.ndim:                  # broadcast over trailing lead dims (e.g. tokens)
+                w = w.unsqueeze(-1)
+            w = w.expand_as(per)
+            l_flow = (w * per).sum() / w.sum().clamp_min(1e-8)
+            self._last_per = per.detach()             # side-channel for group-loss logging (record §8.16)
         return (l_flow, self._consistency(cond, target)) if self.shortcut else (l_flow, None)
 
     def _consistency(self, cond: Tensor, target: Tensor) -> Tensor:

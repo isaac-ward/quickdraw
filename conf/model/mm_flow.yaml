@@ -111,6 +111,11 @@ p_tf_batch_granular: false  # LOCKED false (2026-08-07). true = smooth p_tf ramp
 #                            a big dataset crawled (owm-iss: >5.6h and not even 25% vs ~30min at p_tf=1). Per-epoch
 #                            keeps warmup epochs at p_tf=1.0 (fast parallel), then hard-switches to p_tf=0.0
 #                            (compiled) — the hard 1->0 jump is a feature, not a bug, given the regime cost.
+pred_obs_in_loss: true   # false -> lit._step detaches predictions before the recon loss (the EMA/JEPA
+#                          "decoder-only probe" path): recon trains ONLY the decode heads; the flow/backbone
+#                          train purely by velocity matching. Declared 2026-08-20 (xtcav run-3): the recon
+#                          gradient through flow.sample's ODE unroll blew up the transformer flow head at
+#                          every lr/unroll-depth tried (grad/norm/flow 2->5 in ~10 epochs). true = bit-identical.
 dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding the DYNAMICS (dynamics/latent) loss:
 #                           the dynamics gradient can't reshape the encoder (trained then only by decode/recon).
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.
@@ -139,6 +144,26 @@ diffusion:
   shortcut: false          # true -> K=1 sampling via self-consistency
   sampling_steps: 6
   predict: residual
+  flip_loss_alpha: 0.0     # xtcav run 9 (record §8.16): per-group BALANCED dynamics loss —
+#                            L = alpha*mean(flip-step losses) + (1-alpha)*mean(rest). Composition-invariant
+#                            (deletes the flip fraction f), self-annealing (share ~2.4*alpha at build,
+#                            pinned floor ~alpha at convergence — the anti-collapse guarantee). Implemented
+#                            as a per-BATCH weight w_b = alpha*n_nf/((1-alpha)*n_f) through the flow-loss
+#                            weights arg; empty-flip batches fall back to the plain mean. 0.0 = inert.
+#                            Mutually exclusive with flip_loss_weight.
+  flip_loss_weight: 0.0    # xtcav run 7 (record §8.7): importance weight for dynamics-loss steps whose
+  flip_dim: 1              #   action flips the sign of action dim `flip_dim` (physical sign via the
+#                            dataset's normalization stats). 0.0 = inert/bit-identical. Probe-derived:
+#                            at the DETECTOR's flip fraction (77 flags/5199 v5 train steps = 1.48%,
+#                            splices included; audit §8.8) w=25 puts flips at ~51% of dynamics loss
+#                            mass initially (flip:nonflip loss 2.9x), ~26% asymptotically — inside
+#                            §8.7's 25-30% target. NOTE: train/loss/dynamics/latent becomes a WEIGHTED
+#                            mean (~1.5x the unweighted read early); val stays unweighted (training-
+#                            gated), so train-vs-val and cross-run train curves are not comparable.
+  action_dropout: 0.0      # trained CFG (xtcav run 6, record §8.1): probability per (sample, step) that the
+#                            action embedding is replaced by a learned null token in the DYNAMICS loss (both
+#                            injection sites coherently). 0.0 = inert/bit-identical. Trains an unconditional
+#                            branch for inference guidance v = v_u + w*(v_c - v_u).
   stochastic_eval: true    # TRAIN/EVAL MUST AGREE (user, 2026-08-10). predict_next uses
 #                            det = (not training) and (not stochastic_eval), so TRAINING always rolls on
 #                            SAMPLED predictions. With this false, every validation / eval routine / video

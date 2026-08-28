@@ -10,6 +10,16 @@ F: 64          # future horizon rolled out during training (sets the BPTT length
 window_stride: 1   # LOCKED at 1 (user, 2026-07-20): NEVER use window_stride > 1. It skips training-window starts
                    # (e.g. 8 = only every 8th start -> 8x fewer batches/epoch); the user does not want this speed
                    # shortcut — always full dense coverage (stride 1). DO NOT CHANGE.
+boundary_frac: 0.0   # TRAIN-only window enrichment: duplicate windows whose supervised region contains an
+#                      action-dim-0 (setpoint) change so they form ~this fraction of an epoch. 0 = OFF
+#                      (bit-identical). Every window still appears >= once (a SUPERSET of dense coverage —
+#                      distinct from the LOCKED window_stride, which would REMOVE starts). Added for the
+#                      xtcav run-3 response-surface work (critic-reviewed): scan-step boundaries are ~7-11%
+#                      of windows and carry the entire knob->beam response signal.
+boundary_sign_dim: null  # v5 (xtcav run 6, record §8.1): OPTIONAL extra enrichment triggers on this action
+#                          dim — a SIGN change or a physical |delta| > boundary_delta (evaluated on
+#                          DENORMALIZED values). null = OFF (bit-identical for every other dataset).
+boundary_delta: 0.0
 subsample: 1   # FRAME stride: keep every Nth frame and AGGREGATE the actions across the skipped ones. 1 = OFF
                # = bit-identical. NOT window_stride (above): that thins window STARTS and is locked; this thins
                # the frames INSIDE every window, i.e. it changes the physical timestep the dynamics models.

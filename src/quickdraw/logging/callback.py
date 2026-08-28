@@ -230,7 +230,11 @@ class LoggingCallback(L.Callback):
         # NOT the val hook, so it never gets silently dropped when the eval cadence != val cadence.
         # at_epochs is a UNION of explicit one-off epoch INDICES (literal, not phase-shifted).
         #
-        # EPOCH 0 IS EVALUATED (user, 2026-08-10). It used to be skipped as an "untrained baseline", which was
+        # EPOCH 0 IS EVALUATED (user, 2026-08-10) -- WHEN the cadence includes it: every=1, or 0 listed in
+        # at_epochs. With every>1 and no at_epochs entry for 0, epoch 0 is NOT evaluated ((0+1)%every != 0) --
+        # verified live 2026-08-25 (every=10, at=[5,15] -> first eval ep5). The original rationale stands
+        # (ep0 = a full p_tf=1 epoch, the cheapest and best baseline point): add 0 to at_epochs to get it.
+        # It used to be skipped as an "untrained baseline", which was
         # simply wrong: on_train_epoch_end fires AFTER a FULL epoch of training (thousands of steps), so the
         # model is not untrained -- and epoch 0 is the p_tf=1.0 teacher-forced epoch, which makes it the single
         # most useful baseline point on the curve. It is also the cheapest epoch to evaluate. Losing it meant
@@ -393,8 +397,10 @@ class LoggingCallback(L.Callback):
         if trainer.current_epoch == 0 and self.routines and not trainer.sanity_checking:
             from ..controller.run import _plog
             cv = int(getattr(trainer, "check_val_every_n_epoch", 1) or 1)
-            if cv > 1:      # VAL is on a slower cadence and will not run at ep0. Eval does (see _eval_due).
-                _plog(self.writer, f"[val @ep0] not run — check_val_every_n_epoch={cv}. Eval DOES run at ep0.")
+            if cv > 1:      # VAL is on a slower cadence and will not run at ep0. Eval: only per _eval_due(0).
+                ep0 = ("Eval DOES run at ep0." if self._eval_due(0) else
+                       f"Eval does NOT run at ep0 either (every={self.every}, at_epochs={self.at_epochs}).")
+                _plog(self.writer, f"[val @ep0] not run — check_val_every_n_epoch={cv}. {ep0}")
         if trainer.sanity_checking or not (self.routines and self._eval_due(trainer.current_epoch)):
             return
         from ..evaluation.routines import REGISTRY

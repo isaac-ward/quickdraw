@@ -211,7 +211,8 @@ class MMWindowLoader:
     <image_head> (B,L,H,W,3) in [0,1]]}. Window order matches `stack_windows`, so all streams stay aligned."""
 
     def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device,
-                 image_head: str | None = None, stride: int = 1):
+                 image_head: str | None = None, stride: int = 1, boundary_frac: float = 0.0,
+                 boundary_sign_dim: int | None = None, boundary_delta: float = 0.0):
         L = P + F
         self.image_head = image_head
         obs_w, act_w = stack_windows([(e[0], e[1]) for e in episodes], P, F, normalizer, stride)
@@ -229,13 +230,47 @@ class MMWindowLoader:
             self.win_idx = starts[:, None] + torch.arange(L, device=device)[None]
         self.batch, self.shuffle, self.device = batch, shuffle, device
         self.N = self.obs.shape[0]
+        # boundary enrichment (data.boundary_frac, train only): DUPLICATE windows whose SUPERVISED region
+        # [P-1, L-2] contains an action-dim-0 (setpoint) change, so they form ~boundary_frac of an epoch.
+        # Every window still appears >= once -> a strict SUPERSET of dense stride-1 coverage (the locked
+        # window_stride doctrine forbids REMOVING starts; nothing is removed here). Setpoints are exact
+        # per-step constants, so exact != on the normalized column is safe.
+        # v5 extension (record §8.1): optional extra triggers on ONE designated action dim, evaluated on
+        # DENORMALIZED values (sign(z-scored S) != sign(physical S) — audit finding 12): a sign change OR
+        # a physical |delta| above `boundary_delta`. Both default OFF -> bit-identical for other datasets.
+        self.extra = None
+        if boundary_frac and self.N:
+            chg = (self.act[:, P - 1:L - 1, 0] != self.act[:, P - 2:L - 2, 0]).any(-1)
+            if boundary_sign_dim is not None:
+                phys = (self.act[:, :, boundary_sign_dim] * normalizer.a_std.to(self.act)[boundary_sign_dim]
+                        + normalizer.a_mean.to(self.act)[boundary_sign_dim])
+                a, b = phys[:, P - 1:L - 1], phys[:, P - 2:L - 2]
+                trig = (torch.sign(a) != torch.sign(b)) | ((a - b).abs() > max(boundary_delta, 1e-9))
+                chg = chg | trig.any(-1)
+            n_b = int(chg.sum())
+            if 0 < n_b < self.N:
+                # solve n_b*(k+1) / (N + n_b*k) = frac for k (v5 fix: the old expression
+                # round(frac*N/((1-frac)*n_b))-1 over-duplicated when the NATURAL boundary fraction
+                # already met the target — correct k there is 0, i.e. enrichment becomes a no-op).
+                k = max(0, round((boundary_frac * self.N - n_b) / (n_b * (1.0 - boundary_frac))))
+                if k > 0:
+                    self.extra = torch.nonzero(chg).flatten().repeat(k)
+                    got = n_b * (k + 1) / (self.N + n_b * k)
+                    print(f"[loader] boundary enrichment: {n_b}/{self.N} boundary windows duplicated x{k} "
+                          f"-> {got:.0%} of epoch (target {boundary_frac:.0%})", flush=True)
+
+    def _epoch_ids(self):
+        ids = torch.arange(self.N, device=self.device)
+        return ids if self.extra is None else torch.cat([ids, self.extra])
 
     def __len__(self):
-        return (self.N + self.batch - 1) // self.batch
+        n = self.N + (len(self.extra) if self.extra is not None else 0)
+        return (n + self.batch - 1) // self.batch
 
     def __iter__(self):
-        order = torch.randperm(self.N, device=self.device) if self.shuffle else torch.arange(self.N, device=self.device)
-        for i in range(0, self.N, self.batch):
+        ids = self._epoch_ids()
+        order = ids[torch.randperm(len(ids), device=self.device)] if self.shuffle else ids
+        for i in range(0, len(order), self.batch):
             j = order[i: i + self.batch]
             out = {"obs_seq": self.obs.index_select(0, j), "act_seq": self.act.index_select(0, j)}
             if self.frames is not None:
