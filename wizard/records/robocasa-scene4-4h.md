@@ -1493,6 +1493,89 @@ differently. Only co-training tests that. Three probes and ~2 GPU-hours went to 
 3. **128px with `decode_arch: up`** — the only run that can be scored against 0.2783.
 4. `p_tf_dynamics=0.9` — cheap, fold into any of the above.
 
+## 21. THE `p_tf_dynamics` DOSE CURVE IS A CLEAN NEGATIVE — and `tok64` was stopped on COST, not evidence (08-27/29)
+
+Two things closed on 08-29, both by `kill -TERM` inside `quickdraw-app-1` (the trainers run as **root in the
+container**; a host-side `kill` from `ubuntu` returns EPERM and, if stderr is suppressed, looks like it worked).
+
+### 21.1 The dose curve: every substitution dose LOST, and gradient health degrades monotonically
+
+`p_tf_dynamics` = P(the dynamics loss conditions on the TRUTH). 1.0 = always clean, which `mm_flow.yaml` calls
+"the DEFECT"; lower = more of the model's own rolled-out latents in the conditioning. The theory said the
+defect should hurt. Five doses on the identical `dyn512` base (96px, `ae_bottleneck=6`, `decode_arch=up@64`,
+`flow_hidden=512`, `recon_frac=1.0`):
+
+| `p_tf_dynamics` | evals | best OL LPIPS@+128 | best codec floor | max `grad/norm` |
+|---|---|---|---|---|
+| **1.00** (`dyn512`, the "defect") | 26 | **0.2392** | 0.1554 | **2.1** |
+| 0.9375 (`q09375_dyn512`) | 16 | 0.2864 | 0.1772 | 1.47e4 |
+| 0.875 (`q0875_dyn512`) | 24 | 0.2632 | **0.1442** | 3.33e13 |
+| 0.75 (`q075_dyn512`) | 7 | 0.4060 | 0.2134 | **inf** |
+| 0.50 (`q050_dyn512`) | 2 | 0.6206 | 0.3908 | **inf** |
+| 0.0 (section 18) | — | blow-up | — | — |
+
+Read the last column, not the third. **The objective column is noisy and non-monotone (0.9375 scored worse
+than 0.875); the gradient column is monotone across five doses and spans thirteen orders of magnitude.** That
+is the real finding: substitution re-bases the dynamics target to `z[t+1] - feed`, whose magnitude grows with
+the model's own error, and the resulting positive feedback shows up in the gradient norm long before it shows
+up in LPIPS. `q050` reached `inf` by eval 1; `q075` by eval 5.
+
+Two things this does NOT say:
+- **It is not evidence that clean conditioning is CORRECT.** `dyn512` still ends in the same late collapse
+  (tail 0.364 / **0.239** / 0.606 / 0.253 — the record 0.2392 sits between two blow-ups), and `q0875` collapsed
+  the same way (0.283 / 0.306 / 0.623 / 0.496). Both fail; the defect just fails later and lower.
+- **It is not a floor result.** `q0875`'s floor of 0.1442 is the second best ever recorded on this dataset
+  (behind `dec_up64`'s 0.1432). Substitution left the CODEC alone and damaged the DYNAMICS, exactly where the
+  mechanism predicts.
+
+**Consequence:** `mm_flow.yaml:125`'s "Try 0.9" advice is now measured wrong and should be corrected. Keep
+`p_tf_dynamics=1.0`. The late collapse is real but `p_tf_dynamics` is not its lever — see section 19, which
+already showed `detach_every` is not either.
+
+### 21.2 `tok64` — killed at 2 evals, and it was AHEAD
+
+`num_tokens` 32 -> 64 on the `up@64` base. Section 17's null (`num_tokens` 8->64 moved nothing) was explained
+in section 20 by the U-Net's rank-640 readout; with the query-grid readout the cap is now `grid x d` = 4,608,
+so 64 tokens is 8,192 floats = **178% of cap** — over, though for a query grid "over" buys selection rather
+than bandwidth. A literature review predicted a null (TiTok renders 256px from 32 tokens).
+
+It was killed after 2 evals. **At matched eval index 1 it had the BEST codec floor of any run on this dataset
+and the second-best @+128:**
+
+| run @ eval idx 1 | @+128 | floor |
+|---|---|---|
+| **`tok64`** | 0.4331 | **0.2577** |
+| `dec_unet32` | **0.4251** | 0.2909 |
+| `q0875_dyn512` | 0.4603 | 0.2803 |
+| `dyn512` | 0.4658 | 0.2998 |
+| `dec_up64` | 0.4772 | 0.3027 |
+
+Two evals is noise-dominated and this record's own rule is best-so-far over matched series, so it is not
+evidence that 64 tokens WINS. But it is the opposite of the evidence needed to call it null, and the run was
+**not** stopped for that reason. It was stopped for **cost**: 2,339 batches/epoch at ~72 min against
+`dyn512`'s 1,254, i.e. ~48 h for 40 epochs on one of two GPUs, blocking the entire visual-loss queue below.
+
+**If `num_tokens=64` is retried, it is an OPEN question, not a closed one.** Log it that way.
+
+### 21.3 What the GPUs were freed for
+
+The reconstruction loss, which has never been varied on this dataset. Both pixel-space terms are plain L2:
+
+| site | loss | weight |
+|---|---|---|
+| AR decode (`flow.py`, `no_noise` branch) | `F.mse_loss` | 1.0 |
+| roundtrip codec anchor (`multimodal.py:407`) | `F.mse_loss` | **10** |
+
+L2's minimiser under uncertainty is the conditional MEAN, i.e. blur, and the weight-10 term is the dominant
+pixel pressure in the model. Every published latent codec (VQGAN, SD-VAE, IRIS, MAGVIT) uses L1 + LPIPS
+instead. Planned: one shared `VisualLoss` (`w_l2*L2 + w_l1*L1 + w_lpips*LPIPS`) instantiated ONCE per image
+modality and used at BOTH sites, with the x10 applied outside it.
+
+**TRAP, caught before launch.** `_install_perceptual` calls `evaluation.openloop._lpips_net`, which builds
+**SqueezeNet** — the exact network `image_curves` uses to compute the reported metric. Training that arm as
+written would have optimised the eval metric's own features and produced a number not comparable to any of
+the 25 historical runs. **Train with VGG, keep SqueezeNet for eval.**
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
