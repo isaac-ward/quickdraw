@@ -37,6 +37,19 @@ class ModalitySpec:
     decode_shortcut: bool = False  # flow decode (param=v): opt-in shortcut self-consistency -> K=1 sampling
     #                                (like the dynamics `diffusion.shortcut`; never default-on). Off -> plain flow, decode_steps.
     decode_steps: int = 6     # flow decode sampling steps (K). v: ODE steps (shortcut->1). x0: consistency refine steps (1 = direct)
+    decode_inject: bool = False   # decode_arch=up ONLY. FEATURE 2: add the bottleneck readout map, resampled,
+    #                           at every upsampling level. Above 6x6 the ONLY latent signal is `g`, one pooled
+    #                           d-vector applied as a PER-CHANNEL FiLM -- broadcast over all 9,216 positions at
+    #                           96px, so it cannot say "sharper HERE". ~116k params at decode_base=64 (2.4%):
+    #                           d -> each block's INPUT width, added BEFORE the block so its convs can use it.
+    #                           zero-init, so the model is a strict SUPERSET of the same decoder at step 0.
+    decode_xattn_max_res: int = 0  # decode_arch=up ONLY. FEATURE 3: re-cross-attend the token bag at every
+    #                           upsampling level whose output resolution is <= this (0 = off; 24 -> levels
+    #                           12 and 24 at a 6x6 bottleneck). One query per spatial position, so it is only
+    #                           affordable low: 144+576 queries at 12/24 vs 9,216 at 96x96 alone. ~132k params
+    #                           per level, zero-init output. This is Stable Diffusion's multi-resolution
+    #                           cross-attention pattern; see models/decoders.py:LevelCrossAttn for the caveat
+    #                           that SD injects TEXT into a DENOISER, not a decoder re-reading its own latent.
     visual_l2: float = 1.0     # IMAGE modalities: the pixel-space reconstruction MIX, shared by BOTH image
     visual_l1: float = 0.0     #   loss sites (AR decode at weight 1.0, roundtrip anchor at latent_loss_weight).
     visual_lpips: float = 0.0  #   Defaults (l2 only) are EXACTLY F.mse_loss, i.e. bit-identical to before.
@@ -286,7 +299,9 @@ class ImageModality(Modality):
                     "for flow, or decode_kind='mse' for 'up'. See models/decoders.py.")
             from .decoders import TokenGridDecoder
             self.decode_head = TokenGridDecoder(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
-                                                chunk=_chunk)
+                                                chunk=_chunk,
+                                                inject=bool(getattr(spec, "decode_inject", False)),
+                                                xattn_max_res=int(getattr(spec, "decode_xattn_max_res", 0) or 0))
         elif self.decode_arch == "vit":
             self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc,
                                              no_noise=no_noise, chunk=_chunk)
