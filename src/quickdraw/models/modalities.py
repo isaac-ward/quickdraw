@@ -36,6 +36,19 @@ class ModalitySpec:
     decode_shortcut: bool = False  # flow decode (param=v): opt-in shortcut self-consistency -> K=1 sampling
     #                                (like the dynamics `diffusion.shortcut`; never default-on). Off -> plain flow, decode_steps.
     decode_steps: int = 6     # flow decode sampling steps (K). v: ODE steps (shortcut->1). x0: consistency refine steps (1 = direct)
+    perceptual_weight: float = 0.0   # IMAGE modalities: weight of an LPIPS term ADDED to the decode loss.
+    #                           0 = off = bit-identical. WHY: both image losses are pixel MSE, and
+    #                           design/collapse.md says plainly "MSE loves blur. Dropping detail moves the
+    #                           prediction toward a smooth mean; MSE barely penalizes that... LPIPS was 0.18 the
+    #                           whole time -- the blur was there from the start; MSE never saw it." So we
+    #                           optimise a loss structurally blind to sharpness and then judge on LPIPS. VQ-GAN
+    #                           and the SD-VAE both add LPIPS (+ PatchGAN) for exactly this reason.
+    #                           The LPIPS net is a pretrained SqueezeNet -- a LOSS network, not a codec, so the
+    #                           bespoke-codec rule stands, but it IS a pretrained dependency.
+    perceptual_frames: int = 128   # perceptual_weight>0: score LPIPS on a random subset of this many frames per
+    #                           step instead of all B*F (2048 at batch 32 / F 64), which would dominate the
+    #                           step. A random subset is an unbiased estimate of the same expectation.
+    #                           0 or >= the batch -> all frames.
     decode_stochastic: bool = False  # flow decode ONLY: SAMPLE the obs (eps ~ N(0,1)) instead of committing the
     #                           deterministic eps=0 point. OFF (default) makes decode_kind=flow a TRAINING-ONLY
     #                           change: with param=x0 the committed decode is velocity(zeros, tau=1, cond),
@@ -160,11 +173,20 @@ class Modality(nn.Module):
         return obs.reshape(*lead, *obs.shape[1:])
 
     def decode_loss(self, tok: Tensor, target: Tensor):
-        """Per-head decode loss via the unified head: mse (no_noise) -> (L2, None); flow -> (flow-matching, shortcut)."""
+        """Per-head decode loss via the unified head: mse (no_noise) -> (L2, None); flow -> (flow-matching, shortcut).
+
+        With `perceptual_weight > 0` an LPIPS term is ADDED to the main loss through the head's `aux` hook,
+        which hands back the prediction the head ALREADY computed -- no second decoder forward, which matters
+        because the decoder is ~78% of per-sample memory."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         tgt = target.reshape(-1, *target.shape[len(lead):])
-        return self.decode_head.loss(self._decode_cond(flat), tgt)
+        return self.decode_head.loss(self._decode_cond(flat), tgt, aux=self._perceptual)
+
+    # None = no aux term, which is what TransportHead.loss checks. It must be a None ATTRIBUTE rather than a
+    # method returning None: a bound method is always truthy, so `aux is not None` would pass and the head
+    # would try to add None to the loss. ImageModality assigns a real closure when perceptual_weight > 0.
+    _perceptual = None
 
 
 class VectorModality(Modality):
@@ -227,6 +249,9 @@ class ImageModality(Modality):
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
+        self.perceptual_weight = float(getattr(spec, "perceptual_weight", 0.0) or 0.0)
+        self.perceptual_frames = int(getattr(spec, "perceptual_frames", 0) or 0)
+        self._install_perceptual()
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         # EXPLICIT dispatch with a RAISE on anything unknown. This used to be `if unet ... else vit`, so a
         # typo'd or newly-added decode_arch SILENTLY built the ViT head and the run "tested" nothing at all.
@@ -252,6 +277,30 @@ class ImageModality(Modality):
             raise ValueError(f"unknown decode_arch={self.decode_arch!r} for image modality "
                              f"{spec.name!r}; expected one of 'unet' (conv U-Net, serves mse AND flow), "
                              f"'up' (up-only conv decoder, mse only), 'vit' (all-attention, patch grid)")
+
+    def _install_perceptual(self):
+        """Replace the no-op `_perceptual` with an LPIPS closure when perceptual_weight > 0."""
+        w, n_sub = self.perceptual_weight, self.perceptual_frames
+        if w <= 0.0:
+            return
+
+        def aux(pred: Tensor, target: Tensor):
+            from ..evaluation.openloop import _lpips_net
+            net = _lpips_net(pred.device)
+            if net is None:                        # weights unavailable -> fail soft, exactly as eval does
+                return pred.new_zeros(())
+            p, t = pred, target
+            if 0 < n_sub < p.shape[0]:             # random subset: unbiased, keeps the cost bounded
+                idx = torch.randperm(p.shape[0], device=p.device)[:n_sub]
+                p, t = p[idx], t[idx]
+            # LPIPS is built with normalize=True and REJECTS anything outside [0,1] (torchmetrics validates the
+            # range), so the prediction must be clamped. A plain clamp() would zero the gradient exactly where
+            # the decoder overshoots -- which is where we most want it pulled back -- so use a STRAIGHT-THROUGH
+            # clamp: the forward value is clipped into range, the backward pass sees the identity.
+            pc = p + (p.clamp(0.0, 1.0) - p).detach()
+            return w * net(pc.permute(0, 3, 1, 2).float(), t.permute(0, 3, 1, 2).clamp(0, 1).float())
+
+        self._perceptual = aux
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)

@@ -110,19 +110,31 @@ class TransportHead(nn.Module):
         return torch.cat(outs, 0)
 
     # ---- training ----
-    def loss(self, cond: Tensor, target: Tensor, *, time_sampling: str = "uniform") -> tuple[Tensor, Tensor | None]:
+    def loss(self, cond: Tensor, target: Tensor, *, time_sampling: str = "uniform",
+             aux=None) -> tuple[Tensor, Tensor | None]:
         """param="v": rectified flow-matching ||net - (eps-target)||^2 (+ shortcut self-consistency).
-        param="x0": ||net(x_tau,tau) - target||^2 — predict the clean target directly. Returns (L_main, L_shortcut|None)."""
+        param="x0": ||net(x_tau,tau) - target||^2 — predict the clean target directly. Returns (L_main, L_shortcut|None).
+
+        `aux(pred, target) -> Tensor` is an OPTIONAL extra term added to L_main, called with the head's
+        prediction of the CLEAN target. It exists so a PERCEPTUAL loss can be added without a second decoder
+        forward -- the prediction is already computed here, and re-deriving it outside would double the cost of
+        what is already ~78% of per-sample memory. Only wired for the two parameterisations that HAVE a clean
+        prediction: no_noise (mse) and param="x0". For param="v" the net predicts a velocity, not an image, so
+        there is nothing to hand a perceptual metric and `aux` is ignored -- deliberately silent rather than
+        raising, since the dynamics FlowField shares this method and never passes one."""
         ts = self._tau_shape(target)
         if self.no_noise:                             # mse decode: deterministic cond->target, no noise curriculum
-            x0 = torch.zeros_like(target)
-            return F.mse_loss(self._chunked_velocity(x0, self._temb(target.new_ones(ts)), cond, None), target), None
+            pred = self._chunked_velocity(x0 := torch.zeros_like(target),
+                                          self._temb(target.new_ones(ts)), cond, None)
+            l = F.mse_loss(pred, target)
+            return (l + aux(pred, target)) if aux is not None else l, None
         tau = self._sample_time(ts, target.device, target.dtype, time_sampling)
         eps = torch.randn_like(target)
         x_tau = (1.0 - tau) * target + tau * eps      # straight (rectified) path
         if self.param == "x0":                        # net predicts the CLEAN target directly
             x0_hat = self._chunked_velocity(x_tau, self._temb(tau), cond, None)
-            return F.mse_loss(x0_hat, target), None
+            l = F.mse_loss(x0_hat, target)
+            return (l + aux(x0_hat, target)) if aux is not None else l, None
         u = eps - target                              # velocity along the straight path (regression target)
         demb = self._demb(torch.zeros_like(tau)) if self.shortcut else None   # flow-matching = the d->0 field
         v = self._chunked_velocity(x_tau, self._temb(tau), cond, demb)
