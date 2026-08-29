@@ -277,6 +277,42 @@ class ImageModality(Modality):
             raise ValueError(f"unknown decode_arch={self.decode_arch!r} for image modality "
                              f"{spec.name!r}; expected one of 'unet' (conv U-Net, serves mse AND flow), "
                              f"'up' (up-only conv decoder, mse only), 'vit' (all-attention, patch grid)")
+        self._report_readout(spec, d)   # AFTER the dispatch -- it inspects decode_head
+
+    def _report_readout(self, spec, d: int) -> None:
+        """One startup line: how much of the latent the decoder can physically read.
+
+        WHY THIS EXISTS. Section 17 swept num_tokens 8->64 and the reconstruction floor did not move AT ALL,
+        and it took months to work out why: the U-Net read the whole bag through `Linear(T*d -> 512)` plus
+        `cond.mean(1)`, a rank-<=640 cut, so even EIGHT tokens (1,024 floats) already saturated it and every
+        extra token was invisible to every pixel. That was arithmetic, knowable on day one, and nothing printed
+        it. This line prints it.
+
+        For decode_arch='up' the cap is the query GRID, bott_h*bott_w*d -- one d-vector per cell, and all latent
+        information passes through it. Note it scales with the grid (i.e. with ae_bottleneck and img_size), NOT
+        with num_tokens, so raising num_tokens alone can walk straight past it. OVER the cap is not necessarily
+        useless -- cross-attention lets each cell SELECT from a richer menu, unlike the old fixed dense
+        projection -- but you are then buying choice, not bandwidth, and should say so."""
+        latent = int(spec.num_tokens) * int(d)
+        head = self.decode_head
+        if self.decode_arch == "up":
+            gh, gw = head.readout.grid_hw
+            cap, how = gh * gw * d, f"query grid {gh}x{gw} = {gh * gw} cells x d{d}"
+            over = "OVER the cap -- cross-attention still SELECTS from a richer menu, so this buys choice, not bandwidth"
+        elif self.decode_arch == "unet":
+            w = getattr(getattr(head, "unet", None), "cond_to_spatial", None)
+            cap = (w.out_features if w is not None else 0) + d
+            how = f"Linear(T*d -> {cap - d}) + cond.mean(1) [d{d}] -- FIXED, does NOT scale with num_tokens"
+            # A dense flatten does NOT select: its output subspace is fixed at training time, so latent
+            # directions outside it are simply DISCARDED. This is section 17's null, and it is why the same
+            # "% of cap" number means something different here than for the query grid.
+            over = "OVER the cap -- the excess is DISCARDED (fixed dense projection, no selection)"
+        else:
+            return
+        pct = 100.0 * latent / max(cap, 1)
+        flag = over if latent > cap else "under the cap"
+        print(f"[codec] {self.name}: latent {spec.num_tokens}x{d} = {latent} floats | decoder readout {cap} "
+              f"({how}) | {pct:.0f}% of cap -- {flag}", flush=True)
 
     def _install_perceptual(self):
         """Replace the no-op `_perceptual` with an LPIPS closure when perceptual_weight > 0."""
