@@ -1576,6 +1576,184 @@ modality and used at BOTH sites, with the x10 applied outside it.
 written would have optimised the eval metric's own features and produced a number not comparable to any of
 the 25 historical runs. **Train with VGG, keep SqueezeNet for eval.**
 
+## 22. THE RECONSTRUCTION LOSS WAS NEVER VARIED — and changing it beat the record at EPOCH 1 (08-29/30)
+
+STATUS: round 1 is RUNNING (`vl_keep10`, `vl_iris`). Everything below through 22.5 is settled; 22.6 is the
+live result at eval 1 of 40 and will be extended.
+
+### 22.1 The thing nobody had looked at
+
+Two call sites train the image decoder, and both had been hardcoded `F.mse_loss` since the beginning:
+
+| site | where | weight |
+|---|---|---|
+| (a) AR decode loss | `flow.TransportHead.loss`, `no_noise` branch | 1.0 |
+| (b) roundtrip codec anchor | `multimodal.roundtrip_losses` | **10** |
+
+L2's minimiser under uncertainty is the conditional MEAN, i.e. blur. design/collapse.md had already written the
+consequence down in this project's own words -- *"MSE loves blur. Dropping detail moves the prediction toward a
+smooth mean; MSE barely penalizes that... LPIPS was 0.18 the whole time -- the blur was there from the start;
+MSE never saw it."* So for 25 runs we optimised a loss structurally blind to sharpness and then ranked every
+run on LPIPS. Nobody had tried changing it.
+
+### 22.2 What the field actually uses (code-verified, not paraphrased)
+
+| system | pixel | perceptual | GAN |
+|---|---|---|---|
+| VQGAN | **L1 @ 1.0** | LPIPS-**VGG16** @ **1.0** | yes, delayed |
+| LDM / SD-VAE | L1 @ 1.0 | LPIPS-VGG16 @ 1.0 | from step 50k |
+| **IRIS** | **L1 @ 1.0** | LPIPS-VGG16 @ **1.0** | **none** |
+| ViTok stage 1 | L2 @ 1.0 | LPIPS @ 1.0 (swept 0 / 0.5 / 1.0) | none |
+| SoftVQ-VAE | L2 @ 1.0 | LPIPS-VGG @ 1.0 | 0.2 |
+| MAGVIT-v2 | L2 @ 5.0 | **0.1 -- and NOT LPIPS** (ResNet50 logits) | 0.1, from step 0 |
+| TiTok stage 2 | L2 @ 1.0 | **0.1 -- ConvNeXt-S, not LPIPS** | 0.01, from 20k |
+
+Two families, and the 0.1 family is a TRAP for us: both members have a GAN carrying sharpness AND use a
+non-LPIPS perceptual net. Every GAN-free system uses 1:1. IRIS is the closest published relative -- bespoke
+encoder, 64px frames, no GAN, L1 + LPIPS-VGG16 at exactly 1:1. ViTok measured MSE -> +LPIPS taking rFID
+2.1 -> 0.95. All of them enable the perceptual term from STEP 0; warmup is reserved for the GAN.
+
+### 22.3 THE TRAP THAT WAS CAUGHT BEFORE LAUNCH: train on vgg, evaluate on squeeze
+
+The first version of this work called `evaluation.openloop._lpips_net`, which builds **SqueezeNet** -- the
+backbone of the REPORTED metric and of all 25 historical numbers. Training on it optimises the metric's own
+features and yields a number comparable to nothing. `_lpips_net` now takes `net_type`, cached per
+(device, net_type), DEFAULT UNCHANGED at squeeze; training defaults to **vgg**, which is also what
+VQGAN/LDM/IRIS/SoftVQ all hardcode. Measured on the converged control, vgg/squeeze = **1.713** -- so the two
+are not interchangeable even in scale.
+
+### 22.4 ONE `VisualLoss`, BOTH SITES -- and why sharing it is what makes it safe
+
+`models/visual_loss.py`: `w_l2*L2 + w_l1*L1 + w_lpips*LPIPS(net)`. `ImageModality` owns ONE instance,
+registered once, handed to site (a) through the new `TransportHead.loss(recon_loss=)` and to site (b) directly.
+Site weights apply OUTSIDE. Defaults (`w_l2=1`, rest 0) are bit-identical to `F.mse_loss`.
+
+The sharing is not tidiness. If site (b) kept extra PURE pixel loss outside the module, its 10x weight would
+dominate a small perceptual term at site (a) and re-blur the decoder. Because the site weight scales the whole
+mix, the pixel:perceptual RATIO is identical at both sites and only the magnitude differs.
+
+`recon_loss` REPLACES the head's internal `F.mse_loss` rather than adding to it -- the earlier `aux` hook
+summed on top, which would have double-counted L2. Ignored for `param="v"` (no clean prediction; the dynamics
+FlowField shares that method).
+
+TWO BUGS WORTH REMEMBERING, both invisible to a passing test suite:
+  * **Rank.** Site (a) flattens to (M,H,W,C); site (b) scores `to_obs()` output and keeps its (B,F) lead, so it
+    arrives (B,F,H,W,C). `mse_loss`/`l1_loss` reduce over everything and are rank-agnostic -- which is exactly
+    why a pure-MSE anchor never cared, and why this was invisible for the entire life of the project until
+    LPIPS needed `permute(0,3,1,2)`. It mattered twice: the permute, and `_subsample` drawing over FRAMES
+    rather than whole trajectories. The smoke passed 16/16 on broken code because it only drove the 4-D path.
+  * **`_perceptual` as a method returning None.** A bound method is always truthy, so `aux is not None` passed
+    and the head added None to the loss. It must be a None ATTRIBUTE. (Superseded by `recon_loss`, kept here
+    because the same shape of mistake will recur.)
+
+### 22.5 MEASURED, not estimated: the term magnitudes, and the memory cost
+
+`_oneoff_visual_terms.py` on `dyn512`'s best.ckpt, 256 held-out val frames through the real encode->decode:
+
+| term | converged value |
+|---|---|
+| L2 | 0.01305 (18.84 dB) |
+| L1 | 0.05732 |
+| LPIPS-squeeze | 0.16124 |
+| LPIPS-**vgg** | **0.27613** |
+
+So the literature mix L1+LPIPS is **25.5x** the anchor's current magnitude. Note the ratio is NOT constant:
+~3.7x at random init and ~25.5x at convergence, because L2 collapses ~29x over training while L1 falls ~9x and
+LPIPS only ~3x. No single scalar preserves the anchor's magnitude throughout.
+
+MEMORY, and `visual_frames` is NOT the dial. VGG-LPIPS at both sites takes per-sample memory 3.3 -> 5.636 GB,
+so autobatch picks **batch 16** where the control got 28. Probing `visual_frames=32` gave the IDENTICAL 5.636
+GB/sample and moved only the intercept (2.70 -> 0.87 GB): the frame subsample controls a FIXED cost, not the
+per-sample one. Batch 28 would need ~158 GB.
+
+Consequences for reading the arms against the control, both of which HANDICAP the arms:
+  * batch 16 vs 28 (not cleanly signed -- noisier gradients usually hurt, but this dataset is memorised);
+  * **1350 batches x 16 = 21,600 windows/epoch vs the control's 30,716** (the control had
+    `limit_train_batches` PINNED at 1097, above its natural count). An epoch here is 30% LESS data.
+  * The arms run 40 epochs to the control's 26, so best-so-far draws from more samples of a jittery
+    distribution. Compare best-so-far TRUNCATED to 26 evals.
+
+### 22.6 ROUND 1: the anchor weight, and I got the invariant wrong
+
+Both arms: `visual_l1=1.0 visual_l2=0.0 visual_lpips=1.0` on vgg. ONE variable, the site-(b) weight.
+
+| eval | `vl_keep10` (w=10) @+128 / floor / dB | `vl_iris` (w=0.4) @+128 / floor / dB |
+|---|---|---|
+| 0 | 0.3217 / 0.2412 / 15.02 | 0.4302 / 0.2517 / 14.84 |
+| 1 | **0.2035** / **0.1916** / 16.27 | 0.3598 / 0.4264 / **9.41** |
+
+**`vl_keep10` beat the all-time record (0.2392, which took `dyn512` 23 evals) at EVAL 1**, from behind on both
+data-per-epoch and batch size. Its floor at eval 1 (0.1916) is better than the control's at eval 1 (0.2998) and
+closing on the control's all-time best floor (0.1554).
+
+**`vl_iris` collapsed in one epoch.** Floor PSNR 14.84 -> 9.41 (5.4 dB), floor LPIPS 0.2517 -> 0.4264, dynamics
+latent loss 0.0989 -> **94.27** (~950x), `grad/norm/flow` -> nan (the guard caught it, `nonfinite_skipped 1`),
+motion 1.398 (diverging), raw roundtrip MSE 0.0267 -> 0.0824.
+
+WHAT THAT SETTLES. `up64.yaml` says "latent_loss_weight: 10 -- DO NOT lower: at 1.0 the codec eroded 3.55 dB in
+4 epochs." It was overridden to 0.4 on the argument that the anchor's MAGNITUDE was preserved. That argument is
+WRONG, and the warning was conservative: 5.4 dB in ONE epoch at 0.4 versus 3.55 dB in four at 1.0.
+
+**`latent_loss_weight` is not a magnitude knob. It is a RATIO knob: "stay invertible" against "be
+predictable".** The anchor `Dec(Enc(x))->x` is the ONLY term forcing the latent to remain a faithful encoding.
+Every other loss -- the dynamics flow loss, the AR decode loss -- can be reduced by making the latent EASIER TO
+PREDICT, and the easiest-to-predict latent is degenerate. So the anchor is the sole counterweight to
+representational collapse, and what the encoder responds to is its pressure RELATIVE to everything pulling the
+other way. Preserving its loss VALUE cut that by 25x. The failure is a feedback loop, not a threshold: weak
+anchor -> encoder drifts -> the dynamics' target distribution goes non-stationary -> flow loss climbs ->
+larger gradients -> more drift -> nan. Same topology as section 21's substitution loop, different route.
+
+THE KNOB IS NOW BRACKETED FROM BELOW TWICE AND NEVER FROM ABOVE:
+    w=1.0 (pure MSE)   3.55 dB erosion / 4 epochs
+    w=0.4 (L1+LPIPS)   5.40 dB erosion / 1 epoch
+    w=10  (L1+LPIPS)   healthy, floor improving, record at eval 1
+10 was INHERITED, never optimised. "10 is enough" and "10 is optimal" are different claims and only the first
+is shown.
+
+### 22.7 THE CONFOUND IN THE WINNING ARM -- stated plainly because it decides the next run
+
+The launch script called `vl_keep10` the arm that "changes ONLY the loss shape." **That is wrong.** Holding the
+WEIGHT at 10 while the loss VALUE grew ~25x means the anchor's actual contribution grew ~25x too. So
+`vl_keep10` changes the loss shape AND applies ~25x more codec pressure, and either could be producing the
+record. One run separates them: **pure L2 at `latent_loss_weight`~250** -- same pressure, no perceptual term.
+
+Also note it is NOT a free lunch, and the mechanism is visible in the raw-MSE series (`codec/roundtrip_*_mse`,
+logged at weight 0.0 precisely so any mix stays comparable to the 25 historical runs):
+
+    dyn512     0.01720  0.01437  0.01365  0.01344  0.01315     <- better on MSE, as it must be: it optimises MSE
+    vl_keep10  0.02649  0.02269
+
+We traded pixel error for perceptual quality. That is the trade working as designed, not an artifact.
+
+### 22.8 `vl_iris` DOES NOT REFUTE IRIS -- the arm was misnamed
+
+IRIS's recipe is the MIX (L1 1.0 + LPIPS-VGG16 1.0, no GAN). BOTH arms run exactly that, and the one that kept
+the incumbent anchor weight is breaking records. What failed was the anchor-weight override, which is not part
+of IRIS's recipe at all -- **IRIS has ONE reconstruction site and therefore no such knob to set**. The arm
+should have been called `vl_w04`.
+
+This is the cleanest confirmation of the literature review's warning that our two-site structure is off the
+published map: every cited system applies its reconstruction loss at exactly one site, and token world models
+(IRIS, Genie, MAGVIT lineage) avoid the problem structurally by training dynamics as cross-entropy in token
+space, never decoding to pixels. The literature-faithful part transferred immediately and strongly; the part no
+paper could advise on is precisely where it broke, on a judgment call rather than on anything cited.
+
+### 22.9 Queue
+
+1. **`latent_loss_weight=25` on the `vl_keep10` base** -- the knob has never been swept upward, and 22.6 makes
+   it the highest-EV single run available. Watch for the OPPOSITE failure: an over-anchored encoder pinned to
+   being a good autoencoder at the expense of being predictable, which would show as a good floor with rising
+   `grad/norm/flow` and falling `latent_cos`. Note this does NOT resolve 22.7's confound.
+2. **pure L2 at `latent_loss_weight`~250** -- the confound-breaker. Is the win LPIPS, or just pressure?
+3. **`decode_inject`** (models/decoders.py, feature 2) on whichever loss wins -- 115,584 params, zero-init so
+   the model is a strict superset at step 0.
+4. **`decode_xattn_max_res=24`** (feature 3) -- only if 3 moves the needle; same hypothesis, 2.3x the cost.
+5. `df_scale` toward 0.7 -- the dynamics axis, now a one-number change (section 21 established our DF already
+   has per-position random levels AND a learned Fourier level embedding; only the magnitude was small).
+
+WATCH ITEM on `vl_keep10`: `grad/norm/flow` rose 0.44 -> 1.86 across the first two evals. Every historical
+collapse spiked there first.
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
