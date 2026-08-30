@@ -92,6 +92,16 @@ ls.backward()
 check("frame subsampling still yields a finite loss and a gradient",
       torch.isfinite(ls) and ms.decode_head.out_conv.weight.grad is not None, f"frames=2, loss {float(ls):.6f}")
 
+# ---- 6b. BOTH RANKS. The decode site passes (M,H,W,C); the roundtrip anchor passes (B,F,H,W,C). ----
+m5 = img(visual_l1=1.0, visual_lpips=1.0)
+X5 = X.reshape(2, 3, 96, 96, 3)                      # (B,F,H,W,C) exactly as to_obs() returns it
+P5 = pred.detach().reshape(2, 3, 96, 96, 3)
+l5, l4 = m5.visual(P5, X5), m5.visual(pred.detach(), X)
+check("VisualLoss accepts the anchor's 5-D (B,F,H,W,C) input", torch.isfinite(l5), f"{float(l5):.6f}")
+check("5-D and equivalent 4-D inputs agree (LPIPS subsample is over FRAMES)",
+      abs(float(l5) - float(l4)) < 1e-5, f"{float(l5):.6f} vs {float(l4):.6f}")
+check("terms() also accepts 5-D", torch.isfinite(torch.tensor(m5.visual.terms(P5, X5)["l1"])))
+
 # ---- 7. terms() reports raw magnitudes for choosing the anchor weight ----
 t = m.visual.terms(pred, X)
 check("terms() reports raw l2/l1(/lpips)", {"l2", "l1", "lpips"} <= set(t) and t["l2"] > 0 and t["l1"] > 0,

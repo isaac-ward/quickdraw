@@ -93,7 +93,23 @@ class VisualLoss(nn.Module):
         return net(pc.permute(0, 3, 1, 2).float(), t.permute(0, 3, 1, 2).clamp(0, 1).float())
 
     # ---- public ----
+    @staticmethod
+    def _flatten(pred: Tensor, target: Tensor):
+        """Both sites hand this DIFFERENT RANKS and only one of them is safe for LPIPS.
+
+        The AR decode loss flattens to (M,H,W,C) before calling the head, but the roundtrip anchor scores
+        `to_obs(...)` output, which keeps its (B,F) lead -- so it arrives as (B,F,H,W,C). F.mse_loss and
+        F.l1_loss are rank-agnostic (they reduce over everything), which is exactly why a pure-MSE anchor
+        never cared and why this was invisible until LPIPS was wired in. It matters twice: `permute(0,3,1,2)`
+        needs rank 4, and `_subsample` must draw over FRAMES, not whole trajectories.
+
+        Images are event_dims=3, so the last three axes are always (H,W,C)."""
+        if pred.dim() > 4:
+            return pred.reshape(-1, *pred.shape[-3:]), target.reshape(-1, *target.shape[-3:])
+        return pred, target
+
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred, target = self._flatten(pred, target)     # (B,F,H,W,C) from the anchor -> (B*F,H,W,C)
         loss = pred.new_zeros(())
         if self.w_l2:
             loss = loss + self.w_l2 * F.mse_loss(pred, target)
@@ -110,6 +126,7 @@ class VisualLoss(nn.Module):
         The site-(b) weight of 10 was calibrated for MSE's ~0.005 scale. Anything perceptual is ~40x larger, so
         reusing 10 silently rescales the anchor by more than an order of magnitude. Solve
         `w = 10 * mse / (w_l1*l1 + w_lpips*lpips + w_l2*mse)` from THESE numbers, on a real batch."""
+        pred, target = self._flatten(pred, target)
         out = {"l2": float(F.mse_loss(pred, target)), "l1": float(F.l1_loss(pred, target))}
         out["lpips"] = float(self._lpips_term(pred, target)) if self.w_lpips else float("nan")
         return out
