@@ -1661,17 +1661,27 @@ So the literature mix L1+LPIPS is **25.5x** the anchor's current magnitude. Note
 ~3.7x at random init and ~25.5x at convergence, because L2 collapses ~29x over training while L1 falls ~9x and
 LPIPS only ~3x. No single scalar preserves the anchor's magnitude throughout.
 
-MEMORY, and `visual_frames` is NOT the dial. VGG-LPIPS at both sites takes per-sample memory 3.3 -> 5.636 GB,
-so autobatch picks **batch 16** where the control got 28. Probing `visual_frames=32` gave the IDENTICAL 5.636
-GB/sample and moved only the intercept (2.70 -> 0.87 GB): the frame subsample controls a FIXED cost, not the
-per-sample one. Batch 28 would need ~158 GB.
+MEMORY -- and the first reading of it was WRONG, off BROKEN code. The pre-fix probes fit 5.636 GB/sample and
+chose **batch 16**, and a `visual_frames=32` probe returned the identical figure, which looked like proof that
+the frame subsample controls only a fixed cost. Both measurements were taken with the 22.4 rank bug live. With
+5-D input at the anchor, `_subsample` compared `frames=128` against `pred.shape[0]` = the number of
+TRAJECTORIES (26), so `0 < 128 < 26` was false and **the subsample silently did not apply at the anchor at
+all** -- VGG ran on every frame there. Fixing the rank fixed the memory:
 
-Consequences for reading the arms against the control, both of which HANDICAP the arms:
-  * batch 16 vs 28 (not cleanly signed -- noisier gradients usually hurt, but this dataset is memorised);
-  * **1350 batches x 16 = 21,600 windows/epoch vs the control's 30,716** (the control had
-    `limit_train_batches` PINNED at 1097, above its natural count). An epoch here is 30% LESS data.
-  * The arms run 40 epochs to the control's 26, so best-so-far draws from more samples of a jittery
-    distribution. Compare best-so-far TRUNCATED to 26 evals.
+    02:32 (broken)  probe b=16: 92.9GB   b=8: 47.8GB   fit 5.636 GB/sample  -> batch 16
+    05:41 (fixed)   probe b=16: 58.6GB   b=8: 32.0GB   fit 3.324 GB/sample  -> batch 26
+
+**Both live arms run at batch 26** (verified in `config.resolved.yaml`, not inferred from a log line), and
+1350 x 26 = **35,100 windows/epoch against the control's 30,716**. So the arms are NOT handicapped: batch is
+within 7% of the control's 28 and an epoch is 14% MORE data, not 30% less. An earlier version of this section
+claimed the opposite; the error was reading `fit chose data.batch=16` out of the CRASHED launches and never
+re-reading it after the successful relaunch.
+
+Whether `visual_frames` controls memory on the FIXED path is now UNMEASURED -- do not quote the 32-vs-128
+result, it was taken on the broken path.
+
+The one asymmetry that does remain: the arms run 40 epochs to the control's 26, so best-so-far draws from more
+samples of a jittery distribution. Compare best-so-far TRUNCATED to 26 evals.
 
 ### 22.6 ROUND 1: the anchor weight, and I got the invariant wrong
 
@@ -1737,6 +1747,56 @@ published map: every cited system applies its reconstruction loss at exactly one
 (IRIS, Genie, MAGVIT lineage) avoid the problem structurally by training dynamics as cross-entropy in token
 space, never decoding to pixels. The literature-faithful part transferred immediately and strongly; the part no
 paper could advise on is precisely where it broke, on a judgment call rather than on anything cited.
+
+### 22.10 GHOSTING — the objective is now 83% the one term that cannot see it (user, eyes-on, 08-30)
+
+The user reported a **ghosting artifact in the rendered frames that no previous run had at all**. It is real,
+it is measurable, and it is in the CODEC (`eval_ae_floor`, i.e. encode->decode of a REAL frame), not in the
+dynamics. At matched-or-better floor LPIPS:
+
+| run | ev | floor LPIPS | floor PSNR | floor SSIM |
+|---|---|---|---|---|
+| **`vl_keep10`** | 2 | **0.1347** (best EVER; prior best 0.1432) | **17.42** | **0.581** |
+| `dec_up64` | 6 | 0.1592 | 19.51 | 0.671 |
+| `dyn512` | 6 | 0.1743 | 19.64 | 0.669 |
+
+`vl_keep10` has the best perceptual floor ever recorded while sitting **2.1 dB and 0.09 SSIM BELOW** runs with
+WORSE perceptual scores. Good LPIPS at bad PSNR/SSIM is the signature of "perceptually plausible, spatially
+wrong", and ghosting is what that looks like on screen.
+
+MECHANISM. LPIPS scores VGG features after several POOLING stages, so it is comparatively insensitive to small
+spatial displacement. Where the decoder is unsure of an edge's position, rendering TWO FAINT COPIES costs LPIPS
+almost nothing -- both are plausible in feature space -- while a SQUARED pixel term would punish both copies
+hard. We set `visual_l2 = 0.0`, so there is nothing squared left in the objective at all. And the balance is
+worse than it sounds: at convergence L1 = 0.057 and LPIPS-vgg = 0.276, so the objective is **83% LPIPS and 17%
+L1** -- 83% of it is the one term blind to ghosting, and the 17% that can see it penalises only LINEARLY.
+
+Every historical run was 100% squared error, which is why none of them ghosted and why all of them were BLURRY
+instead. We did not remove an artifact; we traded one for another.
+
+WHAT THIS MEANS FOR TRUSTING THE NUMBER. The literature review flagged exactly this in advance: E-LPIPS
+(arXiv 1906.03973) and R-LPIPS (2307.15157) show that OPTIMISING against an LPIPS network finds
+metric-specific minima that contradict human judgment, and different backbones (our vgg-train / squeeze-eval
+split) attenuate that without eliminating it -- both are ImageNet CNN feature stacks. **The user's eyes are the
+check on the metric, and here they disagreed with it.** Treat `vl_keep10`'s 0.2035 as real but INFLATED until
+it is reproduced with a squared term in the loss. This is also the concrete reason the vgg/squeeze split was
+worth insisting on: without it the contamination would be total rather than partial.
+
+THE FIX, and the weight matters more than the term. At `w_l2=1.0` the squared term would be 0.013 against
+LPIPS's 0.276 -- 4% of the loss, cosmetic. The precedent for SCALING it is HiFiC (arXiv 2006.09965), which
+computes MSE on [0,255] with k_M = 0.075*2^-5, i.e. ~152x MSE on [0,1], explicitly to bring the pixel and
+perceptual terms to the same order of magnitude. For us:
+
+    visual_l2 = 20   ->  0.013 * 20 = 0.26,  comparable to LPIPS 0.276
+    visual_l1 = 1.0
+    visual_lpips = 1.0
+
+`visual_lpips=0.5` (ViTok's own swept value) is the weaker alternative -- it moves LPIPS's share only from 83%
+to 71%, probably not enough.
+
+QUEUED as `vl_l2back` (l1=1.0, l2=20.0, lpips=1.0, latent_loss_weight=10, everything else identical to
+`vl_keep10`). The user elected to let the two running arms finish first. NOTE that both live arms share this
+loss and will BOTH ghost, so the anchor-weight sweep in 22.9 is being read on a partly metric-gamed objective.
 
 ### 22.9 Queue
 
