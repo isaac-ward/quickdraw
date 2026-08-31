@@ -30,6 +30,12 @@ def _mlp(i: int, o: int, h: int) -> nn.Sequential:
 class ModalitySpec:
     name: str
     kind: str           # "vector" | "image"
+    cam: str = ""       # IMAGE only: the camera stream this head reads, i.e. videos/observation.images.<cam>
+    #                     in the run folder. "" -> fall back to data.cam (single-camera datasets, unchanged).
+    #                     Set it when a run has MORE THAN ONE image head, because the head NAME is a model-side
+    #                     label (scene_right) while the directory is a dataset-side one (head_right), and with
+    #                     several heads there is nothing else to pair them by. training/setup.py asserts every
+    #                     head resolves to a distinct camera.
     weight: float = 1.0     # per-head reconstruction-loss weight
     noise_std: float = 0.0  # per-stream input noise sigma (training only; the variations design's per-stream sigma)
     decode_kind: str = "mse"  # "mse" (deterministic decode, bit-identical to before) | "flow" (generative

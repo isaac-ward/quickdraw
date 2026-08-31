@@ -43,9 +43,11 @@ class Episode:
     """The canonical intermediate EVERY processor emits (one recorded trajectory)."""
     states: np.ndarray             # (T, obs_dim) float32
     actions: np.ndarray            # (T, action_dim) float32
-    frames: list[str] | np.ndarray | None
+    frames: list[str] | np.ndarray | dict[str, list[str] | np.ndarray] | None
     #   list[str]  = per-frame image file paths in temporal order (lazy; starling's jpgs)
     #   np.ndarray = (T, H, W, 3) uint8 in-memory frames (robocasa's decoded clips)
+    #   dict       = MULTI-CAMERA: {cam_leaf: paths-or-array}, one entry per camera, all aligned to
+    #                `states`. Keys must match the `cam` list passed to build_recorded_dataset.
     #   None       = no camera -> proprio-only dataset
 
 
@@ -84,7 +86,7 @@ def _frame_hw(frames) -> tuple[int, int]:
     return tuple(imageio.imread(frames[0]).shape[:2])
 
 
-def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: str, log=None,
+def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: str | list[str], log=None,
                            extra_splits: dict[str, list[Episode]] | None = None) -> str:
     """Turn canonical `Episode`s into a standard recorded run folder. Returns the run_dir.
 
@@ -112,24 +114,41 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: st
     for sp_name, sp_eps in (extra_splits or {}).items():
         split_eps[sp_name] = list(sp_eps)
 
-    hw = _frame_hw(episodes[0].frames) if has_frames else None
+    # N CAMERAS: `cam` may be one leaf name (the original path, unchanged) or a list. With a list, every
+    # Episode.frames must be a dict keyed by those same leaves.
+    cams = [cam] if isinstance(cam, str) else list(cam)
+    multi = len(cams) > 1 or isinstance(episodes[0].frames, dict)
+    if has_frames and multi:
+        for ep in episodes:
+            if not isinstance(ep.frames, dict) or set(ep.frames) != set(cams):
+                raise ValueError(f"multi-camera build needs Episode.frames as a dict keyed by {cams}; "
+                                 f"got {sorted(ep.frames) if isinstance(ep.frames, dict) else type(ep.frames).__name__}")
+
+    def _ep_frames(ep, c):
+        return ep.frames[c] if isinstance(ep.frames, dict) else ep.frames
+
+    hws = [_frame_hw(_ep_frames(episodes[0], c)) for c in cams] if has_frames else None
+    hw = hws[0] if hws else None
     all_eps = [ep for eps in split_eps.values() for ep in eps]
     split_desc = ", ".join(f"{sp} {len(eps)}" for sp, eps in split_eps.items())
     log(f"[recorded] {name}: {len(all_eps)} episodes / {sum(len(e.states) for e in all_eps)} frames "
-        f"({'proprio-only' if not has_frames else f'{hw[0]}x{hw[1]}'} @ {fps} Hz) -> "
+        f"({'proprio-only' if not has_frames else ' '.join(f'{c}:{h}x{w}' for c, (h, w) in zip(cams, hws))}"
+        f" @ {fps} Hz) -> "
         f"{split_desc} (train/val seed {SPLIT_SEED})")
 
     workers = int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4))
-    ego_root = os.path.join(run_dir, "media", cam)
+    ego_roots = {c: os.path.join(run_dir, "media", c) for c in cams}
 
-    # 1. encode every episode's frames to a native-size clip at full parallelism (SKIP if no camera)
+    # 1. encode every episode's frames to a native-size clip at full parallelism (SKIP if no camera).
+    #    One clip per (camera, split, episode); all cameras encode in ONE pool so the fan-out is shared.
     if has_frames:
         enc_jobs = []
-        for sp, eps in split_eps.items():
-            os.makedirs(os.path.join(ego_root, sp), exist_ok=True)
-            for i, ep in enumerate(eps):
-                enc_jobs.append({"frames": ep.frames, "fps": fps,
-                                 "out": os.path.join(ego_root, sp, f"ep_{i:04d}.mp4")})
+        for c in cams:
+            for sp, eps in split_eps.items():
+                os.makedirs(os.path.join(ego_roots[c], sp), exist_ok=True)
+                for i, ep in enumerate(eps):
+                    enc_jobs.append({"frames": _ep_frames(ep, c), "fps": fps,
+                                     "out": os.path.join(ego_roots[c], sp, f"ep_{i:04d}.mp4")})
         log(f"[encode] {len(enc_jobs)} episode clips on {workers} workers...")
         with ProcessPoolExecutor(max_workers=workers) as ex:
             for j, _ in enumerate(ex.map(_encode_ep, enc_jobs), 1):
@@ -139,11 +158,11 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: st
     # 2. write one lerobot dataset per split (parallel), ingesting the clips when present
     lr_jobs = [{"name": sp, "root_split": os.path.join(run_dir, sp), "repo_id": f"{name}/{sp}",
                 "obs": [e.states for e in eps], "act": [e.actions for e in eps], "fps": fps,
-                "hw": hw, "cam": cam, "task": name,
-                "ego_dir": os.path.join(ego_root, sp) if has_frames else None}
+                "hw": list(hws) if has_frames else None, "cam": list(cams), "task": name,
+                "ego_dir": [os.path.join(ego_roots[c], sp) for c in cams] if has_frames else None}
                for sp, eps in split_eps.items()]
     log(f"[lerobot] writing {len(lr_jobs)} split datasets "
-        f"({'vectors + observation.images.' + cam if has_frames else 'vectors only'}): "
+        f"({'vectors + ' + ', '.join('observation.images.' + c for c in cams) if has_frames else 'vectors only'}): "
         + ", ".join(j["name"] for j in lr_jobs))
     with ProcessPoolExecutor(max_workers=min(len(lr_jobs), workers)) as ex:
         for k, done in enumerate(ex.map(_write_lr, lr_jobs), 1):
@@ -176,8 +195,10 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam: st
     summary = {"dataset_root": run_dir, "counts": counts, "splits": card["splits"],
                "split_env": card["split_env"], "coloring": card["coloring"], "fps": fps}
     if has_frames:
-        summary["camera"] = cam
+        summary["camera"] = cams[0] if len(cams) == 1 else list(cams)
+        summary["cameras"] = list(cams)
         summary["image_hw"] = [int(hw[0]), int(hw[1])]
+        summary["image_hw_per_camera"] = {c: [int(h), int(w)] for c, (h, w) in zip(cams, hws)}
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump({**summary, "normalization_stats": norm}, f, indent=2)
 
@@ -327,12 +348,12 @@ def _stage_clip(mp4: str, out_paths: list[str], h: int) -> int:
     return n
 
 
-def _stage_job(job: dict) -> tuple[int, int, int]:
-    """One episode's staging (runs in a worker). Returns (episode index, frames written, rows expected)."""
+def _stage_job(job: dict) -> tuple[int, str, int, int]:
+    """One (episode, camera) staging job in a worker -> (episode idx, cam, frames written, rows expected)."""
     got = _stage_clip(job["mp4"], job["paths"], job["h"])
     if got >= len(job["paths"]):
         open(os.path.join(job["dir"], ".done"), "w").close()   # only mark complete on a FULL decode
-    return job["idx"], got, len(job["paths"])
+    return job["idx"], job["cam"], got, len(job["paths"])
 
 
 def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None]:
@@ -354,7 +375,10 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
     extrinsics differ by 26-176deg; grippers anti-correlated). Action-conditioning learns noise here.
     See quickdraw#15. The proprio+image dynamics are unaffected.
 
-    Args: +source.dir=<local snapshot> [+source.name=lego_assemblies] [+source.camera=head_right]
+    Args: +source.dir=<local snapshot> [+source.name=lego_assemblies]
+          [+source.camera=head_right]  -- ONE leaf, or a LIST for a MULTI-CAMERA build. Use hydra's
+                                          bracket form; a bare comma-separated value is read as a SWEEP:
+                                          '+source.camera=[head_right,gripper_left_top,gripper_right_top]' 
           [+source.stage_height=288] [+source.max_episodes=N]."""
     import pyarrow.parquet as pq
 
@@ -366,7 +390,11 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
                          "+source.camera=<leaf>, +source.stage_height=N, +source.max_episodes=N)")
     src = os.path.expanduser(str(src_cfg.dir))
     name = str(src_cfg.get("name", "lego_assemblies"))
-    cam = str(src_cfg.get("camera", "head_right"))          # scene-right by default; wrists are gripper_*
+    _c = src_cfg.get("camera", "head_right")                # scene-right by default; wrists are gripper_*
+    # ONE camera or a comma-separated / list value. Multi-camera emits Episode.frames as a dict keyed by
+    # leaf name, which is what build_recorded_dataset wants.
+    cams = ([x.strip() for x in str(_c).split(",") if x.strip()] if isinstance(_c, str)
+            else [str(x) for x in _c])
     stage_h = int(src_cfg.get("stage_height", 288))
     max_eps = int(src_cfg.get("max_episodes", 0) or 0)
 
@@ -374,12 +402,11 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
     fps, chunk = int(info["fps"]), int(info["chunks_size"])
     n_total = int(info["total_episodes"])
     n = min(max_eps, n_total) if max_eps else n_total
-    vkey = f"observation.images.{cam}"
-    if vkey not in info["features"]:
-        have = [k.rsplit(".", 1)[-1] for k in info["features"] if k.startswith("observation.images.")]
-        raise ValueError(f"camera {cam!r} is not in this dataset; have {have}")
+    have = [k.rsplit(".", 1)[-1] for k in info["features"] if k.startswith("observation.images.")]
+    for cam in cams:
+        if f"observation.images.{cam}" not in info["features"]:
+            raise ValueError(f"camera {cam!r} is not in this dataset; have {have}")
 
-    stage = os.path.join(src, "_quickdraw_frames", f"{cam}_h{stage_h}")
     episodes, jobs = [], []
     for idx in range(n):
         c = idx // chunk
@@ -387,14 +414,19 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
         states = encode_state(np.asarray(t.column("observation.state").to_pylist(), dtype=np.float32))
         actions = encode_action(np.asarray(t.column("action").to_pylist(), dtype=np.float32))
 
-        ep_dir = os.path.join(stage, f"ep_{idx:06d}")
-        paths = [os.path.join(ep_dir, f"{i:06d}.jpg") for i in range(len(states))]
-        if not os.path.exists(os.path.join(ep_dir, ".done")):        # resumable: .done = fully staged
-            os.makedirs(ep_dir, exist_ok=True)
-            jobs.append({"idx": idx, "dir": ep_dir, "paths": paths, "h": stage_h,
-                         "mp4": os.path.join(src, "videos", f"chunk-{c:03d}", vkey,
-                                             f"episode_{idx:06d}.mp4")})
-        episodes.append(Episode(states=states, actions=actions, frames=paths))
+        per_cam = {}
+        for cam in cams:
+            ep_dir = os.path.join(src, "_quickdraw_frames", f"{cam}_h{stage_h}", f"ep_{idx:06d}")
+            paths = [os.path.join(ep_dir, f"{i:06d}.jpg") for i in range(len(states))]
+            per_cam[cam] = paths
+            if not os.path.exists(os.path.join(ep_dir, ".done")):    # resumable: .done = fully staged
+                os.makedirs(ep_dir, exist_ok=True)
+                jobs.append({"idx": idx, "cam": cam, "dir": ep_dir, "paths": paths, "h": stage_h,
+                             "mp4": os.path.join(src, "videos", f"chunk-{c:03d}",
+                                                 f"observation.images.{cam}",
+                                                 f"episode_{idx:06d}.mp4")})
+        episodes.append(Episode(states=states, actions=actions,
+                                frames=per_cam if len(cams) > 1 else per_cam[cams[0]]))
 
     # Decode in PARALLEL across episodes: this is pure 1080p/720p decode, the single longest step in the
     # whole build (~1300 frames/min/core measured -> ~4.5 h for one camera serially, and Arm B needs
@@ -403,21 +435,21 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
     if jobs:
         workers = min(int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4)), 16)
         log_every = max(1, len(jobs) // 20)
-        print(f"[lego] staging {len(jobs)} episode(s) on {workers} workers "
-              f"({len(episodes) - len(jobs)} already cached)...", flush=True)
+        print(f"[lego] staging {len(jobs)} clip(s) on {workers} workers "
+              f"({len(episodes) * len(cams) - len(jobs)} already cached)...", flush=True)
         t0 = time.time()
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            for k, (idx, got, want) in enumerate(ex.map(_stage_job, jobs), 1):
+            for k, (idx, cam_, got, want) in enumerate(ex.map(_stage_job, jobs), 1):
                 if got < want:      # a short clip would silently misalign frames against vector rows
-                    raise ValueError(f"episode {idx}: {vkey} decoded {got} frames but the parquet has "
-                                     f"{want} rows")
+                    raise ValueError(f"episode {idx} camera {cam_}: decoded {got} frames but the "
+                                     f"parquet has {want} rows")
                 if k % log_every == 0 or k == len(jobs):
                     print(f"[lego] staged {k}/{len(jobs)}  ({time.time() - t0:.0f}s)", flush=True)
     staged = len(jobs)
     print(f"[lego] {len(episodes)} episodes, {sum(len(e.states) for e in episodes)} frames @ {fps} Hz | "
           f"state {episodes[0].states.shape[1]}d action {episodes[0].actions.shape[1]}d | "
-          f"cam {cam} staged h{stage_h} ({staged} newly decoded, {len(episodes) - staged} cached)", flush=True)
-    return name, episodes, fps, cam, None
+          f"cams {cams} staged h{stage_h} ({staged} clip(s) newly decoded)", flush=True)
+    return name, episodes, fps, cams if len(cams) > 1 else cams[0], None
 
 
 PROCESSORS = {"starling": starling, "robocasa": robocasa,

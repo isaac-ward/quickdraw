@@ -1,0 +1,99 @@
+# =============================================================================================
+# vl64_multicam — ARM B. vl64 on swoosh-data/lego_assemblies with THREE camera heads.
+# Select with `model=vl64_multicam data=lego`. Companion: conf/model/vl64_scene.yaml (Arm A, 1 head).
+#
+#   scene_right     <- head_right          (1080p scene-right, the SAME head Arm A predicts)
+#   arm_top_left    <- gripper_left_top    (720p left wrist, top)
+#   arm_top_right   <- gripper_right_top   (720p right wrist, top)
+#
+# THE A/B: score this run on `scene_right`, the same head Arm A predicts, so the comparison answers one
+# clean question — do the wrist cameras improve scene prediction? Both arms log
+# val/metric/scene_right/mse, which is why Arm A's head is named scene_right rather than `image`.
+#
+# EACH HEAD DECLARES ITS CAMERA (`cam:`). The head NAME is a model-side label and the directory is a
+# dataset-side one, so with several heads there is nothing else to pair them by. training/setup.py
+# raises if any head lacks `cam` when there is more than one, and raises again if two heads resolve to
+# the same camera. data.cam stays the single-camera fallback and is ignored here.
+#
+# ---------------------------------------------------------------------------------------------
+# MEASURED MEMORY, and why this recipe is NOT just "vl64 three times".
+# From Arm A's own autobatch on the full build (128px, ONE camera):
+#     budget          82.7 GB = card 102.0 - reserve 4.0 - resident frame store 15.28
+#     fit             3.796 GB/sample, intercept 9.04 GB  ->  chose data.batch=19
+#     WORST eval probe 33.3 GB (closed_loop_16_steps, n_ep=7, H=460, decode_chunk=64)
+# Three heads at those settings would triple BOTH terms that matter:
+#     resident frame store  15.28 -> ~46 GB, so the budget falls to ~52 GB
+#     per-sample cost       ~3.8 -> ~10 GB, so the batch falls to ~4
+#     worst eval probe      33.3 -> ~100 GB, i.e. it would NOT FIT AT ALL
+# A batch of 4 is below the ~8 that design/distributed.md names as the point where gradient noise
+# starts to matter, and an eval that cannot be probed hangs the run rather than failing it.
+#
+# So three knobs move, and ONLY these three. img_size stays at 128 so the arms remain comparable —
+# dropping to 96 would buy a lot of headroom but would make Arm B's numbers incomparable to Arm A's,
+# which defeats the study.
+#   num_tokens         32 -> 16   the safest cut available: up64's header records 8->64 as one of the
+#                                 FEW genuine measured nulls on this axis, so capacity per head is not
+#                                 what we are spending. 3 x 16 = 48 image tokens/step + proprio, vs
+#                                 Arm A's 32 + proprio, so the bag grows 1.5x rather than 3x.
+#   decode_chunk_train 64 -> 24   the AR decode loss is the dominant per-sample activation term.
+#   visual_frames     128 -> 64   LPIPS-VGG is per-head, so 3 x 128 frames/step would treble the single
+#                                 largest fixed cost in the step. 64 x 3 = 192 still exceeds Arm A's 128,
+#                                 so the perceptual gradient is not weaker in aggregate.
+#
+# EVAL must also be capped on the CLI, because a model config cannot reach it:
+#     eval.decode_chunk=16  eval.closed_loop_steps=[1]
+# The 33.3 GB worst probe above is a closed-loop-16 mode at decode_chunk 64; three heads need both
+# trimmed or autobatch cannot size the run.
+# ---------------------------------------------------------------------------------------------
+#
+# STILL TO PASS ON THE CLI, as vl64/up64 document:
+#     model.action_dim=20  environments=recorded  environments.obs_dim=34  environments.action_dim=20
+#     environments.position_idx=[0,1,2]  data=lego  data.root=logs/recording_<ts>_lego3
+#     data.repo_id=lego3  data.subsample=6  model.diffusion.flow_hidden=512
+#     trainer.checkpoint_monitor=val/metric/scene_right/mse    <- REQUIRED. With >1 image head the AUTO
+#         monitor now RAISES rather than silently selecting on one head. scene_right is the right choice
+#         because it is the head the A/B is decided on.
+#
+# CARRIED-IN CAVEATS: same as vl64_scene. `action` is not in the state's frame on this dataset
+# (quickdraw#15), vl64 ghosts, its rollout is worse than up64's, and it collapsed at eval 12 after one
+# non-finite step — watch `latent_cos`.
+# =============================================================================================
+defaults:
+  - vl64
+  - _self_
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them, so inheriting vl64 and editing
+  # one entry is impossible -- and being explicit is what makes the recipe auditable.
+  - {name: proprio, kind: vector, dim: 34, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  #   dim 34 = 2 arms x [tcp_xyz(3) 6d_rotation(6) j1..j7(7) gripper(1)]; see conf/model/vl64_scene.yaml.
+
+  # ---- THREE IMAGE HEADS. weight 1/3 each, NOT 1.0.
+  #      Three heads at weight 1.0 would triple the image gradient against proprio, changing head count
+  #      AND loss balance in the same step -- exactly the confound vl64's own header flags in its own
+  #      results ("THE WIN IS CONFOUNDED"). At 1/3 the aggregate image:proprio ratio is identical to
+  #      vl64's, so this run isolates "more views" as the single variable.
+  - {name: scene_right, kind: image, cam: head_right, weight: 0.3333, img_size: 128,
+     pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 24,
+     visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 64,
+     latent_loss_weight: 10}
+  - {name: arm_top_left, kind: image, cam: gripper_left_top, weight: 0.3333, img_size: 128,
+     pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 24,
+     visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 64,
+     latent_loss_weight: 10}
+  - {name: arm_top_right, kind: image, cam: gripper_right_top, weight: 0.3333, img_size: 128,
+     pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 24,
+     visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 64,
+     latent_loss_weight: 10}
+  # latent_loss_weight stays at 10 PER HEAD, deliberately not divided by 3. vl64's header is emphatic
+  # that it is bracketed on both sides -- 0.4 erased 5.4 dB in one epoch, 25 froze motion and drove
+  # gradients to inf -- and that it is a RATIO knob (stay invertible vs be predictable), not a magnitude
+  # knob, which is precisely why magnitude-matching at 0.4 failed. Each head has its OWN codec to keep
+  # invertible, so each needs the full ratio; the anchor is not a shared budget to split. WATCH
+  # `latent_cos` per head: negative is the collapse signature, and three codecs give it three chances.

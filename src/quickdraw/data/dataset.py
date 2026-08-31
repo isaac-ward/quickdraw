@@ -251,23 +251,38 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
 
 
 def load_split_episodes_mm(root: str, split: str, img_size: int | tuple[int, int] | None = 128,
-                           cam: str = "fpv", repo_id: str = "torus"):
+                           cam: str | list[str] | tuple[str, ...] = "fpv", repo_id: str = "torus"):
     """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled to img_size,
-    uint8), aligned 1:1 with obs steps. Returns list of (obs (T,D), act (T,A), img (T,H,W,3) uint8).
-    The chunked video is read in dataset row order (== obs row order), then split by episode_index.
-    The obs subset (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
+    uint8), aligned 1:1 with obs steps. Returns list of (obs (T,D), act (T,A), img0 (T,H,W,3) uint8, ...)
+    with ONE img stream per camera in `cam` order -- a single string gives exactly the old 3-tuple, so
+    single-camera datasets are bit-identical. The chunked video is read in dataset row order (== obs row
+    order), then split by episode_index. The obs subset (set_obs_keep) is applied here, INSIDE the loader,
+    so no call site can bypass it.
+
+    `img_size` may be one value for every camera, or a list aligned with `cam` (heads may differ in size).
+    _subsample_episodes already decimates every stream past ep[1] generically, so N cameras need no change
+    there."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    cams = [cam] if isinstance(cam, str) else list(cam)
+    sizes = [img_size] * len(cams) if not isinstance(img_size, list) else list(img_size)
+    assert len(sizes) == len(cams), f"{len(sizes)} img_size(s) for {len(cams)} camera(s)"
 
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
     obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
     act_all = np.stack(hf["action"]).astype(np.float32)
-    frames_all = load_fpv_frames(root, split, size=img_size, cam=cam)      # (N, H, W, 3), row order
-    assert len(frames_all) == len(obs_all), f"{cam}/row count mismatch: {len(frames_all)} vs {len(obs_all)}"
+
+    frames = []
+    for c, sz in zip(cams, sizes):
+        fa = load_fpv_frames(root, split, size=sz, cam=c)                  # (N, H, W, 3), row order
+        assert len(fa) == len(obs_all), f"{c}/row count mismatch: {len(fa)} vs {len(obs_all)}"
+        frames.append(fa)
     return _subsample_episodes(
-        [(obs_all[ep_idx == e], act_all[ep_idx == e], frames_all[ep_idx == e]) for e in np.unique(ep_idx)],
-        f"{repo_id}/{split}+{cam}")
+        [(obs_all[ep_idx == e], act_all[ep_idx == e], *(f[ep_idx == e] for f in frames))
+         for e in np.unique(ep_idx)],
+        f"{repo_id}/{split}+{'+'.join(cams)}")
 
 
 class MMWindowLoader:
@@ -278,22 +293,31 @@ class MMWindowLoader:
     <image_head> (B,L,H,W,3) in [0,1]]}. Window order matches `stack_windows`, so all streams stay aligned."""
 
     def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device,
-                 image_head: str | None = None, stride: int = 1):
+                 image_head: str | list[str] | None = None, stride: int = 1):
         L = P + F
-        self.image_head = image_head
+        # ONE head stays a bare string for callers and for the batch key; N heads is a list. Episode tuples
+        # carry the streams at ep[2 + i], in the SAME order as image_head.
+        heads = [] if image_head is None else ([image_head] if isinstance(image_head, str) else list(image_head))
+        self.image_head = image_head          # kept verbatim for back-compat with any caller that reads it
+        self.image_heads = heads
         obs_w, act_w = stack_windows([(e[0], e[1]) for e in episodes], P, F, normalizer, stride)
         self.obs, self.act = obs_w.to(device), act_w.to(device)
-        self.frames = None
-        if image_head is not None:   # concat all episode frames -> one GPU uint8 store + per-window GLOBAL frame idx
+        self.frames = None                    # single-head alias, so existing probes keep working
+        self.stores = {}
+        self.win_idx = None
+        for i, head in enumerate(heads):      # concat all episode frames -> one GPU uint8 store PER HEAD
             frames, starts, off = [], [], 0
             for e in episodes:
-                o, img = e[0], e[2]
+                o, img = e[0], e[2 + i]
                 frames.append(torch.from_numpy(img))
                 starts.extend(range(off, off + len(o) - L + 1, stride))   # stride matches stack_windows -> streams stay aligned
                 off += len(img)
-            self.frames = torch.cat(frames, 0).to(device)                    # (N_total,H,W,3) uint8, GPU-resident
-            starts = torch.tensor(starts, device=device)
-            self.win_idx = starts[:, None] + torch.arange(L, device=device)[None]
+            self.stores[head] = torch.cat(frames, 0).to(device)              # (N_total,H,W,3) uint8, GPU-resident
+            if self.win_idx is None:          # every head shares one window index: same episodes, same stride
+                starts = torch.tensor(starts, device=device)
+                self.win_idx = starts[:, None] + torch.arange(L, device=device)[None]
+        if len(heads) == 1:
+            self.frames = self.stores[heads[0]]
         self.batch, self.shuffle, self.device = batch, shuffle, device
         self.N = self.obs.shape[0]
 
@@ -305,8 +329,10 @@ class MMWindowLoader:
         for i in range(0, self.N, self.batch):
             j = order[i: i + self.batch]
             out = {"obs_seq": self.obs.index_select(0, j), "act_seq": self.act.index_select(0, j)}
-            if self.frames is not None:
-                out[self.image_head] = self.frames[self.win_idx.index_select(0, j)].float().div_(255.0)  # GPU gather
+            if self.win_idx is not None:
+                w = self.win_idx.index_select(0, j)
+                for head, store in self.stores.items():
+                    out[head] = store[w].float().div_(255.0)                 # GPU gather, no host copy
             yield out
 
 

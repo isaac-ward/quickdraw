@@ -804,15 +804,39 @@ def window_loaders(cfg, norm: Normalizer):
     P, F = cfg.data.P, cfg.data.F
     root = resolve_data_root(cfg)
     specs = _modality_specs(cfg)
-    img = next((s for s in specs if s.kind == "image"), None)   # image modality (if any) -> resident frame store
-    cam, repo = str(cfg.data.get("cam", "fpv")), str(cfg.data.get("repo_id", "torus"))
+    imgs = [s for s in specs if s.kind == "image"]      # image modalities -> one resident frame store each
+    repo = str(cfg.data.get("repo_id", "torus"))
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Each image head reads ONE camera directory. The head NAME is a model-side label (scene_right) and the
+    # directory is a dataset-side one (head_right), so with several heads there is nothing to pair them by
+    # except an explicit declaration: ModalitySpec.cam. data.cam remains the fallback, which keeps every
+    # single-camera dataset (torus, starling, robocasa) resolving exactly as before.
+    default_cam = cfg.data.get("cam", "fpv")
+    default_cams = [str(default_cam)] if isinstance(default_cam, str) else [str(c) for c in default_cam]
+    cams = []
+    for k, sp in enumerate(imgs):
+        c = str(getattr(sp, "cam", "") or "")
+        if not c:
+            if len(imgs) > 1 and len(default_cams) != len(imgs):
+                raise ValueError(
+                    f"image head {sp.name!r} has no `cam`, and data.cam cannot disambiguate "
+                    f"({len(imgs)} heads vs {len(default_cams)} camera(s) in data.cam). Set "
+                    f"model.modalities.<i>.cam=<leaf> on every image head when there is more than one.")
+            c = default_cams[k] if len(default_cams) == len(imgs) else default_cams[0]
+        cams.append(c)
+    if len(set(cams)) != len(cams):      # two heads on one camera trains a duplicate, silently
+        raise ValueError(f"image heads map to duplicate cameras: "
+                         f"{list(zip([s.name for s in imgs], cams))}")
+
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
-        if img is not None:
-            eps = load_split_episodes_mm(root, split, img_size=img.img_size, cam=cam, repo_id=repo)
-            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, image_head=img.name, stride=stride)
+        if imgs:
+            eps = load_split_episodes_mm(root, split, img_size=[i.img_size for i in imgs],
+                                         cam=cams, repo_id=repo)
+            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev,
+                                            image_head=[i.name for i in imgs], stride=stride)
         else:                                                    # proprio-only: (obs, act) pairs, no camera frames
             eps = load_split_episodes(root, split, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
