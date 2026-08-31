@@ -269,9 +269,17 @@ def main(cfg):
     # the env's proprio metric, which on an image run picks best.ckpt blind to every image result (measured:
     # bott_bott16 pinned best.ckpt to e8 while its floor peaked e14 and its perceptual distance e18). mse and
     # NOT psnr because psnr = -10*log10(mse) -> minimising mse IS maximising psnr, while staying a min-metric.
-    _img = next((m for m in cfg.model.get("modalities", []) or [] if str(m.get("kind", "")) == "image"), None)
-    ckpt_monitor = cfg.trainer.get("checkpoint_monitor", None) or (
-        f"val/metric/{_img.get('name', 'image')}/mse" if _img is not None
+    _imgs = [m for m in cfg.model.get("modalities", []) or [] if str(m.get("kind", "")) == "image"]
+    _explicit = cfg.trainer.get("checkpoint_monitor", None)
+    if _explicit is None and len(_imgs) > 1:
+        # MULTI-HEAD: AUTO would pick the FIRST image head and select best.ckpt blind to the rest — the same
+        # class of miss as the bott_bott16 case above, one head wide. Refuse to guess; make the choice explicit.
+        raise ValueError(
+            f"{len(_imgs)} image modalities ({[str(m.get('name', 'image')) for m in _imgs]}) but no "
+            f"trainer.checkpoint_monitor. AUTO selects on ONE head and would ignore the others. Set it "
+            f"explicitly, e.g. trainer.checkpoint_monitor=val/metric/{_imgs[0].get('name', 'image')}/mse")
+    ckpt_monitor = _explicit or (
+        f"val/metric/{_imgs[0].get('name', 'image')}/mse" if _imgs
         else f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}")
     # AUTO direction from the metric NAME. mode used to be hardcoded "min", so aiming checkpoint_monitor at a
     # higher-is-better metric silently selected the WORST epoch. Override with trainer.checkpoint_mode.

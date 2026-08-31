@@ -104,7 +104,7 @@ _SIZE_BASE = {"d": 128, "heads": 8, "depth": 4, "num_tokens": 8, "decode_base": 
 
 def apply_size_preset(cfg):
     """model.size=tiny|small -> set the preset's hidden capacity knobs (model.d/heads + the image modality's
-    num_tokens/decode_base) IN PLACE on cfg, so config.resolved records the real values. RAISES if you ALSO overrode
+    num_tokens/decode_base, applied to EVERY image head) IN PLACE on cfg, so config.resolved records the real values. RAISES if you ALSO overrode
     one of those knobs individually (size vs explicit-knob clash -> pick one). Image knobs apply only when an image
     modality is present. No-op if model.size is unset. Call ONCE, early (before the resolved dump), NOT on resume."""
     from omegaconf import open_dict
@@ -115,24 +115,25 @@ def apply_size_preset(cfg):
     if size not in SIZE_PRESETS:
         raise ValueError(f"model.size={size!r} is unknown; options: {sorted(SIZE_PRESETS)}")
     preset = SIZE_PRESETS[size]
-    img = next((md for md in (m.get("modalities") or []) if md.get("kind") == "image"), None)
+    imgs = [md for md in (m.get("modalities") or []) if md.get("kind") == "image"]
     clashes = []
     for k, v in preset.items():
-        holder = m if k in _SIZE_MODEL_KEYS else img
-        if holder is None:                                    # image key but no image modality -> skip
-            continue
-        cur = holder.get(k, _SIZE_BASE.get(k))
-        if cur not in (_SIZE_BASE.get(k), v):
-            clashes.append(f"model.{'' if k in _SIZE_MODEL_KEYS else 'modalities.<image>.'}{k}={cur}")
+        holders = [m] if k in _SIZE_MODEL_KEYS else imgs   # image key + no image modality -> empty -> skip
+        for holder in holders:
+            cur = holder.get(k, _SIZE_BASE.get(k))
+            if cur not in (_SIZE_BASE.get(k), v):
+                nm = '' if k in _SIZE_MODEL_KEYS else f"modalities.{holder.get('name', 'image')}."
+                clashes.append(f"model.{nm}{k}={cur}")
     if clashes:
         raise ValueError(f"model.size={size} sets {sorted(preset)}, but you also overrode {clashes}. "
                          f"Use model.size OR the individual knob(s), not both — remove one.")
     for k, v in preset.items():
         if k in _SIZE_MODEL_KEYS:
             m[k] = v
-        elif img is not None:
-            with open_dict(img):
-                img[k] = v
+        else:
+            for img in imgs:                                  # EVERY image head, not just the first
+                with open_dict(img):
+                    img[k] = v
 
 
 def _proprio_prior_mode(cfg):
