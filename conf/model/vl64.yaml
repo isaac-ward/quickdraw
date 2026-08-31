@@ -1,0 +1,93 @@
+# =============================================================================================
+# vl64 — up64 plus the L1+LPIPS VISUAL LOSS. The best-measured recipe on robocasa-scene4-4h as of 2026-08-31.
+# Select with `model=vl64`. See wizard/records/robocasa-scene4-4h.md section 22 for the full experiment.
+#
+# Inherits up64 (which inherits bsp32mse) and changes ONLY the reconstruction loss: `visual_l1: 1.0` +
+# `visual_lpips: 1.0` on a VGG16 backbone, replacing the plain `F.mse_loss` that every one of the first 25 runs
+# on this dataset used at BOTH image loss sites. See models/visual_loss.py.
+#
+# MEASURED (96px, ae_bottleneck 6, identical to up64 in every other respect, as run `vl_keep10`):
+#   best raw OL LPIPS@+128    0.1507 (ev8)    vs the previous ALL-TIME best of 0.2392  -- 37% better
+#   best codec floor LPIPS    0.0945 (ev11)   vs the previous ALL-TIME best of 0.1432  -- 34% better
+# Both numbers are directly comparable to every historical run because the EVAL path is untouched: training
+# uses vgg, `evaluation.openloop._lpips_net` still defaults to SqueezeNet. That split is deliberate and load-
+# bearing -- training on the network that scores the run optimises the metric's own features and would make the
+# number incomparable to everything before it.
+#
+# WHY IT WORKS. L2's minimiser under uncertainty is the conditional MEAN, i.e. blur, and design/collapse.md had
+# already recorded the consequence: "MSE loves blur... LPIPS was 0.18 the whole time -- the blur was there from
+# the start; MSE never saw it." We optimised a loss structurally blind to sharpness and then ranked every run
+# on LPIPS. Every published GAN-free latent codec (IRIS, ViTok stage 1) uses pixel@1.0 + LPIPS@1.0; IRIS is the
+# closest relative (bespoke encoder, 64px frames, no GAN, L1 + LPIPS-VGG16 at exactly 1:1).
+#
+# HONEST CAVEATS, because they are easy to lose and two of them are visible to the naked eye:
+#   * IT GHOSTS. The user looked at the frames and called them "perceptually weird". Measured at eval 2: the
+#     best floor LPIPS ever recorded while sitting 2.1 dB and 0.09 SSIM BELOW runs with WORSE perceptual
+#     scores -- "perceptually plausible, spatially wrong". Largely closes by eval 10 (floor SSIM 0.669 vs the
+#     controls' 0.680, floor PSNR within 0.9 dB) but READ THE FRAMES, do not trust the metric alone.
+#   * THE ROLLOUT IS WORSE than the pure-MSE decoder it beats. At matched eval 10: OL PSNR 13.42 vs
+#     dec_up64's 14.86, latent_cos 0.300 vs 0.392. The CODEC improved; the dynamics did not. Plausible
+#     mechanism: the AR decode loss is the only autoregressive gradient in the model and reaches the dynamics
+#     solely through the decoder's Jacobian (design/flow.md), so a loss blind to spatial displacement tells the
+#     dynamics that landing in the wrong place is cheap. LPIPS scores VGG features after several POOLING
+#     stages, and is exactly that blind.
+#   * IT COLLAPSED AT EVAL 12, into a degenerate stable state (latent_cos -0.13, motion 0.31), after one
+#     non-finite gradient step. It was still improving at eval 11. Watch `latent_cos`: going negative is the
+#     signature. As of 018bf5d a non-finite step PRINTS to progress.log and does NOT stop the run.
+#   * THE WIN IS CONFOUNDED. Holding `latent_loss_weight` at 10 while the loss VALUE grew ~15x means the
+#     roundtrip anchor's contribution grew ~15x too, so "LPIPS helps" and "more codec pressure helps" are not
+#     separated. `dyn512` is the pure-L2-at-weight-1 control; separating them would need pure L2 at ~15x
+#     scale. Deliberately not run -- it explains the win, it does not improve on it.
+#
+# DO NOT MOVE `latent_loss_weight`. It is now bracketed on BOTH sides, every neighbour fails:
+#     0.4  (magnitude-matched)  codec erased 5.4 dB in ONE epoch          -- run `vl_iris`
+#     10   THIS RECIPE          healthy; every record above                -- run `vl_keep10`
+#     25                        motion froze to 0.02, latent_cos NEGATIVE, grad -> inf -- run `vl_w25`
+# The anchor is the ONLY term forcing the latent to stay a faithful encoding; every other loss can be reduced
+# by making the latent EASIER TO PREDICT, and the easiest such latent is degenerate. It is a RATIO knob (stay
+# invertible vs be predictable), not a magnitude knob -- which is why matching its magnitude at 0.4 failed.
+#
+# `visual_lpips: 0.25` WAS TRIED AND LOST (run `vl_lp025`): floor 0.2317 vs 0.0945, @+128 0.2084 vs 0.1507.
+# It did improve directional tracking (latent_cos 0.481, the best of any run) but reconstructed far worse, and
+# it lowered the total loss value and therefore the anchor's pressure by 2.6x -- confounded the same way.
+#
+# COST: VGG-LPIPS at both sites takes per-sample memory from ~3.3 to ~3.5 GB. autobatch picks 26 where the
+# pure-MSE recipe got 28, i.e. ~7%. (An earlier 5.636 GB/sample figure was measured on code with a rank bug
+# that stopped `visual_frames` subsampling from applying at the anchor -- ignore it.)
+# =============================================================================================
+defaults:
+  - up64
+  - _self_
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them, so inheriting up64 and editing one
+  # entry is impossible -- and being explicit is what makes the recipe auditable.
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  #   proprio keeps plain MSE: `VisualLoss` is IMAGE-only (Modality.recon_loss defaults to F.mse_loss and only
+  #   ImageModality overrides it), and a 6-dim vector has no perceptual structure to score.
+  - {name: image, kind: image, weight: 1.0, img_size: 128,
+     pretrained: false,
+     num_tokens: 32,
+     encode_arch: conv,
+     encode_base: 32,
+     decode_kind: mse,
+     decode_arch: up,
+     decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64,
+     # ---- THE CHANGE (models/visual_loss.py). ONE VisualLoss instance, registered once, used at BOTH the AR
+     #      decode loss and the roundtrip anchor, so the pixel:perceptual RATIO is identical at both sites and
+     #      only the magnitude differs (the site weights are applied outside it).
+     visual_l1: 1.0,          # IRIS/VQGAN/LDM all use pixel@1.0
+     visual_l2: 0.0,          # no squared term. NOTE this is what makes it ghost -- see the caveats above.
+     visual_lpips: 1.0,       # the GAN-free published value. MAGVIT-v2/TiTok's 0.1 is the WRONG family to
+     #                          copy: both have a GAN carrying sharpness and neither uses LPIPS at all.
+     visual_lpips_net: vgg,   # TRAINING backbone. Never "squeeze" -- that is the REPORTED metric's backbone.
+     visual_frames: 128,      # LPIPS on a random subset per step; unbiased, bounded cost. All B*F frames
+     #                          (1664 at batch 26 / F 64) would dominate the step.
+     latent_loss_weight: 10}  # DO NOT MOVE -- bracketed on both sides, see the header.
+
+# NOT covered here (a model config cannot hold them) -- pass on the CLI, exactly as up64 documents:
+#   data.subsample=<k>   data.F=64   model.action_dim / modalities.0.dim / environments.*
+#   model.modalities.1.img_size=96  +model.modalities.1.ae_bottleneck=6   <- PAIR THESE, see up64's header
+#   model.diffusion.flow_hidden=512  <- every number quoted above used it
