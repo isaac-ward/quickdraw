@@ -202,12 +202,15 @@ as specified. If faster feedback matters more than breadth, restart with
       decoder is "~78% of per-sample training memory across TWO passes... the one lever that buys
       real batch size; everything else lives in the other 22%". SMALLER chunk = more checkpointing =
       less memory, same result. Arm B currently sets 24; dropping toward 8 or 4 should recover batch
-      into the 6–10 range at ~1.33x decode time. **Needs one more autobatch probe to confirm before
-      the real Arm B launches.**
+      into the 6–10 range at ~1.33x decode time. Applied as 24 -> 8 in the recipe; Arm B's own
+      autobatch will report the result.
 
-## ARM B — multicamera (gpu 1, 3 heads)
+## ARM B — multicamera (gpu 0, 3 heads)
 
-- [ ] Launch `model=vl64_multicam`.
+- [x] **LAUNCHED** — `logs/train_world_model_2026_08_31_11_32_38_lego_arm_b_multicam`, GPU 0, on the
+      full 3-camera build `lego3full` with `decode_chunk_train: 8`, 50 epochs,
+      `eval.decode_chunk=16 eval.closed_loop_steps=[1]`,
+      `trainer.checkpoint_monitor=val/metric/scene_right/mse`.
 - [ ] Score on `scene_right` — the SAME camera Arm A predicts — so the comparison answers one clean
       question: do the wrist cameras improve scene prediction?
 
