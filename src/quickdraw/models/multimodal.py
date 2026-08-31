@@ -400,11 +400,22 @@ class MultiModalSequenceModel(nn.Module):
         # commit=True: the anchor measures the CODEC, which is deterministic. Scoring a stochastic sample here
         # would train its variance to zero (MSE of a sample = bias^2 + variance) at weight 10 -- see decode().
         rec = self.to_obs(bag, heads=heads, anchor=anchor, commit=True)   # REAL decode, de-relativized -> ABSOLUTE
-        # RAW mse + its weight, so the logged series is comparable across runs that sweep latent_loss_weight
-        # (every sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec
-        # panel rescale while the decode panels did not.
-        return ({f"codec/roundtrip_{n}": F.mse_loss(rec[n], targets[n]) for n in heads},
-                {f"codec/roundtrip_{n}": wts[n] for n in heads})
+        # The SAME `recon_loss` object the AR decode loss uses (Modality.recon_loss; for images that is the one
+        # shared VisualLoss). Sharing it is what keeps the pixel:perceptual RATIO identical at the two sites --
+        # a large-weight PURE-L2 anchor beside a small-weight perceptual decode loss would re-blur the decoder.
+        # RAW + its weight, so the logged series is comparable across runs that sweep latent_loss_weight (every
+        # sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec panel
+        # rescale while the decode panels did not.
+        out = {f"codec/roundtrip_{n}": self.modalities[n].recon_loss(rec[n], targets[n]) for n in heads}
+        w = {f"codec/roundtrip_{n}": wts[n] for n in heads}
+        # And the raw MSE alongside, at weight ZERO so it is LOGGED but contributes nothing. Without this, any
+        # run that changes the mix stops being comparable to the 25 historical runs on `codec/roundtrip_*`,
+        # which is the series every codec-erosion finding in the record is written against.
+        with torch.no_grad():
+            for n in heads:
+                out[f"codec/roundtrip_{n}_mse"] = F.mse_loss(rec[n], targets[n])
+                w[f"codec/roundtrip_{n}_mse"] = 0.0
+        return out, w
 
     def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
         """Diffusion-forcing hook: add a per-state-token noise-LEVEL embedding to the bag before fusion.

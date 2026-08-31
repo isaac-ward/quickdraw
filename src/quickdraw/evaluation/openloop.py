@@ -26,21 +26,29 @@ def _ssim(a, b):
 _LPIPS_CACHE: dict = {}
 
 
-def _lpips_net(device):
-    """Cached LPIPS (SqueezeNet backbone — the cheapest of the three; ~0.1 GFLOP/frame at 128px, negligible
-    beside the rollout that produced the frames). Returns None if the weights can't be fetched, so a missing
-    download degrades the metric rather than killing an eval."""
-    key = str(device)
+def _lpips_net(device, net_type: str = "squeeze"):
+    """Cached LPIPS. Returns None if the weights can't be fetched, so a missing download degrades the metric
+    rather than killing an eval.
+
+    `net_type` defaults to SqueezeNet — the cheapest of the three (~0.1 GFLOP/frame at 128px, negligible beside
+    the rollout that produced the frames) and, critically, THE BACKBONE OF THE REPORTED METRIC. `image_curves`
+    below must keep this default forever: every historical number on every dataset was computed with it.
+
+    The parameter exists so `models.visual_loss.VisualLoss` can request a DIFFERENT backbone ("vgg") for the
+    TRAINING loss. Training against the same network that scores the run optimises the metric's own features
+    and yields a number not comparable to any prior run — see visual_loss.py. Cache is keyed by both, so the
+    two coexist in one process."""
+    key = (str(device), net_type)
     if key not in _LPIPS_CACHE:
         try:
             from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-            net = LearnedPerceptualImagePatchSimilarity(net_type="squeeze", normalize=True).to(device).eval()
+            net = LearnedPerceptualImagePatchSimilarity(net_type=net_type, normalize=True).to(device).eval()
             for prm in net.parameters():
                 prm.requires_grad_(False)
             _LPIPS_CACHE[key] = net
         except Exception as e:                     # LOUD, once: a silent None disables lpips for the whole
             _LPIPS_CACHE[key] = None               # run (design/logging.md: fail-soft but NOT silent)
-            print(f"[lpips] DISABLED for this process ({type(e).__name__}: {e}) — "
+            print(f"[lpips:{net_type}] DISABLED for this process ({type(e).__name__}: {e}) — "
                   f"image_curves will omit the lpips key")
     return _LPIPS_CACHE[key]
 

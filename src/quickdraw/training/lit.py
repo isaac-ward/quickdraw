@@ -50,6 +50,7 @@ class LitWorldModel(L.LightningModule):
         # the per-STEP half (total pre-clip norm + the non-finite guard) is unchanged, because the guard gates
         # the optimizer step and the pre-clip norm is the headline early-warning signal.
         self.grad_diag_every = max(1, int(grad_diag_every))
+        self._nonfinite_epoch = 0   # per-epoch count of non-finite-gradient steps, for the progress.log report
         # train-time shaping variations (off by default -> empty suite, zero overhead). See variations.py.
         self.variations = make_variation_suite(variations)
         # physical-loss warmup: ramp its weight 0 -> 1 over warmup_epochs (same linear schedule as p_tf;
@@ -272,6 +273,9 @@ class LitWorldModel(L.LightningModule):
                         self.log(k, val)
         return loss
 
+    def on_train_epoch_start(self):
+        self._nonfinite_epoch = 0     # reset the per-epoch non-finite counter (see configure_gradient_clipping)
+
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
         # clip (Trainer sets val=1.0) AND log the total grad norm pre- and post-clip, generically for
         # every model, so BPTT blow-ups (DSAR diverged ~ep30 even with clipping) are diagnosable.
@@ -324,6 +328,28 @@ class LitWorldModel(L.LightningModule):
         if skipped:
             for g in grads:
                 g.zero_()
+            # REPORT IT, loudly, to stdout -> progress.log. `grad/nonfinite_skipped` (reduce_fx=sum) already
+            # carries the per-epoch count, but a metrics key is only read when someone goes looking, and this
+            # is exactly the event you want to see WHILE watching a run: vl_keep10 and vl_lp025 both took one
+            # non-finite step and then sat in a degenerate state for 4-5 further epochs unnoticed.
+            # DELIBERATELY DOES NOT STOP THE RUN (user, 2026-08-31) -- a skipped step is survivable and killing
+            # on it would have thrown away recoverable runs. Report, do not act.
+            # getattr default: smoke/grad_diag.py drives this method from a bare Probe object that never
+            # runs LitWorldModel.__init__, so the attribute may not exist.
+            n = self._nonfinite_epoch = getattr(self, "_nonfinite_epoch", 0) + 1
+            if n <= 3 or n % 50 == 0:            # first few in detail, then sampled, so a systematic
+                #                                  problem is visible without flooding 1350 lines/epoch
+                worst = ""
+                if module_sq:                    # `want_diag` is forced True on any skip, so this is populated
+                    bad = [k for k, v in module_sq.items() if not bool(torch.isfinite(v))]
+                    top = sorted(((float(v) if bool(torch.isfinite(v)) else float("inf"), k)
+                                  for k, v in module_sq.items()), reverse=True)[:3]
+                    worst = (f" | non-finite in: {','.join(bad) if bad else 'none (total only)'}"
+                             f" | largest: {', '.join(f'{k}={v:.3g}' for v, k in top)}")
+                ep = getattr(self, "current_epoch", -1)   # see the getattr note above: bare Probe in the smoke
+                print(f"[grad] NON-FINITE gradient at epoch {ep} step {int(self.global_step)} "
+                      f"-- step SKIPPED (grads zeroed, weights unchanged; #{n} this epoch). "
+                      f"nan={int(n_nan)} inf={int(n_inf)}{worst}", flush=True)
         else:
             self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val,
                                 gradient_clip_algorithm=gradient_clip_algorithm)

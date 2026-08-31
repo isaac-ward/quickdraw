@@ -19,6 +19,7 @@ from torch import Tensor
 
 from .flow import FlowField, ImageFlowHead, ImageUNetFlowHead, TransportHead
 from .vision import (ConvImageEncoder, GridToTokens, ImageAutoencoder, TokensToGrid, VisionAEConfig, img_hw)
+from .visual_loss import VisualLoss
 
 
 def _mlp(i: int, o: int, h: int) -> nn.Sequential:
@@ -36,6 +37,38 @@ class ModalitySpec:
     decode_shortcut: bool = False  # flow decode (param=v): opt-in shortcut self-consistency -> K=1 sampling
     #                                (like the dynamics `diffusion.shortcut`; never default-on). Off -> plain flow, decode_steps.
     decode_steps: int = 6     # flow decode sampling steps (K). v: ODE steps (shortcut->1). x0: consistency refine steps (1 = direct)
+    decode_inject: bool = False   # decode_arch=up ONLY. FEATURE 2: add the bottleneck readout map, resampled,
+    #                           at every upsampling level. Above 6x6 the ONLY latent signal is `g`, one pooled
+    #                           d-vector applied as a PER-CHANNEL FiLM -- broadcast over all 9,216 positions at
+    #                           96px, so it cannot say "sharper HERE". ~116k params at decode_base=64 (2.4%):
+    #                           d -> each block's INPUT width, added BEFORE the block so its convs can use it.
+    #                           zero-init, so the model is a strict SUPERSET of the same decoder at step 0.
+    decode_xattn_max_res: int = 0  # decode_arch=up ONLY. FEATURE 3: re-cross-attend the token bag at every
+    #                           upsampling level whose output resolution is <= this (0 = off; 24 -> levels
+    #                           12 and 24 at a 6x6 bottleneck). One query per spatial position, so it is only
+    #                           affordable low: 144+576 queries at 12/24 vs 9,216 at 96x96 alone. ~132k params
+    #                           per level, zero-init output. This is Stable Diffusion's multi-resolution
+    #                           cross-attention pattern; see models/decoders.py:LevelCrossAttn for the caveat
+    #                           that SD injects TEXT into a DENOISER, not a decoder re-reading its own latent.
+    visual_l2: float = 1.0     # IMAGE modalities: the pixel-space reconstruction MIX, shared by BOTH image
+    visual_l1: float = 0.0     #   loss sites (AR decode at weight 1.0, roundtrip anchor at latent_loss_weight).
+    visual_lpips: float = 0.0  #   Defaults (l2 only) are EXACTLY F.mse_loss, i.e. bit-identical to before.
+    #                           WHY: both sites were pixel MSE, and design/collapse.md says plainly "MSE loves
+    #                           blur. Dropping detail moves the prediction toward a smooth mean; MSE barely
+    #                           penalizes that... LPIPS was 0.18 the whole time -- the blur was there from the
+    #                           start; MSE never saw it." So we optimise a loss structurally blind to sharpness
+    #                           and then rank runs on LPIPS. Published GAN-free codecs (IRIS, ViTok stage 1) use
+    #                           L1 or L2 at 1.0 PLUS LPIPS at 1.0; see models/visual_loss.py for the full table
+    #                           and for why MAGVIT-v2/TiTok's 0.1 is the WRONG number to copy here.
+    visual_lpips_net: str = "vgg"   # TRAINING backbone. Must NOT be "squeeze": that is the backbone of the
+    #                           REPORTED metric (evaluation/openloop.py), and training on it optimises the
+    #                           metric's own features -- the resulting number would not be comparable to any of
+    #                           the 25 historical runs. vgg is also what VQGAN/LDM/IRIS/SoftVQ all hardcode.
+    #                           The LPIPS net is a pretrained VGG16 -- a LOSS network, not a codec, so the
+    #                           bespoke-codec rule stands, but it IS a pretrained dependency.
+    visual_frames: int = 128   # visual_lpips>0: score LPIPS on a random subset of this many frames per step
+    #                           instead of all B*F (2048 at batch 32 / F 64), which would dominate the step. A
+    #                           random subset is an unbiased estimate of the same expectation. 0 -> all frames.
     decode_stochastic: bool = False  # flow decode ONLY: SAMPLE the obs (eps ~ N(0,1)) instead of committing the
     #                           deterministic eps=0 point. OFF (default) makes decode_kind=flow a TRAINING-ONLY
     #                           change: with param=x0 the committed decode is velocity(zeros, tau=1, cond),
@@ -73,7 +106,19 @@ class ModalitySpec:
     patch: int = 16
     num_tokens: int = 8
     ae_depth: int = 4
-    ae_bottleneck: int = 8   # conv-pyramid bottleneck target (px, short side); 8 = previous behaviour
+    ae_bottleneck: int = 8   # conv-pyramid bottleneck TARGET in px on the short side (8 = pre-2026-08-21
+    #                          behaviour). It is a TARGET, not a guarantee: both pyramids size themselves with
+    #                          `n_levels = int(log2(short_side // bottleneck))`, and int() TRUNCATES, so any
+    #                          img_size/bottleneck ratio that is not a power of 2 SILENTLY lands somewhere else.
+    #                          PAIR IT WITH img_size. The two verified-exact settings on this project:
+    #                              img_size 128 -> ae_bottleneck 8   enc 3 lvls -> 8px,  dec 4 lvls -> 8px
+    #                              img_size  96 -> ae_bottleneck 6   enc 3 lvls -> 6px,  dec 4 lvls -> 6px
+    #                          Both give a 256x spatial reduction with the same level counts, so 96/6 is the
+    #                          exact structural analogue of 128/8 and results transfer between them.
+    #                          THE TRAP: at 96px the DEFAULT of 8 truncates to a 12x12 bottleneck -- a 64x
+    #                          reduction, i.e. a materially LESS compressed codec than requested, with one
+    #                          fewer level on each side. Nothing warns you. (At 128px, 6 truncates back to 8,
+    #                          so 128 is forgiving and 96 is not.) See models/vision.py VisionAEConfig.
     decode_chunk_train: int = 0   # >0: chunk the DECODE head's velocity forward into groups of this many
     #                               frames and checkpoint each, so its intermediates are recomputed in
     #                               backward instead of retained. 0 = OFF (bit-identical). The decoder is
@@ -148,11 +193,25 @@ class Modality(nn.Module):
         return obs.reshape(*lead, *obs.shape[1:])
 
     def decode_loss(self, tok: Tensor, target: Tensor):
-        """Per-head decode loss via the unified head: mse (no_noise) -> (L2, None); flow -> (flow-matching, shortcut)."""
+        """Per-head decode loss via the unified head: mse (no_noise) -> (recon_loss, None); flow -> (flow-matching, shortcut).
+
+        The head scores its clean prediction with `self.recon_loss`, which is the SAME object the roundtrip
+        anchor uses -- see recon_loss below. Passing it into the head (rather than re-decoding outside) means
+        no second decoder forward, which matters because the decoder is ~78% of per-sample memory."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         tgt = target.reshape(-1, *target.shape[len(lead):])
-        return self.decode_head.loss(self._decode_cond(flat), tgt)
+        return self.decode_head.loss(self._decode_cond(flat), tgt, recon_loss=self.recon_loss)
+
+    def recon_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        """The reconstruction loss used at BOTH sites that train this modality's decoder: the AR decode loss
+        (above) and the codec roundtrip anchor (multimodal.roundtrip_losses).
+
+        Base = plain MSE, which is what every non-image modality wants. `ImageModality` overrides it with a
+        single shared `VisualLoss` so the two sites can never silently disagree about the mix, and so the
+        pixel:perceptual RATIO is identical at both -- the site weights (1.0 and latent_loss_weight) scale the
+        whole mix, not its balance."""
+        return F.mse_loss(pred, target)
 
 
 class VectorModality(Modality):
@@ -215,6 +274,14 @@ class ImageModality(Modality):
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
+        # ONE VisualLoss, registered ONCE here as a child of this modality. `recon_loss` below hands the SAME
+        # object to both loss sites; registering it under two parents would duplicate the frozen LPIPS weights
+        # in every checkpoint.
+        self.visual = VisualLoss(w_l2=float(getattr(spec, "visual_l2", 1.0) or 0.0),
+                                 w_l1=float(getattr(spec, "visual_l1", 0.0) or 0.0),
+                                 w_lpips=float(getattr(spec, "visual_lpips", 0.0) or 0.0),
+                                 lpips_net=str(getattr(spec, "visual_lpips_net", "vgg")),
+                                 frames=int(getattr(spec, "visual_frames", 128) or 0))
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         # EXPLICIT dispatch with a RAISE on anything unknown. This used to be `if unet ... else vit`, so a
         # typo'd or newly-added decode_arch SILENTLY built the ViT head and the run "tested" nothing at all.
@@ -232,7 +299,9 @@ class ImageModality(Modality):
                     "for flow, or decode_kind='mse' for 'up'. See models/decoders.py.")
             from .decoders import TokenGridDecoder
             self.decode_head = TokenGridDecoder(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
-                                                chunk=_chunk)
+                                                chunk=_chunk,
+                                                inject=bool(getattr(spec, "decode_inject", False)),
+                                                xattn_max_res=int(getattr(spec, "decode_xattn_max_res", 0) or 0))
         elif self.decode_arch == "vit":
             self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc,
                                              no_noise=no_noise, chunk=_chunk)
@@ -240,6 +309,46 @@ class ImageModality(Modality):
             raise ValueError(f"unknown decode_arch={self.decode_arch!r} for image modality "
                              f"{spec.name!r}; expected one of 'unet' (conv U-Net, serves mse AND flow), "
                              f"'up' (up-only conv decoder, mse only), 'vit' (all-attention, patch grid)")
+        self._report_readout(spec, d)   # AFTER the dispatch -- it inspects decode_head
+
+    def _report_readout(self, spec, d: int) -> None:
+        """One startup line: how much of the latent the decoder can physically read.
+
+        WHY THIS EXISTS. Section 17 swept num_tokens 8->64 and the reconstruction floor did not move AT ALL,
+        and it took months to work out why: the U-Net read the whole bag through `Linear(T*d -> 512)` plus
+        `cond.mean(1)`, a rank-<=640 cut, so even EIGHT tokens (1,024 floats) already saturated it and every
+        extra token was invisible to every pixel. That was arithmetic, knowable on day one, and nothing printed
+        it. This line prints it.
+
+        For decode_arch='up' the cap is the query GRID, bott_h*bott_w*d -- one d-vector per cell, and all latent
+        information passes through it. Note it scales with the grid (i.e. with ae_bottleneck and img_size), NOT
+        with num_tokens, so raising num_tokens alone can walk straight past it. OVER the cap is not necessarily
+        useless -- cross-attention lets each cell SELECT from a richer menu, unlike the old fixed dense
+        projection -- but you are then buying choice, not bandwidth, and should say so."""
+        latent = int(spec.num_tokens) * int(d)
+        head = self.decode_head
+        if self.decode_arch == "up":
+            gh, gw = head.readout.grid_hw
+            cap, how = gh * gw * d, f"query grid {gh}x{gw} = {gh * gw} cells x d{d}"
+            over = "OVER the cap -- cross-attention still SELECTS from a richer menu, so this buys choice, not bandwidth"
+        elif self.decode_arch == "unet":
+            w = getattr(getattr(head, "unet", None), "cond_to_spatial", None)
+            cap = (w.out_features if w is not None else 0) + d
+            how = f"Linear(T*d -> {cap - d}) + cond.mean(1) [d{d}] -- FIXED, does NOT scale with num_tokens"
+            # A dense flatten does NOT select: its output subspace is fixed at training time, so latent
+            # directions outside it are simply DISCARDED. This is section 17's null, and it is why the same
+            # "% of cap" number means something different here than for the query grid.
+            over = "OVER the cap -- the excess is DISCARDED (fixed dense projection, no selection)"
+        else:
+            return
+        pct = 100.0 * latent / max(cap, 1)
+        flag = over if latent > cap else "under the cap"
+        print(f"[codec] {self.name}: latent {spec.num_tokens}x{d} = {latent} floats | decoder readout {cap} "
+              f"({how}) | {pct:.0f}% of cap -- {flag}", flush=True)
+
+    def recon_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        """The shared mix (models/visual_loss.py). Same instance, same weights, both sites."""
+        return self.visual(pred, target)
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)

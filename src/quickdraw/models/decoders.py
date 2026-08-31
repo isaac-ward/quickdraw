@@ -133,6 +133,36 @@ class TokenPool(nn.Module):
         return self.pool(self.q.expand(cond.shape[0], -1, -1), cond)[:, 0]
 
 
+class LevelCrossAttn(nn.Module):
+    """Feature 3: let one UP level RE-SELECT from the token bag, instead of reusing the bottleneck readout.
+
+    The trunk runs at `ch` channels while attention lives at `d`, so this projects in, cross-attends the bag
+    with every spatial position as its own query, and projects back through a ZERO-INIT conv -- so the level is
+    an exact identity at step 0 and this can only be learned into, never regressed into.
+
+    LITERATURE. This is the pattern Stable Diffusion's U-Net uses (cross-attention to the conditioning at
+    several resolutions, NOT at full res) and what TiTok/SoftVQ get for free by being ViTs that re-attend the
+    latent at every layer. The honest caveat is that SD's cross-attention injects a DIFFERENT modality (text)
+    into a DENOISER; no published latent-image decoder re-reads its own latent per level. See the class
+    docstring of TokenGridDecoder for why our geometry differs from theirs.
+
+    COST. Queries are H*W, so this is only affordable at low resolution: 36 + 144 + 576 = 756 queries over 32
+    keys for levels 6/12/24, versus 9,216 queries at 96x96 alone. `decode_xattn_max_res` gates it."""
+
+    def __init__(self, ch: int, d: int, heads: int):
+        super().__init__()
+        self.to_d = nn.Conv2d(ch, d, 1)
+        self.xa = CrossAttn(d, heads)
+        self.to_ch = nn.Conv2d(d, ch, 1)
+        nn.init.zeros_(self.to_ch.weight); nn.init.zeros_(self.to_ch.bias)
+
+    def forward(self, h: Tensor, cond: Tensor) -> Tensor:      # (M,ch,H,W), (M,T,d) -> (M,ch,H,W)
+        M, _, H, W = h.shape
+        q = self.to_d(h).flatten(2).transpose(1, 2)            # (M, H*W, d) -- one query per spatial position
+        a = self.xa(q, cond).transpose(1, 2).reshape(M, -1, H, W)
+        return h + self.to_ch(a)
+
+
 class TokenGridDecoder(TransportHead):
     """`decode_arch: "up"` -- tokens -> image, UP ONLY. Deterministic decoder (no_noise), never a denoiser.
 
@@ -147,7 +177,8 @@ class TokenGridDecoder(TransportHead):
     CONSTANT, so folding it in is a bias with extra steps. The denoiser keeps its time embedding.
     """
 
-    def __init__(self, ae_cfg, *, base: int = 32, chunk: int = 0):
+    def __init__(self, ae_cfg, *, base: int = 32, chunk: int = 0,
+                 inject: bool = False, xattn_max_res: int = 0):
         # x0 + no_noise: this head predicts the clean image directly and never sees noise. param/shortcut are
         # NOT configurable -- a "generative up-only decoder" would be a different object (see the denoiser).
         super().__init__(param="x0", shortcut=False, event_dims=3, no_noise=True, chunk=chunk)
@@ -166,8 +197,32 @@ class TokenGridDecoder(TransportHead):
         self.to_ch = nn.Conv2d(d, chs[-1], 1)
         self.gpool = TokenPool(d, c.heads)
         self.mid = _FiLMResBlock(chs[-1], chs[-1], d)
+        # FEATURE 2 (`inject`) and FEATURE 3 (`xattn_max_res`). Both are OFF by default and both are ZERO-INIT
+        # on their output path, so a decoder with either enabled is bit-identical to one without at step 0 --
+        # a strict superset, which is what makes them cheap to A/B.
+        #
+        # WHAT THEY FIX. Above the bottleneck the ONLY latent signal reaching this trunk is `g`, a single
+        # attention-pooled d-vector, and `_FiLMResBlock` applies it as a PER-CHANNEL (1+s), b -- broadcast over
+        # every spatial position. So at 96x96 the latent's influence on 9,216 positions is 2*ch numbers, and it
+        # cannot say "sharper HERE". SPADE (Park et al. 2019) exists for exactly this reason: a global
+        # conditioning vector "washes away semantic information", and the fix is spatially-varying modulation.
+        #
+        # WHY NO PUBLISHED DECODER DOES THIS, AND WHY WE STILL MIGHT. VQ-GAN / SD-VAE take the latent once at
+        # the bottleneck and synthesize upward with no re-reading. But their bottleneck is a SPATIAL latent
+        # (SD-VAE: 32x32x4 for 256px), while ours is a token BAG with no spatial structure at all, projected
+        # into 6x6. They do not re-inject because their bottleneck map is already spatially rich; ours is not.
         self.ups, prev = nn.ModuleList(), chs[-1]
-        for ch in reversed(chs):
+        self.inject = nn.ModuleList() if inject else None
+        self.xattn = nn.ModuleDict()
+        for i, ch in enumerate(reversed(chs)):
+            if inject:
+                # d -> the block's INPUT width, added BEFORE the block so the convs can actually use it.
+                cv = nn.Conv2d(d, prev, 1)
+                nn.init.zeros_(cv.weight); nn.init.zeros_(cv.bias)
+                self.inject.append(cv)
+            res = self.bott_hw[0] * (2 ** (i + 1))                   # this level's output resolution
+            if 0 < xattn_max_res and res <= xattn_max_res:
+                self.xattn[str(i)] = LevelCrossAttn(prev, d, c.heads)
             self.ups.append(_FiLMResBlock(prev, ch, d))              # NO concat: there are no skips to concat
             prev = ch
         self.out_norm = nn.GroupNorm(min(8, chs[0]), chs[0])
@@ -177,11 +232,16 @@ class TokenGridDecoder(TransportHead):
         """cond (M,T,d) -> (M,H,W,C). x/temb/demb ignored (see the class docstring)."""
         assert cond is not None, "TokenGridDecoder decodes from `cond`; x carries no information."
         g = self.gpool(cond)                                         # (M,d) attention-pooled, not a mean
-        h = self.to_ch(self.readout(cond))                           # (M,chs[-1],bh,bw) full-bandwidth readout
-        h = self.mid(h, g)
-        for up in self.ups:
+        r = self.readout(cond)                                       # (M,d,bh,bw) full-bandwidth readout
+        h = self.mid(self.to_ch(r), g)
+        for i, up in enumerate(self.ups):
             h = F.interpolate(h, scale_factor=2, mode="nearest")     # resize-conv (Odena et al.); SD-VAE/TAESD
-            h = up(h, g)                                             #   do the same. NOT transposed conv.
+            if self.inject is not None:                              # feature 2: the readout map, resampled to
+                h = h + self.inject[i](F.interpolate(                #   THIS level -- spatially varying, unlike g
+                    r, size=h.shape[-2:], mode="bilinear", align_corners=False))
+            if str(i) in self.xattn:                                 # feature 3: re-select from the bag here
+                h = self.xattn[str(i)](h, cond)                      #   (nn.ModuleDict has no .get())
+            h = up(h, g)                                             #   NOT transposed conv.
         return self.out_conv(F.silu(self.out_norm(h))).permute(0, 2, 3, 1)
 
     def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
