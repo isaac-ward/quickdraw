@@ -289,6 +289,15 @@ to keep invertible, so the anchor is not a shared budget to split.
 **14.3 h/epoch** (15,356 batches at batch 3), so first eval (epoch 5) lands ~01:40 on 09-04 and 50 epochs
 would be ~30 days.
 
+**NO VALIDATION DATA YET, and none for ~2 days.** As of 08-31 22:16 Arm B is still inside epoch 0
+(`metrics.jsonl` has 0 `val/` entries). With the stock `check_val_every_n_epoch: 4` its first val point
+is epoch 3 ≈ **09-02 20:00**, and its first eval is epoch 5 ≈ 09-04. Every read in §8 — the
+codec-limited image head, the proprio error — is **ARM A ONLY, one camera, one val point**. Nothing is
+yet known about the three-head model beyond that it trains without collapsing.
+
+This is the strongest argument for raising the eval/val cadence: at 14.3 h/epoch, a cadence tuned for
+2.6 h epochs leaves Arm B blind for days. See §11.
+
 ### ⚠️ THE ARMS ARE NOT BATCH-MATCHED — the open question
 
 Both arms load **46,066 train / 5,565 val windows** — identical episodes, seed-0 split and subsample, so
@@ -311,6 +320,31 @@ Three options, in the order worth trying:
 3. **Accept and document** the batch difference as a caveat. Weakest.
 
 Left running as-is: both arms produce useful single-arm results either way, and this is a research call.
+
+## 11. Eval cadence — raise it, and Arm B is why
+
+Asked by the user (2026-08-31): *can we eval more often, epoch 1 3 5?*
+
+`at_epochs` is NOT the mechanism — `conf/eval/default.yaml` warns "DO NOT add per-epoch early points
+like [1,3] (that made eval effectively 'every 2' and clogged training)". The cadence knob already does
+it exactly, because it fires on `(epoch+1) % every == 0`:
+
+    eval.during_train.every_epochs=2  trainer.check_val_every_n_epoch=2      -> epochs 1, 3, 5, 7, ...
+
+Matching `check_val_every_n_epoch` keeps eval on the same phase as validation and the checkpoint, which
+the config says is load-bearing. NOTE `check_val_every_n_epoch: 4` carries "DECIDED (user, 2026-07-20):
+DO NOT CHANGE without asking" — this IS that ask, recorded.
+
+Two reasons the original warning may not apply here: `distributed.md` §2 measured eval at **1.0% of
+wall time**, and on `recorded` the expensive routines (MPPI control) self-skip because there is no
+simulator. Validation alone measured 11 min against Arm A's 158 min epoch (7%).
+
+**The case is much stronger for Arm B than Arm A.** At 14.3 h/epoch the stock cadence gives it a first
+val at ~2 days and a first eval at ~3.5 days; at `every_epochs=2` those become ~1 day and ~1.2 days.
+Arm A, at 2.6 h/epoch, already gets a first eval the same night.
+
+TODO: measure the actual eval cost at Arm A's epoch-5 eval (~23:20 on 08-31) before committing the
+change, so the "1.0%" figure is confirmed on THIS dataset rather than inherited from robocasa.
 
 ## 10. Open items
 
