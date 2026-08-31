@@ -202,8 +202,39 @@ as specified. If faster feedback matters more than breadth, restart with
       decoder is "~78% of per-sample training memory across TWO passes... the one lever that buys
       real batch size; everything else lives in the other 22%". SMALLER chunk = more checkpointing =
       less memory, same result. Arm B currently sets 24; dropping toward 8 or 4 should recover batch
-      into the 6–10 range at ~1.33x decode time. Applied as 24 -> 8 in the recipe; Arm B's own
-      autobatch will report the result.
+      into the 6–10 range at ~1.33x decode time. Applied as 24 -> 8 in the recipe.
+- [x] **`decode_chunk_train` did NOT help — a useful negative result.** At chunk 8 on the full
+      3-camera build, autobatch reported numbers **byte-identical** to chunk 24: b=2 → 28.3 GB,
+      b=3 → 35.5 GB, b=4 → 98.0 GB, batch 3 again. The config did land (`config.resolved.yaml` shows
+      `decode_chunk_train: 8` on all three heads) and `TokenGridDecoder` does receive `chunk=_chunk`,
+      so the knob is wired. Two things follow:
+        * `_chunked_velocity` (`flow.py:102`) short-circuits on `x.shape[0] <= c`, so any chunk larger
+          than the leading dim is a no-op — 24 and 8 can behave identically.
+        * More importantly, identical memory means **the decoder is not the bottleneck at these
+          settings.** The docs' "~78% of per-sample memory" was measured at ONE head with
+          `num_tokens: 32`; here each head has 16 tokens (a smaller decoder) and there are three
+          encoders, a 50-token bag and three LPIPS-VGG passes instead.
+- [ ] **UNEXPLAINED: the b=4 memory spike.** b=2 → 28.3, b=3 → 35.5 (+7.2), b=4 → **98.0** (+62.5).
+      A marginal cost of ~7 GB/sample predicts ~43 GB at b=4, not 98. Something changes
+      qualitatively between 3 and 4 — a kernel/allocation path, not linear scaling. Worth one probe:
+      if it is fixable, the batch could rise a lot and the confound below dissolves.
+
+### ⚠️ THE ARMS ARE NOT BATCH-MATCHED — the A/B is confounded as it stands
+
+Arm A trains at **batch 15**, Arm B at **batch 3**. That is a second variable moving alongside "more
+views", and this repo's own vl64 header flags exactly this class of problem ("THE WIN IS
+CONFOUNDED"). `accumulate_grad_batches` cannot rescue it — `conf/trainer/default.yaml` LOCKS it at 1
+with "NEVER use gradient accumulation".
+
+Three options, and this is a research call rather than a bug to fix:
+  1. **Accept and document** — run both, report the batch difference as a caveat. Cheapest, weakest.
+  2. **Match down: rerun Arm A at `data.batch=3`, `data.autobatch=false`.** Clean comparison, but
+     ~5x slower per epoch (Arm A is currently ~2 h/epoch at batch 15).
+  3. **Explain the b=4 spike first** and see whether Arm B can reach 8-15, which would make the
+     arms comparable without slowing anything.
+
+Left as-is overnight: both arms are running and produce useful single-arm results either way, and
+restarting Arm A a third time on my own judgment is not the right call.
 
 ## ARM B — multicamera (gpu 0, 3 heads)
 
