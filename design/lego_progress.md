@@ -2,7 +2,9 @@
 
 Branch `lego`. Two single-GPU arms on `swoosh-data/lego_assemblies` (74 episodes, 341,494 frames,
 30 Hz, dual xArm7 bimanual teleop). **Arm A** = scene prediction, one camera. **Arm B** = multicamera,
-three heads. Plan and rationale: the published plan artifact; this file is the live status.
+three heads. Plan and rationale: the published plan artifact. **Findings and decisions:
+`wizard/records/lego.md`** (the running log, same shape as owm.md / robocasa-scene4-4h.md).
+This file is the live per-item status.
 
 Ticked items are DONE AND VERIFIED — each carries the evidence that closed it.
 
@@ -98,7 +100,6 @@ Ticked items are DONE AND VERIFIED — each carries the evidence that closed it.
       epoch 0 started 08:06:43. autobatch: budget 82.7 GB = card 102.0 − reserve 4.0 − **resident
       frame store 15.28** (predicted 16.8), fit 3.796 GB/sample → **batch 19**. 50 epochs, evals at
       {5, 9, 15, 19, 29, 39, 49}.
-- [ ] Launch `model=vl64_scene`.
 - [ ] `_oneoff_action_sensitivity` early — near-zero sensitivity is quickdraw#15 (action not in the
       state's frame), NOT the model. Record the number either way.
 
