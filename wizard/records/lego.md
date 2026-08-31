@@ -213,9 +213,31 @@ batches/epoch, **9,457 s/epoch (2.63 h)**, `run_eta` finish 09-05 18:49.
 `best.ckpt` selects on `val/metric/scene_right/mse` — the image head, not the proprio metric, and named
 `scene_right` rather than `image` so Arm B logs the same key and the A/B is directly joinable.
 
-| epoch | train_loss | val_loss |
-|---|---|---|
-| 3 | 176.8348 | 188.3930 |
+**First validation, epoch 3** (`check_val_every_n_epoch: 4`, so this is the first val point):
+
+| metric | value |
+|---|---|
+| `val/loss/total` | 188.3930 (train 176.8348) |
+| `val/loss/dynamics/latent` | **182.46** — dominates the total |
+| `val/metric/scene_right/psnr` | **15.61 dB** |
+| `val/metric/scene_right/mse` | 0.028267 → 15.49 dB |
+| `val/loss/codec/roundtrip_scene_right_mse` | 0.028615 → **15.43 dB** |
+| `val/metric/proprio/pointwise_error` | **396.8 mm** (position-only L2, right-arm TCP) |
+| `val/metric/proprio/obs_error` | 1.2609 (normalised, full vector) |
+| `grad/nonfinite_skipped` | 0 |
+
+**READ 1 — the image head is CODEC-limited, not dynamics-limited.** Prediction MSE (0.028267) is
+essentially identical to the codec's own round-trip MSE (0.028615) — 15.49 dB vs 15.43 dB. The dynamics
+cannot be blamed for the image number because the autoencoder it predicts through is itself only at
+15.4 dB. For scale, the frozen-TAESD reference floor on this data is **23.79 dB** (§3). vl64's AE trains
+from scratch, so this is expected to climb for many epochs; until it does, image metrics measure the AE.
+
+**READ 2 — proprio is worse than a constant predictor.** `pointwise_error` 396.8 mm against a workspace
+where the mean distance from the centroid is **249 mm** (right TCP spans 359 / 488 / 691 mm in x/y/z,
+per-axis std 95 / 87 / 227). Predicting the centroid every step would score ~249 mm. At epoch 3 of 50
+over a 12.8 s open-loop rollout this is not alarming, but it is the number to watch: if it has not gone
+below ~249 mm by the epoch 9–15 evals, the model is not learning position dynamics at all, and §1b
+(action not in the state's frame) is the first suspect.
 
 Eval epochs `{5, 9, 15, 19, 29, 39, 49}` → first eval ~23:20 on 08-31, second ~09:50 on 09-01.
 
