@@ -221,7 +221,15 @@ as specified. If faster feedback matters more than breadth, restart with
 
 ### ⚠️ THE ARMS ARE NOT BATCH-MATCHED — the A/B is confounded as it stands
 
-Arm A trains at **batch 15**, Arm B at **batch 3**. That is a second variable moving alongside "more
+Both arms load **46,066 train / 5,565 val windows** — identical, same episodes, same seed-0 split,
+same subsample. So the DATA is matched and only the batch differs:
+
+| | batch | batches/epoch | ~h/epoch | 50 epochs | first eval (ep 5) |
+|---|---|---|---|---|---|
+| Arm A (1 head) | **22** | 2,094 | ~2.0 | ~4 days | ~10 h |
+| Arm B (3 heads) | **3** | 15,355 | ~6.6 | ~14 days | ~33 h |
+
+Arm A trains at **batch 22**, Arm B at **batch 3** — a 7.3x gap. That is a second variable moving alongside "more
 views", and this repo's own vl64 header flags exactly this class of problem ("THE WIN IS
 CONFOUNDED"). `accumulate_grad_batches` cannot rescue it — `conf/trainer/default.yaml` LOCKS it at 1
 with "NEVER use gradient accumulation".
@@ -229,7 +237,7 @@ with "NEVER use gradient accumulation".
 Three options, and this is a research call rather than a bug to fix:
   1. **Accept and document** — run both, report the batch difference as a caveat. Cheapest, weakest.
   2. **Match down: rerun Arm A at `data.batch=3`, `data.autobatch=false`.** Clean comparison, but
-     ~5x slower per epoch (Arm A is currently ~2 h/epoch at batch 15).
+     ~7x slower per epoch, putting Arm A on Arm B's ~6.6 h/epoch and ~14-day schedule.
   3. **Explain the b=4 spike first** and see whether Arm B can reach 8-15, which would make the
      arms comparable without slowing anything.
 
