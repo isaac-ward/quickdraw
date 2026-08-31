@@ -1,0 +1,70 @@
+# =============================================================================================
+# lego_assemblies — swoosh-data/lego_assemblies, dual xArm7 bimanual VR teleoperation, 30 Hz.
+# Build the run folder first:
+#     uv run python -m quickdraw.data.processors +processor=lego_assemblies \
+#         +source.dir=~/data/lego_assemblies +source.name=lego     # smoke: +source.max_episodes=2
+# then train with `data=lego data.root=logs/recording_<ts>_lego environments=recorded`.
+#
+# Inherits conf/data/torus.yaml for every generic knob (batch/autobatch/workers/P/F/window_stride/...)
+# and overrides ONLY what this dataset changes. The torus-specific keys it carries along (fpv_fov,
+# composite_grid, action_sampler, the OOD split table) are inert here: `recorded` has no simulator, so
+# nothing reads them. This is the same inheritance pattern conf/model/vl64.yaml uses over up64.
+# =============================================================================================
+defaults:
+  - torus
+  - _self_
+
+root: null          # the recording run dir, e.g. data.root=logs/recording_2026_08_31_..._lego
+hf_repo: null       # local build by default; the SOURCE repo is private and is read by the processor,
+#                     not by the loader, so this stays null.
+repo_id: lego       # lerobot repo prefix the splits were WRITTEN with (matches +source.name)
+
+cam: head_right     # scene-right (1080p). The other five: head_left (scene-left, 1080p), and the four
+#                     720p wrist views gripper_{left,right}_{top,bottom}. Arm B adds gripper_left_top
+#                     and gripper_right_top alongside this one.
+
+obs_keep: null      # DECIDED 2026-08-31 (user): keep the FULL 34-dim state. The 7 joints per arm are
+#                     redundant with TCP pose only up to null-space configuration — they are the one
+#                     signal separating two arm poses that reach the same point — and 34 dims is
+#                     negligible beside 32 image tokens. If this ever changes you MUST also update
+#                     model.modalities.0.dim, environments.obs_dim and environments.position_idx.
+
+# ---- DIMS. The processor re-encodes both rotations to the continuous 6D form (data/rotations.py):
+#      observation.state 28 -> 34 (rpy -> 6D), action 16 -> 20 (quaternion -> 6D). Raw rpy wraps
+#      702/802 times per arm on this data and the quaternion sign flips 29 times per arm, with the
+#      rotations spanning nearly all of SO(3) so no hemisphere canonicalisation helps. Set to match:
+#          model.modalities.0.dim=34  model.action_dim=20
+#          environments.obs_dim=34    environments.action_dim=20    environments.position_idx=[0,1,2]
+#      position_idx [0,1,2] is right-arm TCP xyz, which stays leading after encoding.
+
+subsample: 6        # DERIVED 2026-08-31 (smoke/lego_subsample.py), not guessed. 30 Hz / 6 = 5 Hz.
+#                     Frozen-TAESD floor at 128px on THIS data: RMSE 0.0647 (PSNR 23.79 dB) -- robocasa's
+#                     was 0.0637 / 23.92 dB, near-identical, so record §13's table is a valid reference
+#                     here rather than a loose analogy. Frame-delta RMSE vs that floor, 11 episodes
+#                     spread across sessions, measured at the SQUARE 128px the model actually sees:
+#                       stride  1 (30.0 Hz)  0.0500  0.77x   BELOW the codec's own error
+#                       stride  2 (15.0 Hz)  0.0770  1.19x   marginal
+#                       stride  3 (10.0 Hz)  0.0963  1.49x   clears the floor
+#                       stride  4 ( 7.5 Hz)  0.1109  1.72x
+#                       stride  6 ( 5.0 Hz)  0.1323  2.05x   <-- CHOSEN
+#                       stride  8 ( 3.8 Hz)  0.1479  2.29x
+#                       stride 16 ( 1.9 Hz)  0.1854  2.87x
+#                     RULE: smallest stride BOTH clear of the floor (>=1.25x, where robocasa crossed
+#                     into a learnable target) AND inside the 2-5 Hz band every published long-rollout
+#                     system converges on (V-JEPA-2-AC 4 fps, IRASim ~4 fps, HMA 2 Hz; robocasa chose
+#                     4 Hz). "First to clear 1.25x" alone gives stride 3, which sits on the marginal
+#                     edge and buys the shortest horizon -- the very thing subsampling exists to fix.
+#                     At stride 6, F=64 spans 12.8 s of robot time instead of 2.1 s.
+#
+#                     NOTE THE SURPRISE: stride 1 here is 0.77x, NOT worse than robocasa's 0.61x as the
+#                     higher frame rate would predict. Real bimanual teleop simply moves more per frame
+#                     than robocasa's data, and that more than offsets 30 Hz vs 20 Hz. Measure, do not
+#                     extrapolate from fps.
+#
+#                     CAVEAT: TAESD is a REFERENCE codec, not vl64's (which trains a bespoke AE from
+#                     scratch, so its floor is a training outcome). Re-check once Arm A has a few
+#                     epochs. The choice is coarse, so this is unlikely to move it.
+subsample_all_phases: true   # at stride s, frames 1..s-1 of every group are otherwise DISCARDED
+#                     entirely; this emits all s phase offsets as separate TRAIN episodes, giving ~s x
+#                     the windows at the SAME frame rate. Free, and it offsets the window loss the
+#                     stride costs. TRAIN only — val stays single-phase.
