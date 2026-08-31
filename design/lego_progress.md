@@ -87,34 +87,83 @@ Ticked items are DONE AND VERIFIED — each carries the evidence that closed it.
       property that made path-based frames the right call for the encode workers. **Measured:** 4
       episodes / 22,393 frames in **79 s** vs ~17 min serially (~13×). Full single-camera stage drops
       from ~4.5 h to ~20 min; Arm B's three cameras from ~13 h to ~1 h.
-- [ ] Full dataset build at stride 6 — RUNNING (74 episodes, 341,494 frames).
+- [x] Full dataset build — `logs/recording_2026_08_31_06_30_02_lego`, 67 train / 7 val episodes,
+      341,494 transitions, obs_dim 34, action_dim 20, 8.2 GB. Stage 508 s + encode 148 s + lerobot
+      write 4369 s (that writer round-trips every frame through a PNG; it dominates and is serial per
+      split, so it is a fixed ~85 min per camera).
+- [x] **GPU shakedown** — 2 epochs on the 6-episode build. Proved the path runs and returned
+      autobatch `batch=23` at 128px / 1 camera. Also flushed out that training REQUIRES a 5-point
+      `run_summary`, and that hydra rejects bare commas/parens in override values.
+- [x] **ARM A LAUNCHED** — `logs/train_world_model_2026_08_31_07_55_29_lego_arm_a_scene`, GPU 1,
+      epoch 0 started 08:06:43. autobatch: budget 82.7 GB = card 102.0 − reserve 4.0 − **resident
+      frame store 15.28** (predicted 16.8), fit 3.796 GB/sample → **batch 19**. 50 epochs, evals at
+      {5, 9, 15, 19, 29, 39, 49}.
 - [ ] Launch `model=vl64_scene`.
 - [ ] `_oneoff_action_sensitivity` early — near-zero sensitivity is quickdraw#15 (action not in the
       state's frame), NOT the model. Record the number either way.
+
+### ⚠️ WALL-CLOCK: `subsample_all_phases` makes an epoch 6x bigger, and 50 of them is ~8 days
+
+Arm A loaded **276,231 train windows** at batch 19 = **~14,540 steps/epoch**. Measured step rate is
+around 1/s (heavy step: F=64 BPTT + 128px decode + LPIPS-VGG), so that is **~4 h/epoch** and the
+first eval, at epoch 5, is **~20 h away**. 50 epochs is ~8 days.
+
+The cause is not a mistake, it is a knob interaction worth naming: `subsample_all_phases: true`
+multiplies train windows by `subsample` (6), which the record calls free "because more data means
+fewer epochs for equal gradient steps" — but `max_epochs` was left at the stock 50, so the run is 6x
+longer than that reasoning intends.
+
+THE TRADE, at matched wall-clock (~33 h):
+  * all_phases ON  -> ~8 epochs, ~276k DISTINCT windows seen ~8x. Better data breadth, but only
+    ONE or TWO eval points (cadence is {5, 9, 15, 19, ...}).
+  * all_phases OFF -> 50 epochs of ~46k windows, ~40 min/epoch, **7 eval points** and first signal
+    at ~3.3 h. Same total window-presentations, repeated more.
+
+Deliberately NOT changed unilaterally: `subsample_all_phases` and the eval cadence are both recorded
+user decisions, and trading data breadth for eval frequency is a research call. Arm A is left running
+as specified. If faster feedback matters more than breadth, restart with
+`data.subsample_all_phases=false`.
 - [ ] Watch `latent_cos` (negative = the vl64 collapse signature) and read actual frames, not just
       LPIPS (vl64 ghosts: "perceptually plausible, spatially wrong").
 
-## P4 — multi-camera data path (~1 day, ARM B only)
+## P4 — multi-camera data path (ARM B only) — code DONE, loader untested on GPU
 
-- [ ] `processors.py:46` — `Episode.frames` → `dict[str, ndarray]` keyed by camera.
-- [ ] `processors.py:87` — `build_recorded_dataset(…, cam)` → `cams: list[str]`; one video key each.
-- [ ] `dataset.py:198` — `load_fpv_frames(cam=…)` per-camera, one `.npy` cache each.
-- [ ] `dataset.py:254` — `load_split_episodes_with_frames` per-camera; count assert per camera.
-- [ ] `dataset.py:285-310` — `MMWindowLoader`'s singular `self.image_head`/`self.frames` → one store
-      and one batch key per camera. **The load-bearing change.**
-- [ ] `conf/data/*.yaml` — `cam:` scalar → list.
-- [ ] Backward compat: the single-camera path (Arm A, torus, robocasa) still works unchanged.
+- [x] `Episode.frames` → accepts `dict[cam, paths|array]`; processor emits it for a camera list.
+- [x] `build_recorded_dataset(cam: str | list)` — one encode job per (camera, split, episode) in a
+      shared pool; `summary.json` records every camera.
+- [x] `write_lerobot_split` — N video features, per-frame entry each, per-episode decode dropped
+      before the next (3 cameras × a long episode is GBs).
+- [x] `load_split_episodes_mm(cam=list, img_size=list)` → `(obs, act, img0, img1, img2)`.
+      `_subsample_episodes` needed **no change** — it already decimates every stream past `ep[1]`.
+- [x] `MMWindowLoader` — one resident uint8 store PER head, one batch key per head, all sharing ONE
+      window index so streams cannot drift. `.frames` kept as an alias at exactly one head.
+- [x] `ModalitySpec.cam` — each image head declares its camera directory. Raises if a head omits it
+      with >1 head, and raises if two heads resolve to the same camera.
+- [x] `_resident_frame_bytes()` needed no change — already sums over all image specs, so autobatch
+      sizes 3 cameras correctly.
+- [x] 3-camera build verified on 2 episodes → `logs/recording_2026_08_31_08_02_12_lego3`, all three
+      `observation.images.*` keys written.
+- [ ] **Loader not yet exercised on GPU** — needs a run; both cards were busy. This is the one
+      remaining unverified link in P4.
+- [ ] Full 3-camera build — RUNNING (`lego3full`).
 
-## P5 — multicam recipe (~2 h, ARM B only)
+## P5 — multicam recipe (ARM B only) — DONE
 
-- [ ] `conf/model/vl64_multicam.yaml` — 3 image modalities: `scene_right` (`head_right`),
-      `arm_top_left` (`gripper_left_top`), `arm_top_right` (`gripper_right_top`).
-- [ ] `weight: 1/3` each — holds vl64's image:proprio ratio; 1.0 each would change head count AND
-      loss balance together (the confound the vl64 header flags in its own results).
-- [ ] `latent_loss_weight` — start at 10, watch `latent_cos`. Bracketed on both sides in vl64
-      (0.4 erased 5.4 dB in one epoch; 25 froze motion, gradients → inf). It is a RATIO knob, so do
-      NOT naively divide by 3.
-- [ ] Memory check before launch: ~16.8 GB/camera at 128px, GPU-resident → ~50 GB of 96 GB for three.
+- [x] `conf/model/vl64_multicam.yaml` — 3 heads, each declaring its camera. `model_summary` clean:
+      3 encoders (0.401M ea) + 3 decoders (4.764M ea), 50 tokens/step vs Arm A's 34, 23.26M params.
+- [x] `weight: 0.3333` each — aggregate image:proprio ratio matches vl64's, so the run isolates
+      "more views" as the single variable.
+- [x] `latent_loss_weight` stays **10 per head**, deliberately NOT divided by 3 — it is a ratio knob
+      and each head has its own codec to keep invertible, so the anchor is not a shared budget.
+- [x] **Memory sized from Arm A's own autobatch, not guessed.** At 128px/1 camera: budget 82.7 GB
+      after a 15.28 GB frame store, 3.796 GB/sample → batch 19, worst eval probe 33.3 GB. Tripling
+      heads → frame store ~46 GB (budget ~52), ~10 GB/sample (batch ~4, below the ~8 where
+      `distributed.md` says gradient noise bites), eval probe ~100 GB (**would not fit**). So three
+      knobs move: `num_tokens` 32→16 (8→64 is a documented null, so per-head capacity is not what
+      we're spending), `decode_chunk_train` 64→24, `visual_frames` 128→64 (3×64 still exceeds Arm A's
+      128 in aggregate). **`img_size` stays 128** — 96 would buy headroom but make the arms
+      incomparable, defeating the study.
+- [ ] Eval must be capped on the CLI too: `eval.decode_chunk=16 eval.closed_loop_steps=[1]`.
 
 ## ARM B — multicamera (gpu 1, 3 heads)
 

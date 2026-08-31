@@ -89,6 +89,30 @@ def get_subsample() -> int:
     return _SUBSAMPLE
 
 
+_ACTION_AGGREGATE = "sum"
+
+
+def set_action_aggregate(mode: str) -> None:
+    """data.action_aggregate: how `subsample` combines the actions it skips over. "sum" | "last".
+
+    "sum" (the default, unchanged) assumes actions are DELTA-like, so they compose additively over the
+    skipped frames, with an automatic take-last for dims that look BINARY (<=2 unique values).
+
+    "last" takes the final raw action of each group for EVERY dim. Required when the action is an
+    ABSOLUTE command rather than a delta, where summing is meaningless: summing six absolute poses gives
+    six times the position. lego_assemblies is exactly that case -- its action is an absolute
+    VR-controller pose (xyz in metres in a room frame, y centred on 1.47) plus a normalised gripper.
+
+    The binary auto-detect is NOT a safety net there either. lego_assemblies' gripper sits at exactly 0
+    or 1 for 94% of frames but has ~1000 unique values because it ramps between them, so `<=2 unique`
+    never fires and a [0,1] gripper would be summed into [0,6]."""
+    global _ACTION_AGGREGATE
+    mode = str(mode or "sum")
+    if mode not in ("sum", "last"):
+        raise ValueError(f"data.action_aggregate must be 'sum' or 'last', got {mode!r}")
+    _ACTION_AGGREGATE = mode
+
+
 _SUBSAMPLE_ALL_PHASES = False
 
 
@@ -154,7 +178,10 @@ def _subsample_episodes(eps, tag: str):
     if s <= 1:
         return eps
     acts = np.concatenate([e[1] for e in eps], 0)
-    hold = [d for d in range(acts.shape[1]) if len(np.unique(acts[:, d])) <= 2]
+    if _ACTION_AGGREGATE == "last":       # ABSOLUTE actions: every dim takes the group's last raw value
+        hold = list(range(acts.shape[1]))
+    else:
+        hold = [d for d in range(acts.shape[1]) if len(np.unique(acts[:, d])) <= 2]
     # PHASE OFFSETS: normally just [0] -- frames 1..s-1 of every group are discarded and never seen. With
     # data.subsample_all_phases (TRAIN only) emit all s of them as separate episodes: ~s x the windows at the
     # SAME rate. See set_subsample_all_phases.
@@ -174,8 +201,9 @@ def _subsample_episodes(eps, tag: str):
                 aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the sum
             out.append((o[:n * s:s], aa) + tuple(x[ph:][:n * s:s] for x in ep[2:]))
     print(f"[subsample] {tag}: stride {s}{f' x {s} PHASES' if all_phases else ''} | {len(eps)} eps "
-          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions SUMMED except "
-          f"take-last on dims {hold} | {dropped} eps dropped as too short", flush=True)
+          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions "
+          f"{'TAKE-LAST on every dim (action_aggregate=last)' if _ACTION_AGGREGATE == 'last' else f'SUMMED except take-last on dims {hold}'}"
+          f" | {dropped} eps dropped as too short", flush=True)
     return out
 
 

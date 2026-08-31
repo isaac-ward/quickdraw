@@ -64,7 +64,46 @@ subsample: 6        # DERIVED 2026-08-31 (smoke/lego_subsample.py), not guessed.
 #                     CAVEAT: TAESD is a REFERENCE codec, not vl64's (which trains a bespoke AE from
 #                     scratch, so its floor is a training outcome). Re-check once Arm A has a few
 #                     epochs. The choice is coarse, so this is unlikely to move it.
-subsample_all_phases: true   # at stride s, frames 1..s-1 of every group are otherwise DISCARDED
-#                     entirely; this emits all s phase offsets as separate TRAIN episodes, giving ~s x
-#                     the windows at the SAME frame rate. Free, and it offsets the window loss the
-#                     stride costs. TRAIN only — val stays single-phase.
+subsample_all_phases: false  # OFF, and this is a deliberate reversal -- measured 2026-08-31.
+#                     At stride s the phase-shifted variant emits all s offsets as separate TRAIN
+#                     episodes, ~s x the windows at the same frame rate, which record §22 calls free
+#                     "because more data means fewer epochs for equal gradient steps".
+#
+#                     ON THIS DATASET IT IS NOT FREE, because nothing reduces the epoch count to match.
+#                     Measured: it loaded 276,231 train windows, which at the autobatch-chosen batch 19
+#                     is ~14,540 steps/epoch. At the measured ~0.28 steps/s -- a heavy step: F=64 BPTT,
+#                     128px decode, LPIPS-VGG -- that is ~14 h/EPOCH, so the stock 50-epoch schedule is
+#                     ~30 DAYS and the first eval, at epoch 5, is ~3 days out. The run cannot finish its
+#                     own schedule.
+#
+#                     Pairing it with a 6x smaller max_epochs (~8), which is what the record's reasoning
+#                     implies, does not work either: the eval cadence is {5, 9, 15, 19, ...}, so an
+#                     8-epoch run yields exactly ONE eval point.
+#
+#                     OFF gives ~46k windows -> ~2,420 steps/epoch -> the stock 50 epochs with all SEVEN
+#                     eval points and first signal in hours rather than days. Same recipe shape as every
+#                     robocasa result it will be compared against.
+#
+#                     WHAT IT COSTS, stated honestly: at matched wall-clock the ON variant sees ~6x more
+#                     DISTINCT windows and should generalise better. If a long final run is ever worth
+#                     the days, turn this back on AND lower max_epochs -- but then accept one eval point,
+#                     or move the eval cadence to steps.
+
+action_aggregate: last   # REQUIRED here, and the default of "sum" would be silently WRONG.
+#                     `subsample` has to combine the actions it skips over. The default assumes actions
+#                     are DELTA-like and SUMS them, with an automatic take-last for dims that look binary
+#                     (<=2 unique values). Neither half of that holds on this dataset:
+#
+#                     1. THE ACTION IS ABSOLUTE, not a delta. It is a VR-controller pose -- xyz in metres
+#                        in a room frame (y spans [0.22, 2.69], centred on 1.47, i.e. headset height),
+#                        plus orientation and a normalised gripper. Summing six absolute poses gives six
+#                        times the position, which is meaningless. Measured: the action does NOT correlate
+#                        with d(state_tcp) at any lag, so it is not a delta encoding either.
+#
+#                     2. THE BINARY AUTO-DETECT DOES NOT FIRE. The gripper sits at exactly 0 or 1 for 94%
+#                        of frames but has ~1000 unique values because it ramps between them, so
+#                        `<=2 unique` misses it and a [0,1] gripper would be summed into [0,6]. Observed
+#                        live: `[subsample] lego3/val: ... take-last on dims []` -- an empty hold list.
+#
+#                     "last" takes each group's final raw action for every dim, which is the correct
+#                     aggregation for an absolute command.
