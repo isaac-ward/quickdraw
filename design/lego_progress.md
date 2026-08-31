@@ -167,9 +167,12 @@ as specified. If faster feedback matters more than breadth, restart with
       sizes 3 cameras correctly.
 - [x] 3-camera build verified on 2 episodes → `logs/recording_2026_08_31_08_02_12_lego3`, all three
       `observation.images.*` keys written.
-- [ ] **Loader not yet exercised on GPU** — needs a run; both cards were busy. This is the one
-      remaining unverified link in P4.
-- [ ] Full 3-camera build — RUNNING (`lego3full`).
+- [x] **Loader VERIFIED on GPU** — `lego_multicam_smoke` completed a full epoch with 3 heads:
+      `train_loss=19.8193 val_loss=23.0602`, 798.5 s/ep, 207 train batches at autobatch batch 3.
+      Three resident stores, three batch keys, three codecs, no drift. P4 is done.
+- [x] Full 3-camera build — `logs/recording_2026_08_31_08_17_37_lego3full`, 24 GB, 67 train / 7 val,
+      305,108 transitions, all three cameras at 288x512. 11,615 s, dominated by the lerobot PNG
+      round-trip (3x one camera, as predicted).
 
 ## P5 — multicam recipe (ARM B only) — DONE
 

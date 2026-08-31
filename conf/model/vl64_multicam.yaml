@@ -35,7 +35,18 @@
 #                                 FEW genuine measured nulls on this axis, so capacity per head is not
 #                                 what we are spending. 3 x 16 = 48 image tokens/step + proprio, vs
 #                                 Arm A's 32 + proprio, so the bag grows 1.5x rather than 3x.
-#   decode_chunk_train 64 -> 24   the AR decode loss is the dominant per-sample activation term.
+#   decode_chunk_train 64 -> 8    MEASURED, after 24 proved not to be enough. At 24 the multicam smoke
+#                                 reported 35.0 GB/SAMPLE -- not the ~10 predicted from Arm A's 3.796 --
+#                                 with b=2 at 28.3 GB, b=3 at 35.5 and b=4 at 98.3 against a 98 GB
+#                                 budget. Strongly superlinear, so autobatch chose batch 3 and left
+#                                 62 GB unused, well under the ~8 where design/distributed.md says
+#                                 gradient noise starts to matter. This knob is the right lever and it
+#                                 is FREE: modalities.py:128 documents it as gradient checkpointing --
+#                                 "0 = OFF (bit-identical)", "~1.33x decode compute" -- over a decoder
+#                                 that is "~78% of per-sample training memory across TWO passes... the
+#                                 one lever that buys real batch size; everything else lives in the
+#                                 other 22%". SMALLER chunk = more checkpointing = less retained
+#                                 memory, identical results.
 #   visual_frames     128 -> 64   LPIPS-VGG is per-head, so 3 x 128 frames/step would treble the single
 #                                 largest fixed cost in the step. 64 x 3 = 192 still exceeds Arm A's 128,
 #                                 so the perceptual gradient is not weaker in aggregate.
@@ -76,19 +87,19 @@ modalities:
   - {name: scene_right, kind: image, cam: head_right, weight: 0.3333, img_size: 128,
      pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
      decode_kind: mse, decode_arch: up, decode_base: 64,
-     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 24,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 8,
      visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 64,
      latent_loss_weight: 10}
   - {name: arm_top_left, kind: image, cam: gripper_left_top, weight: 0.3333, img_size: 128,
      pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
      decode_kind: mse, decode_arch: up, decode_base: 64,
-     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 24,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 8,
      visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 64,
      latent_loss_weight: 10}
   - {name: arm_top_right, kind: image, cam: gripper_right_top, weight: 0.3333, img_size: 128,
      pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
      decode_kind: mse, decode_arch: up, decode_base: 64,
-     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 24,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 8,
      visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 64,
      latent_loss_weight: 10}
   # latent_loss_weight stays at 10 PER HEAD, deliberately not divided by 3. vl64's header is emphatic
