@@ -102,6 +102,30 @@ Ticked items are DONE AND VERIFIED — each carries the evidence that closed it.
 - [ ] `_oneoff_action_sensitivity` early — near-zero sensitivity is quickdraw#15 (action not in the
       state's frame), NOT the model. Record the number either way.
 
+### 🐛 BUG FOUND AND FIXED: `subsample` was SUMMING an absolute action
+
+Caught in a live run's log while Arm A was starting. `_subsample_episodes` combines the actions it
+skips over and assumed they are DELTA-like: sum them, with an auto take-last for dims that look
+binary (≤2 unique values). **Both halves are false here, and it fails silently.**
+
+1. **The action is ABSOLUTE, not a delta** — a VR-controller pose, xyz in metres in a room frame
+   (y spans [0.22, 2.69], centred on 1.47 = headset height). Summing six absolute poses gives six
+   times the position. Measured: it does not correlate with `d(state_tcp)` at any lag 0–60.
+2. **The binary guard never fires.** The gripper is at exactly 0 or 1 for **94%** of frames but has
+   **~1000 unique values** because it ramps between them, so `≤2 unique` misses it. The live log
+   showed `take-last on dims []` — an empty hold list.
+
+Measured at stride 6 on a synthetic absolute ramp + a gripper with one ramp value:
+
+| mode | dim0 | gripper |
+|---|---|---|
+| `sum` | [0.25, **5.75**] | [0.00, **6.00**] |
+| `last` | [0.08, 1.00] | [0.00, 1.00] |
+
+Fix: new `data.action_aggregate` = `sum` \| `last`, defaulting to `sum` so every existing dataset is
+bit-identical; `last` set in `conf/data/lego.yaml`. It would not have crashed — it would have fed the
+action encoder and normalizer a 6×-out-of-scale action and produced a plausible run.
+
 ### ⚠️ WALL-CLOCK: `subsample_all_phases` makes an epoch 6x bigger, and 50 of them is ~8 days
 
 Arm A loaded **276,231 train windows** at batch 19 = **~14,540 steps/epoch**. Measured step rate is
@@ -163,7 +187,20 @@ as specified. If faster feedback matters more than breadth, restart with
       we're spending), `decode_chunk_train` 64→24, `visual_frames` 128→64 (3×64 still exceeds Arm A's
       128 in aggregate). **`img_size` stays 128** — 96 would buy headroom but make the arms
       incomparable, defeating the study.
-- [ ] Eval must be capped on the CLI too: `eval.decode_chunk=16 eval.closed_loop_steps=[1]`.
+- [x] Eval capped on the CLI: `eval.decode_chunk=16 eval.closed_loop_steps=[1]`. **Verified:** worst
+      eval probe drops from 33.3 GB (1 camera, uncapped) to **4.0 GB** with 3 heads.
+- [ ] **⚠️ MEASURED: 3 heads cost 35.0 GB/sample, not the ~10 I predicted — batch lands at 3.**
+      Multicam smoke autobatch: b=2 → 28.3 GB, b=3 → 35.5 GB, b=4 → **98.3 GB** (over the 98 GB
+      budget). Strongly superlinear, so it chose batch 3 and left 62 GB unused. Batch 3 is well below
+      the ~8 `design/distributed.md` names as where gradient noise bites.
+
+      **The fix is `decode_chunk_train`, and it is free.** `modalities.py:128` documents it as
+      gradient checkpointing — "0 = OFF (bit-identical)", "~1.33x decode compute" — and says the
+      decoder is "~78% of per-sample training memory across TWO passes... the one lever that buys
+      real batch size; everything else lives in the other 22%". SMALLER chunk = more checkpointing =
+      less memory, same result. Arm B currently sets 24; dropping toward 8 or 4 should recover batch
+      into the 6–10 range at ~1.33x decode time. **Needs one more autobatch probe to confirm before
+      the real Arm B launches.**
 
 ## ARM B — multicamera (gpu 1, 3 heads)
 
