@@ -292,7 +292,136 @@ def robocasa(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]
     return name, episodes, fps, cam, None   # robocasa: no extra splits (builder's seed-0 train/val only)
 
 
-PROCESSORS = {"starling": starling, "robocasa": robocasa}
+def _stage_clip(mp4: str, out_paths: list[str], h: int) -> int:
+    """One source clip -> one jpg per frame at height `h`, ASPECT PRESERVED. Returns frames written.
+
+    Aspect is kept here on purpose: both lego_assemblies camera families are 16:9 (1080p scene, 720p
+    wrist), and the squash to the recipe's SQUARE img_size belongs downstream in `load_fpv_frames`,
+    where the recipe controls it. Staging square would bake that choice in and force a full re-decode
+    of 444 source clips to undo. Same area-downsample as dataset.py so the two agree."""
+    import imageio.v2 as imageio
+    import torch
+
+    n, buf = 0, []
+
+    def flush():
+        nonlocal n
+        if not buf:
+            return
+        x = torch.from_numpy(np.stack(buf)).permute(0, 3, 1, 2).float()      # (b,3,H,W)
+        w = max(2, int(round(x.shape[3] * h / x.shape[2] / 2)) * 2)          # even width, 16:9 kept
+        x = torch.nn.functional.interpolate(x, size=(h, w), mode="area")     # anti-aliased, as dataset.py
+        for fr in x.permute(0, 2, 3, 1).round().clamp(0, 255).to(torch.uint8).numpy():
+            if n < len(out_paths):
+                imageio.imwrite(out_paths[n], fr, quality=95)
+            n += 1
+        buf.clear()
+
+    rd = imageio.get_reader(mp4)
+    for fr in rd:
+        buf.append(np.asarray(fr)[..., :3])
+        if len(buf) >= 256:                                                   # bounded peak memory
+            flush()
+    flush()
+    rd.close()
+    return n
+
+
+def _stage_job(job: dict) -> tuple[int, int, int]:
+    """One episode's staging (runs in a worker). Returns (episode index, frames written, rows expected)."""
+    got = _stage_clip(job["mp4"], job["paths"], job["h"])
+    if got >= len(job["paths"]):
+        open(os.path.join(job["dir"], ".done"), "w").close()   # only mark complete on a FULL decode
+    return job["idx"], got, len(job["paths"])
+
+
+def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None]:
+    """`swoosh-data/lego_assemblies` - LeRobot v2.1, dual xArm7 bimanual VR teleop, 30 Hz, 6 cameras.
+
+    ROTATIONS ARE RE-ENCODED before anything downstream sees them (data/rotations.py): state 28 -> 34
+    (rpy -> continuous 6D), action 16 -> 20 (quaternion -> 6D). Both raw forms are discontinuous where
+    it matters ON THIS DATA - rpy wraps 702/802 times per arm (pitch reaches +-78deg, near the gimbal
+    singularity) and the quaternion sign flips 29 times per arm, with the rotations spanning nearly all
+    of SO(3) so no hemisphere canonicalisation can fix it. Set model dims to match: modalities.0.dim=34,
+    model.action_dim=20, environments.obs_dim=34, environments.action_dim=20.
+
+    FRAMES ARE STAGED TO DISK AS PATHS, not decoded into arrays (the starling pattern). The shared
+    builder pickles `Episode.frames` to its encode workers; this dataset's longest episode is 10,769
+    frames, so in-memory arrays would push GBs per job through IPC. Staging is resumable - an episode
+    with a `.done` marker is skipped, so a re-run after an interrupt costs nothing.
+
+    CAVEAT, measured: `action` is NOT in the state's frame (no Euler convention fits; per-session
+    extrinsics differ by 26-176deg; grippers anti-correlated). Action-conditioning learns noise here.
+    See quickdraw#15. The proprio+image dynamics are unaffected.
+
+    Args: +source.dir=<local snapshot> [+source.name=lego_assemblies] [+source.camera=head_right]
+          [+source.stage_height=288] [+source.max_episodes=N]."""
+    import pyarrow.parquet as pq
+
+    from .rotations import encode_action, encode_state
+
+    src_cfg = cfg.get("source", None)
+    if src_cfg is None or not src_cfg.get("dir"):
+        raise ValueError("pass +source.dir=<local lego_assemblies snapshot> (optional: +source.name=..., "
+                         "+source.camera=<leaf>, +source.stage_height=N, +source.max_episodes=N)")
+    src = os.path.expanduser(str(src_cfg.dir))
+    name = str(src_cfg.get("name", "lego_assemblies"))
+    cam = str(src_cfg.get("camera", "head_right"))          # scene-right by default; wrists are gripper_*
+    stage_h = int(src_cfg.get("stage_height", 288))
+    max_eps = int(src_cfg.get("max_episodes", 0) or 0)
+
+    info = json.load(open(os.path.join(src, "meta", "info.json")))
+    fps, chunk = int(info["fps"]), int(info["chunks_size"])
+    n_total = int(info["total_episodes"])
+    n = min(max_eps, n_total) if max_eps else n_total
+    vkey = f"observation.images.{cam}"
+    if vkey not in info["features"]:
+        have = [k.rsplit(".", 1)[-1] for k in info["features"] if k.startswith("observation.images.")]
+        raise ValueError(f"camera {cam!r} is not in this dataset; have {have}")
+
+    stage = os.path.join(src, "_quickdraw_frames", f"{cam}_h{stage_h}")
+    episodes, jobs = [], []
+    for idx in range(n):
+        c = idx // chunk
+        t = pq.read_table(os.path.join(src, "data", f"chunk-{c:03d}", f"episode_{idx:06d}.parquet"))
+        states = encode_state(np.asarray(t.column("observation.state").to_pylist(), dtype=np.float32))
+        actions = encode_action(np.asarray(t.column("action").to_pylist(), dtype=np.float32))
+
+        ep_dir = os.path.join(stage, f"ep_{idx:06d}")
+        paths = [os.path.join(ep_dir, f"{i:06d}.jpg") for i in range(len(states))]
+        if not os.path.exists(os.path.join(ep_dir, ".done")):        # resumable: .done = fully staged
+            os.makedirs(ep_dir, exist_ok=True)
+            jobs.append({"idx": idx, "dir": ep_dir, "paths": paths, "h": stage_h,
+                         "mp4": os.path.join(src, "videos", f"chunk-{c:03d}", vkey,
+                                             f"episode_{idx:06d}.mp4")})
+        episodes.append(Episode(states=states, actions=actions, frames=paths))
+
+    # Decode in PARALLEL across episodes: this is pure 1080p/720p decode, the single longest step in the
+    # whole build (~1300 frames/min/core measured -> ~4.5 h for one camera serially, and Arm B needs
+    # three). Only PATHS cross the process boundary, so the fan-out is nearly free -- the same property
+    # that made path-based frames the right call for the encode workers below.
+    if jobs:
+        workers = min(int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4)), 16)
+        log_every = max(1, len(jobs) // 20)
+        print(f"[lego] staging {len(jobs)} episode(s) on {workers} workers "
+              f"({len(episodes) - len(jobs)} already cached)...", flush=True)
+        t0 = time.time()
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for k, (idx, got, want) in enumerate(ex.map(_stage_job, jobs), 1):
+                if got < want:      # a short clip would silently misalign frames against vector rows
+                    raise ValueError(f"episode {idx}: {vkey} decoded {got} frames but the parquet has "
+                                     f"{want} rows")
+                if k % log_every == 0 or k == len(jobs):
+                    print(f"[lego] staged {k}/{len(jobs)}  ({time.time() - t0:.0f}s)", flush=True)
+    staged = len(jobs)
+    print(f"[lego] {len(episodes)} episodes, {sum(len(e.states) for e in episodes)} frames @ {fps} Hz | "
+          f"state {episodes[0].states.shape[1]}d action {episodes[0].actions.shape[1]}d | "
+          f"cam {cam} staged h{stage_h} ({staged} newly decoded, {len(episodes) - staged} cached)", flush=True)
+    return name, episodes, fps, cam, None
+
+
+PROCESSORS = {"starling": starling, "robocasa": robocasa,
+              "lego_assemblies": lego_assemblies}
 
 
 @hydra.main(config_path="../../../conf", config_name="config", version_base=None)
