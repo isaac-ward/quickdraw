@@ -80,33 +80,44 @@ def _read_frames(path: str) -> np.ndarray:
 
 
 def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
-                        fpv_dir: str | None = None, fpv_size=256, cam: str = "fpv", task: str = "torus"):
+                        fpv_dir=None, fpv_size=256, cam="fpv", task: str = "torus"):
     """Write episodes to a LeRobotDataset on disk. ISOLATED lerobot API surface.
 
-    When `fpv_dir` is given, each episode's pre-rendered clip `fpv_dir/ep_<i>.mp4` is read back and
+    MULTI-CAMERA. `cam` is a camera name OR a list of them, and `fpv_dir` correspondingly a directory
+    OR a {cam: dir} mapping. Each episode's pre-rendered clip `<dir>/ep_<i>.mp4` is read back and
     stored as the lerobot-standard image observation `observation.images.<cam>` (dtype=video), aligned
-    1:1 with the vector frames. `obs`/`act`: (n_traj, steps, dim) arrays OR lists of per-episode
-    (T_i, dim) arrays (recorded episodes have variable length). `fpv_size`: int (square) or (H, W).
+    1:1 with the vector frames -- one such key PER CAMERA, which is exactly the layout
+    `data/dataset.py` already reads (`<split>/videos/observation.images.<cam>/*/*.mp4`), so a
+    multi-camera dataset needs no loader change at all: pick one with `data.cam`.
+
+    `obs`/`act`: (n_traj, steps, dim) arrays OR lists of per-episode (T_i, dim) arrays (recorded
+    episodes have variable length). `fpv_size`: int (square) or (H, W); all cameras share it.
+
+    Passing a bare str + str (the torus/generate path) behaves exactly as before.
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    video = fpv_dir is not None
-    key = f"observation.images.{cam}"
+    cams = [cam] if isinstance(cam, str) else list(cam)
+    dirs = {cams[0]: fpv_dir} if isinstance(fpv_dir, str) else dict(fpv_dir or {})
+    video = bool(dirs)
     features = {
         "observation_vector": {"dtype": "float32", "shape": (obs[0].shape[-1],), "names": None},
         "action": {"dtype": "float32", "shape": (act[0].shape[-1],), "names": None},
     }
     if video:   # vector-only splits pass fpv_dir=None and no fpv_size -> no image feature
         h, w = (fpv_size, fpv_size) if isinstance(fpv_size, int) else tuple(fpv_size)
-        features[key] = {"dtype": "video", "shape": (h, w, 3),
-                         "names": ["height", "width", "channels"]}
+        for c in cams:
+            features[f"observation.images.{c}"] = {"dtype": "video", "shape": (h, w, 3),
+                                                   "names": ["height", "width", "channels"]}
     ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=root, features=features, use_videos=video)
     for i in range(len(obs)):
-        frames = _read_frames(os.path.join(fpv_dir, f"ep_{i:04d}.mp4")) if video else None
+        # decode every camera's clip for THIS episode up front; they are frame-aligned by construction
+        frames = {c: _read_frames(os.path.join(dirs[c], f"ep_{i:04d}.mp4")) for c in cams} if video else None
         for t in range(len(obs[i])):
             f = {"observation_vector": obs[i][t], "action": act[i][t], "task": task}
             if video:
-                f[key] = frames[t]
+                for c in cams:
+                    f[f"observation.images.{c}"] = frames[c][t]
             ds.add_frame(f)
         ds.save_episode()
     ds.finalize()
