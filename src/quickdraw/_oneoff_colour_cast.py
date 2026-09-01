@@ -38,12 +38,19 @@ mod = m.modalities[name]
 mix = (float(getattr(mod.visual, "w_l1", 0)), float(getattr(mod.visual, "w_l2", 0)),
        float(getattr(mod.visual, "w_lpips", 0))) if hasattr(mod, "visual") else ("?", "?", "?")
 
+# frames come back as a DICT keyed by camera (data/dataset.py). Single-camera script:
+
+# name the key once rather than indexing position 2 as if there were only ever one view.
+
+_CAMK = str(cfg.data.get("cam", "fpv"))
+
 ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=mod.ae.cfg.img_size,
                             cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
 rng = np.random.default_rng(0)
 fr = []
 for i in range(len(ds)):
-    _, _, im = ds[i]
+    _, _, _fr = ds[i]
+    im = _fr[_CAMK]
     fr.append(torch.from_numpy(im[rng.permutation(len(im))[:max(1, N // len(ds) + 1)]]).float().div(255.0))
 X = torch.cat(fr)[:N].to(dev)
 

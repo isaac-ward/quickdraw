@@ -17,7 +17,7 @@ import numpy as np
 from ..controller.run import _plog, run_and_log_control
 from ..environments.registry import make_env
 from ..logging import viz
-from ..training.setup import eval_episodes, resolve_data_root
+from ..training.setup import eval_episodes, image_head_cams, image_head_sizes, resolve_data_root
 import torch
 
 from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_curves, proprio_curves
@@ -158,8 +158,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         _plog(writer, f"[eval_ood_horizon @ep{step}] {pct:3d}% — {what}")
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))
     n_ep, H, cl_h, _modes, _calls = ood_horizon_shapes(cfg, bool(img_heads),
                                                       [len(o) for o, _, _ in eps], P)
     eps = eps[:n_ep]
@@ -170,7 +172,9 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     pro0 = torch.stack([norm.norm_obs(torch.from_numpy(o[:P])) for o, _, _ in eps]).float().to(device)
     ctx_obs = norm.denorm_obs(pro0[:n_plot]).cpu().numpy()
     p_true = torch.stack([torch.from_numpy(o[P:P + H]) for o, _, _ in eps]).float().to(device)
-    itrue = {h: torch.stack([torch.from_numpy(im[P:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
+    # fr is the per-head frame DICT (load_split_episodes_mm). Indexing it by head is what stops one camera
+    # being scored as all of them -- this line used to hand EVERY head the same `im` array.
+    itrue = {h: torch.stack([torch.from_numpy(fr[h][P:P + H]) for _, _, fr in eps]).float().div(255.0).to(device)
              for h in img_heads}
 
     def rollout_regrounded(every, Hm, want_bag=False):
@@ -185,12 +189,12 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         C = {"proprio": []}
         C.update({h: [] for h in img_heads})
         A = []
-        for o, a, im in eps:                                                # (episode, segment) row order
+        for o, a, fr in eps:                                                # (episode, segment) row order
             for s in range(n_seg):
                 st = s * every
                 C["proprio"].append(norm.norm_obs(torch.from_numpy(o[st:st + P])))
                 for h in img_heads:
-                    C[h].append(torch.from_numpy(im[st:st + P]))
+                    C[h].append(torch.from_numpy(fr[h][st:st + P]))          # per-head frames, not one shared array
                 idx = _np.clip(_np.arange(st, st + P + every - 1), 0, len(a) - 1)   # last seg: pad+clamp (tail discarded)
                 A.append(norm.norm_act(torch.from_numpy(a[idx])))
         ctx = {"proprio": torch.stack(C["proprio"]).float().to(device)}
@@ -267,7 +271,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
             ic.update(lat or {})            # latent_motion_ratio / latent_cos ride the head's curve dict, so they
             #                                 reach the SAME panel + the same @+x scalar readouts as motion_ratio
             images[head] = {"icurves": ic,
-                            "full_true": _np.stack([eps[i][2][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
+                            "full_true": _np.stack([eps[i][2][head][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                             "ipred": ipred[:n_plot].cpu().numpy()}
             emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
         emit_openloop(writer, subroutine, step, env=env, R=getattr(ecfg, "R", None), r=getattr(ecfg, "r", None),
@@ -329,8 +333,10 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
         _plog(writer, f"[eval_ae_floor @ep{step}] {pct:3d}% — {what}")
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))
     n_ep = min(int(cfg.eval.get("ae_floor_episodes", 2) or 2), len(eps))
     eps = eps[:n_ep]
     H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
@@ -339,7 +345,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
     pro_full = torch.stack([norm.norm_obs(torch.from_numpy(o[:P + H])) for o, _, _ in eps]).float().to(device)
     obs_full = {"proprio": pro_full}
     for h in img_heads:
-        obs_full[h] = torch.stack([torch.from_numpy(im[:P + H]) for _, _, im in eps]).float().div(255.0).to(device)
+        obs_full[h] = torch.stack([torch.from_numpy(fr[h][:P + H]) for _, _, fr in eps]).float().div(255.0).to(device)
 
     # per-frame encode->decode (encode_state is per-frame; chunk over time so image decode memory stays bounded)
     # relative-position: ONE anchor for the whole trajectory (its first frame), threaded to every chunk so the
@@ -371,7 +377,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
         ipred = recon[head][:, P:P + H].clamp(0, 1)
         itrue = obs_full[head][:, P:P + H]
         images[head] = {"icurves": image_curves(ipred, itrue),               # shared per-step psnr/ssim/mse/l1
-                        "full_true": _np.stack([eps[i][2][:P + H].astype(_np.float32) / 255.0 for i in range(n_plot)]),
+                        "full_true": _np.stack([eps[i][2][head][:P + H].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                         "ipred": ipred[:n_plot].cpu().numpy()}
         emit_horizon_readouts(writer, "eval_ae_floor", head, images[head]["icurves"], H, step)
     prog(45, "curves + metrics")
@@ -441,8 +447,10 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     m.eval()
     t0 = time.perf_counter()
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                    cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
+    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
     _, latents, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
                                                 stride=1, seed=0, device=device)
     sub = (f"each point = one committed 1-step next-state prediction from a real val context "
@@ -496,13 +504,16 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     P, W, d, K, n_swarm = cfg.data.P, m.window, m.d, m.sampling_steps, 16
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                    cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))
     # per-eval variety: a seed drives WHICH trajectory + the swarm angle, so a bad-looking eval won't recur (the
     # next eval shows a different one from a different angle) yet stays reproducible. Defaults to the epoch `step`.
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
     rng = _np.random.default_rng(seed)
-    o, a, im = eps_ds[int(rng.integers(len(eps_ds)))]               # a seed-chosen episode (raw physical obs/actions)
+    o, a, _fr = eps_ds[int(rng.integers(len(eps_ds)))]              # a seed-chosen episode (raw physical obs/actions)
+    im = _fr[img_head]                     # this routine deliberately shows ONE head; name it explicitly
     Tlen = len(o)
     obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device)}
     if img_head is not None:
@@ -632,8 +643,10 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     #                                       (RecordedConfig has inert R/r=1.0, so R-is-not-None can't gate this; #11)
     pos, _ = _pos_idx(cfg); K, P = m.sampling_steps, cfg.data.P
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                    cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
     _plog(writer, f"[denoising_aggregate @ep{step}] seed={seed} pooling val contexts, K={K}...")
     paths_phys, _, n_avail = manifold_clouds(m, norm, eps_ds, P=P, n_points=5000, cube=3.0, stride=1, seed=seed, device=device)
@@ -712,8 +725,10 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     hz = list(cfg.eval.get("denoising_filmstrip_horizons", None) or [1, 8, 16, 32, 64])
     hz = sorted({int(h) for h in hz if int(h) >= 1})
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                    cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))
     seed = int(step if cfg.eval.get("denoising_seed", None) is None else cfg.eval.denoising_seed)
     n_images = int(cfg.eval.get("denoising_filmstrip_images", 4) or 4)   # separate FILES, each a different episode
     rng = _np.random.default_rng(seed)
@@ -724,7 +739,8 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
         Hmax = max(hz)
         for _try in range(8):                                    # need an episode long enough for the deepest row
             ep_idx = int(rng.integers(len(eps_ds)))
-            o, a, im = eps_ds[ep_idx]
+            o, a, _fr = eps_ds[ep_idx]
+            im = _fr[img_head]             # this routine deliberately shows ONE head; name it explicitly
             if len(o) > P + Hmax + 2:
                 break
         else:
@@ -732,8 +748,11 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
             continue
         Tlen = len(o)
         t_ctx = int(rng.integers(max(P, 1), max(P + 1, Tlen - Hmax - 2)))   # context ends here; predict t_ctx+1..+Hmax
-        obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device),
-               img_head: torch.from_numpy(im).float().div(255.0)[None].to(device)}
+        # encode_state indexes EVERY layout name, so obs must carry EVERY image head even though this
+        # routine only VISUALISES img_head. Omitting the others is a KeyError, not a silent wrong number.
+        obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device)}
+        obs.update({h: torch.from_numpy(_fr[h]).float().div(255.0)[None].to(device)
+                    for h in (n for n, _ in m.layout if n != "proprio")})
         act = norm.norm_act(torch.from_numpy(a)).float()[None].to(device)
         g = torch.Generator(device=device).manual_seed(seed + i)
         with torch.autocast(device_type=dev, dtype=torch.bfloat16, enabled=(dev == "cuda")):
@@ -849,8 +868,10 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     P, H, fps = cfg.data.P, int(ic["clip_len"]), round(1.0 / ecfg.dt)
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))
 
     # ---- sample N clips (episode, t0): P context frames + H imagined steps ----
     rng = _np.random.RandomState(int(ic["seed"]))
@@ -868,8 +889,11 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     decoded = {n: [] for n in heads}                                    # per-trunk decoded imaginations, keyed by trunk id
     for c0 in range(0, len(slices), bs):
         chunk = slices[c0:c0 + bs]
-        ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(eps[ei][0][t - P:t])) for ei, t in chunk]).float().to(device),
-               img_head: torch.stack([torch.from_numpy(eps[ei][2][t - P:t]) for ei, t in chunk]).float().div(255.0).to(device)}
+        # every image head, not just the one this routine interprets -- encode_state needs the full bag
+        ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(eps[ei][0][t - P:t])) for ei, t in chunk]).float().to(device)}
+        ctx.update({h: torch.stack([torch.from_numpy(eps[ei][2][h][t - P:t])
+                                    for ei, t in chunk]).float().div(255.0).to(device)
+                    for h in (n for n, _ in m.layout if n != "proprio")})
         act = torch.stack([norm.norm_act(torch.from_numpy(eps[ei][1][t - P:t + H - 1])) for ei, t in chunk]).float().to(device)
         # ONE open-loop rollout: bag = the model's INTERNAL predictive state at each imagined step (B,H,n_state,d);
         # each trunk is DECODED from it. So the plotted latent is the state that PRODUCES the prediction, and
@@ -1084,8 +1108,10 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     except Exception:
         pass
     a_max = getattr(ecfg, "a_max", None)   # torus-only histogram x-limit knob; None -> viz derives it from the data
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))
     n_ep = min(int(cfg.eval.get("action_dist_episodes", 64) or 64), len(eps))   # default 64 = full val split (max distinct contexts)
     eps = eps[:n_ep]
     L = min(len(o) for o, _, _ in eps)
@@ -1093,7 +1119,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
 
     ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(o[:L])) for o, _, _ in eps]).float().to(device)}
     for h in img_heads:
-        ctx[h] = torch.stack([torch.from_numpy(im[:L]) for _, _, im in eps]).float().div(255.0).to(device)
+        ctx[h] = torch.stack([torch.from_numpy(fr[h][:L]) for _, _, fr in eps]).float().div(255.0).to(device)
     act = torch.stack([norm.norm_act(torch.from_numpy(a[:L])) for _, a, _ in eps]).float().to(device)  # (E,L,2) normalized
 
     with torch.no_grad():                                        # no grad: this eval also runs on the TRAINING GPU

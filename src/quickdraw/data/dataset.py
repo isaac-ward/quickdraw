@@ -172,7 +172,11 @@ def _subsample_episodes(eps, tag: str):
             aa = grp.sum(axis=1)
             if hold:
                 aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the sum
-            out.append((o[:n * s:s], aa) + tuple(x[ph:][:n * s:s] for x in ep[2:]))
+            # extra streams (ep[2:]) are sliced identically. A DICT of streams (the multi-camera frame
+            # bundle) is sliced VALUE-WISE -- without this branch `x[ph:]` on a dict raises TypeError.
+            extra = tuple({k: v[ph:][:n * s:s] for k, v in x.items()} if isinstance(x, dict)
+                          else x[ph:][:n * s:s] for x in ep[2:])
+            out.append((o[:n * s:s], aa) + extra)
     print(f"[subsample] {tag}: stride {s}{f' x {s} PHASES' if all_phases else ''} | {len(eps)} eps "
           f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions SUMMED except "
           f"take-last on dims {hold} | {dropped} eps dropped as too short", flush=True)
@@ -251,41 +255,56 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
 
 
 def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_id: str = "torus"):
-    """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled to img_size,
-    uint8), aligned 1:1 with obs steps.
+    """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled, uint8),
+    aligned 1:1 with obs steps. Returns one entry per episode:
 
-    N CAMERAS. `cam` is a name OR a sequence of names, and `img_size` correspondingly one size or one per
-    camera (a single size is broadcast). Returns one list entry per episode:
+        (obs (T,D), act (T,A), frames)          frames = {key: (T,H,W,3) uint8}   -- ALWAYS a dict
 
-        (obs (T,D), act (T,A), img_cam0 (T,H,W,3) uint8, img_cam1, ...)
+    `cam` may be:
+        "robot0_agentview_left"                  -> {"robot0_agentview_left": frames}
+        ["cam_a", "cam_b"]                       -> {"cam_a": ..., "cam_b": ...}
+        {"cam_scene": "robot0_agentview_left",   -> {"cam_scene": ..., "cam_wrist": ...}
+         "cam_wrist": "robot0_eye_in_hand"}         (a MAPPING lets the caller key by MODALITY HEAD)
+    `img_size` is one size for every camera, or a mapping/sequence keyed/ordered to match `cam`.
 
-    A SINGLE camera returns exactly the 3-tuples it always did, so every existing call site is unchanged
-    -- and a call site that reads `ep[2]` on a MULTI-camera load still gets camera 0, which is what makes
-    the evaluation routines keep working while they are migrated one at a time. `_subsample_episodes` is
-    already generic over the extra streams (it maps `ep[2:]`), so nothing there changes either.
+    ELEMENT 2 IS A DICT EVEN FOR ONE CAMERA, DELIBERATELY. It used to be a bare array, so every call site
+    wrote `ep[2]` to mean "the camera". With N image heads that pattern silently hands EVERY head the FIRST
+    camera's frames -- a head scored against another camera's pixels produces a plausible WRONG NUMBER
+    rather than a crash, which is the worst failure mode available. Making it a dict turns every such site
+    into an immediate TypeError until it names the head it wants. See design/two_camera_plan.md.
 
     The chunked video is read in dataset row order (== obs row order), then split by episode_index. The obs
     subset (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    cams = [cam] if isinstance(cam, str) else list(cam)
-    sizes = ([img_size] * len(cams) if isinstance(img_size, (int, tuple)) or img_size is None
-             else list(img_size))
-    assert len(sizes) == len(cams), f"img_size/cam length mismatch: {len(sizes)} vs {len(cams)}"
+    if isinstance(cam, str):
+        keys, cams = [cam], [cam]
+    elif isinstance(cam, dict):
+        keys, cams = list(cam), [cam[k] for k in cam]
+    else:
+        keys = cams = list(cam)
+    if isinstance(img_size, dict):
+        sizes = [img_size[k] for k in keys]
+    elif img_size is None or isinstance(img_size, (int, tuple)):
+        sizes = [img_size] * len(keys)
+    else:
+        sizes = list(img_size)
+    assert len(sizes) == len(keys), f"img_size/cam length mismatch: {len(sizes)} vs {len(keys)}"
+    assert len(set(keys)) == len(keys), f"duplicate frame keys {keys}"
 
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
     obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
     act_all = np.stack(hf["action"]).astype(np.float32)
-    per_cam = []
-    for c, sz in zip(cams, sizes):
+    per_key = {}
+    for k, c, sz in zip(keys, cams, sizes):
         fr = load_fpv_frames(root, split, size=sz, cam=c)                  # (N, H, W, 3), row order
         assert len(fr) == len(obs_all), f"{c}/row count mismatch: {len(fr)} vs {len(obs_all)}"
-        per_cam.append(fr)
+        per_key[k] = fr
     return _subsample_episodes(
-        [(obs_all[ep_idx == e], act_all[ep_idx == e], *(fr[ep_idx == e] for fr in per_cam))
-         for e in np.unique(ep_idx)],
+        [(obs_all[ep_idx == e], act_all[ep_idx == e],
+          {k: fr[ep_idx == e] for k, fr in per_key.items()}) for e in np.unique(ep_idx)],
         f"{repo_id}/{split}+{'+'.join(cams)}")
 
 
@@ -305,6 +324,8 @@ class MMWindowLoader:
                  image_head=None, stride: int = 1):
         L = P + F
         heads = [] if image_head is None else ([image_head] if isinstance(image_head, str) else list(image_head))
+        # heads index the frame DICT at episode element 2 by NAME -- see load_split_episodes_mm. Positional
+        # access is deliberately impossible: it is what let one camera masquerade as all of them.
         self.image_head = image_head          # kept verbatim for any caller that inspects it
         self.heads = heads
         obs_w, act_w = stack_windows([(e[0], e[1]) for e in episodes], P, F, normalizer, stride)
@@ -312,14 +333,15 @@ class MMWindowLoader:
         self.frames = None
         if heads:   # per head: concat all episode frames -> one GPU uint8 store; ONE shared per-window index
             self.frames = {}
+            avail = set(episodes[0][2]) if isinstance(episodes[0][2], dict) else set()
             for i, h in enumerate(heads):
-                assert len(episodes[0]) > 2 + i, (
-                    f"image_head[{i}]={h!r} needs episode element {2 + i}, but episodes carry "
-                    f"{len(episodes[0])} elements -- load_split_episodes_mm was called with fewer cameras "
-                    f"than there are image modalities")
+                assert h in avail, (
+                    f"image head {h!r} has no frames: the episodes carry {sorted(avail)}. "
+                    f"load_split_episodes_mm must be called with cam={{head: camera}} covering every image "
+                    f"modality -- see training/setup.py:window_loaders")
                 frames, starts, off = [], [], 0
                 for e in episodes:
-                    o, img = e[0], e[2 + i]
+                    o, img = e[0], e[2][h]
                     frames.append(torch.from_numpy(img))
                     starts.extend(range(off, off + len(o) - L + 1, stride))   # stride matches stack_windows
                     off += len(img)

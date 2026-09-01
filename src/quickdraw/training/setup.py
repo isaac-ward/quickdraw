@@ -797,6 +797,34 @@ def normalizer(cfg) -> Normalizer:
     return Normalizer.from_file(resolve_data_root(cfg)).subset_obs()   # subset via the process-wide set_obs_keep
 
 
+def image_head_cams(cfg) -> dict[str, str]:
+    """{image modality name: camera stream} from the model config. THE one place head->camera is resolved.
+
+    Every image modality names its own camera via `ModalitySpec.cam`; a SINGLE image head may leave it unset
+    and fall back to `data.cam`, so single-camera configs are untouched. With more than one head an unset
+    `cam` is an ERROR rather than a fallback: falling back would point every head at the same camera, and a
+    head scored against another camera's frames is a plausible WRONG NUMBER rather than a crash.
+
+    Exists so `window_loaders` and all eight evaluation load sites resolve it IDENTICALLY -- they used to
+    each read `data.cam` directly, which is how the evals ended up feeding one camera to every head."""
+    specs = [sp for sp in _modality_specs(cfg) if sp.kind == "image"]
+    default_cam = str(cfg.data.get("cam", "fpv"))
+    if len(specs) > 1:
+        missing = [sp.name for sp in specs if not getattr(sp, "cam", None)]
+        assert not missing, (f"{len(specs)} image modalities but {missing} have no `cam:` -- with more than "
+                             f"one image head each must name its own camera, or they all read data.cam="
+                             f"{default_cam!r} and the extra heads are scored against the wrong frames")
+    out = {sp.name: str(getattr(sp, "cam", None) or default_cam) for sp in specs}
+    if len(out) > 1:
+        assert len(set(out.values())) == len(out), f"two image modalities share a camera: {out}"
+    return out
+
+
+def image_head_sizes(cfg) -> dict[str, int]:
+    """{image modality name: img_size}. Companion to image_head_cams -- heads may differ in resolution."""
+    return {sp.name: sp.img_size for sp in _modality_specs(cfg) if sp.kind == "image"}
+
+
 def window_loaders(cfg, norm: Normalizer):
     """The ONE GPU-resident loader for every model. Loads the FPV frame store only when an image modality
     is present; proprio-only just loads (obs, act) — no frames touched."""
@@ -807,28 +835,17 @@ def window_loaders(cfg, norm: Normalizer):
     # took the FIRST image spec and silently ignored the rest: a second image modality was BUILT in the
     # model but never LOADED, so lit.py's `obs[name] = batch[name]` KeyError'd at step 0 -- nothing at
     # config time said anything was wrong. See design/two_camera_plan.md.
-    imgs = [sp for sp in specs if sp.kind == "image"]
+    head_cams = image_head_cams(cfg)          # {head: camera} -- the ONE resolution point
+    head_sizes = image_head_sizes(cfg)
     repo = str(cfg.data.get("repo_id", "torus"))
-    default_cam = str(cfg.data.get("cam", "fpv"))
-    cams = [str(getattr(sp, "cam", None) or default_cam) for sp in imgs]
-    # With ONE image modality an unset `cam` falls back to data.cam, so every existing config is unchanged.
-    # With several, falling back would silently point two heads at the SAME camera -- a head scored against
-    # another camera's frames is a plausible WRONG number rather than a crash, which is worse. So require it.
-    if len(imgs) > 1:
-        missing = [sp.name for sp in imgs if not getattr(sp, "cam", None)]
-        assert not missing, (f"{len(imgs)} image modalities but {missing} have no `cam:` -- with more than one "
-                             f"image head each must name its own camera, or they all read data.cam="
-                             f"{default_cam!r} and the extra heads are scored against the wrong frames")
-        assert len(set(cams)) == len(cams), f"two image modalities share a camera: {list(zip([s.name for s in imgs], cams))}"
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
-        if imgs:
-            eps = load_split_episodes_mm(root, split, img_size=[sp.img_size for sp in imgs],
-                                         cam=cams, repo_id=repo)
+        if head_cams:
+            eps = load_split_episodes_mm(root, split, img_size=head_sizes, cam=head_cams, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev,
-                                            image_head=[sp.name for sp in imgs], stride=stride)
+                                            image_head=list(head_cams), stride=stride)
         else:                                                    # proprio-only: (obs, act) pairs, no camera frames
             eps = load_split_episodes(root, split, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
