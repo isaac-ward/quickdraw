@@ -239,7 +239,60 @@ over a 12.8 s open-loop rollout this is not alarming, but it is the number to wa
 below ~249 mm by the epoch 9–15 evals, the model is not learning position dynamics at all, and §1b
 (action not in the state's frame) is the first suspect.
 
-Eval epochs `{5, 9, 15, 19, 29, 39, 49}` → first eval ~23:20 on 08-31, second ~09:50 on 09-01.
+### ⛔ EVAL 5 — COLLAPSED. The documented vl64 signature, at eval 5 instead of eval 12.
+
+vl64's own header: *"IT COLLAPSED AT EVAL 12, into a degenerate stable state (latent_cos -0.13, motion
+0.31), after one non-finite gradient step... Watch `latent_cos`: going negative is the signature."*
+
+| metric | robocasa collapse (eval 12) | **lego, eval 5** |
+|---|---|---|
+| `latent_cos_mean` | −0.13 | **−0.376** |
+| `motion_ratio_mean` | 0.31 | 0.269 |
+
+`latent_cos` is negative at EVERY horizon: −0.310 @+1, −0.120 @+16, −0.453 @+64, −0.476 @+230. The
+prediction is ANTI-correlated with the true latent — worse than predicting nothing.
+
+The mechanism is visible in one more number: **`latent_motion_ratio_mean` = 72.6**, and **495 at @+1**.
+The latent is moving ~72x more than the true latent does, while the decoded image moves 0.27x as much as
+it should. So the latent wanders enormously and the decoder maps all of that wandering onto nearly the
+same picture. That is exactly "a degenerate stable state".
+
+**It does not look broken from the image metrics, which is the trap.** open-loop PSNR 15.92, SSIM 0.544,
+one-step 17.64 — all sitting right at the codec floor of ~15.4 dB, because a near-static prediction
+scores fine when the codec is the binding constraint. Only `latent_cos` and `latent_motion_ratio` show it.
+
+**No non-finite gradient step preceded it** (`grad/nonfinite_skipped` = 0, nothing in progress.log), so
+unlike the robocasa case this was not triggered by a bad step — it is the objective's own minimiser.
+
+**Suspected cause — the loss balance, not the recipe per se.** At epoch 3, `val/loss/dynamics/latent` was
+**182.46** of a 188.39 total, against `decode/scene_right` 0.45 and the round-trip anchor 0.446. The
+dynamics term is ~400x the anchor. vl64's header states the mechanism precisely: *"The anchor is the ONLY
+term forcing the latent to stay a faithful encoding; every other loss can be reduced by making the latent
+EASIER TO PREDICT, and the easiest such latent is degenerate."* At this ratio `latent_loss_weight: 10` —
+tuned on robocasa at 96px where the latent loss was not 400x the anchor — cannot hold the latent.
+
+**Do NOT simply raise `latent_loss_weight`.** It is bracketed on both sides in vl64: 0.4 erased 5.4 dB in
+one epoch, 25 froze motion and drove gradients to inf. It is a RATIO knob. What changed here is the
+DENOMINATOR — the latent loss scale on this dataset — so the ratio has to be re-derived, not nudged.
+
+Eval epochs `{5, 9, 15, 19, 29, 39, 49}` → first eval was ~23:20 on 08-31.
+
+### The images the model trains on ARE SQUARE (aspect squashed 1.78x)
+
+Asked by the user. Staging preserves 16:9 (`512x288`), but `load_fpv_frames` turns an INT `img_size`
+into a square shape — `dataset.py:234`, `hw = (size, size) if isinstance(size, int)` — and the recipe
+sets `img_size: 128`. So:
+
+    source  1920 x 1080  (16:9)  ->  staged  512 x 288  (16:9)  ->  MODEL  128 x 128  (1:1)
+
+The staging decision to preserve aspect was real but the recipe squashes it one layer down, so the net
+effect is a **1.78x horizontal compression**. `load_fpv_frames` already accepts an `(H, W)` tuple, so
+`img_size: [128, 228]` would preserve aspect — but `img_size` also drives the AE pyramid depth
+(`n_levels = int(log2(short_side // bottleneck))`, and up64's header warns that truncation there
+silently changes the codec), so a non-square value needs checking against that before use.
+
+Unlikely to be the collapse cause — a consistent anisotropic scale is something conv nets handle — but
+it is a real distortion, it was not an explicit decision, and it is worth fixing for any rerun.
 
 **To watch:** `latent_cos` going negative is vl64's documented collapse signature (it collapsed at eval 12
 on robocasa after one non-finite step). And **read frames, not just LPIPS** — vl64 is documented to ghost
