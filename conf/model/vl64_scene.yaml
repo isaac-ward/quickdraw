@@ -20,9 +20,15 @@
 #     data.subsample=<DERIVED>          <- P3. 1 is wrong; see the placeholder note in conf/data/lego.yaml
 #     model.diffusion.flow_hidden=512   <- every number quoted in vl64's header used it
 #
-# img_size 128 keeps vl64's DEFAULT ae_bottleneck of 8 (a 256x reduction, verified-exact). Do NOT drop
-# to 96 without ALSO setting +model.modalities.1.ae_bottleneck=6 — at 96 the default 8 truncates to a
-# 12x12 bottleneck, a materially less compressed codec than requested, with no warning. See up64's header.
+# img_size IS [128, 224], NOT 128. A bare int means SQUARE (dataset.py:234 -- `hw = (size, size)`), and
+# these cameras are 16:9, so `img_size: 128` fed the model a 1.78x HORIZONTALLY SQUASHED scene. The AE
+# supports non-square by design (`VisionAEConfig.img_size: int | tuple  # (H, W) -> non-square (recorded
+# cams)`). 224 rather than the exact 227.6 because the conv pyramid downsamples by
+# 2^n_levels = 2^log2(128//8) = 16, so BOTH sides must be divisible by 16: 224/16 = 14 exactly, while
+# 228/16 = 14.25 would break it. Aspect 1.750 vs the true 1.778 -- 1.6% off, against 78% before.
+# The short side still pairs with ae_bottleneck: 128 keeps the DEFAULT 8. Do NOT drop the short side to
+# 96 without ALSO setting ae_bottleneck=6 -- at 96 the default 8 truncates to 12x12, a materially less
+# compressed codec than requested, with no warning. See up64's header.
 #
 # CARRIED-IN CAVEATS, all measured, none speculative:
 #   * `action` is NOT in the state's frame on this dataset (no Euler convention fits — best 126.6 deg
@@ -48,7 +54,7 @@ modalities:
   #   -- training, eval, norm stats -- sees 34 and never touches an Euler angle.
   #   Still plain MSE: VisualLoss is IMAGE-only (only ImageModality overrides Modality.recon_loss), and a
   #   state vector has no perceptual structure to score.
-  - {name: scene_right, kind: image, weight: 1.0, img_size: 128,
+  - {name: scene_right, kind: image, weight: 1.0, img_size: [128, 224],
      pretrained: false,
      num_tokens: 32,
      encode_arch: conv,

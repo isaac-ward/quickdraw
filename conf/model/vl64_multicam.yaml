@@ -28,9 +28,10 @@
 # A batch of 4 is below the ~8 that design/distributed.md names as the point where gradient noise
 # starts to matter, and an eval that cannot be probed hangs the run rather than failing it.
 #
-# So three knobs move, and ONLY these three. img_size stays at 128 so the arms remain comparable —
-# dropping to 96 would buy a lot of headroom but would make Arm B's numbers incomparable to Arm A's,
-# which defeats the study.
+# So three knobs move, and ONLY these three. img_size is [128, 224] in BOTH arms -- see vl64_scene's
+# header: a bare int means SQUARE, and these 16:9 cameras were being squashed 1.78x. The SHORT side
+# stays 128 in both arms so they remain comparable; dropping it to 96 would buy headroom but make the
+# arms incomparable, which defeats the study.
 #   num_tokens         32 -> 16   the safest cut available: up64's header records 8->64 as one of the
 #                                 FEW genuine measured nulls on this axis, so capacity per head is not
 #                                 what we are spending. 3 x 16 = 48 image tokens/step + proprio, vs
@@ -84,19 +85,19 @@ modalities:
   #      AND loss balance in the same step -- exactly the confound vl64's own header flags in its own
   #      results ("THE WIN IS CONFOUNDED"). At 1/3 the aggregate image:proprio ratio is identical to
   #      vl64's, so this run isolates "more views" as the single variable.
-  - {name: scene_right, kind: image, cam: head_right, weight: 0.3333, img_size: 128,
+  - {name: scene_right, kind: image, cam: head_right, weight: 0.3333, img_size: [128, 224],
      pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
      decode_kind: mse, decode_arch: up, decode_base: 64,
      decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 8,
      visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 64,
      latent_loss_weight: 10}
-  - {name: arm_top_left, kind: image, cam: gripper_left_top, weight: 0.3333, img_size: 128,
+  - {name: arm_top_left, kind: image, cam: gripper_left_top, weight: 0.3333, img_size: [128, 224],
      pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
      decode_kind: mse, decode_arch: up, decode_base: 64,
      decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 8,
      visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 64,
      latent_loss_weight: 10}
-  - {name: arm_top_right, kind: image, cam: gripper_right_top, weight: 0.3333, img_size: 128,
+  - {name: arm_top_right, kind: image, cam: gripper_right_top, weight: 0.3333, img_size: [128, 224],
      pretrained: false, num_tokens: 16, encode_arch: conv, encode_base: 32,
      decode_kind: mse, decode_arch: up, decode_base: 64,
      decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 8,

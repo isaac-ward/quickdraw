@@ -374,6 +374,99 @@ Three options, in the order worth trying:
 
 Left running as-is: both arms produce useful single-arm results either way, and this is a research call.
 
+## 12. THE IMAGE CODEC IS COLLAPSED TO A CONSTANT IMAGE. That is the whole failure.
+
+Not "underperforming" — **outputting one fixed frame forever**. Verified three independent ways.
+
+**(a) Direct, from the run's own saved eval frames** (`armA_w10` ep1,
+`logs/epoch_0001/eval_ae_floor/scene_right/raw_filmstrip_frames_0.npz`, 460 timesteps):
+
+| | across-frame std | mean \|frame_t − frame_0\| |
+|---|---|---|
+| ground truth | 0.068056 | 0.051555 |
+| **prediction** | **0.000335** | **0.000242** |
+
+203x and 213x less. The model emits the same image at every timestep, for two different episodes.
+
+**(b) A constant image beats the trained autoencoder.** Measured on 200 val frames: the train-mean
+frame scores **17.29 dB**, the val-mean frame **18.16 dB**. The trained `ae_floor` is **15.44 dB**.
+Doing nothing is 1.9 dB BETTER than what training produced.
+
+**(c) Every mystery number falls out of it.** The 15.3–15.5 dB "ceiling" static across three runs, two
+anchor weights and two aspect ratios; `motion_ratio` 0.023 (a constant has no motion); prediction PSNR
+16.31 "above" the 15.44 codec ceiling (both are the same constant, scored on different frame sets).
+
+### Where it collapses, and why the anchor cannot fix it
+
+Layer-by-layer on the trained encoder — the conv trunk still sees the scene; the **Perceiver readout**
+(`vision.py:378`) throws it away:
+
+| stage | across-frame std / overall |
+|---|---|
+| conv trunk through `to_d+pos` | 0.383 / 4.08 — **9.4%**, frame info intact |
+| `to_latent` cross-attention | 0.00097 / 4.58 — **0.021%**, a 440x suppression |
+
+The readout is `latent_q + proj(attn(...))` where `latent_q` is input-INDEPENDENT (`vision.py:367`).
+Training drove the input-dependent branch to ~0 and inflated the constant branch ~14x.
+
+**It is self-sealing.** The decoder's Jacobian w.r.t. the latent is dead: feeding it a fully RANDOM
+latent changes its output by 3.9%, and its latent-sensitivity is ~70x BELOW the same architecture at
+random init. Measured `grad/norm/encode_scene_right` = 0.005 against `decode_scene_right` = 53.3 — a
+**10,000:1** split, versus ~1:1.6 at init. So the roundtrip anchor's gradient reaches the encoder
+through a Jacobian that no longer exists. **`latent_loss_weight` cannot fix this at ANY value** — which
+retrospectively explains why 10 and 100 gave identical floors, and why my whole anchor-weight line of
+inquiry was chasing a coefficient on a dead path.
+
+### Why this dataset and not robocasa
+
+The constant-image basin is far more attractive here:
+- ONE fixed camera, one table, one wall across all 65 sessions, so the constant solution already scores
+  17.3 dB — **above robocasa's entire from-scratch AE wall of 14.3 dB** (§1 of that record).
+- At stride 6 only **~4.6%** of pixels change more than the TAESD floor RMSE, and the **top 1% of pixels
+  carry 53.6%** of the frame-delta energy. An L1/LPIPS objective is nearly indifferent to the arms.
+- Total headroom from constant image to TAESD-quality is only **2.45x** in the loss mix — all of it
+  gated behind the hard part, while the decoder-bias path captures the first ~40% for free.
+
+`design/collapse.md` predicts exactly this ("the realized failure sheds exactly the information that is
+hard to predict") — here it sheds ALL of it, because the hard part is only ~5% of pixels.
+
+### The normalization hypothesis: REFUTED for pixels/LPIPS, partially confirmed for the latent LN
+
+Traced end-to-end and consistent: frames are [0,1] (`dataset.py:363`), the AE contract is [0,1]
+(`vision.py:13,114,373`), `VisualLoss` expects [0,1] (`visual_loss.py:51`) and its torchmetrics LPIPS
+uses `normalize=True`, which rescales internally — `visual_loss.py:88-93` deliberately does not
+pre-scale. Pixel stats healthy (mean 0.525, std 0.262, p1/p99 0/0.95). Identical to what worked on
+robocasa.
+
+The one real normalization finding: the non-invertible latent LayerNorm (`multimodal.py:31`) costs
+**8.9 dB at fit-start on this data versus 3.51 dB on robocasa/TAESD** (23.83 → 14.95 dB, replicated with
+frozen TAESD on lego frames). But restoring dataset-AVERAGE per-position stats — exactly what a decoder
+bias can learn — recovers 22.54 dB, so only ~1.3 dB is truly destroyed. It deepens the early hole the
+decoder escapes via its constant path, worsening the race, but it is not the wall.
+
+### `ae_bottleneck: 16` is the WRONG first lever
+
+This architecture reached 18.7–20.4 dB at 128px/bottleneck-8 on robocasa. We are 3+ dB below that, so
+capacity is not binding yet. The 7.0 px/float at 128x224 (vs 2.25 at robocasa's 96px) only starts to
+bind AFTER the collapse is fixed. I had this queued as the next experiment; it would have measured
+nothing.
+
+### Gradient clipping is an enabler, not the cause
+
+`gradient_clip_val=1.0` is hardcoded (`train_world_model.py:317`). Measured `grad/norm_preclip` maxima:
+372.8 → 293.4 (probes), 58.1 (`armA_w10`), **896** (`armA_w100` — it scales with the anchor weight, so
+the anchor owns the norm). At init the anchor's gradient is enc 380 / dec 618 at w=10, so **the clip
+cuts 50–900x from step 0** and the surviving unit-norm direction is decoder-dominated. The encoder must
+learn a 28,672-px → 4,096-float code at ~1/300 of nominal LR while the decoder need only learn a bias.
+Stated honestly: init gradients are large at 96px too (260) and with pure MSE (478), and robocasa's
+healthy 0.17–0.27 is from a CONVERGED run — so clipping alone does not separate sim from real.
+
+### THE TRIPWIRE, for every future run
+
+`eval_ae_floor/<head>/motion_ratio_mean` ≈ 0.02 is the one-number signature of this state, and it is far
+more specific than PSNR — PSNR looked like a plausible 15.4 dB "codec floor" for three runs while the
+codec was emitting a still image.
+
 ## 11. Eval cadence — raise it, and Arm B is why
 
 Asked by the user (2026-08-31): *can we eval more often, epoch 1 3 5?*
