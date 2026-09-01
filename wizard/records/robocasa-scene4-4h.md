@@ -1800,6 +1800,27 @@ loss and will BOTH ghost, so the anchor-weight sweep in 22.9 is being read on a 
 
 ### 22.9 Queue
 
+0. **`visual_l1=3.0` with `visual_lpips=1.0`** (PINNED 2026-09-01). Currently 1.0/1.0, which is NOT balanced:
+   measured on `vl_keep10`'s own checkpoint the terms are L1 0.0587 and LPIPS-vgg 0.1835, so the objective is
+   **24% pixel / 76% perceptual**. At `l1=3.0` it is 49/51 -- state it as "weighted 3:1 so the pixel and
+   perceptual terms contribute equally, measured on the trained codec". DO NOT write 3.13: the third digit is
+   one measurement on one checkpoint and the ratio drifts more than 4% during training.
+   MOTIVATION, measured (`_oneoff_colour_cast.py`, 128 val frames, real encode->decode):
+
+   | | channel bias R/G/B | tint (spread) | saturation | MAE |
+   |---|---|---|---|---|
+   | `dyn512` (pure L2) | -0.0018 / -0.0017 / -0.0007 | 0.0011 | 0.985 matched | 0.0567 |
+   | `vl_keep10` (L1+LPIPS) | **+0.0024 / -0.0026 / +0.0018** | **0.0050** (4.5x) | **1.100** | 0.0584 |
+
+   Same MAE, differently SHAPED error: a magenta cast (R,B up / G down) and **10% oversaturation**. LPIPS
+   scores VGG features, which barely move under a global colour shift, and oversaturating makes edges "pop"
+   in feature space at almost no metric cost. The tint itself is ~1.3/255 and probably invisible; the
+   SATURATION is the part the user could see. NOTE this also kills the "add L2 back" idea: a 0.0025 bias
+   against a 0.058 per-pixel error is 4% under L1 and negligible under L2, so no squared term fixes a small
+   global cast at any sane weight. Raising L1 (rather than lowering LPIPS) is the right direction because it
+   raises pixel pressure WITHOUT lowering total pressure -- which is how `vl_lp025` wrecked its floor.
+   `l1=5.0` (62/38, pixel-dominant) is the follow-up if parity is not enough.
+
 1. **`latent_loss_weight=25` on the `vl_keep10` base** -- the knob has never been swept upward, and 22.6 makes
    it the highest-EV single run available. Watch for the OPPOSITE failure: an over-anchored encoder pinned to
    being a good autoencoder at the expense of being predictable, which would show as a good floor with rising
@@ -1813,6 +1834,145 @@ loss and will BOTH ghost, so the anchor-weight sweep in 22.9 is being read on a 
 
 WATCH ITEM on `vl_keep10`: `grad/norm/flow` rose 0.44 -> 1.86 across the first two evals. Every historical
 collapse spiked there first.
+
+## 23. THE COLLAPSE WAS `flow_hidden=512` — narrowing it fixed everything and broke every record (08-31/09-01)
+
+STATUS: `st_fh128` and `vl_l1x3` are RUNNING. Everything through 23.4 is settled.
+
+### 23.1 The finding, in one line
+
+**Every L1+LPIPS run that destroyed itself had `flow_hidden=512`. Setting it back to 128 — the model
+dimension, i.e. the stock width — fixed the collapse and broke every all-time record on this dataset.**
+
+| run | mix | `flow_hidden` | died | best @+128 | best floor |
+|---|---|---|---|---|---|
+| `dec_up64` | pure L2 | **128** | never (18 ev) | 0.2429 | 0.1432 |
+| `dec_unet32` | pure L2 | **128** | never (17 ev) | 0.2688 | 0.1881 |
+| `dyn512` | pure L2 | 512 | ev22 | 0.2392 | 0.1554 |
+| `vl_keep10` | L1+LPIPS | 512 | **ev12** | 0.1507 | 0.0945 |
+| `vl_lp025` | L1+0.25 LPIPS | 512 | **ev9** | 0.2084 | 0.2317 |
+| `dec_inject` | L1+LPIPS | 512 | **ev5** | 0.1709 | 0.1404 |
+| **`st_fh128`** | **L1+LPIPS** | **128** | **NO -- past ev15** | **0.1315** | **0.0887** |
+
+`st_fh128` is byte-identical to `vl_keep10` except that one number. `vl_keep10` was dead from ev12 and
+sat frozen through ev15; `st_fh128` sailed through ev12 and was STILL SETTING RECORDS at ev15:
+
+    ev11 floor 0.0939 @+128 0.1445 cos 0.352      <- vl_keep10 was already dead here
+    ev12 floor 0.0942 @+128 0.1444 cos 0.358
+    ev14 floor 0.0928 @+128 0.1386 cos 0.373
+    ev15 floor 0.0887 @+128 0.1315 cos 0.381      floor PSNR 19.49 dB
+
+Cumulative against the pre-LPIPS state of the art: **@+128 0.2392 -> 0.1315 (45% better)** and
+**floor 0.1432 -> 0.0887 (38% better)**. It is also the first run to hold floor PSNR above 19 dB at a
+sub-0.09 perceptual floor -- the pure-MSE runs reached 19.6 dB but only ever at floor ~0.17.
+
+NOTE `flow_hidden=512` was not a wasted experiment. Under PURE MSE it won @+128 by a hair over the
+narrow head (`dyn512` 0.2392 vs `dec_up64` 0.2429). It is only under the perceptual loss that it
+becomes fatal. Capacity that is harmless with one loss is lethal with another.
+
+### 23.2 Two rival explanations, both tested, both wrong
+
+* **`detach_every` 32 -> 8** (shorten the exploding Jacobian PRODUCT). It FROZE the model instead:
+  `grad/norm/flow` fell to **0.096** against the ~0.29 reference, `motion_ratio` to **0.018**, dynamics
+  loss stayed at 0.204 -- no explosion at all -- and it died at **ev9, THREE EVALS EARLIER** than the
+  base it was meant to protect. That is precisely the vanishing-Jacobian mode section 19 predicted:
+  "if ||J|| < 1 the 32-step product VANISHES rather than exploding... if it falls well BELOW the
+  control's ~0.29 rather than rising, the AR gradient has died." Truncating BPTT did not tame the
+  recurrent path, it starved it. LEAVE `detach_every` AT 32.
+* **The loss mix.** Falsified earlier (section 22.9): `visual_lpips=0.25` bought no time and cost three
+  epochs. Composition is not the stability lever.
+
+### 23.3 `latent_cos` IS NOT A COLLAPSE PREDICTOR -- tested and refuted
+
+Recorded because it was an explicit prediction that failed. At ev4 `dec_inject` had `cos` **0.458**, the
+highest of any arm, and was called "roughly twice as far from the failure boundary" as the base. It died
+at ev5. `dec_xattn`, with the LOWER cos (0.13-0.33), was the only arm that ever RECOVERED from a wobble
+(ev11 spiked to @+128 0.338 / cos 0.157, ev12 back to 0.179 / 0.305).
+
+There is NO leading indicator at eval granularity. The eval before death looks healthy every time:
+`vl_keep10` ev11 dyn 0.122 / cos 0.321 / clip 15.3; `dec_inject` ev4 dyn 0.134 / cos 0.458 / clip 32.
+The dynamics loss goes from ~0.13 to 19-30 between two evals with no warning at the epoch boundary.
+
+The one variable that ordered survival correctly was mean `clip_ratio` (dec_inject ~50 died ev5,
+vl_keep10 ~31 died ev12, dec_xattn ~26 survived) -- consistent with `flow_hidden` being the cause, since
+the wide head is what produced the oversized gradients in the first place. `gradient_clip_val` was NOT
+touched: the user's counter-reading (clipping was the only thing keeping those runs alive) fits the same
+data, and narrowing the head made the question moot.
+
+### 23.4 The decoder-conditioning features both LOST (measured, closed)
+
+Both built in `ea4a3d8`, both zero-init so they start bit-identical, both run on vl_keep10's loss:
+* `decode_inject` (+115,584 params): floor 0.1404 vs the base's 0.0945, @+128 0.1709 vs 0.1507. It DID
+  triple `latent_cos` (0.43 vs 0.11) -- then died at ev5, and cos turned out not to predict survival.
+* `decode_xattn_max_res=24` (+264,960): floor 0.1277, @+128 0.1788. Behind on everything, cos erratic.
+Neither beat the base on any metric that mattered. The literature review's "~zero evidence-backed
+headroom left in decoder architecture" was right. Do not re-run these without a new reason.
+
+### 23.5 `visual_l1=3.0` — parity, and the user's eyes were ahead of every metric
+
+vl64's `1.0/1.0` LOOKS balanced and is not. Measured on the trained codec: L1 = 0.0587,
+LPIPS-vgg = 0.1835, a **3.13:1** ratio, so the objective is **24% pixel / 76% perceptual**. At
+`visual_l1=3.0` it is 49/51. Quote it as "weighted 3:1 so the two terms contribute equally, measured on
+the trained codec"; do NOT write 3.13 (one measurement, one checkpoint, and the ratio drifts >4% over
+training).
+
+THE USER SAW THE PROBLEM BEFORE ANY METRIC DID -- they said the frames looked "perceptually weird af"
+while every number said the run was the best in the project's history. `_oneoff_colour_cast.py`
+(128 val frames, real encode->decode) found it:
+
+| | channel bias R/G/B | spread (tint) | saturation | MAE |
+|---|---|---|---|---|
+| `dyn512` (pure L2) | -0.0018 / -0.0017 / -0.0007 | 0.0011 | 0.985 matched | 0.0567 |
+| `vl_keep10` (L1+LPIPS) | **+0.0024 / -0.0026 / +0.0018** | **0.0050** (4.5x) | **1.100** | 0.0584 |
+
+IDENTICAL MAE, differently SHAPED error: a magenta cast (R,B up / G down) and **10% oversaturation**.
+LPIPS scores VGG features after several POOLING stages, so a global colour shift barely moves it, and
+oversaturating makes edges "pop" in feature space at almost no metric cost. The tint alone is ~1.3/255
+and probably invisible; the SATURATION is what the eye catches.
+
+`vl_l1x3` at matched eval 4 against `st_fh128`, everything else identical:
+
+| | floor | floor PSNR | @+128 | OL PSNR | latent_cos |
+|---|---|---|---|---|---|
+| `st_fh128` (l1=1) | 0.1056 | 18.48 | **0.1598** | 13.76 | 0.295 |
+| `vl_l1x3` (l1=3) | **0.1027** | **18.82** | 0.1628 | 13.76 | **0.523** |
+
+Better reconstruction AND `latent_cos` 0.523 -- the highest EVER on this dataset (prior best 0.481) --
+for 0.003 of @+128, well inside the 0.02-0.08 jitter. First loss change to buy tracking rather than
+sell it. But SIX EVALS; `st_fh128` remains the more-proven configuration.
+
+WHY RAISE L1 RATHER THAN LOWER LPIPS: lowering lpips also lowers TOTAL loss and therefore codec
+pressure, which is how `vl_lp025` wrecked its floor. Raising l1 does not.
+WHY NOT ADD L2 BACK: killed on arithmetic. A systematic 0.0025 bias against a 0.058 per-pixel error is
+4% of it under L1 and NEGLIGIBLE under L2 (b^2), so no squared term fixes a small global cast at any
+sane weight -- while dragging the loss back toward the blur regime.
+
+### 23.6 `conf/model/vl128.yaml`
+
+The recipe: `vl64` + `flow_hidden: 128` + `visual_l1: 3.0`. Its header states plainly which half is
+proven (flow_hidden, records + survived the collapse) and which is promising at six evals (l1=3.0), and
+lists the four dead ends above so nobody re-runs them. Set `visual_l1: 1.0` to reproduce `st_fh128`
+exactly, which is the safer configuration.
+
+Pass `data.autobatch=false data.batch=26` on the CLI: every number quoted here used batch 26, and
+autobatch would now pick a larger one because the flow head is 4x narrower -- silently adding a second
+variable.
+
+### 23.7 Queue
+
+1. **A SECOND CAMERA input + prediction head** (user, 09-01). `isaac-ronald-ward/robocasa-scene4-4h` now
+   carries all THREE RoboCasa cameras (`robot0_agentview_left`, `robot0_agentview_right`,
+   `robot0_eye_in_hand`) after `25dfe59` made the builder multi-camera; the loader already selected by
+   `data.cam` and needed no change. The wrist view is the interesting one -- it moves with the gripper,
+   so it carries manipulation detail the fixed scene view cannot.
+2. **`df_scale` -> 0.7** — the dynamics axis. Section 21 established our diffusion forcing already has
+   per-position random levels AND a learned Fourier level embedding; only the magnitude was ever small.
+3. **`num_tokens=64`** — section 21.2 has it OPEN, not null: killed on cost while leading at matched eval.
+4. **`visual_l1=5.0`** (62/38 pixel-dominant) if parity at 3.0 is not enough for the saturation.
+
+STILL THE WEAK HALF: the rollout. At matched eval the new runs sit at OL PSNR ~13.7-13.8 where the old
+pure-MSE narrow-head run (`dec_up64`) reached 14.9-15.4. The autoencoder improved far more than the
+dynamics did, and `latent_cos` (0.38-0.52) is the metric to watch there.
 
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
