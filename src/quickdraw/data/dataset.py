@@ -250,50 +250,83 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
     return frames
 
 
-def load_split_episodes_mm(root: str, split: str, img_size: int | tuple[int, int] | None = 128,
-                           cam: str = "fpv", repo_id: str = "torus"):
+def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_id: str = "torus"):
     """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled to img_size,
-    uint8), aligned 1:1 with obs steps. Returns list of (obs (T,D), act (T,A), img (T,H,W,3) uint8).
-    The chunked video is read in dataset row order (== obs row order), then split by episode_index.
-    The obs subset (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
+    uint8), aligned 1:1 with obs steps.
+
+    N CAMERAS. `cam` is a name OR a sequence of names, and `img_size` correspondingly one size or one per
+    camera (a single size is broadcast). Returns one list entry per episode:
+
+        (obs (T,D), act (T,A), img_cam0 (T,H,W,3) uint8, img_cam1, ...)
+
+    A SINGLE camera returns exactly the 3-tuples it always did, so every existing call site is unchanged
+    -- and a call site that reads `ep[2]` on a MULTI-camera load still gets camera 0, which is what makes
+    the evaluation routines keep working while they are migrated one at a time. `_subsample_episodes` is
+    already generic over the extra streams (it maps `ep[2:]`), so nothing there changes either.
+
+    The chunked video is read in dataset row order (== obs row order), then split by episode_index. The obs
+    subset (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    cams = [cam] if isinstance(cam, str) else list(cam)
+    sizes = ([img_size] * len(cams) if isinstance(img_size, (int, tuple)) or img_size is None
+             else list(img_size))
+    assert len(sizes) == len(cams), f"img_size/cam length mismatch: {len(sizes)} vs {len(cams)}"
 
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
     obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
     act_all = np.stack(hf["action"]).astype(np.float32)
-    frames_all = load_fpv_frames(root, split, size=img_size, cam=cam)      # (N, H, W, 3), row order
-    assert len(frames_all) == len(obs_all), f"{cam}/row count mismatch: {len(frames_all)} vs {len(obs_all)}"
+    per_cam = []
+    for c, sz in zip(cams, sizes):
+        fr = load_fpv_frames(root, split, size=sz, cam=c)                  # (N, H, W, 3), row order
+        assert len(fr) == len(obs_all), f"{c}/row count mismatch: {len(fr)} vs {len(obs_all)}"
+        per_cam.append(fr)
     return _subsample_episodes(
-        [(obs_all[ep_idx == e], act_all[ep_idx == e], frames_all[ep_idx == e]) for e in np.unique(ep_idx)],
-        f"{repo_id}/{split}+{cam}")
+        [(obs_all[ep_idx == e], act_all[ep_idx == e], *(fr[ep_idx == e] for fr in per_cam))
+         for e in np.unique(ep_idx)],
+        f"{repo_id}/{split}+{'+'.join(cams)}")
 
 
 class MMWindowLoader:
-    """The ONE GPU-resident window loader for every model. obs/act windows live on `device`; when an image
-    modality is present (`image_head` set) its FRAME store (uint8, ~3 GB at 128²) is held resident too and
-    gathered per batch by a pure GPU index (no host copy). PROPRIO-ONLY passes `image_head=None` -> no frames
-    are loaded or gathered (episodes are (obs, act) pairs). Yields {obs_seq (B,L,6), act_seq (B,L,2)[,
-    <image_head> (B,L,H,W,3) in [0,1]]}. Window order matches `stack_windows`, so all streams stay aligned."""
+    """The ONE GPU-resident window loader for every model. obs/act windows live on `device`; when image
+    modalities are present (`image_head` set) each one's FRAME store (uint8, ~3 GB at 128²) is held resident
+    too and gathered per batch by a pure GPU index (no host copy). PROPRIO-ONLY passes `image_head=None` ->
+    no frames are loaded or gathered (episodes are (obs, act) pairs).
+
+    N HEADS. `image_head` is a name OR a sequence of names; head i reads episode element `e[2 + i]`, which is
+    the order `load_split_episodes_mm` returns its cameras in. Yields {obs_seq (B,L,6), act_seq (B,L,2),
+    <head> (B,L,H,W,3) in [0,1] per head}. `win_idx` is SHARED across heads -- the same window indices apply
+    to every camera, because all streams come from the same episode row order -- so N heads cost N frame
+    stores but only one index tensor. Window order matches `stack_windows`, so all streams stay aligned."""
 
     def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device,
-                 image_head: str | None = None, stride: int = 1):
+                 image_head=None, stride: int = 1):
         L = P + F
-        self.image_head = image_head
+        heads = [] if image_head is None else ([image_head] if isinstance(image_head, str) else list(image_head))
+        self.image_head = image_head          # kept verbatim for any caller that inspects it
+        self.heads = heads
         obs_w, act_w = stack_windows([(e[0], e[1]) for e in episodes], P, F, normalizer, stride)
         self.obs, self.act = obs_w.to(device), act_w.to(device)
         self.frames = None
-        if image_head is not None:   # concat all episode frames -> one GPU uint8 store + per-window GLOBAL frame idx
-            frames, starts, off = [], [], 0
-            for e in episodes:
-                o, img = e[0], e[2]
-                frames.append(torch.from_numpy(img))
-                starts.extend(range(off, off + len(o) - L + 1, stride))   # stride matches stack_windows -> streams stay aligned
-                off += len(img)
-            self.frames = torch.cat(frames, 0).to(device)                    # (N_total,H,W,3) uint8, GPU-resident
-            starts = torch.tensor(starts, device=device)
-            self.win_idx = starts[:, None] + torch.arange(L, device=device)[None]
+        if heads:   # per head: concat all episode frames -> one GPU uint8 store; ONE shared per-window index
+            self.frames = {}
+            for i, h in enumerate(heads):
+                assert len(episodes[0]) > 2 + i, (
+                    f"image_head[{i}]={h!r} needs episode element {2 + i}, but episodes carry "
+                    f"{len(episodes[0])} elements -- load_split_episodes_mm was called with fewer cameras "
+                    f"than there are image modalities")
+                frames, starts, off = [], [], 0
+                for e in episodes:
+                    o, img = e[0], e[2 + i]
+                    frames.append(torch.from_numpy(img))
+                    starts.extend(range(off, off + len(o) - L + 1, stride))   # stride matches stack_windows
+                    off += len(img)
+                self.frames[h] = torch.cat(frames, 0).to(device)              # (N_total,H,W,3) uint8, resident
+                if i == 0:                                                    # identical for every head
+                    self.win_idx = torch.tensor(starts, device=device)[:, None] + \
+                                   torch.arange(L, device=device)[None]
         self.batch, self.shuffle, self.device = batch, shuffle, device
         self.N = self.obs.shape[0]
 
@@ -306,7 +339,9 @@ class MMWindowLoader:
             j = order[i: i + self.batch]
             out = {"obs_seq": self.obs.index_select(0, j), "act_seq": self.act.index_select(0, j)}
             if self.frames is not None:
-                out[self.image_head] = self.frames[self.win_idx.index_select(0, j)].float().div_(255.0)  # GPU gather
+                wi = self.win_idx.index_select(0, j)                          # shared across heads
+                for h in self.heads:
+                    out[h] = self.frames[h][wi].float().div_(255.0)            # GPU gather, per head
             yield out
 
 

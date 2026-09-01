@@ -30,6 +30,12 @@ def _mlp(i: int, o: int, h: int) -> nn.Sequential:
 class ModalitySpec:
     name: str
     kind: str           # "vector" | "image"
+    cam: str | None = None  # IMAGE modalities: which camera stream feeds this head. None -> fall back to
+    #                         `data.cam`, so every single-camera config is unchanged. The field exists
+    #                         because the modality NAME and the camera NAME are independent: a head called
+    #                         "wrist" can read `robot0_eye_in_hand` without forcing that string into every
+    #                         metric key. With N image modalities each MUST name its own camera -- there is
+    #                         no meaningful default once there is more than one.
     weight: float = 1.0     # per-head reconstruction-loss weight
     noise_std: float = 0.0  # per-stream input noise sigma (training only; the variations design's per-stream sigma)
     decode_kind: str = "mse"  # "mse" (deterministic decode, bit-identical to before) | "flow" (generative
@@ -494,5 +500,14 @@ def make_modality(spec: ModalitySpec, d: int) -> Modality:
 
 
 def build_modalities(specs: list[ModalitySpec], d: int) -> nn.ModuleDict:
-    """Ordered name -> Modality. Iteration order = registry order = token-bag layout = log-key order."""
+    """Ordered name -> Modality. Iteration order = registry order = token-bag layout = log-key order.
+
+    The uniqueness assert is not decoration: this is a dict comprehension, so two specs sharing a name
+    would SILENTLY OVERWRITE each other -- you would get one modality, a shorter token bag than the config
+    describes, and a loader yielding a batch key nothing consumes. Cheap to hit when copy-pasting an image
+    entry to add a second camera, which is exactly what N-camera configs require."""
+    names = [s.name for s in specs]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    assert not dup, (f"duplicate modality name(s) {dup} in {names} -- names are the token-bag layout AND the "
+                     f"log-key namespace AND the loader's batch keys, so they must be unique")
     return nn.ModuleDict({s.name: make_modality(s, d) for s in specs})

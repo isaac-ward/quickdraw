@@ -803,15 +803,32 @@ def window_loaders(cfg, norm: Normalizer):
     P, F = cfg.data.P, cfg.data.F
     root = resolve_data_root(cfg)
     specs = _modality_specs(cfg)
-    img = next((s for s in specs if s.kind == "image"), None)   # image modality (if any) -> resident frame store
-    cam, repo = str(cfg.data.get("cam", "fpv")), str(cfg.data.get("repo_id", "torus"))
+    # EVERY image modality gets its own camera stream. This used to be `next(... kind == "image")`, which
+    # took the FIRST image spec and silently ignored the rest: a second image modality was BUILT in the
+    # model but never LOADED, so lit.py's `obs[name] = batch[name]` KeyError'd at step 0 -- nothing at
+    # config time said anything was wrong. See design/two_camera_plan.md.
+    imgs = [sp for sp in specs if sp.kind == "image"]
+    repo = str(cfg.data.get("repo_id", "torus"))
+    default_cam = str(cfg.data.get("cam", "fpv"))
+    cams = [str(getattr(sp, "cam", None) or default_cam) for sp in imgs]
+    # With ONE image modality an unset `cam` falls back to data.cam, so every existing config is unchanged.
+    # With several, falling back would silently point two heads at the SAME camera -- a head scored against
+    # another camera's frames is a plausible WRONG number rather than a crash, which is worse. So require it.
+    if len(imgs) > 1:
+        missing = [sp.name for sp in imgs if not getattr(sp, "cam", None)]
+        assert not missing, (f"{len(imgs)} image modalities but {missing} have no `cam:` -- with more than one "
+                             f"image head each must name its own camera, or they all read data.cam="
+                             f"{default_cam!r} and the extra heads are scored against the wrong frames")
+        assert len(set(cams)) == len(cams), f"two image modalities share a camera: {list(zip([s.name for s in imgs], cams))}"
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
-        if img is not None:
-            eps = load_split_episodes_mm(root, split, img_size=img.img_size, cam=cam, repo_id=repo)
-            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, image_head=img.name, stride=stride)
+        if imgs:
+            eps = load_split_episodes_mm(root, split, img_size=[sp.img_size for sp in imgs],
+                                         cam=cams, repo_id=repo)
+            loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev,
+                                            image_head=[sp.name for sp in imgs], stride=stride)
         else:                                                    # proprio-only: (obs, act) pairs, no camera frames
             eps = load_split_episodes(root, split, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
