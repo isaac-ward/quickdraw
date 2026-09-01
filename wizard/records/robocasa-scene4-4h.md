@@ -1800,6 +1800,27 @@ loss and will BOTH ghost, so the anchor-weight sweep in 22.9 is being read on a 
 
 ### 22.9 Queue
 
+0. **`visual_l1=3.0` with `visual_lpips=1.0`** (PINNED 2026-09-01). Currently 1.0/1.0, which is NOT balanced:
+   measured on `vl_keep10`'s own checkpoint the terms are L1 0.0587 and LPIPS-vgg 0.1835, so the objective is
+   **24% pixel / 76% perceptual**. At `l1=3.0` it is 49/51 -- state it as "weighted 3:1 so the pixel and
+   perceptual terms contribute equally, measured on the trained codec". DO NOT write 3.13: the third digit is
+   one measurement on one checkpoint and the ratio drifts more than 4% during training.
+   MOTIVATION, measured (`_oneoff_colour_cast.py`, 128 val frames, real encode->decode):
+
+   | | channel bias R/G/B | tint (spread) | saturation | MAE |
+   |---|---|---|---|---|
+   | `dyn512` (pure L2) | -0.0018 / -0.0017 / -0.0007 | 0.0011 | 0.985 matched | 0.0567 |
+   | `vl_keep10` (L1+LPIPS) | **+0.0024 / -0.0026 / +0.0018** | **0.0050** (4.5x) | **1.100** | 0.0584 |
+
+   Same MAE, differently SHAPED error: a magenta cast (R,B up / G down) and **10% oversaturation**. LPIPS
+   scores VGG features, which barely move under a global colour shift, and oversaturating makes edges "pop"
+   in feature space at almost no metric cost. The tint itself is ~1.3/255 and probably invisible; the
+   SATURATION is the part the user could see. NOTE this also kills the "add L2 back" idea: a 0.0025 bias
+   against a 0.058 per-pixel error is 4% under L1 and negligible under L2, so no squared term fixes a small
+   global cast at any sane weight. Raising L1 (rather than lowering LPIPS) is the right direction because it
+   raises pixel pressure WITHOUT lowering total pressure -- which is how `vl_lp025` wrecked its floor.
+   `l1=5.0` (62/38, pixel-dominant) is the follow-up if parity is not enough.
+
 1. **`latent_loss_weight=25` on the `vl_keep10` base** -- the knob has never been swept upward, and 22.6 makes
    it the highest-EV single run available. Watch for the OPPOSITE failure: an over-anchored encoder pinned to
    being a good autoencoder at the expense of being predictable, which would show as a good floor with rising
