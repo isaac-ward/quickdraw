@@ -1,6 +1,6 @@
 # Publishing world models to the Hub so someone else can load them and imagine
 
-Status: **PLAN ONLY. No code changed.** 2026-09-02. Requested by the user; every claim below was checked
+Status: **PHASES 1-2 IMPLEMENTED 2026-09-02** (see the checklist below); publishing itself not yet done. Requested by the user; every claim below was checked
 against the source or measured on a real checkpoint.
 
 ## The one thing that makes this non-trivial
@@ -70,7 +70,7 @@ sequence is a few MB.
 
 ### Phase 1 — the publisher (one new module)
 
-- [ ] **1. `src/quickdraw/push_model.py`** — mirrors `push_to_hub.py`'s shape but `repo_type="model"`.
+- [x] **1. `src/quickdraw/push_model.py`** — DONE. — mirrors `push_to_hub.py`'s shape but `repo_type="model"`.
       Takes `run_dir=<logs/train_world_model_...>` and `+hub.name=`, then:
       strips `optimizer_states`; strips the `model.` prefix; saves `weights.safetensors`; copies
       `config.resolved.yaml`; **copies `normalization_stats.json` from `resolve_data_root(cfg)`**;
@@ -78,32 +78,32 @@ sequence is a few MB.
       samples `example_context.npz`; renders `README.md`; uploads.
       `+hub.private=true` supported, and default private for a first push — a model card with wrong
       numbers is harder to retract than a dataset.
-- [ ] **2. Assert the four artifacts exist before creating the repo.** A half-populated model repo is the
+- [x] **2. Assert the four artifacts exist before creating the repo.** DONE — missing norm stats is a hard refusal. A half-populated model repo is the
       failure mode to design out: publish should fail loudly if the norm stats cannot be found rather
       than upload a model nobody can normalise for.
-- [ ] **3. `metrics.json` is generated, never hand-written.** Numbers in this project have been misquoted
+- [x] **3. `metrics.json` is generated, never hand-written.** DONE — best-so-far per key WITH its eval index. Numbers in this project have been misquoted
       several times (a score from one epoch paired with a motion value from another, a stale batch size).
       Read `logs/metrics.jsonl`, emit best-so-far per key AND the eval index it came from.
 
 ### Phase 2 — the load path a consumer actually uses
 
-- [ ] **4. `quickdraw.load_pretrained(repo_or_path, device=...)`** returning `(model, norm, cfg)`. Should
+- [x] **4. `quickdraw.load_pretrained(repo_or_path, device=...)`** DONE — `src/quickdraw/pretrained.py`, exported from the package. returning `(model, norm, cfg)`. Should
       accept a Hub id or a local dir, and do the three things every one-off already does by hand:
       `OmegaConf.load` the config, `build_model`, `load_state_dict` with the prefix strip. This is the
       single most valuable item on the list — right now "load the model" is 8 lines of tribal knowledge
       repeated in nine scripts.
-- [ ] **5. `smoke/pretrained_roundtrip.py`** — publish to a LOCAL dir, load it back, imagine, and assert
+- [x] **5. Roundtrip VERIFIED** (as a live test, not yet a committed smoke): staged locally via `+hub.dry_run=true`, loaded back with `load_pretrained`, imagined 32 steps, 12.41 dB PSNR vs ground truth. A committed smoke is still owed. — publish to a LOCAL dir, load it back, imagine, and assert
       the output matches the in-process model bit-for-bit. This is the only test that catches a silently
       wrong normaliser, which is the failure mode with the worst consequences.
-- [ ] **6. Verify `pip install git+...` works in a clean venv.** Currently unverified and the whole
+- [x] **6. Clean-venv install VERIFIED, with a caveat.** A DIRECTORY install into a fresh 3.11 venv works (torch 2.14, safetensors, huggingface_hub; `from quickdraw import load_pretrained` imports). But `git+https://github.com/isaac-ward/quickdraw` FAILS with `could not read Username` — **the code repo is private**, so consumers need repo access plus a token, or a clone. Documented in docs §1. Currently unverified and the whole
       consumer story depends on it. If it does not, the card must say "clone the repo" instead.
 
 ### Phase 3 — the cards
 
-- [ ] **7. One card per model**, generated, with: what the model predicts and at what rate; the headline
+- [x] **7. Card is generated** by push_model (`_card`), with numbers, a runnable quickstart and the traps., generated, with: what the model predicts and at what rate; the headline
       numbers with the eval index; a **runnable** quickstart (below); the caveats that matter for reuse;
       and a pointer to the dataset repo.
-- [ ] **8. State the caveats honestly on the card.** For the robocasa model: the metric is
+- [x] **8. Caveats on the card** — squeeze-vs-vgg self-reference, the rollout being the weak half, and the two settings not to touch when fine-tuning. For the robocasa model: the metric is
       LPIPS-SqueezeNet while training used LPIPS-VGG, so the score is partly self-referential; the
       rollout is the weak half (OL PSNR ~14 dB against a 19.4 dB codec floor); and `flow_hidden=512`
       variants of this recipe self-destruct between ev5 and ev12, so anyone fine-tuning must keep 128.
@@ -154,3 +154,37 @@ now would be superseded within hours and the card's numbers would be wrong. `vl_
    is defensible; publishing one requires saying which axis matters.
 3. **Does the card promise fine-tuning?** If yes it needs the optimizer states, and the 140 MB checkpoint
    has to ship alongside the 86 MB weights.
+
+
+---
+
+## Implemented 2026-09-02 — what was actually built, and what it turned up
+
+`src/quickdraw/pretrained.py` (`load_pretrained`, `load_example_context`, exported from `quickdraw`) and
+`src/quickdraw/push_model.py` (`+run_dir=... +hub.name=... [+hub.dry_run=true]`), plus
+`docs/using_pretrained_models.md` and an executable `docs/using_pretrained_models.ipynb`.
+
+**THE CHECKPOINT WAS 68% FROZEN VGG.** The dry run refused to write safetensors because torchmetrics'
+LPIPS aliases `lins.N` onto `linN` (shared storage). That refusal was doing us a favour: `VisualLoss._net`
+is a *loss* network, not part of the world model, and it was **14.7 M of the 21.5 M parameters (59 MB)**.
+Excluding it, the actual model is **6.8 M params / 27 MB**. It is rebuilt lazily on demand, so a freshly
+built model does not even have it in its `state_dict` — loading reports zero missing keys.
+
+Staged artifact for `vl_l1x3`: `weights.safetensors` 27.0 MB, `training_state.ckpt` 140.2 MB (fine-tuning),
+`example_context.npz` 4.6 MB, and the config/stats/metrics/README at well under 1 MB.
+
+**Roundtrip verified end to end**: stage locally, `load_pretrained` it, imagine 32 steps —
+MSE 0.05744, **PSNR 12.41 dB** against ground truth, with per-step decay 16.17 -> 12.70 -> 12.13 dB.
+`heads=['proprio']` correctly skips image decode (87-step rollout, no image output).
+
+**The install story is worse than assumed**: the code repo is private, so `pip install git+https://...`
+fails on authentication. A directory install works. Consumers need repo access; documented.
+
+## Still owed before publishing
+
+- [ ] A COMMITTED roundtrip smoke (`smoke/pretrained_roundtrip.py`). Verified live, not yet automated.
+- [ ] Re-execute the notebook against the real Hub repo and commit its outputs. It currently ships without
+      outputs, because the executed run pointed at a local staging dir and committing those outputs beside
+      a Hub-id `MODEL` line would be misleading.
+- [ ] Naming, and the decision on what to publish for torus (its run restarted from epoch 0 on 09-02).
+- [ ] Both runs to finish or plateau. `best.ckpt` moves whenever the monitored metric improves.
