@@ -68,45 +68,39 @@ sequence is a few MB.
 
 ## Implementation checklist
 
-### Phase 1 — the publisher (one new module)
+### Phase 1 — the publisher
 
-- [x] **1. `src/quickdraw/push_model.py`** — DONE. — mirrors `push_to_hub.py`'s shape but `repo_type="model"`.
-      Takes `run_dir=<logs/train_world_model_...>` and `+hub.name=`, then:
-      strips `optimizer_states`; strips the `model.` prefix; saves `weights.safetensors`; copies
-      `config.resolved.yaml`; **copies `normalization_stats.json` from `resolve_data_root(cfg)`**;
-      writes `metrics.json` from the run's `metrics.jsonl` (best-so-far per key, not last);
-      samples `example_context.npz`; renders `README.md`; uploads.
-      `+hub.private=true` supported, and default private for a first push — a model card with wrong
-      numbers is harder to retract than a dataset.
-- [x] **2. Assert the four artifacts exist before creating the repo.** DONE — missing norm stats is a hard refusal. A half-populated model repo is the
-      failure mode to design out: publish should fail loudly if the norm stats cannot be found rather
-      than upload a model nobody can normalise for.
-- [x] **3. `metrics.json` is generated, never hand-written.** DONE — best-so-far per key WITH its eval index. Numbers in this project have been misquoted
-      several times (a score from one epoch paired with a motion value from another, a stale batch size).
-      Read `logs/metrics.jsonl`, emit best-so-far per key AND the eval index it came from.
+- [x] **1. `src/quickdraw/push_model.py`** — mirrors `push_to_hub.py` but `repo_type="model"`.
+      `+run_dir=... +hub.name=... [+hub.private=true] [+hub.dry_run=true] [+hub.ckpt=<path>]`.
+- [x] **2. Refuse to publish an incomplete repo.** Missing `normalization_stats.json` is a hard assert,
+      not a warning: a model nobody can normalise for produces plausible-but-wrong rollouts.
+- [x] **3. `metrics.json` generated, never hand-written** — best-so-far per key WITH the eval index it
+      came from, read from the run's own `metrics.jsonl`.
 
-### Phase 2 — the load path a consumer actually uses
+### Phase 2 — the load path
 
-- [x] **4. `quickdraw.load_pretrained(repo_or_path, device=...)`** DONE — `src/quickdraw/pretrained.py`, exported from the package. returning `(model, norm, cfg)`. Should
-      accept a Hub id or a local dir, and do the three things every one-off already does by hand:
-      `OmegaConf.load` the config, `build_model`, `load_state_dict` with the prefix strip. This is the
-      single most valuable item on the list — right now "load the model" is 8 lines of tribal knowledge
-      repeated in nine scripts.
-- [x] **5. Roundtrip VERIFIED** (as a live test, not yet a committed smoke): staged locally via `+hub.dry_run=true`, loaded back with `load_pretrained`, imagined 32 steps, 12.41 dB PSNR vs ground truth. A committed smoke is still owed. — publish to a LOCAL dir, load it back, imagine, and assert
-      the output matches the in-process model bit-for-bit. This is the only test that catches a silently
-      wrong normaliser, which is the failure mode with the worst consequences.
-- [x] **6. Clean-venv install VERIFIED, with a caveat.** A DIRECTORY install into a fresh 3.11 venv works (torch 2.14, safetensors, huggingface_hub; `from quickdraw import load_pretrained` imports). But `git+https://github.com/isaac-ward/quickdraw` FAILS with `could not read Username` — **the code repo is private**, so consumers need repo access plus a token, or a clone. Documented in docs §1. Currently unverified and the whole
-      consumer story depends on it. If it does not, the card must say "clone the repo" instead.
+- [x] **4. `quickdraw.load_pretrained(repo_or_path, device=...) -> (model, norm, cfg)`** —
+      `src/quickdraw/pretrained.py`, exported from the package, accepts a Hub id or a local dir.
+      Plus `load_example_context()`.
+- [x] **5. Roundtrip verified** — staged with `+hub.dry_run=true`, loaded back, imagined 32 steps:
+      MSE 0.05744, **PSNR 12.41 dB** vs ground truth, per-step decay 16.17 -> 12.70 -> 12.13 dB.
+      Verified LIVE, not yet as a committed smoke — that is still owed.
+- [x] **6. Clean-venv install verified, with a caveat.** A DIRECTORY install into a fresh 3.11 venv works
+      (torch 2.14, safetensors, huggingface_hub; `from quickdraw import load_pretrained` imports).
+      But `git+https://github.com/isaac-ward/quickdraw` FAILS with `could not read Username` — **the code
+      repo is private.** Consumers need repo access plus a token, or a clone. Documented in docs §1.
 
-### Phase 3 — the cards
+### Phase 3 — the cards and docs
 
-- [x] **7. Card is generated** by push_model (`_card`), with numbers, a runnable quickstart and the traps., generated, with: what the model predicts and at what rate; the headline
-      numbers with the eval index; a **runnable** quickstart (below); the caveats that matter for reuse;
-      and a pointer to the dataset repo.
-- [x] **8. Caveats on the card** — squeeze-vs-vgg self-reference, the rollout being the weak half, and the two settings not to touch when fine-tuning. For the robocasa model: the metric is
-      LPIPS-SqueezeNet while training used LPIPS-VGG, so the score is partly self-referential; the
-      rollout is the weak half (OL PSNR ~14 dB against a 19.4 dB codec floor); and `flow_hidden=512`
-      variants of this recipe self-destruct between ev5 and ev12, so anyone fine-tuning must keep 128.
+- [x] **7. Card generated by `push_model._card`** — what it predicts, the headline numbers with eval
+      indices, a runnable quickstart, the three traps, and the fine-tuning notes.
+- [x] **8. Caveats stated on the card** — squeeze-vs-vgg self-reference, the rollout being the weaker
+      half, and the two settings not to touch when fine-tuning (`flow_hidden` 128, `latent_loss_weight` 10).
+- [x] **9. `docs/using_pretrained_models.md`** — install, load, imagine, the traps, how to read a card,
+      which checkpoint you get and why, and a troubleshooting table.
+- [x] **10. `docs/using_pretrained_models.ipynb`** — 14 cells, executes clean: load, imagine, score
+      against ground truth, render a pred-vs-truth strip, cheap proprio-only long rollout, read
+      `metrics.json`.
 
 ## The quickstart the card must contain
 
