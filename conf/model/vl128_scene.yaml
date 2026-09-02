@@ -1,0 +1,73 @@
+# =============================================================================================
+# vl128_scene — vl128 on swoosh-data/lego_assemblies, ONE camera (scene-right).
+# Select with `model=vl128_scene data=lego`. Inherits vl128 (= vl64 + flow_hidden 128 + visual_l1 3.0).
+#
+# Changes ONLY what this dataset forces:
+#   * proprio dim 6 -> 34         (the 6D-encoded bimanual xArm7 state; see conf/data/lego.yaml)
+#   * image head `image` -> `scene_right`   (so a multicamera arm can be scored on the same key)
+#   * img_size 128 -> [128, 224]  (these cameras are 16:9; see below)
+#
+# WHY THIS SUPERSEDES vl64_scene. Every lego run before this passed `model.diffusion.flow_hidden=512`
+# on the CLI, because vl64's header says "every number quoted above used it". Record §23 established
+# that this is the collapse cause: `st_fh128` is byte-identical to `vl_keep10` except that one number,
+# and it survived past ev15 while breaking every record. On lego the same wide head produced the
+# CONSTANT-IMAGE collapse in wizard/records/lego.md §12 -- prediction across-frame std 0.000335 against
+# the ground truth's 0.068056, a codec worse than a constant-image predictor. flow_hidden comes from
+# vl128 as 128 and MUST NOT be overridden back to 512.
+#
+# img_size IS [128, 224], NOT a bare 128. A bare int means SQUARE (dataset.py `hw = (size, size)`) and
+# these cameras are 16:9, so a bare 128 trains on a 1.78x horizontally squashed scene. 224 rather than
+# the exact 227.6 because the conv pyramid downsamples by 2^log2(short_side//bottleneck) = 16, so BOTH
+# sides must divide by 16: 224/16 = 14 exactly, 228/16 = 14.25 would truncate silently. Aspect error
+# 1.6% against 78% before. The short side stays 128 so it pairs with the DEFAULT ae_bottleneck of 8.
+#
+# NOTE THE CAPACITY COST of the wider frame, because it is a live risk on THIS dataset: 128x224 =
+# 28,672 px into a 32x128 = 4,096-float bag is 7.0 px/float, against 2.25 on robocasa-vl64 at 96px --
+# 3.1x harder. It is not the binding constraint yet (this architecture proved 18.7-20.4 dB at
+# 128px/bott-8 on robocasa and lego is 3+ dB below that), but it becomes one as soon as the collapse is
+# fixed, which is why `num_tokens: 64` is a queued follow-up rather than a speculative default.
+#
+# STILL TO PASS ON THE CLI:
+#     data=lego  data.root=logs/recording_<ts>_lego  data.repo_id=lego
+#     environments=recorded  environments.obs_dim=34  environments.action_dim=20
+#     environments.position_idx=[0,1,2]  model.action_dim=20
+#     data.autobatch=false  data.batch=26   <- vl128's header: every §23 number used batch 26, and
+#                                              autobatch would pick a larger one now the flow head is
+#                                              4x narrower, silently adding a second variable.
+#     DO NOT pass model.diffusion.flow_hidden -- vl128 sets it to 128 deliberately.
+#
+# THE TRIPWIRE for this dataset: `eval_ae_floor/scene_right/motion_ratio_mean` ~= 0.02 means the codec
+# has collapsed to a still image. It is far more specific than PSNR, which sat at a plausible-looking
+# 15.4 dB "floor" for three runs while the codec emitted one frozen frame. Note `latent_cos` is NOT a
+# collapse predictor -- record §23.3 tested and refuted that.
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them.
+  - {name: proprio, kind: vector, dim: 34, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  #   34 = 2 arms x [tcp_xyz(3) 6d_rotation(6) j1..j7(7) gripper(1)]. The 6D block replaces raw rpy,
+  #   which wraps 702/802 times per arm on this data. Encoded in the PROCESSOR, so nothing downstream
+  #   touches an Euler angle.
+  - {name: scene_right, kind: image, weight: 1.0, img_size: [128, 224],
+     pretrained: false,
+     num_tokens: 32,
+     encode_arch: conv,
+     encode_base: 32,
+     decode_kind: mse,
+     decode_arch: up,
+     decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64,
+     visual_l1: 3.0,          # from vl128: parity with the perceptual term (measured 3.13:1 on the
+     #                          trained codec = 24% pixel / 76% perceptual at l1=1.0; 3.0 makes it 49/51).
+     visual_l2: 0.0,
+     visual_lpips: 1.0,
+     visual_lpips_net: vgg,
+     visual_frames: 128,
+     latent_loss_weight: 10}  # DO NOT MOVE. Bracketed on both sides, and lego.md §12 measured why
+     #                          moving it cannot help while the codec is collapsed: the encoder's
+     #                          gradient was 0.005 against the decoder's 53.3, so the anchor's pressure
+     #                          reaches the encoder through a dead Jacobian at ANY weight.

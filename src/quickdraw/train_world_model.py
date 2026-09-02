@@ -314,7 +314,14 @@ def main(cfg):
     # so we pin devices=1 rather than let Lightning auto-pick DDP across both H100s.
     # enable_progress_bar=False: no tqdm; ProgressPrinter emits plain per-epoch lines instead.
     trainer = L.Trainer(max_epochs=cfg.trainer.max_epochs, precision=cfg.trainer.precision,
-                        accelerator="gpu", devices=1, gradient_clip_val=1.0, enable_progress_bar=False,
+                        accelerator="gpu", devices=1, enable_progress_bar=False,
+                        # gradient_clip_val was HARDCODED at 1.0. Exposed (default unchanged, so every
+                        # existing recipe is bit-identical) because on lego_assemblies the anchor's
+                        # gradient at init measures enc 380 / dec 618, so a clip of 1.0 truncates 50-900x
+                        # from step 0 and the surviving unit-norm direction is decoder-dominated -- a
+                        # candidate mechanism for the encoder never learning to encode. Untestable while
+                        # the value could not be changed.
+                        gradient_clip_val=float(cfg.trainer.get("gradient_clip_val", 1.0) or 0.0) or None,
                         accumulate_grad_batches=int(cfg.trainer.get("accumulate_grad_batches", 1)),  # effective
                         #  batch = data.batch x this; use it to keep a large effective batch when the per-step
                         #  micro-batch is memory-bound (no batchnorm here, so it's gradient-equivalent).

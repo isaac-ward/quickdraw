@@ -467,6 +467,40 @@ healthy 0.17–0.27 is from a CONVERGED run — so clipping alone does not separ
 more specific than PSNR — PSNR looked like a plausible 15.4 dB "codec floor" for three runs while the
 codec was emitting a still image.
 
+## 13. flow_hidden=128 does NOT transfer. CAPACITY does — `num_tokens=64` is the first thing to move the floor
+
+Screen of vl128_scene on lego (4 epochs x 600 batches, evals at 1 and 3, autobatch on).
+
+| config | ep | motion | **ae_psnr** | val_psnr | proprio mm |
+|---|---|---|---|---|---|
+| base (l1=3, tok32, bott8) | 1 / 3 | 0.0386 / 0.0320 | 15.22 / 15.35 | 15.38 / 15.71 | 124 / 139 |
+| `visual_l1=1.0` (= st_fh128) | 1 / 3 | 0.0337 / 0.0311 | 15.38 / 15.26 | 15.71 / 15.86 | 120 / 117 |
+| **`num_tokens=64`** | 1 | 0.0396 | **17.58** | **16.88** | 138 |
+| *flow_hidden=512 reference* | | *0.0231* | *15.44* | | |
+
+**FINDING 1: the robocasa fix does not transfer.** `flow_hidden=128` broke every record on sim; on real
+data it leaves the floor at 15.2-15.4 dB, indistinguishable from `flow_hidden=512`'s 15.44. Both loss
+balances (l1=1 and l1=3) sit on the same wall, and motion_ratio DECREASES across epochs (0.0386 → 0.0320)
+— drifting toward collapse, not away.
+
+**FINDING 2: capacity IS binding, and I said it was not.** `num_tokens` 32 → 64 moved the AE floor
+**+2.2 dB** — the first movement in that number across ~10 runs. Both the subagent's analysis and my own
+summary said capacity "only binds after the collapse is fixed" and that `ae_bottleneck`/`num_tokens` were
+the wrong first levers. That was wrong, and the arithmetic was available the whole time: lego is
+128x224 = 28,672 px through the same 32x128 token bag as robocasa's 96px = 9,216 px, i.e. **7.0 px/float
+against 2.25 — 3.1x harder**. The subagent computed that number and we both filed it as "not the binding
+constraint yet".
+
+Still open at this point: motion_ratio is 0.0396, better than the 0.0231 collapsed reference but far from
+healthy, so `tok64` has raised the ceiling without yet proving the codec tracks motion. `bott16` has no
+eval point. `tok64+bott16` and `l1=5` are running.
+
+**Process lesson worth more than any of the above:** six earlier screen runs died at the epoch-0 eval
+because `data.autobatch=false data.batch=26` was copied from vl128's header, where 26 was calibrated at
+96px square. At 128x224 the train step fit at 93.87 GiB and the eval's LPIPS pass OOMed. Pinning the
+batch also disabled the one mechanism that probes eval memory. **Do not transplant a batch size across
+resolutions; let autobatch size it, and cap the eval with `eval.decode_chunk` when it is tight.**
+
 ## 11. Eval cadence — raise it, and Arm B is why
 
 Asked by the user (2026-08-31): *can we eval more often, epoch 1 3 5?*
