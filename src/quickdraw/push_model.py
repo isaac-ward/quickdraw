@@ -130,164 +130,135 @@ def _example_context(cfg, n_eps: int = 4, steps: int = 96) -> dict | None:
     return out
 
 
-def _frame_strip(model, norm, cfg, ctx_np: dict, head: str, out_png: str, horizon: int = 48) -> dict | None:
-    """Render a pred-vs-truth strip from the PUBLISHED checkpoint and save it next to the card.
+def _logged_products(run_dir: str, ckpt_path: str, dest: str) -> dict:
+    """Copy the run's OWN logged eval artifacts for the PUBLISHED checkpoint's epoch.
 
-    Exists because a card that says "imagines the frames that follow" and shows only a good LPIPS number
-    oversells the model. On these checkpoints the prediction is faithful for the first few steps and then
-    holds the original viewpoint while the truth pans away, which is visible instantly in a strip and
-    invisible in a scalar. Fail-soft: a card without a picture is worse than no card, but a failed publish
-    is worse still.
+    Ships what the evaluation actually produced rather than an ad-hoc re-render. Better three ways: it is
+    the canonical artifact (the same picture the run was judged on), it covers the FULL eval horizon
+    (+1..+128, where a hand-rolled strip covered 48 steps on two episodes and led me to overstate a
+    failure mode), and it includes the error-vs-step curve and a rollout video for free.
+
+    Returns {name: relative filename} for whatever was found; missing products are simply omitted.
     """
+    m = re.search(r"epoch=(\d+)", os.path.basename(ckpt_path))
+    if not m:
+        return {}
+    ep = int(m.group(1))
+    base = os.path.join(run_dir, "logs", f"epoch_{ep:04d}", "eval_ood_horizon", "open_loop")
+    if not os.path.isdir(base):
+        print(f"[push_model] no logged eval products for epoch {ep} at {base}", flush=True)
+        return {}
+    head = next((d for d in sorted(os.listdir(base)) if d != "proprio"), None)
+    if head is None:
+        return {}
+    src = os.path.join(base, head)
+    want = {"filmstrip.png": "filmstrip_0.png",
+            "filmstrip_2.png": "filmstrip_1.png",
+            "error_vs_step.png": "error_vs_step_avg_log.png",
+            "rollout.mp4": "rollout_0.mp4"}
+    out = {}
+    for newname, orig in want.items():
+        p = os.path.join(src, orig)
+        if os.path.exists(p):
+            shutil.copy2(p, os.path.join(dest, newname))
+            out[newname] = newname
+    print(f"[push_model] logged eval products from epoch {ep}: {sorted(out)}", flush=True)
+    return {"epoch": ep, "head": head, "files": out}
+
+
+def _versions() -> dict:
+    """The quickdraw version and git commit the weights were produced by, so a consumer can pin it.
+
+    `pyproject.toml`'s version has never been bumped (0.1.0), so on its own it identifies nothing -- the
+    COMMIT is the useful pin, and the card prints an install line using it.
+    """
+    out = {}
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import torch as _t
-        dev = next(model.parameters()).device
-        P = int(cfg.data.P)
-        n = min(2, ctx_np["obs"].shape[0])
-        ctx = {"proprio": norm.norm_obs(_t.from_numpy(ctx_np["obs"][:n, :P])).float().to(dev),
-               head: _t.from_numpy(ctx_np[f"frames__{head}"][:n, :P]).float().div(255).to(dev)}
-        acts = norm.norm_act(_t.from_numpy(ctx_np["act"][:n, :P + horizon - 1])).float().to(dev)
-        with _t.no_grad():
-            out = model.imagine_eval(ctx, acts, horizon=horizon, decode_chunk=8)
-        pred = out[head].clamp(0, 1).float().cpu().numpy()
-        gt = ctx_np[f"frames__{head}"][:n, P:P + horizon].astype("float32") / 255.0
-        ts = [0, 4, 11, 23, 35, horizon - 1]
-        ts = sorted({t for t in ts if t < horizon})
-        rows = 2 * n
-        fig, ax = plt.subplots(rows, len(ts), figsize=(1.9 * len(ts), 2.0 * rows))
-        ax = np.atleast_2d(ax)
-        for e in range(n):
-            for k, src in ((0, pred[e]), (1, gt[e])):
-                r = 2 * e + k
-                for j, t in enumerate(ts):
-                    ax[r, j].imshow(src[t]); ax[r, j].set_xticks([]); ax[r, j].set_yticks([])
-                    if r == 0:
-                        ax[r, j].set_title(f"+{t + 1}", fontsize=9)
-                ax[r, 0].set_ylabel(("imagined" if k == 0 else "truth") + f"\nep{e}", fontsize=8)
-        fig.suptitle("open-loop imagination vs ground truth", fontsize=11)
-        plt.tight_layout(); plt.savefig(out_png, dpi=100, bbox_inches="tight"); plt.close(fig)
-        mse = float(((pred - gt) ** 2).mean())
-        per = ((pred - gt) ** 2).mean(axis=(0, 2, 3, 4))
-        return {"horizon": horizon,
-                "psnr_overall": round(float(-10 * np.log10(mse)), 2),
-                "psnr_per_step": {f"+{t + 1}": round(float(-10 * np.log10(per[t])), 2) for t in ts}}
-    except Exception as e:                      # a missing GPU, an OOM, no matplotlib -- publish anyway
-        print(f"[push_model] frame strip skipped ({type(e).__name__}: {str(e)[:120]})", flush=True)
-        return None
+        from importlib.metadata import version
+        out["quickdraw"] = version("quickdraw")
+    except Exception:
+        out["quickdraw"] = "unknown"
+    # The container's /app is a baked copy with no .git, so `git rev-parse` there returns nothing. Accept
+    # the sha from the environment (the launcher reads it on the host) and fall back to git only if that
+    # actually works -- reporting "unknown" gives a consumer nothing to pin.
+    out["git_commit"] = os.environ.get("QUICKDRAW_GIT_COMMIT", "") or "unknown"
+    if out["git_commit"] == "unknown":
+        try:
+            import subprocess
+            root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            out["git_commit"] = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            pass
+    out["torch"] = torch.__version__
+    return out
 
 
-def _card(name: str, cfg, metrics: dict, why_ckpt: str, heads: list[str], strip: dict | None = None) -> str:
-    def g(k, d="?"):
-        v = metrics.get(k)
-        return f"**{v['best']}** (eval {v['at_eval']} of {v['n_evals']})" if v else d
-    h0 = heads[0] if heads else "image"
+CARD_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_card_template.md")
+
+
+def _metrics_at(run_dir: str, epoch: int) -> dict:
+    """{key: value} at ONE eval index — the epoch whose checkpoint is being published.
+
+    The card used to show each metric's own best epoch, which is incoherent when you ship a single
+    checkpoint: a reader would see an LPIPS from epoch 11 next to a PSNR from epoch 8 and reasonably
+    assume both describe the weights in the repo. They did not. These are the numbers that checkpoint
+    actually scored. Run-wide bests stay in metrics.json, where they are labelled as such.
+    """
+    f = os.path.join(run_dir, "logs", "metrics.jsonl")
+    out = {}
+    if os.path.exists(f):
+        for line in open(f):
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            if j.get("step") == epoch and j.get("value") is not None:
+                out[j.get("tag", "")] = float(j["value"])
+    return out
+
+
+def _card(name: str, cfg, at_epoch: dict, epoch: int, why_ckpt: str, heads: list[str],
+          products: dict | None = None, vers: dict | None = None, dataset: str = "?") -> str:
+    """Fill the EDITABLE template at model_card_template.md. Keep prose there, not here."""
+    vers = vers or {}
     img = next((m for m in cfg.model.get("modalities", []) if str(m.get("kind", "")) == "image"), {})
-    P = int(cfg.data.P)
-    if strip:
-        ps = "  ".join(f"`+{k.lstrip('+')}` {v} dB" for k, v in strip["psnr_per_step"].items())
-        strip_md = (f"![open-loop imagination](imagination.png)\n\n"
-                    f"Top row of each pair is imagined, bottom is ground truth, over "
-                    f"{strip['horizon']} open-loop steps from a single context.\n"
-                    f"PSNR {strip['psnr_overall']} dB overall; per step: {ps}.\n\n"
-                    f"**The known failure is large viewpoint change.** Early steps track well; when the "
-                    f"robot base drives, the prediction tends to hold the original view while the truth "
-                    f"pans away. Judge the model on this, not only on the table below.\n\n")
-    else:
-        strip_md = ""
-    # An EXPLICIT list. A permissive substring filter dumped every ae_floor sub-metric (l1 at seven
-    # horizons), which buries the two numbers a reader actually wants.
+    prop = next((m for m in cfg.model.get("modalities", []) if str(m.get("kind", "")) == "vector"), {})
+
     want = []
     for h in heads:
-        want += [(f"eval_ood_horizon/open_loop/{h}/lpips/@+128", "open-loop LPIPS @+128 (headline, lower better)"),
-                 (f"eval_ood_horizon/open_loop/{h}/lpips/@+64", "open-loop LPIPS @+64"),
-                 (f"eval_ood_horizon/open_loop/{h}/psnr/@+128", "open-loop PSNR @+128 (dB, higher better)"),
-                 (f"eval_ae_floor/{h}/lpips_mean", "autoencoder floor LPIPS (perfect-dynamics bound)"),
-                 (f"eval_ae_floor/{h}/psnr_mean", "autoencoder floor PSNR (dB)")]
-    rows = "\n".join(f"| {desc} | `{k.split('/')[-1]}` | {metrics[k]['best']} | {metrics[k]['at_eval']} |"
-                     for k, desc in want if k in metrics)
-    return f"""---
-license: mit
-library_name: quickdraw
-tags:
-- world-models
-- robotics
-- video-prediction
----
+        want += [(f"eval_ood_horizon/open_loop/{h}/lpips/@+128", f"`{h}` open-loop LPIPS @+128 (headline)"),
+                 (f"eval_ood_horizon/open_loop/{h}/lpips/@+64", f"`{h}` open-loop LPIPS @+64"),
+                 (f"eval_ood_horizon/open_loop/{h}/psnr/@+128", f"`{h}` open-loop PSNR @+128 (dB)"),
+                 (f"eval_ae_floor/{h}/lpips_mean", f"`{h}` autoencoder floor LPIPS (perfect-dynamics bound)"),
+                 (f"eval_ae_floor/{h}/psnr_mean", f"`{h}` autoencoder floor PSNR (dB)")]
+    rows = "\n".join(f"| {desc} | {round(at_epoch[k], 5)} |" for k, desc in want if k in at_epoch) \
+           or "| (no eval metrics logged at this epoch) | — |"
 
-# {name}
+    parts = []
+    files = (products or {}).get("files", {})
+    if "filmstrip.png" in files:
+        parts.append(f"![open-loop filmstrip](filmstrip.png)\n\n**Top row predicted, bottom row ground "
+                     f"truth**, over the full +1..+128 open-loop horizon on a held-out validation episode. "
+                     f"This is the run's own logged evaluation artifact at epoch {products['epoch']}.\n")
+    if "filmstrip_2.png" in files:
+        parts.append("A second episode: [`filmstrip_2.png`](filmstrip_2.png).\n")
+    if "error_vs_step.png" in files:
+        parts.append("Error against horizon (log axis): [`error_vs_step.png`](error_vs_step.png).\n")
+    if "rollout.mp4" in files:
+        parts.append("Rollout video: [`rollout.mp4`](rollout.mp4).\n")
+    products_md = ("\n".join(parts) + "\n") if parts else ""
 
-A latent world model: it takes {P} steps of context (proprioceptive vector + camera frame{'s' if len(heads) > 1 else ''})
-plus a sequence of actions, and rolls forward **open-loop** — predicting the frames and states that follow
-with no further observations. Faithful for the first several steps; see the strip below for where it stops
-being faithful, which matters more than the headline number.
-
-Trained with `quickdraw` (`model={cfg.model.get('name', '?')}`, recipe `vl128`). Image head{'s' if len(heads) > 1 else ''}: {', '.join(f'`{h}`' for h in heads)}
-at {img.get('img_size', '?')}px, {img.get('num_tokens', '?')} latent tokens each.
-
-{strip_md}## Headline numbers
-
-Raw open-loop image prediction at +128 steps, and the autoencoder's own reconstruction floor:
-
-| what | key | best | at eval |
-|---|---|---|---|
-{rows}
-
-`metrics.json` in this repo carries every logged metric with the eval index it came from. **Lower is
-better for `lpips`, higher for `psnr`.** The `@+128` suffix means 128 prediction steps with no
-re-grounding — the hardest of the reported horizons.
-
-Checkpoint selection: {why_ckpt}.
-
-## Quickstart
-
-```python
-from quickdraw import load_pretrained, load_example_context
-import torch
-
-model, norm, cfg = load_pretrained("{name}", device="cuda")
-ex = load_example_context("{name}")          # ships with the repo; no dataset needed
-
-P, H = int(cfg.data.P), 64
-ctx = {{"proprio": norm.norm_obs(torch.from_numpy(ex["obs"][:, :P])).float().cuda(),
-       "{h0}": torch.from_numpy(ex["frames__{h0}"][:, :P]).float().div(255).cuda()}}
-acts = norm.norm_act(torch.from_numpy(ex["act"][:, :P + H - 1])).float().cuda()
-
-out = model.imagine_eval(ctx, acts, horizon=H, decode_chunk=16)
-frames  = out["{h0}"].clamp(0, 1)            # (B, H, HW, HW, 3) imagined frames
-proprio = norm.denorm_obs(out["proprio"])    # (B, H, obs_dim) in physical units
-```
-
-## Three things that will bite you
-
-1. **Vectors are normalised, images are not.** `proprio` in and out goes through `norm_obs`/`denorm_obs`;
-   frames are plain `[0, 1]` floats. Mixing these up produces plausible garbage rather than an error.
-2. **`acts` needs `P + H - 1` steps, not `H`.** The context steps consume actions too.
-3. **Pass `decode_chunk`.** The image decoder is ~78% of per-sample memory; a long horizon without it will
-   exhaust the GPU.
-
-## Fine-tuning
-
-`training_state.ckpt` is the full Lightning checkpoint including AdamW moment buffers, so training can
-resume rather than restart the optimizer. `weights.safetensors` is inference-only.
-
-If you fine-tune: **keep `diffusion.flow_hidden` at 128.** Every run of this recipe at 512 destroyed
-itself between epochs 5 and 12 under the perceptual loss, while 128 ran past epoch 21 healthy. Likewise
-do not move `latent_loss_weight` from 10 — it is bracketed on both sides (0.4 erased the codec in one
-epoch; 25 froze it).
-
-## Honest caveats
-
-* The reported `lpips` uses a **SqueezeNet** backbone while training used **VGG**. Different networks, but
-  both are ImageNet feature stacks and therefore correlated, so the score is partly self-referential.
-  Read `psnr`/`ssim` and look at the frames too.
-* **The rollout is the weaker half.** The autoencoder reconstructs far better than the dynamics predicts;
-  most of the remaining error at +128 is the codec floor, not drift.
-* Trained on one dataset with a fixed camera geometry. Nothing here has been tested off-distribution
-  beyond the eval splits reported above.
-"""
+    with open(CARD_TEMPLATE) as f:
+        tpl = f.read()
+    return tpl.format(
+        name=name, P=int(cfg.data.P), plural=("s" if len(heads) > 1 else ""),
+        model_name=cfg.model.get("name", "?"), recipe="vl128", dataset=dataset,
+        head_list=", ".join(f"`{h}`" for h in heads), head0=(heads[0] if heads else "image"),
+        img_size=img.get("img_size", "?"), num_tokens=img.get("num_tokens", "?"),
+        obs_dim=prop.get("dim", "?"), products_md=products_md, epoch=epoch, rows=rows,
+        why_ckpt=why_ckpt, git_commit=vers.get("git_commit", "main"),
+        pkg_version=vers.get("quickdraw", "?"), torch_version=vers.get("torch", "?"))
 
 
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
@@ -340,19 +311,18 @@ def main(cfg):
         if ctx is not None:
             np.savez_compressed(os.path.join(tmp, "example_context.npz"), **ctx)
 
-        strip = None
-        if ctx is not None and heads:
-            from .pretrained import load_pretrained
-            shutil.copy2(os.path.join(tmp, "weights.safetensors"), os.path.join(tmp, ".w.tmp"))
-            os.remove(os.path.join(tmp, ".w.tmp"))
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-            mdl, nrm, lcfg = load_pretrained(tmp, device=dev)
-            strip = _frame_strip(mdl, nrm, lcfg, ctx, heads[0], os.path.join(tmp, "imagination.png"))
-            del mdl
-            if dev == "cuda":
-                torch.cuda.empty_cache()
+        products = _logged_products(run_dir, ckpt, tmp)
+        vers = _versions()
+        with open(os.path.join(tmp, "versions.json"), "w") as f:
+            json.dump(vers, f, indent=2)
+        ep = products.get("epoch")
+        if ep is None:
+            m = re.search(r"epoch=(\d+)", os.path.basename(ckpt))
+            ep = int(m.group(1)) if m else -1
+        at_epoch = _metrics_at(run_dir, ep)
+        dataset = str(rcfg.data.get("hf_repo", None) or rcfg.data.get("repo_id", "?"))
         with open(os.path.join(tmp, "README.md"), "w") as f:
-            f.write(_card(name, rcfg, metrics, why, heads, strip))
+            f.write(_card(name, rcfg, at_epoch, ep, why, heads, products, vers, dataset))
 
         sizes = {p: os.path.getsize(os.path.join(tmp, p)) / 1e6 for p in sorted(os.listdir(tmp))}
         print("[push_model] staged:\n" + "\n".join(f"    {k:26s} {v:8.1f} MB" for k, v in sizes.items()),
@@ -369,7 +339,19 @@ def main(cfg):
         api = HfApi()
         repo_id = name if "/" in name else f"{api.whoami()['name']}/{name}"
         api.create_repo(repo_id, repo_type="model", private=private, exist_ok=True)
-        api.upload_folder(repo_id=repo_id, repo_type="model", folder_path=tmp)
+        # create_repo(exist_ok=True) does NOT change the visibility of a repo that already exists, so a
+        # re-push with a different `private` silently kept the old setting -- measured: a push reporting
+        # PUBLIC left the repo private. Set it explicitly every time.
+        try:
+            api.update_repo_settings(repo_id=repo_id, repo_type="model", private=private)
+        except Exception as e:
+            print(f"[push_model] could not set visibility ({type(e).__name__}: {str(e)[:100]}) -- "
+                  f"CHECK IT MANUALLY", flush=True)
+        # delete_patterns="*": a re-push must REPLACE the repo, not union with it. Without this an
+        # artifact from an earlier layout survives forever -- the first push shipped `imagination.png`
+        # (an ad-hoc re-render) and it persisted alongside the logged filmstrip that replaced it,
+        # leaving two conflicting pictures in one repo. push_to_hub.py does the same for datasets.
+        api.upload_folder(repo_id=repo_id, repo_type="model", folder_path=tmp, delete_patterns="*")
         print(f"[push_model] {run_dir} -> https://huggingface.co/{repo_id} "
               f"({'private' if private else 'PUBLIC'})", flush=True)
 

@@ -63,7 +63,7 @@ rollout still runs, you are only choosing what gets rendered:
 out = model.imagine_eval(ctx, acts_long, horizon=512, heads=["proprio"])
 ```
 
-## 4. Common issues
+## 4. Common pitfalls
 
 **Vectors are normalised. Images are not.** `proprio` in through `norm_obs`, out through `denorm_obs`;
 frames are plain `[0, 1]` floats (divide `uint8` by 255). Getting this backwards produces plausible
