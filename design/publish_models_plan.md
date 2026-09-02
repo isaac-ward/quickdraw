@@ -1,7 +1,7 @@
 # Publishing world models to the Hub so someone else can load them and imagine
 
-Status: **PHASES 1-2 IMPLEMENTED 2026-09-02** (see the checklist below); publishing itself not yet done. Requested by the user; every claim below was checked
-against the source or measured on a real checkpoint.
+Status: **BOTH MODELS PUBLISHED AND PUBLIC 2026-09-02** — see "What was published" at the bottom.
+Requested by the user; every claim below was checked against the source or measured on a real checkpoint.
 
 ## The one thing that makes this non-trivial
 
@@ -133,11 +133,14 @@ Two models, and the timing matters because both are still training:
 
 | repo | source run | status |
 |---|---|---|
-| `quickdraw-wm-robocasa-vl128` | `vl_l1x3` (GPU 0) | ep 17/40, still improving — **publish its best.ckpt when it finishes or plateaus** |
-| `quickdraw-wm-torus-vl128` | `torus_vl128` (GPU 1) | ep 0/40, just launched |
+| `quickdraw-wm-robocasa-vl128` | `vl_l1x3` (GPU 0) | **published**, epoch 11, OL LPIPS@+128 0.13697. Run since stopped, so this is final unless `twocam_full` beats it |
+| `quickdraw-wm-torus-vl128` | `torus_vl128b` (GPU 1) | **published**, epoch 0, OL LPIPS@+128 0.33974 — an in-progress placeholder, auto-updated by the watcher as better epochs land |
 
-**Do not publish mid-run.** `best.ckpt` moves every time the monitored metric improves, so a repo pushed
-now would be superseded within hours and the card's numbers would be wrong. `vl_l1x3` is the nearer one.
+Publishing mid-run was the user's call ("would be good to even push the models in training just so the
+pipeline is complete, and we can update later"), so the risk that `best.ckpt` moves is handled by a
+watcher rather than by waiting: `preserve_ol.py` copies each new best-open-loop checkpoint out of
+`save_top_k`'s way and `push_torus_watch.py` re-publishes when that copy changes. The card is regenerated
+from the run's own `metrics.jsonl` every push, so its numbers cannot drift from the shipped weights.
 
 ## Open decisions for the user
 
@@ -180,5 +183,23 @@ fails on authentication. A directory install works. Consumers need repo access; 
 - [ ] Re-execute the notebook against the real Hub repo and commit its outputs. It currently ships without
       outputs, because the executed run pointed at a local staging dir and committing those outputs beside
       a Hub-id `MODEL` line would be misleading.
-- [ ] Naming, and the decision on what to publish for torus (its run restarted from epoch 0 on 09-02).
-- [ ] Both runs to finish or plateau. `best.ckpt` moves whenever the monitored metric improves.
+- [ ] Torus to actually train. Epoch 0 is published so the pipeline is complete end to end, but 0.33974
+      is an epoch-0 number and will improve a lot; the watcher republishes automatically.
+
+## What was published (2026-09-02)
+
+Both repos are **public**, 13 files each, and both were verified by downloading from the Hub, loading with
+`load_pretrained`, and imagining 24 steps:
+
+| repo | epoch | OL LPIPS@+128 | AE floor LPIPS | imagine check |
+|---|---|---|---|---|
+| `isaac-ronald-ward/quickdraw-wm-robocasa-vl128` | 11 | **0.13697** | 0.0855 | `(1,24,96,96,3)`, 10.38 dB |
+| `isaac-ronald-ward/quickdraw-wm-torus-vl128` | 0 | 0.33974 | 0.11964 | `(1,24,128,128,3)`, 16.42 dB |
+
+Two things the publish path got wrong first, both now guarded in code: the card's headline numbers were
+each metric's own best epoch rather than the published one (`_metrics_at`), and `create_repo(exist_ok=True)`
+does not change visibility, so a push that *reported* PUBLIC left the repo private (`update_repo_settings`).
+
+One process trap that cost real time: `preserve_ol.py` was still watching the dead run name `torus_vl128`
+after the relaunch as `torus_vl128b`, so nothing was protecting the live run's checkpoints. Rename a run,
+retarget the watchers.
