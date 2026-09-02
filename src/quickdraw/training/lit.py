@@ -261,6 +261,16 @@ class LitWorldModel(L.LightningModule):
                     self.log(f"val/metric/{name}/mse", mse)
                     self.log(f"val/metric/{name}/l1", F.l1_loss(dclamp, future[name]))
                     self.log(f"val/metric/{name}/psnr", -10.0 * torch.log10(mse.clamp_min(1e-12)))
+                    # THE MIX THE MODEL IS ACTUALLY TRAINED ON, on the open-loop val rollout. `.../mse` is
+                    # blind to sharpness by construction -- record §22: "MSE loves blur... LPIPS was 0.18 the
+                    # whole time; MSE never saw it" -- so selecting best.ckpt on it selects the least-blurry
+                    # -in-MSE-terms epoch, which is the criterion the perceptual loss exists to replace.
+                    # Measured on vl_l1x3: best val mse was ep15 (OL LPIPS@+128 0.1455) while the best actual
+                    # open-loop LPIPS was ep11 (0.1370) -- best.ckpt pointed at a model 6% worse on the
+                    # metric the run is judged by. This key is what `checkpoint_monitor` now defaults to.
+                    vis = getattr(m.modalities[name], "visual", None)
+                    if vis is not None:
+                        self.log(f"val/metric/{name}/visual", vis(dclamp, future[name]))
                 if hasattr(m, "collapse_diagnostics"):        # latent-collapse (esp. for EMA); on the encoded bag
                     for k, val in m.collapse_diagnostics(obs).items():
                         self.log(f"collapse/{k}", val)

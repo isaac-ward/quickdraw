@@ -90,7 +90,16 @@ class VisualLoss(nn.Module):
         # clamp() would zero the gradient exactly where the decoder overshoots, which is where we most want it
         # pulled back. Hence a STRAIGHT-THROUGH clamp: forward value clipped, backward pass the identity.
         pc = p + (p.clamp(0.0, 1.0) - p).detach()
-        return net(pc.permute(0, 3, 1, 2).float(), t.permute(0, 3, 1, 2).clamp(0, 1).float())
+        out = net(pc.permute(0, 3, 1, 2).float(), t.permute(0, 3, 1, 2).clamp(0, 1).float())
+        # RESET, every call. LearnedPerceptualImagePatchSimilarity is a stateful torchmetrics Metric: every
+        # __call__ appends the batch score to `all_scores`, and the net is cached for the whole process, so
+        # without this the list grows WITHOUT BOUND -- measured 22 -> 42 -> 62 entries over 60 calls. This
+        # site runs twice per training step (decode loss + roundtrip anchor), i.e. ~2,700 times an epoch.
+        # `evaluation.openloop.image_curves` already does this and says why; VisualLoss did not copy it.
+        # reset() clears the accumulated STATE only -- `out` keeps its autograd graph, so the gradient is
+        # unaffected (asserted in smoke/visual_loss.py).
+        net.reset()
+        return out
 
     # ---- public ----
     @staticmethod

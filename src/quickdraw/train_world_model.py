@@ -281,8 +281,15 @@ def main(cfg):
     # bott_bott16 pinned best.ckpt to e8 while its floor peaked e14 and its perceptual distance e18). mse and
     # NOT psnr because psnr = -10*log10(mse) -> minimising mse IS maximising psnr, while staying a min-metric.
     _img = next((m for m in cfg.model.get("modalities", []) or [] if str(m.get("kind", "")) == "image"), None)
+    # DEFAULT IS THE VISUAL-LOSS MIX, not mse. Both are open-loop rollout metrics on val, but mse is
+    # structurally blind to sharpness (record §22), so monitoring it picks the blurriest-acceptable epoch --
+    # exactly the criterion the L1+LPIPS loss was adopted to replace. Measured on vl_l1x3: best val mse was
+    # ep15 (open-loop LPIPS@+128 0.1455) while the best open-loop LPIPS was ep11 (0.1370). `.../visual` is
+    # the mix the model is actually trained on, so best.ckpt now tracks the objective rather than a proxy
+    # that contradicts it. For a pure-L2 config VisualLoss IS mse, so this changes nothing there.
+    # Override with trainer.checkpoint_monitor (e.g. a specific head when there are several).
     ckpt_monitor = cfg.trainer.get("checkpoint_monitor", None) or (
-        f"val/metric/{_img.get('name', 'image')}/mse" if _img is not None
+        f"val/metric/{_img.get('name', 'image')}/visual" if _img is not None
         else f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}")
     # AUTO direction from the metric NAME. mode used to be hardcoded "min", so aiming checkpoint_monitor at a
     # higher-is-better metric silently selected the WORST epoch. Override with trainer.checkpoint_mode.
