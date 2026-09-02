@@ -501,6 +501,73 @@ because `data.autobatch=false data.batch=26` was copied from vl128's header, whe
 batch also disabled the one mechanism that probes eval memory. **Do not transplant a batch size across
 resolutions; let autobatch size it, and cap the eval with `eval.decode_chunk` when it is tight.**
 
+## 14. THE FIX: `num_tokens=64` **WITH** `ae_bottleneck=16` — the pair, not either knob (09-02)
+
+The codec finally reconstructs motion. One config diff over `vl128_scene`, nothing else changed:
+
+    model.modalities.1.num_tokens=64          # was 32
+    +model.modalities.1.ae_bottleneck=16      # was 8 (the default)
+
+Run: `logs/train_world_model_2026_09_02_06_13_10_r4_tok64_bott16` (4 epochs x 600 batches, ~55 min/epoch).
+
+| config (ep3) | motion_ratio | ae_psnr |
+|---|---|---|
+| `tok32` `bott8` (base) | 0.0320 | 15.35 |
+| `tok64` `bott8` | 0.0396 | 17.58 |
+| `tok128` `bott8` | 0.0267 | 15.51 ← **worse** |
+| aeonly (`lambda_flow=0`) `tok64` | 0.0627 | 17.85 |
+| aeonly `tok128` `bott16` | 0.1077 | 17.52 |
+| **`tok64` `bott16`** | **0.3218** | **19.93** |
+| *collapsed reference* | *0.0231* | *15.44* |
+
+**Verified independently from the saved frames**, not the logged metric — across-frame std of `pred`
+against `gt` in `raw_filmstrip_frames_0.npz`:
+
+| run | pred std | gt std | motion retained |
+|---|---|---|---|
+| `armA_w10` (collapsed) | 0.000335 | 0.068056 | **0.5%** |
+| `r4` epoch 1 | 0.005556 | 0.068056 | **8.2%** |
+| `r4` epoch 3 | 0.040987 | 0.068056 | **60.2%** |
+
+19.93 dB also puts the codec INSIDE the 18.7-20.4 dB band this architecture reached on robocasa — it is
+finally performing to its own precedent instead of sitting 3 dB below it.
+
+### Why it is the PAIR, and the mechanism `vision.py` already stated
+
+`ae_bottleneck` is the conv pyramid's target spatial size. At 8 it pools `128 -> 8`, a **256x spatial
+reduction**, so the arms and blocks are gone BEFORE the token queries see the feature map. At 16 it is
+`128 -> 16`, a **64x reduction** — 4x more detail surviving to the readout. `num_tokens` then decides how
+much of that reaches the latent. Neither alone works, and `tok128` alone went BACKWARDS.
+
+`vision.py` says it in one clause that was read past twice: *"Raising this to 16 makes the bottleneck
+16x16 (a 64x spatial reduction at 128px instead of 256x) and **gives the token budget something to
+carry**."*
+
+The pairing is EXACT rather than lucky: `n_levels = log2(128//16) = 3` and `224/8 = 28`, so the
+bottleneck is 16x28 with no silent truncation. A non-power-of-2 ratio would have landed elsewhere
+with no warning (up64's header documents that trap).
+
+### Three of my calls this record should not repeat
+
+1. **"`ae_bottleneck` is the wrong first lever."** Written in §12 on a subagent's read that capacity only
+   binds after the collapse is fixed. It WAS the fix.
+2. **`lambda_flow=0` was my bet and it lost.** Training the codec with NO dynamics pressure reached only
+   motion 0.0627 — so joint training was never the blocker and the 400:1 dynamics:anchor ratio was a
+   symptom, not a cause. The winner has dynamics fully on at `lambda_flow=1.0`.
+3. **"Capacity knobs cannot help while the codec emits a constant image."** Said an hour before the
+   capacity pair fixed it.
+
+The arithmetic that pointed here was available from the start and both a subagent and I filed it as "not
+binding yet": lego is 128x224 = 28,672 px through the same token bag robocasa filled with 96px = 9,216 px,
+i.e. **7.0 px/float against 2.25**.
+
+### Consequence for scheduling
+
+Autobatch drops to **batch 12** (from 18) — 4x the bottleneck area costs real memory. At 46,066 train
+windows that is **3,839 batches/epoch**, and the screen measured ~5.6 s/batch at this config, so a FULL
+epoch is roughly **6 hours**. The 50-epoch schedule is not reachable; useful eval points are, at epochs
+1 and 3.
+
 ## 11. Eval cadence — raise it, and Arm B is why
 
 Asked by the user (2026-08-31): *can we eval more often, epoch 1 3 5?*
