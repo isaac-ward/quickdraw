@@ -85,11 +85,29 @@ class VisualLoss(nn.Module):
         if net is None:                        # weights unavailable -> fail soft, exactly as eval does
             return pred.new_zeros(())
         p, t = self._subsample(pred, target)
-        # torchmetrics is built with normalize=True, i.e. it expects [0,1] and rescales to [-1,1] itself -- so
-        # do NOT pre-scale here. It also VALIDATES the range and raises on anything outside it, and a plain
-        # clamp() would zero the gradient exactly where the decoder overshoots, which is where we most want it
-        # pulled back. Hence a STRAIGHT-THROUGH clamp: forward value clipped, backward pass the identity.
-        pc = p + (p.clamp(0.0, 1.0) - p).detach()
+        # torchmetrics is built with normalize=True, i.e. it expects [0,1] and VALIDATES it, raising on
+        # anything outside. A plain clamp() would zero the gradient exactly where the decoder overshoots,
+        # which is where we most want it pulled back -- hence a STRAIGHT-THROUGH clamp: forward value
+        # clipped, backward pass the identity.
+        #
+        # BUT THE NAIVE STRAIGHT-THROUGH IS NUMERICALLY UNSAFE, and it killed a run (torus_vl128, 2026-09-02,
+        # dead 7.5 h before anyone noticed). `p + (p.clamp(0,1) - p)` is exact only for moderate magnitudes.
+        # Measured: 1e8 -> 0.0 (catastrophic cancellation) and +-inf or nan -> NaN. A FRESH decoder at step 0
+        # is unbounded and can emit exactly those, and then torchmetrics raises mid-training-step:
+        #   "Expected both input arguments to be normalized tensors ... values in range [0., 2.]"
+        # So: sanitise the non-finites FIRST, then straight-through, then a final clamp as a belt. That last
+        # clamp is a NO-OP for any value already inside [0,1], so it does not touch the gradient in the region
+        # that matters -- it only catches precision artifacts, which have no meaningful gradient anyway.
+        finite = torch.isfinite(p)
+        if not bool(finite.all()):
+            if not getattr(self, "_warned_nonfinite", False):
+                self._warned_nonfinite = True
+                print(f"[visual_loss] NON-FINITE decoder output into LPIPS "
+                      f"({int((~finite).sum())}/{p.numel()} elements) -- sanitised so the step survives. "
+                      f"This is a symptom, not the disease: check grad/norm_preclip and the decode loss.",
+                      flush=True)
+            p = torch.nan_to_num(p, nan=0.5, posinf=1.0, neginf=0.0)
+        pc = (p + (p.clamp(0.0, 1.0) - p).detach()).clamp(0.0, 1.0)
         out = net(pc.permute(0, 3, 1, 2).float(), t.permute(0, 3, 1, 2).clamp(0, 1).float())
         # RESET, every call. LearnedPerceptualImagePatchSimilarity is a stateful torchmetrics Metric: every
         # __call__ appends the batch score to `all_scores`, and the net is cached for the whole process, so

@@ -116,6 +116,20 @@ g = torch.rand(4, 96, 96, 3, requires_grad=True)
 mleak.visual(g, torch.rand(4, 96, 96, 3)).backward()
 check("gradient survives the metric reset", g.grad is not None and float(g.grad.abs().sum()) > 0)
 
+# ---- 6d. LPIPS must not CRASH on a pathological decoder output (it killed torus_vl128) ----
+vsafe = VisualLoss(w_l1=0.0, w_l2=0.0, w_lpips=1.0, frames=0)
+tt = torch.rand(4, 32, 32, 3)
+ok = True
+for val in (2.0, 1e8, float("inf"), float("-inf"), float("nan")):
+    q = torch.full((4, 32, 32, 3), 0.5); q[0, 0, 0, 0] = val
+    try:
+        r = float(vsafe(q, tt))
+        ok &= bool(torch.isfinite(torch.tensor(r)))
+    except Exception as e:
+        ok = False
+        print("      raised on", val, type(e).__name__)
+check("LPIPS term survives 2.0 / 1e8 / +-inf / nan decoder output (was a mid-step ValueError)", ok)
+
 # ---- 7. terms() reports raw magnitudes for choosing the anchor weight ----
 t = m.visual.terms(pred, X)
 check("terms() reports raw l2/l1(/lpips)", {"l2", "l1", "lpips"} <= set(t) and t["l2"] > 0 and t["l1"] > 0,
