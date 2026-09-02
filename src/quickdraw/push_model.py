@@ -83,14 +83,28 @@ def _metrics(run_dir: str) -> dict:
                 continue
             if j.get("value") is not None:
                 rows[j.get("tag", "")][j.get("step")] = float(j["value"])
-    HI = ("psnr", "ssim", "cos", "motion_ratio")            # higher-is-better leaves
+    # Direction is decided by scanning EVERY path segment, not just the last one. The last segment of
+    # `eval_ood_horizon/open_loop/image/psnr/@+128` is "@+128", so a last-segment test silently classified
+    # every horizon-suffixed PSNR as lower-is-better and reported its WORST epoch (measured: 10.84 dB at
+    # eval 0 instead of the real best).
+    HI = ("psnr", "ssim", "cos")             # higher is better
+    NEAR_ONE = ("motion_ratio",)             # neither direction is "better" -- 1.0 is the target
     out = {}
     for k, series in rows.items():
         if not k.startswith(("eval_", "val/")):
             continue
-        hi = any(k.rsplit("/", 1)[-1].startswith(h) for h in HI)
-        step = (max if hi else min)(series, key=series.get)
-        out[k] = {"best": round(series[step], 6), "at_eval": int(step), "n_evals": len(series)}
+        segs = k.split("/")
+        if any(seg.startswith(t) for seg in segs for t in NEAR_ONE):
+            step = min(series, key=lambda st: abs(series[st] - 1.0))
+            direction = "closest to 1.0"
+        elif any(seg.startswith(h) for seg in segs for h in HI):
+            step = max(series, key=series.get)
+            direction = "max"
+        else:
+            step = min(series, key=series.get)
+            direction = "min"
+        out[k] = {"best": round(series[step], 6), "at_eval": int(step),
+                  "n_evals": len(series), "direction": direction}
     return out
 
 
@@ -116,17 +130,84 @@ def _example_context(cfg, n_eps: int = 4, steps: int = 96) -> dict | None:
     return out
 
 
-def _card(name: str, cfg, metrics: dict, why_ckpt: str, heads: list[str]) -> str:
+def _frame_strip(model, norm, cfg, ctx_np: dict, head: str, out_png: str, horizon: int = 48) -> dict | None:
+    """Render a pred-vs-truth strip from the PUBLISHED checkpoint and save it next to the card.
+
+    Exists because a card that says "imagines the frames that follow" and shows only a good LPIPS number
+    oversells the model. On these checkpoints the prediction is faithful for the first few steps and then
+    holds the original viewpoint while the truth pans away, which is visible instantly in a strip and
+    invisible in a scalar. Fail-soft: a card without a picture is worse than no card, but a failed publish
+    is worse still.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import torch as _t
+        dev = next(model.parameters()).device
+        P = int(cfg.data.P)
+        n = min(2, ctx_np["obs"].shape[0])
+        ctx = {"proprio": norm.norm_obs(_t.from_numpy(ctx_np["obs"][:n, :P])).float().to(dev),
+               head: _t.from_numpy(ctx_np[f"frames__{head}"][:n, :P]).float().div(255).to(dev)}
+        acts = norm.norm_act(_t.from_numpy(ctx_np["act"][:n, :P + horizon - 1])).float().to(dev)
+        with _t.no_grad():
+            out = model.imagine_eval(ctx, acts, horizon=horizon, decode_chunk=8)
+        pred = out[head].clamp(0, 1).float().cpu().numpy()
+        gt = ctx_np[f"frames__{head}"][:n, P:P + horizon].astype("float32") / 255.0
+        ts = [0, 4, 11, 23, 35, horizon - 1]
+        ts = sorted({t for t in ts if t < horizon})
+        rows = 2 * n
+        fig, ax = plt.subplots(rows, len(ts), figsize=(1.9 * len(ts), 2.0 * rows))
+        ax = np.atleast_2d(ax)
+        for e in range(n):
+            for k, src in ((0, pred[e]), (1, gt[e])):
+                r = 2 * e + k
+                for j, t in enumerate(ts):
+                    ax[r, j].imshow(src[t]); ax[r, j].set_xticks([]); ax[r, j].set_yticks([])
+                    if r == 0:
+                        ax[r, j].set_title(f"+{t + 1}", fontsize=9)
+                ax[r, 0].set_ylabel(("imagined" if k == 0 else "truth") + f"\nep{e}", fontsize=8)
+        fig.suptitle("open-loop imagination vs ground truth", fontsize=11)
+        plt.tight_layout(); plt.savefig(out_png, dpi=100, bbox_inches="tight"); plt.close(fig)
+        mse = float(((pred - gt) ** 2).mean())
+        per = ((pred - gt) ** 2).mean(axis=(0, 2, 3, 4))
+        return {"horizon": horizon,
+                "psnr_overall": round(float(-10 * np.log10(mse)), 2),
+                "psnr_per_step": {f"+{t + 1}": round(float(-10 * np.log10(per[t])), 2) for t in ts}}
+    except Exception as e:                      # a missing GPU, an OOM, no matplotlib -- publish anyway
+        print(f"[push_model] frame strip skipped ({type(e).__name__}: {str(e)[:120]})", flush=True)
+        return None
+
+
+def _card(name: str, cfg, metrics: dict, why_ckpt: str, heads: list[str], strip: dict | None = None) -> str:
     def g(k, d="?"):
         v = metrics.get(k)
         return f"**{v['best']}** (eval {v['at_eval']} of {v['n_evals']})" if v else d
     h0 = heads[0] if heads else "image"
     img = next((m for m in cfg.model.get("modalities", []) if str(m.get("kind", "")) == "image"), {})
     P = int(cfg.data.P)
-    rows = "\n".join(
-        f"| `{k}` | {v['best']} | {v['at_eval']} |" for k, v in sorted(metrics.items())
-        if any(s in k for s in ("open_loop/image/lpips/@+128", "open_loop/image/psnr/@+128",
-                                "ae_floor") ) and k.count("/") <= 4)
+    if strip:
+        ps = "  ".join(f"`+{k.lstrip('+')}` {v} dB" for k, v in strip["psnr_per_step"].items())
+        strip_md = (f"![open-loop imagination](imagination.png)\n\n"
+                    f"Top row of each pair is imagined, bottom is ground truth, over "
+                    f"{strip['horizon']} open-loop steps from a single context.\n"
+                    f"PSNR {strip['psnr_overall']} dB overall; per step: {ps}.\n\n"
+                    f"**The known failure is large viewpoint change.** Early steps track well; when the "
+                    f"robot base drives, the prediction tends to hold the original view while the truth "
+                    f"pans away. Judge the model on this, not only on the table below.\n\n")
+    else:
+        strip_md = ""
+    # An EXPLICIT list. A permissive substring filter dumped every ae_floor sub-metric (l1 at seven
+    # horizons), which buries the two numbers a reader actually wants.
+    want = []
+    for h in heads:
+        want += [(f"eval_ood_horizon/open_loop/{h}/lpips/@+128", "open-loop LPIPS @+128 (headline, lower better)"),
+                 (f"eval_ood_horizon/open_loop/{h}/lpips/@+64", "open-loop LPIPS @+64"),
+                 (f"eval_ood_horizon/open_loop/{h}/psnr/@+128", "open-loop PSNR @+128 (dB, higher better)"),
+                 (f"eval_ae_floor/{h}/lpips_mean", "autoencoder floor LPIPS (perfect-dynamics bound)"),
+                 (f"eval_ae_floor/{h}/psnr_mean", "autoencoder floor PSNR (dB)")]
+    rows = "\n".join(f"| {desc} | `{k.split('/')[-1]}` | {metrics[k]['best']} | {metrics[k]['at_eval']} |"
+                     for k, desc in want if k in metrics)
     return f"""---
 license: mit
 library_name: quickdraw
@@ -139,18 +220,19 @@ tags:
 # {name}
 
 A latent world model: it takes {P} steps of context (proprioceptive vector + camera frame{'s' if len(heads) > 1 else ''})
-plus a sequence of actions, and **imagines** the frames and states that follow — open-loop, with no further
-observations.
+plus a sequence of actions, and rolls forward **open-loop** — predicting the frames and states that follow
+with no further observations. Faithful for the first several steps; see the strip below for where it stops
+being faithful, which matters more than the headline number.
 
 Trained with `quickdraw` (`model={cfg.model.get('name', '?')}`, recipe `vl128`). Image head{'s' if len(heads) > 1 else ''}: {', '.join(f'`{h}`' for h in heads)}
 at {img.get('img_size', '?')}px, {img.get('num_tokens', '?')} latent tokens each.
 
-## Headline numbers
+{strip_md}## Headline numbers
 
 Raw open-loop image prediction at +128 steps, and the autoencoder's own reconstruction floor:
 
-| metric | best | at eval |
-|---|---|---|
+| what | key | best | at eval |
+|---|---|---|---|
 {rows}
 
 `metrics.json` in this repo carries every logged metric with the eval index it came from. **Lower is
@@ -258,9 +340,19 @@ def main(cfg):
         if ctx is not None:
             np.savez_compressed(os.path.join(tmp, "example_context.npz"), **ctx)
 
-        api_name = name if "/" in name else None
+        strip = None
+        if ctx is not None and heads:
+            from .pretrained import load_pretrained
+            shutil.copy2(os.path.join(tmp, "weights.safetensors"), os.path.join(tmp, ".w.tmp"))
+            os.remove(os.path.join(tmp, ".w.tmp"))
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            mdl, nrm, lcfg = load_pretrained(tmp, device=dev)
+            strip = _frame_strip(mdl, nrm, lcfg, ctx, heads[0], os.path.join(tmp, "imagination.png"))
+            del mdl
+            if dev == "cuda":
+                torch.cuda.empty_cache()
         with open(os.path.join(tmp, "README.md"), "w") as f:
-            f.write(_card(api_name or name, rcfg, metrics, why, heads))
+            f.write(_card(name, rcfg, metrics, why, heads, strip))
 
         sizes = {p: os.path.getsize(os.path.join(tmp, p)) / 1e6 for p in sorted(os.listdir(tmp))}
         print("[push_model] staged:\n" + "\n".join(f"    {k:26s} {v:8.1f} MB" for k, v in sizes.items()),
