@@ -178,7 +178,7 @@ class TokenGridDecoder(TransportHead):
     """
 
     def __init__(self, ae_cfg, *, base: int = 32, chunk: int = 0,
-                 inject: bool = False, xattn_max_res: int = 0):
+                 inject: bool = False, xattn_max_res: int = 0, out_act: str = "none"):
         # x0 + no_noise: this head predicts the clean image directly and never sees noise. param/shortcut are
         # NOT configurable -- a "generative up-only decoder" would be a different object (see the denoiser).
         super().__init__(param="x0", shortcut=False, event_dims=3, no_noise=True, chunk=chunk)
@@ -227,6 +227,14 @@ class TokenGridDecoder(TransportHead):
             prev = ch
         self.out_norm = nn.GroupNorm(min(8, chs[0]), chs[0])
         self.out_conv = nn.Conv2d(chs[0], c.channels, 3, padding=1)
+        # OUTPUT ACTIVATION. "none" keeps `out_conv` bare, which is what every run before 2026-09-03 used and
+        # is therefore bit-identical -- the output is unbounded and only the LOSS holds it in [0,1].
+        # "sigmoid" bounds it by CONSTRUCTION. See ModalitySpec.decode_out_act for the measurements: on a
+        # saturated target the clamped-LPIPS term has dLPIPS/dp == 0 for every value above 1.0, so the only
+        # restoring force is L1's constant +-1 and the decoder walked to +77.
+        if out_act not in ("none", "sigmoid"):
+            raise ValueError(f"decode_out_act={out_act!r}; expected 'none' or 'sigmoid'")
+        self.out_act = out_act
 
     def velocity(self, x=None, temb=None, cond=None, demb=None) -> Tensor:
         """cond (M,T,d) -> (M,H,W,C). x/temb/demb ignored (see the class docstring)."""
@@ -242,7 +250,10 @@ class TokenGridDecoder(TransportHead):
             if str(i) in self.xattn:                                 # feature 3: re-select from the bag here
                 h = self.xattn[str(i)](h, cond)                      #   (nn.ModuleDict has no .get())
             h = up(h, g)                                             #   NOT transposed conv.
-        return self.out_conv(F.silu(self.out_norm(h))).permute(0, 2, 3, 1)
+        out = self.out_conv(F.silu(self.out_norm(h)))
+        if self.out_act == "sigmoid":
+            out = torch.sigmoid(out)
+        return out.permute(0, 2, 3, 1)
 
     def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
                record_path: bool = False):

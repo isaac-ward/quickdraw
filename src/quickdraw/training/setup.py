@@ -104,7 +104,7 @@ _SIZE_BASE = {"d": 128, "heads": 8, "depth": 4, "num_tokens": 8, "decode_base": 
 
 def apply_size_preset(cfg):
     """model.size=tiny|small -> set the preset's hidden capacity knobs (model.d/heads + the image modality's
-    num_tokens/decode_base, applied to EVERY image head) IN PLACE on cfg, so config.resolved records the real values. RAISES if you ALSO overrode
+    num_tokens/decode_base) IN PLACE on cfg, so config.resolved records the real values. RAISES if you ALSO overrode
     one of those knobs individually (size vs explicit-knob clash -> pick one). Image knobs apply only when an image
     modality is present. No-op if model.size is unset. Call ONCE, early (before the resolved dump), NOT on resume."""
     from omegaconf import open_dict
@@ -115,25 +115,24 @@ def apply_size_preset(cfg):
     if size not in SIZE_PRESETS:
         raise ValueError(f"model.size={size!r} is unknown; options: {sorted(SIZE_PRESETS)}")
     preset = SIZE_PRESETS[size]
-    imgs = [md for md in (m.get("modalities") or []) if md.get("kind") == "image"]
+    img = next((md for md in (m.get("modalities") or []) if md.get("kind") == "image"), None)
     clashes = []
     for k, v in preset.items():
-        holders = [m] if k in _SIZE_MODEL_KEYS else imgs   # image key + no image modality -> empty -> skip
-        for holder in holders:
-            cur = holder.get(k, _SIZE_BASE.get(k))
-            if cur not in (_SIZE_BASE.get(k), v):
-                nm = '' if k in _SIZE_MODEL_KEYS else f"modalities.{holder.get('name', 'image')}."
-                clashes.append(f"model.{nm}{k}={cur}")
+        holder = m if k in _SIZE_MODEL_KEYS else img
+        if holder is None:                                    # image key but no image modality -> skip
+            continue
+        cur = holder.get(k, _SIZE_BASE.get(k))
+        if cur not in (_SIZE_BASE.get(k), v):
+            clashes.append(f"model.{'' if k in _SIZE_MODEL_KEYS else 'modalities.<image>.'}{k}={cur}")
     if clashes:
         raise ValueError(f"model.size={size} sets {sorted(preset)}, but you also overrode {clashes}. "
                          f"Use model.size OR the individual knob(s), not both — remove one.")
     for k, v in preset.items():
         if k in _SIZE_MODEL_KEYS:
             m[k] = v
-        else:
-            for img in imgs:                                  # EVERY image head, not just the first
-                with open_dict(img):
-                    img[k] = v
+        elif img is not None:
+            with open_dict(img):
+                img[k] = v
 
 
 def _proprio_prior_mode(cfg):
@@ -798,45 +797,55 @@ def normalizer(cfg) -> Normalizer:
     return Normalizer.from_file(resolve_data_root(cfg)).subset_obs()   # subset via the process-wide set_obs_keep
 
 
+def image_head_cams(cfg) -> dict[str, str]:
+    """{image modality name: camera stream} from the model config. THE one place head->camera is resolved.
+
+    Every image modality names its own camera via `ModalitySpec.cam`; a SINGLE image head may leave it unset
+    and fall back to `data.cam`, so single-camera configs are untouched. With more than one head an unset
+    `cam` is an ERROR rather than a fallback: falling back would point every head at the same camera, and a
+    head scored against another camera's frames is a plausible WRONG NUMBER rather than a crash.
+
+    Exists so `window_loaders` and all eight evaluation load sites resolve it IDENTICALLY -- they used to
+    each read `data.cam` directly, which is how the evals ended up feeding one camera to every head."""
+    specs = [sp for sp in _modality_specs(cfg) if sp.kind == "image"]
+    default_cam = str(cfg.data.get("cam", "fpv"))
+    if len(specs) > 1:
+        missing = [sp.name for sp in specs if not getattr(sp, "cam", None)]
+        assert not missing, (f"{len(specs)} image modalities but {missing} have no `cam:` -- with more than "
+                             f"one image head each must name its own camera, or they all read data.cam="
+                             f"{default_cam!r} and the extra heads are scored against the wrong frames")
+    out = {sp.name: str(getattr(sp, "cam", None) or default_cam) for sp in specs}
+    if len(out) > 1:
+        assert len(set(out.values())) == len(out), f"two image modalities share a camera: {out}"
+    return out
+
+
+def image_head_sizes(cfg) -> dict[str, int]:
+    """{image modality name: img_size}. Companion to image_head_cams -- heads may differ in resolution."""
+    return {sp.name: sp.img_size for sp in _modality_specs(cfg) if sp.kind == "image"}
+
+
 def window_loaders(cfg, norm: Normalizer):
     """The ONE GPU-resident loader for every model. Loads the FPV frame store only when an image modality
     is present; proprio-only just loads (obs, act) — no frames touched."""
     P, F = cfg.data.P, cfg.data.F
     root = resolve_data_root(cfg)
     specs = _modality_specs(cfg)
-    imgs = [s for s in specs if s.kind == "image"]      # image modalities -> one resident frame store each
+    # EVERY image modality gets its own camera stream. This used to be `next(... kind == "image")`, which
+    # took the FIRST image spec and silently ignored the rest: a second image modality was BUILT in the
+    # model but never LOADED, so lit.py's `obs[name] = batch[name]` KeyError'd at step 0 -- nothing at
+    # config time said anything was wrong. See design/two_camera_plan.md.
+    head_cams = image_head_cams(cfg)          # {head: camera} -- the ONE resolution point
+    head_sizes = image_head_sizes(cfg)
     repo = str(cfg.data.get("repo_id", "torus"))
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Each image head reads ONE camera directory. The head NAME is a model-side label (scene_right) and the
-    # directory is a dataset-side one (head_right), so with several heads there is nothing to pair them by
-    # except an explicit declaration: ModalitySpec.cam. data.cam remains the fallback, which keeps every
-    # single-camera dataset (torus, starling, robocasa) resolving exactly as before.
-    default_cam = cfg.data.get("cam", "fpv")
-    default_cams = [str(default_cam)] if isinstance(default_cam, str) else [str(c) for c in default_cam]
-    cams = []
-    for k, sp in enumerate(imgs):
-        c = str(getattr(sp, "cam", "") or "")
-        if not c:
-            if len(imgs) > 1 and len(default_cams) != len(imgs):
-                raise ValueError(
-                    f"image head {sp.name!r} has no `cam`, and data.cam cannot disambiguate "
-                    f"({len(imgs)} heads vs {len(default_cams)} camera(s) in data.cam). Set "
-                    f"model.modalities.<i>.cam=<leaf> on every image head when there is more than one.")
-            c = default_cams[k] if len(default_cams) == len(imgs) else default_cams[0]
-        cams.append(c)
-    if len(set(cams)) != len(cams):      # two heads on one camera trains a duplicate, silently
-        raise ValueError(f"image heads map to duplicate cameras: "
-                         f"{list(zip([s.name for s in imgs], cams))}")
-
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
-        if imgs:
-            eps = load_split_episodes_mm(root, split, img_size=[i.img_size for i in imgs],
-                                         cam=cams, repo_id=repo)
+        if head_cams:
+            eps = load_split_episodes_mm(root, split, img_size=head_sizes, cam=head_cams, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev,
-                                            image_head=[i.name for i in imgs], stride=stride)
+                                            image_head=list(head_cams), stride=stride)
         else:                                                    # proprio-only: (obs, act) pairs, no camera frames
             eps = load_split_episodes(root, split, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)

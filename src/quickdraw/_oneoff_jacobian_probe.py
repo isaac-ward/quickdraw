@@ -64,6 +64,9 @@ def probe(cfg, m, tag):
     norm = normalizer(cfg)
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
     img_size = next((md.ae.cfg.img_size for md in m.modalities.values() if hasattr(md, "ae")), 128)
+    # frames come back as a DICT keyed by camera (data/dataset.py). Single-camera script:
+    # name the key once rather than indexing position 2 as if there were only ever one view.
+    _CAMK = str(cfg.data.get("cam", "fpv"))
     ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     P = int(cfg.data.P)
@@ -77,7 +80,8 @@ def probe(cfg, m, tag):
     gnorm = {h: [] for h in range(DEPTH)}
     opnorm = {h: [] for h in range(DEPTH)}
     for (ei, t0) in picks:
-        o, a, im = ds[ei]
+        o, a, _fr = ds[ei]
+        im = _fr[_CAMK]
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(dev),
                img_head: torch.from_numpy(im).float().div(255.0)[None].to(dev)}
         act = norm.norm_act(torch.from_numpy(a)).float()[None].to(dev)

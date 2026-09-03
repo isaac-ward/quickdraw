@@ -102,6 +102,34 @@ check("5-D and equivalent 4-D inputs agree (LPIPS subsample is over FRAMES)",
       abs(float(l5) - float(l4)) < 1e-5, f"{float(l5):.6f} vs {float(l4):.6f}")
 check("terms() also accepts 5-D", torch.isfinite(torch.tensor(m5.visual.terms(P5, X5)["l1"])))
 
+# ---- 6c. the LPIPS metric object must NOT accumulate state across calls ----
+mleak = img(visual_lpips=1.0, visual_frames=8)
+X8 = torch.rand_like(X)                       # same batch as `pred` (6 frames)
+sizes = []
+for _ in range(3):
+    for _ in range(10):
+        out = mleak.visual(pred.detach(), X8)
+    sizes.append(len(getattr(mleak.visual._net, "all_scores", [])) if mleak.visual._net is not None else 0)
+check("LPIPS metric state does NOT grow across calls (torchmetrics accumulates every __call__)",
+      len(set(sizes)) == 1, f"after 10/20/30 calls: {sizes}")
+g = torch.rand(4, 96, 96, 3, requires_grad=True)
+mleak.visual(g, torch.rand(4, 96, 96, 3)).backward()
+check("gradient survives the metric reset", g.grad is not None and float(g.grad.abs().sum()) > 0)
+
+# ---- 6d. LPIPS must not CRASH on a pathological decoder output (it killed torus_vl128) ----
+vsafe = VisualLoss(w_l1=0.0, w_l2=0.0, w_lpips=1.0, frames=0)
+tt = torch.rand(4, 32, 32, 3)
+ok = True
+for val in (2.0, 1e8, float("inf"), float("-inf"), float("nan")):
+    q = torch.full((4, 32, 32, 3), 0.5); q[0, 0, 0, 0] = val
+    try:
+        r = float(vsafe(q, tt))
+        ok &= bool(torch.isfinite(torch.tensor(r)))
+    except Exception as e:
+        ok = False
+        print("      raised on", val, type(e).__name__)
+check("LPIPS term survives 2.0 / 1e8 / +-inf / nan decoder output (was a mid-step ValueError)", ok)
+
 # ---- 7. terms() reports raw magnitudes for choosing the anchor weight ----
 t = m.visual.terms(pred, X)
 check("terms() reports raw l2/l1(/lpips)", {"l2", "l1", "lpips"} <= set(t) and t["l2"] > 0 and t["l1"] > 0,

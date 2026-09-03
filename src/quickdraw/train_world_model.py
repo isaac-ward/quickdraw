@@ -160,9 +160,20 @@ def main(cfg):
     # Auto-size the batch to fill VRAM (the AR step is dispatch-bound -> bigger batch is nearly-free
     # throughput; accelerations.md Exp 8). Fresh runs only — a resume keeps its original batch. Disable with
     # data.autobatch=false for controlled A/Bs where a FIXED batch matters.
-    if not resume and bool(cfg.data.get("autobatch", True)) and torch.cuda.is_available():
+    _ab_on = not resume and bool(cfg.data.get("autobatch", True)) and torch.cuda.is_available()
+    if _ab_on:
         cfg.data.batch = int(autobatch_find(cfg, torch.device("cuda"), log=lambda m: _startup_log(run_dir, m)))
         OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))  # record chosen batch
+    if not resume:
+        # ALWAYS report the batch, and say WHERE it came from. With data.autobatch=false the entire
+        # [autobatch] block is skipped, so progress.log contained NO record of the batch size at all and the
+        # only trace was checkpoints/config.resolved.yaml. That gap directly caused a wrong reading of two
+        # arms (2026-08-30): a stale "fit chose data.batch=16" from an earlier CRASHED launch was carried
+        # forward, and windows-per-epoch was computed from it, producing a claimed 30% data handicap that did
+        # not exist -- both arms were actually at 26. One unconditional line prevents that class of error.
+        _startup_log(run_dir, f"[batch] data.batch={int(cfg.data.batch)} "
+                              f"({'autobatch' if _ab_on else 'PINNED via data.autobatch=false'}) | "
+                              f"F={int(cfg.data.get('F', 0))} subsample={cfg.data.get('subsample')}")
     elif resume:
         # A RESUME KEEPS ITS ORIGINAL BATCH -- which the comment above always claimed but nothing implemented
         # (fixed 2026-08-18). autobatch is skipped on resume regardless of data.autobatch, so cfg.data.batch fell
@@ -270,17 +281,16 @@ def main(cfg):
     # the env's proprio metric, which on an image run picks best.ckpt blind to every image result (measured:
     # bott_bott16 pinned best.ckpt to e8 while its floor peaked e14 and its perceptual distance e18). mse and
     # NOT psnr because psnr = -10*log10(mse) -> minimising mse IS maximising psnr, while staying a min-metric.
-    _imgs = [m for m in cfg.model.get("modalities", []) or [] if str(m.get("kind", "")) == "image"]
-    _explicit = cfg.trainer.get("checkpoint_monitor", None)
-    if _explicit is None and len(_imgs) > 1:
-        # MULTI-HEAD: AUTO would pick the FIRST image head and select best.ckpt blind to the rest — the same
-        # class of miss as the bott_bott16 case above, one head wide. Refuse to guess; make the choice explicit.
-        raise ValueError(
-            f"{len(_imgs)} image modalities ({[str(m.get('name', 'image')) for m in _imgs]}) but no "
-            f"trainer.checkpoint_monitor. AUTO selects on ONE head and would ignore the others. Set it "
-            f"explicitly, e.g. trainer.checkpoint_monitor=val/metric/{_imgs[0].get('name', 'image')}/mse")
-    ckpt_monitor = _explicit or (
-        f"val/metric/{_imgs[0].get('name', 'image')}/mse" if _imgs
+    _img = next((m for m in cfg.model.get("modalities", []) or [] if str(m.get("kind", "")) == "image"), None)
+    # DEFAULT IS THE VISUAL-LOSS MIX, not mse. Both are open-loop rollout metrics on val, but mse is
+    # structurally blind to sharpness (record §22), so monitoring it picks the blurriest-acceptable epoch --
+    # exactly the criterion the L1+LPIPS loss was adopted to replace. Measured on vl_l1x3: best val mse was
+    # ep15 (open-loop LPIPS@+128 0.1455) while the best open-loop LPIPS was ep11 (0.1370). `.../visual` is
+    # the mix the model is actually trained on, so best.ckpt now tracks the objective rather than a proxy
+    # that contradicts it. For a pure-L2 config VisualLoss IS mse, so this changes nothing there.
+    # Override with trainer.checkpoint_monitor (e.g. a specific head when there are several).
+    ckpt_monitor = cfg.trainer.get("checkpoint_monitor", None) or (
+        f"val/metric/{_img.get('name', 'image')}/visual" if _img is not None
         else f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}")
     # AUTO direction from the metric NAME. mode used to be hardcoded "min", so aiming checkpoint_monitor at a
     # higher-is-better metric silently selected the WORST epoch. Override with trainer.checkpoint_mode.
@@ -315,12 +325,7 @@ def main(cfg):
     # enable_progress_bar=False: no tqdm; ProgressPrinter emits plain per-epoch lines instead.
     trainer = L.Trainer(max_epochs=cfg.trainer.max_epochs, precision=cfg.trainer.precision,
                         accelerator="gpu", devices=1, enable_progress_bar=False,
-                        # gradient_clip_val was HARDCODED at 1.0. Exposed (default unchanged, so every
-                        # existing recipe is bit-identical) because on lego_assemblies the anchor's
-                        # gradient at init measures enc 380 / dec 618, so a clip of 1.0 truncates 50-900x
-                        # from step 0 and the surviving unit-norm direction is decoder-dominated -- a
-                        # candidate mechanism for the encoder never learning to encode. Untestable while
-                        # the value could not be changed.
+                        # exposed (default unchanged) so the clip can be varied; was hardcoded at 1.0
                         gradient_clip_val=float(cfg.trainer.get("gradient_clip_val", 1.0) or 0.0) or None,
                         accumulate_grad_batches=int(cfg.trainer.get("accumulate_grad_batches", 1)),  # effective
                         #  batch = data.batch x this; use it to keep a large effective batch when the per-step
