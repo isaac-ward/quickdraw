@@ -56,6 +56,28 @@ class ModalitySpec:
     #                           per level, zero-init output. This is Stable Diffusion's multi-resolution
     #                           cross-attention pattern; see models/decoders.py:LevelCrossAttn for the caveat
     #                           that SD injects TEXT into a DENOISER, not a decoder re-reading its own latent.
+    decode_out_act: str = "none"   # decode_arch=up ONLY. "none" (default, bit-identical to every historical
+    #                           run) | "sigmoid" -> bound the decoder output to (0,1) BY CONSTRUCTION.
+    #                           WHY IT EXISTS (2026-09-03). `out_conv` is a bare nn.Conv2d, so the output is
+    #                           unbounded and only the LOSS holds it in range -- and on a saturated target the
+    #                           loss cannot. Measured on `torus_vl128b`: where the target is exactly 1.0,
+    #                           LPIPS scores the CLAMPED image, so 1.0 and 77 are byte-identical to it and
+    #                           dLPIPS/dp is exactly 0.0000 at 1.05, 1.50, 5.00 and 50.00. That leaves L1,
+    #                           whose gradient is a constant +-1 -- the same push at 1.05 as at 50. Approaching
+    #                           1.0 from BELOW, LPIPS pushes up with -1.233 at 0.99; crossing it, only L1's
+    #                           +0.053 pushes back. A 24x ratchet, and the decoder walked to +77 through it.
+    #                           Torus is 66.9% exactly-1.0 target pixels (rows 0-9: 94.6%); robocasa is 0.4%,
+    #                           which is why 60 robocasa runs never hit this and top out at 1.034.
+    #                           WHY SIGMOID AND NOT A PENALTY: it removes the failure class rather than pricing
+    #                           it -- there is no out-of-range to drift into, so LPIPS's blindness above 1.0
+    #                           stops mattering, and there is no weight to tune or be outvoted. Measured
+    #                           through a sigmoid on that same saturated patch, dLPIPS/dz stays NON-ZERO all
+    #                           the way up (-0.0097 at z=0, -0.0214 at z=4, -0.0021 at z=5.5) and only reaches
+    #                           zero at z=8, where the output is 0.999665 -- i.e. zero gradient at the right
+    #                           answer, not at a 76x error.
+    #                           ITS OWN FAILURE MODE, and it is real: past |z| ~ 8 the gradient is numerically
+    #                           zero in BOTH directions, so a pixel driven to the WRONG bound is stuck there.
+    #                           Watch codec/range_*/frac_hi and frac_lo (visual_loss.pop_diagnostics).
     visual_l2: float = 1.0     # IMAGE modalities: the pixel-space reconstruction MIX, shared by BOTH image
     visual_l1: float = 0.0     #   loss sites (AR decode at weight 1.0, roundtrip anchor at latent_loss_weight).
     visual_lpips: float = 0.0  #   Defaults (l2 only) are EXACTLY F.mse_loss, i.e. bit-identical to before.
@@ -209,9 +231,12 @@ class Modality(nn.Module):
         tgt = target.reshape(-1, *target.shape[len(lead):])
         return self.decode_head.loss(self._decode_cond(flat), tgt, recon_loss=self.recon_loss)
 
-    def recon_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+    def recon_loss(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
         """The reconstruction loss used at BOTH sites that train this modality's decoder: the AR decode loss
         (above) and the codec roundtrip anchor (multimodal.roundtrip_losses).
+
+        `site` names the caller ("decode" | "codec") so the image mix can attribute its range diagnostics to
+        one site or the other. Ignored here -- a vector modality has no raw-range failure mode.
 
         Base = plain MSE, which is what every non-image modality wants. `ImageModality` overrides it with a
         single shared `VisualLoss` so the two sites can never silently disagree about the mix, and so the
@@ -283,6 +308,9 @@ class ImageModality(Modality):
         # ONE VisualLoss, registered ONCE here as a child of this modality. `recon_loss` below hands the SAME
         # object to both loss sites; registering it under two parents would duplicate the frozen LPIPS weights
         # in every checkpoint.
+        # Read BEFORE the decoder dispatch (it is a constructor arg) and kept on the modality so the per-epoch
+        # range report can pick the right alarm: out-of-range under "none", pinning under "sigmoid".
+        self.decode_out_act = str(getattr(spec, "decode_out_act", "none") or "none")
         self.visual = VisualLoss(w_l2=float(getattr(spec, "visual_l2", 1.0) or 0.0),
                                  w_l1=float(getattr(spec, "visual_l1", 0.0) or 0.0),
                                  w_lpips=float(getattr(spec, "visual_lpips", 0.0) or 0.0),
@@ -307,7 +335,8 @@ class ImageModality(Modality):
             self.decode_head = TokenGridDecoder(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
                                                 chunk=_chunk,
                                                 inject=bool(getattr(spec, "decode_inject", False)),
-                                                xattn_max_res=int(getattr(spec, "decode_xattn_max_res", 0) or 0))
+                                                xattn_max_res=int(getattr(spec, "decode_xattn_max_res", 0) or 0),
+                                                out_act=self.decode_out_act)
         elif self.decode_arch == "vit":
             self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc,
                                              no_noise=no_noise, chunk=_chunk)
@@ -352,9 +381,13 @@ class ImageModality(Modality):
         print(f"[codec] {self.name}: latent {spec.num_tokens}x{d} = {latent} floats | decoder readout {cap} "
               f"({how}) | {pct:.0f}% of cap -- {flag}", flush=True)
 
-    def recon_loss(self, pred: Tensor, target: Tensor) -> Tensor:
-        """The shared mix (models/visual_loss.py). Same instance, same weights, both sites."""
-        return self.visual(pred, target)
+    def recon_loss(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
+        """The shared mix (models/visual_loss.py). Same instance, same weights, both sites.
+
+        `site` is passed through so `VisualLoss` can bucket its raw-range diagnostics per site; it does NOT
+        change the loss. Default "decode" because the AR site reaches this through
+        `TransportHead.loss(recon_loss=...)`, which calls it positionally with two arguments."""
+        return self.visual(pred, target, site=site)
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
         return self.ae.encode(obs)

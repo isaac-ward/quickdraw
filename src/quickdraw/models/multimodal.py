@@ -406,7 +406,10 @@ class MultiModalSequenceModel(nn.Module):
         # RAW + its weight, so the logged series is comparable across runs that sweep latent_loss_weight (every
         # sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec panel
         # rescale while the decode panels did not.
-        out = {f"codec/roundtrip_{n}": self.modalities[n].recon_loss(rec[n], targets[n]) for n in heads}
+        # site="codec": tags this call's raw-range diagnostics as the ANCHOR (encoded real frames), so they are
+        # separable from the AR decode site's (rolled latents). See visual_loss.pop_diagnostics.
+        out = {f"codec/roundtrip_{n}": self.modalities[n].recon_loss(rec[n], targets[n], site="codec")
+               for n in heads}
         w = {f"codec/roundtrip_{n}": wts[n] for n in heads}
         # And the raw MSE alongside, at weight ZERO so it is LOGGED but contributes nothing. Without this, any
         # run that changes the mix stops being comparable to the 25 historical runs on `codec/roundtrip_*`,

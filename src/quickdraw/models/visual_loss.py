@@ -62,6 +62,60 @@ class VisualLoss(nn.Module):
         self.lpips_net, self.frames = str(lpips_net), int(frames)
         self._net = None                      # built lazily on first use: it needs a device, and constructing
         #                                       it in __init__ would download weights during a --help.
+        self._diag: dict = {}                 # per-site RAW output range, drained per epoch -- see range_stats
+
+    # ---- diagnostics ----
+    # WHY THIS EXISTS (2026-09-03). The decoder head is an unbounded nn.Conv2d and NOTHING here reads its raw
+    # magnitude: every consumer clamps first (LPIPS validates [0,1], and so do the eval metrics and the image
+    # writers). `torus_vl128b` therefore trained 9 hours with a strip of decoder output reaching +77 across the
+    # top rows of every frame while every clamped metric read healthy -- the only trace was `roundtrip_*_mse`,
+    # which is logged at weight 0 and read by nobody. These four numbers are the missing alarm.
+    #
+    # WHY MAX/MIN AND *TWO* FRACTIONS, and not percentiles or a histogram. Benign overshoot and a runaway are
+    # different by ORDERS of magnitude, not by shape: measured, robocasa's decoder tops out at 1.034 while
+    # torus reached 20.0 / 77.2 / 52.5 over three epochs. `max`/`min` separate those on sight. The fractions
+    # then separate benign-but-widespread (32% of torus pixels sit just over 1.0, median 1.052, because 67% of
+    # its TARGETS are exactly 1.0) from spreading (the >5.0 population grew 0.51% -> 1.04%). Percentiles added
+    # nothing to that diagnosis when it was done by hand.
+    #
+    # BOTH BOUNDS, not just the top. The mechanism is symmetric -- a target of exactly 0.0 makes an output of
+    # -5 clamp to a PIXEL-PERFECT 0.0, so LPIPS is equally blind below -- and the low side is real (min reached
+    # -1.592, with 8.6%/9.6%/1.3% of pixels below 0). It is also unexplained why the low excursion stayed 48x
+    # smaller than the high one, which is precisely why it is measured rather than assumed to mirror.
+    #
+    # AND BOTH SITES, keyed by `site`. One VisualLoss serves the AR decode loss (rolled latents -- the output
+    # that `@+128` actually scores) and the roundtrip anchor (encoded real frames). The DIFFERENCE between them
+    # is diagnostic: comparable => the loss cannot hold the range; much worse on rolled latents => the dynamics
+    # are pushing the decoder off-manifold and the range violation is downstream of that.
+    @torch.no_grad()
+    def _record(self, site: str, pred: Tensor) -> None:
+        p = pred.detach().float()
+        d = self._diag.setdefault(site, {"max": -float("inf"), "min": float("inf"),
+                                         "hi": 0.0, "lo": 0.0, "n": 0})
+        d["max"] = max(d["max"], float(p.max()))
+        d["min"] = min(d["min"], float(p.min()))
+        d["hi"] += float((p >= 1.0 - 1e-3).float().mean())
+        d["lo"] += float((p <= 1e-3).float().mean())
+        d["n"] += 1
+
+    def pop_diagnostics(self) -> dict:
+        """Drain the accumulated range stats -> {site: {max,min,frac_hi,frac_lo}, "nonfinite": n}, and reset.
+
+        Called once per epoch from `lit.on_train_epoch_end`. Draining (rather than reading) is what makes the
+        non-finite warning per-EPOCH: it was `_warned_nonfinite`, a one-shot per PROCESS, so a run could take
+        thousands of non-finite steps and print a single line.
+
+        `max`/`min` are extrema over the epoch's steps; the fractions are step means. At the AR decode site the
+        tensor is the `recon_frac` frame subset for that step, so the fractions stay unbiased but `max` is a
+        max over a subset and reads slightly below the true per-step maximum -- the two sites' `max` are
+        therefore not exactly like-for-like. It does not weaken the alarm (77 vs 1.03 survives any subset).
+        """
+        out = {s: {"max": d["max"], "min": d["min"],
+                   "frac_hi": d["hi"] / max(1, d["n"]), "frac_lo": d["lo"] / max(1, d["n"])}
+               for s, d in self._diag.items() if d["n"]}
+        out["nonfinite"] = int(getattr(self, "_nonfinite_calls", 0))
+        self._diag, self._nonfinite_calls = {}, 0
+        return out
 
     # ---- internals ----
     def _lpips(self, device):
@@ -100,8 +154,10 @@ class VisualLoss(nn.Module):
         # that matters -- it only catches precision artifacts, which have no meaningful gradient anyway.
         finite = torch.isfinite(p)
         if not bool(finite.all()):
-            if not getattr(self, "_warned_nonfinite", False):
-                self._warned_nonfinite = True
+            # COUNTED, and the count is drained per EPOCH by pop_diagnostics -- this used to be a one-shot
+            # `_warned_nonfinite` per PROCESS, so a run taking thousands of these printed one line.
+            n = self._nonfinite_calls = int(getattr(self, "_nonfinite_calls", 0)) + 1
+            if n <= 3:                     # first few in detail; the per-epoch total comes from the report
                 print(f"[visual_loss] NON-FINITE decoder output into LPIPS "
                       f"({int((~finite).sum())}/{p.numel()} elements) -- sanitised so the step survives. "
                       f"This is a symptom, not the disease: check grad/norm_preclip and the decode loss.",
@@ -135,8 +191,9 @@ class VisualLoss(nn.Module):
             return pred.reshape(-1, *pred.shape[-3:]), target.reshape(-1, *target.shape[-3:])
         return pred, target
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+    def forward(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
         pred, target = self._flatten(pred, target)     # (B,F,H,W,C) from the anchor -> (B*F,H,W,C)
+        self._record(site, pred)                       # RAW range, before any term clamps -- see pop_diagnostics
         loss = pred.new_zeros(())
         if self.w_l2:
             loss = loss + self.w_l2 * F.mse_loss(pred, target)
