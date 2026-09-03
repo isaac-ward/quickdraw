@@ -98,19 +98,42 @@ def set_action_aggregate(mode: str) -> None:
     "sum" (the default, unchanged) assumes actions are DELTA-like, so they compose additively over the
     skipped frames, with an automatic take-last for dims that look BINARY (<=2 unique values).
 
-    "last" takes the final raw action of each group for EVERY dim. Required when the action is an
-    ABSOLUTE command rather than a delta, where summing is meaningless: summing six absolute poses gives
-    six times the position. lego_assemblies is exactly that case -- its action is an absolute
-    VR-controller pose (xyz in metres in a room frame, y centred on 1.47) plus a normalised gripper.
+    "last" takes the final raw action of each group for EVERY dim. Correct when the action is an ABSOLUTE
+    command rather than a delta, where summing is meaningless: summing six absolute poses gives six times
+    the position. lego_assemblies is exactly that case -- an absolute VR-controller pose (xyz in metres in
+    a room frame, y centred on 1.47) plus a normalised gripper.
 
-    The binary auto-detect is NOT a safety net there either. lego_assemblies' gripper sits at exactly 0
-    or 1 for 94% of frames but has ~1000 unique values because it ramps between them, so `<=2 unique`
-    never fires and a [0,1] gripper would be summed into [0,6]."""
+    The binary auto-detect is NOT a safety net for "sum" there either. lego_assemblies' gripper sits at
+    exactly 0 or 1 for 94% of frames but has ~1000 unique values because it ramps between them, so
+    `<=2 unique` never fires and a [0,1] gripper would be summed into [0,6].
+
+    "concat" (LOSSLESS) keeps all `s` skipped actions side by side instead of collapsing them, so one
+    decimated step carries the whole intra-step command trajectory and action_dim becomes `base * s`.
+    This is the action-CHUNK formulation the literature uses (ACT, diffusion policy, RT-2), and it is the
+    honest answer when neither aggregation is right: "sum" is wrong for an absolute command, and "last"
+    discards the path between commands, which at 5 Hz is most of what happened. It also retires the
+    binary auto-detect, because nothing is aggregated.
+
+    DO NOT hardcode the resulting width. `effective_action_dim` below is the single source of truth, and
+    training/setup.py derives environments.action_dim and model.action_dim from the DATASET's own recorded
+    action_dim through it -- the same pattern `_recorded_dt` already uses for fps."""
     global _ACTION_AGGREGATE
     mode = str(mode or "sum")
-    if mode not in ("sum", "last"):
-        raise ValueError(f"data.action_aggregate must be 'sum' or 'last', got {mode!r}")
+    if mode not in ("sum", "last", "concat"):
+        raise ValueError(f"data.action_aggregate must be 'sum', 'last' or 'concat', got {mode!r}")
     _ACTION_AGGREGATE = mode
+
+
+def get_action_aggregate() -> str:
+    return _ACTION_AGGREGATE
+
+
+def effective_action_dim(base_dim: int) -> int:
+    """The action width a model must expect, given the process-wide stride and aggregation mode.
+
+    ONE definition so nothing restates the arithmetic: "sum"/"last" collapse s actions into one and leave
+    the width alone; "concat" lays them side by side, so the width is base * s."""
+    return int(base_dim) * (_SUBSAMPLE if _ACTION_AGGREGATE == "concat" else 1)
 
 
 _SUBSAMPLE_ALL_PHASES = False
@@ -178,7 +201,9 @@ def _subsample_episodes(eps, tag: str):
     if s <= 1:
         return eps
     acts = np.concatenate([e[1] for e in eps], 0)
-    if _ACTION_AGGREGATE == "last":       # ABSOLUTE actions: every dim takes the group's last raw value
+    if _ACTION_AGGREGATE == "concat":     # LOSSLESS: nothing is aggregated, so the binary detect is moot
+        hold = []
+    elif _ACTION_AGGREGATE == "last":     # ABSOLUTE actions: every dim takes the group's last raw value
         hold = list(range(acts.shape[1]))
     else:
         hold = [d for d in range(acts.shape[1]) if len(np.unique(acts[:, d])) <= 2]
@@ -196,7 +221,7 @@ def _subsample_episodes(eps, tag: str):
                 dropped += 1
                 continue
             grp = a[:n * s].reshape(n, s, -1)
-            aa = grp.sum(axis=1)
+            aa = grp.reshape(n, -1) if _ACTION_AGGREGATE == "concat" else grp.sum(axis=1)
             if hold:
                 aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the sum
             # extra streams (ep[2:]) are sliced identically. A DICT of streams (the multi-camera frame
@@ -205,8 +230,9 @@ def _subsample_episodes(eps, tag: str):
                           else x[ph:][:n * s:s] for x in ep[2:])
             out.append((o[:n * s:s], aa) + extra)
     print(f"[subsample] {tag}: stride {s}{f' x {s} PHASES' if all_phases else ''} | {len(eps)} eps "
-          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions SUMMED except "
-          f"take-last on dims {hold} | {dropped} eps dropped as too short", flush=True)
+          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions "
+          f"{f'CONCATENATED {s}x -> width {out[0][1].shape[1] if out else 0} (lossless)' if _ACTION_AGGREGATE == 'concat' else 'TAKE-LAST on every dim' if _ACTION_AGGREGATE == 'last' else f'SUMMED except take-last on dims {hold}'}"
+          f" | {dropped} eps dropped as too short", flush=True)
     return out
 
 

@@ -135,6 +135,17 @@ def main(cfg):
     # using the frames the decimation otherwise throws away. Off = bit-identical. See set_subsample_all_phases.
     set_subsample_all_phases(bool(cfg.data.get("subsample_all_phases", False)))
     set_action_aggregate(cfg.data.get("action_aggregate", "sum"))   # how subsample combines skipped actions
+    # action_aggregate=concat makes the action width a function of data.subsample, so model.action_dim must
+    # NOT be a hand-kept constant. Derive it from whatever is configured through the ONE definition in
+    # data/dataset.py, and say so. physical_loss consumes act_raw positionally (physics_proprio_chained),
+    # so a reshaped action would be silently misread -- refuse rather than mis-train.
+    if str(cfg.data.get("action_aggregate", "sum")) == "concat":
+        if float(cfg.get("variations", {}).get("physical_loss", {}).get("weight", 0.0) or 0.0) > 0.0:
+            raise ValueError("data.action_aggregate=concat with variations.physical_loss.weight>0: the "
+                             "physics prior reads act_raw positionally and cannot interpret a concatenated "
+                             "action. Set physical_loss.weight=0 or use action_aggregate=last.")
+        print(f"[action_aggregate] concat: the action width is derived from data.subsample="
+              f"{cfg.data.get('subsample', 1)} in training/setup.py, not from model.action_dim", flush=True)
     set_obs_keep(cfg.data.get("obs_keep", None))   # process-wide obs subset -> applied inside every loader + normalizer
     if not data_exists(cfg):
         raise FileNotFoundError(

@@ -38,6 +38,49 @@ def _recorded_dt(cfg, fallback: float) -> float:
     return fallback
 
 
+def _effective_action_dim_for(cfg, base: int) -> int:
+    """`base` widened by data.subsample when data.action_aggregate=concat, else `base` unchanged.
+
+    Reads the mode off cfg rather than the process-wide setter, because the model can be built by entry
+    points that never call set_action_aggregate (model_summary, the smokes). set_subsample IS still the
+    authority on the stride at load time; this only has to agree with it, which it does because both read
+    data.subsample."""
+    from ..data.dataset import effective_action_dim, set_action_aggregate
+    mode = str(cfg.data.get("action_aggregate", "sum")) if cfg.get("data", None) is not None else "sum"
+    if mode != "concat":
+        return int(base)
+    set_action_aggregate(mode)      # keep the process-wide state consistent with what we just resolved
+    from ..data.dataset import set_subsample
+    set_subsample(int(cfg.data.get("subsample", 1) or 1))
+    return effective_action_dim(int(base))
+
+
+def _recorded_action_dim(cfg, fallback: int) -> int:
+    """A recorded env's action width is DATASET-SPECIFIC, and with data.action_aggregate=concat it is also
+    a function of data.subsample -- so it must not be hardcoded in two configs and hoped to agree.
+
+    Prefer the dataset's OWN recorded action_dim (summary.json split_env.action_dim) put through
+    `effective_action_dim`, which is the single definition of the mode/stride arithmetic. Falls back to
+    environments.action_dim with a LOUD warning, exactly like `_recorded_dt` does for fps -- a silent
+    action-width mismatch would either crash in the encoder or, worse, train on a reshaped action."""
+    import json
+
+    from ..data.dataset import effective_action_dim, get_action_aggregate
+    try:
+        root = resolve_data_root(cfg)
+        base = json.load(open(os.path.join(root, "summary.json")))["split_env"]["train"]["action_dim"]
+    except Exception as ex:   # noqa: BLE001
+        print(f"[env_cfg] WARNING: could not read action_dim from the dataset ({type(ex).__name__}); using "
+              f"environments.action_dim={fallback}. With action_aggregate=concat that is very likely WRONG "
+              f"(the width scales with data.subsample).", flush=True)
+        return fallback
+    eff = effective_action_dim(int(base))
+    if eff != fallback:
+        print(f"[env_cfg] recorded action_dim <- dataset {base} x aggregate={get_action_aggregate()} "
+              f"=> {eff} (overrides environments.action_dim={fallback})", flush=True)
+    return eff
+
+
 def env_cfg(cfg):
     """cfg.environments -> the env's config dataclass (torus: TorusConfig, unchanged; recorded: RecordedConfig)."""
     e = cfg.environments
@@ -49,7 +92,7 @@ def env_cfg(cfg):
                               m=float(e.m), l=float(e.l))
     if str(e.name).lower() == "recorded":
         from ..environments.recorded import RecordedConfig
-        return RecordedConfig(obs_dim=int(e.obs_dim), action_dim=int(e.action_dim),
+        return RecordedConfig(obs_dim=int(e.obs_dim), action_dim=_recorded_action_dim(cfg, int(e.action_dim)),
                               dt=_recorded_dt(cfg, float(e.dt)),
                               position_idx=(list(e.position_idx) if e.get("position_idx", None) is not None else None),
                               velocity_idx=(list(e.velocity_idx) if e.get("velocity_idx", None) is not None else None),
@@ -218,7 +261,13 @@ def build_model(cfg):
                     f"head_dim={head_dim}. Pick d/heads giving head_dim in {{16,32,64}} (e.g. d=192/heads=12 -> 16), "
                     f"or disable compile_rollout (eager has no such constraint).")
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
-                      mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2),
+                      mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta,
+                      # action_dim goes through the ONE definition in data/dataset.py, so
+                      # data.action_aggregate=concat (which scales the width by data.subsample) cannot
+                      # disagree with a hand-kept constant. Identity for sum/last, so every existing
+                      # recipe is bit-identical. HERE rather than in train_world_model so that
+                      # model_summary, the eval entry points and any smoke all resolve the same width.
+                      action_dim=_effective_action_dim_for(cfg, int(m.get("action_dim", 2))),
                       grad_checkpoint=bool(m.get("grad_checkpoint", False)),
                       compile_rollout=compile_rollout,
                       latent_norm=m.get("latent_norm", "layernorm"),
