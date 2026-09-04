@@ -167,6 +167,8 @@ def build_model(cfg):
                       compile_rollout=compile_rollout,
                       latent_norm=m.get("latent_norm", "layernorm"),
                       action_fourier_freqs=int(m.get("action_fourier_freqs", 0)),
+                      action_fourier_fmax=float(m.get("action_fourier_fmax", 100.0)),
+                      action_delta=bool(m.get("action_delta", False)),
                       action_squash=str(m.get("action_squash", "none")))
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
@@ -240,6 +242,37 @@ def build_model(cfg):
             mdl.flip_loss_weight = float(dfg("flip_loss_weight", 0.0))
             mdl.flip_loss_alpha = float(dfg("flip_loss_alpha", 0.0))   # v6 balanced loss (record §8.16)
             mdl.flip_dim = int(dfg("flip_dim", 1))
+            # temporal-attention precision (§8.64): default off = bit-identical to every prior run
+            if bool(m.get("temporal_attn_fp32", False)):
+                for _blk in mdl.backbone.blocks:
+                    _blk.t_fp32 = True
+                print("[attn] temporal attention pinned to fp32 (bf16 Flex backward overflow fix, §8.64)",
+                      flush=True)
+            _fwc = dfg("flip_weight_cap", None)
+            mdl.flip_weight_cap = None if _fwc is None else float(_fwc)
+            # physics-token loss weighting (record §8.43). 0.0 -> inert / bit-identical. `physics_alpha` is
+            # the composition-invariant SHARE of the realized dynamics-loss mass given to the physics
+            # modality's token, so it is stable against bag-size changes (same closed form as flip_loss_alpha).
+            # action_delta scale (§8.57): per-dim std of the NORMALIZED action delta, from config
+            # (computed offline on the training corpus — explicit, auditable). REQUIRED when on: leaving
+            # the buffer at ones would feed near-raw Δz, i.e. the tiny displacement the channel exists to fix.
+            _ads = m.get("action_delta_scale", None)
+            if getattr(mdl, "action_delta", False):
+                assert _ads is not None and len(_ads) == mdl.act_delta_scale.numel(), \
+                    "model.action_delta=true requires model.action_delta_scale=[per-dim std of the z-action delta]"
+                mdl.act_delta_scale.copy_(torch.tensor([float(x) for x in _ads]))
+                print(f"[action-delta] scale={[round(float(x), 5) for x in mdl.act_delta_scale]}", flush=True)
+            mdl.physics_modality = dfg("physics_modality", None) or None
+            mdl.physics_alpha = float(dfg("physics_alpha", 0.0))
+            _pvi = dfg("physics_valid_idx", None)
+            mdl.physics_valid_idx = None if _pvi is None else int(_pvi)   # obs channel = extractor ok flag
+            assert 0.0 <= mdl.physics_alpha < 1.0, "physics_alpha must be in [0, 1)"
+            if mdl.physics_alpha > 0.0:
+                _names = [n for n, _ in mdl.layout]
+                assert mdl.physics_modality in _names, \
+                    f"physics_modality={mdl.physics_modality!r} not in bag layout {_names}"
+                print(f"[physics-loss] modality={mdl.physics_modality} alpha={mdl.physics_alpha} "
+                      f"(bag {mdl.n_state} tokens)", flush=True)
             assert not (mdl.flip_loss_weight > 0.0 and mdl.flip_loss_alpha > 0.0), \
                 "flip_loss_weight (legacy per-step) and flip_loss_alpha (balanced) are mutually exclusive"
             if mdl.flip_loss_weight > 0.0 or mdl.flip_loss_alpha > 0.0:
@@ -716,6 +749,47 @@ def eval_episodes(cfg, norm: Normalizer, split: str):
 def data_exists(cfg) -> bool:
     root = resolve_data_root(cfg)
     return bool(root) and os.path.exists(os.path.join(root, "normalization_stats.json"))
+
+
+def warm_start(model, path: str) -> None:
+    """WEIGHTS-ONLY warm start (record §8.45 P3 / §8.56 F9): load every parameter/buffer whose name AND
+    shape match; SKIP (with a loud report) anything else. Unlike `+resume` this never touches optimizer
+    state or epoch counters and never reuses the source run_dir — the caller keeps its fresh run_dir.
+    Unlike `load_checkpoint` it tolerates shape changes (e.g. act_enc widened by model.action_delta:
+    those weights were untrained in a codec-only Stage A anyway) instead of raising.
+    Refuses `best.ckpt` for a Stage-A source unless explicit: §8.56 F9 measured codec-only best.ckpt
+    8.9 dB worse than last.ckpt (the monitor is meaningless with the flow untrained)."""
+    import torch
+
+    if os.path.isdir(path):
+        path = os.path.join(path, "checkpoints", "last.ckpt")
+    assert os.path.basename(path) != "best.ckpt", \
+        "warm_start refuses best.ckpt: in a codec-only Stage A it is 8.9 dB worse than last.ckpt " \
+        "(record §8.56 F9). Pass the run DIR (resolves to last.ckpt) or a specific snap."
+    sd = torch.load(path, map_location="cpu")
+    sd = sd.get("state_dict", sd)
+    clean = {}
+    for k, v in sd.items():
+        if k.startswith("model."):
+            k = k[len("model."):]
+        clean[k.replace("_orig_mod.", "")] = v
+    own = dict(model.named_parameters()) | dict(model.named_buffers())
+    load, skip_shape = {}, []
+    for k, v in clean.items():
+        if k == "act_delta_scale":
+            continue   # config-owned (§8.45 P2-2 review): loading it would silently overwrite the
+            #            configured scale on any warm start FROM a Stage-B checkpoint.
+        if k in own and own[k].shape == v.shape:
+            load[k] = v
+        elif k in own:
+            skip_shape.append((k, tuple(v.shape), tuple(own[k].shape)))
+    missing = [k for k in own if k not in load]
+    inc = model.load_state_dict(load, strict=False)
+    assert not inc.unexpected_keys
+    print(f"[warm_start] {path}: loaded {len(load)}/{len(own)} tensors"
+          + (f" | SHAPE-SKIPPED {len(skip_shape)}: "
+             + ", ".join(f"{k} {a}->{b}" for k, a, b in skip_shape[:6]) if skip_shape else "")
+          + (f" | left at init ({len(missing)}): {missing[:6]}" if missing else ""), flush=True)
 
 
 def load_checkpoint(model, path: str):

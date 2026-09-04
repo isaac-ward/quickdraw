@@ -27,6 +27,29 @@ def adamw_with_warmup(params, lr: float, weight_decay: float, warmup_steps: int 
     return opt
 
 
+
+def _obs_dict(m, batch):
+    """Per-modality targets from one batch. A modality with `obs_slice` reads that [start, stop) slice of the
+    shared observation_vector; everything else keeps the historical behaviour (`proprio` = the whole vector,
+    any other name = its own batch stream). See ModalitySpec.obs_slice / record §8.43."""
+    out = {}
+    for name, _ in m.layout:
+        sl = getattr(m.modalities[name], "obs_slice", None)
+        if sl is not None:
+            out[name] = batch["obs_seq"][..., int(sl[0]):int(sl[1])]
+        elif name == "proprio":
+            out[name] = batch["obs_seq"]
+        else:
+            out[name] = batch[name]
+    # Validity of the physics features, if the corpus carries a flag channel. Not a modality -- it is read
+    # only by MultiModalFlow.loss_terms to ZERO the physics token's flow weight on frames where the
+    # extractor failed, instead of imputing a value (record §8.40 F4/F5: impute-plus-mask is a live hazard
+    # in this corpus). encode_state/recon_losses iterate `layout`, so this extra key is ignored everywhere else.
+    vi = getattr(m, "physics_valid_idx", None)
+    if vi is not None:
+        out["_phys_valid"] = (batch["obs_seq"][..., int(vi)] > 0).to(batch["obs_seq"].dtype)
+    return out
+
 class LitWorldModel(L.LightningModule):
     def __init__(self, model, normalizer, R: float, r: float, v_scale: float, P: int, F: int,
                  p_tf_start: float, p_tf_end: float, p_tf_warmup: int,
@@ -97,26 +120,24 @@ class LitWorldModel(L.LightningModule):
         m = self._core()
         P, L = self.P, self.P + self.F
         p_tf = self._cur_p_tf() if tag == "train" else 0.0   # val = pure autoregressive + deterministic (no teacher forcing)
-        obs = {"proprio": batch["obs_seq"]}
-        for name, _ in m.layout:
-            if name != "proprio":
-                obs[name] = batch[name]
+        obs = _obs_dict(m, batch)
         act = batch["act_seq"]
         # per-stream input noise (training only): perturb the model INPUTS; targets/metrics use clean obs.
         obs_in = obs
         if tag == "train":
-            obs_in = {k: (v + torch.randn_like(v) * m.modalities[k].noise_std) if m.modalities[k].noise_std > 0 else v
-                      for k, v in obs.items()}
+            obs_in = {k: (v + torch.randn_like(v) * m.modalities[k].noise_std)
+                      if (k in m.modalities and m.modalities[k].noise_std > 0) else v
+                      for k, v in obs.items()}                # non-modality keys (_phys_valid) pass through
         # SHARED-ENCODE fast path (design/accelerations P4): when inputs == targets (all noise_std==0) in the
         # p_tf==0 AR regime, encode the frames ONCE and slice for the rollout ctx + loss_terms + roundtrip
         # instead of re-encoding them 2-3x. Bit-identical (smoke-verified). Flow model only; encode is per-frame,
         # so z_full[:, sl] == encode(obs[:, sl]) exactly. noise_std>0 -> inputs differ from targets -> OFF.
         share = (p_tf == 0.0) and hasattr(m, "flow") and \
-            (tag != "train" or all(m.modalities[k].noise_std == 0 for k in obs))
+            (tag != "train" or all(m.modalities[k].noise_std == 0 for k in obs if k in m.modalities))
         z_full = m.encode_state(obs_in) if share else None
         if tag == "train" and not getattr(self, "_noise_share_noted", False):
             self._noise_share_noted = True
-            noisy = [k for k in obs if m.modalities[k].noise_std > 0]
+            noisy = [k for k in obs if k in m.modalities and m.modalities[k].noise_std > 0]
             if noisy:
                 print(f"[encode-share] input noise on {noisy} -> shared-encode fast path OFF; frames are "
                       f"re-encoded per loss site (slower). Set modalities.<i>.noise_std=0 to enable it.", flush=True)
@@ -181,8 +202,17 @@ class LitWorldModel(L.LightningModule):
         if tag == "val":
             with torch.no_grad():
                 dec = m.to_obs(src)                           # decode (mse) / 1-step sample (flow) — val metrics only
-                p_hat = torch.nan_to_num(self.norm.denorm_obs(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
-                p_true = self.norm.denorm_obs(future["proprio"])
+                # obs_slice-aware denorm: a sliced modality (v7phys: proprio = dims 0:138 of a 145-D
+                # vector) must be denormalized with the SAME slice of the stats, or the broadcast fails.
+                _psl = getattr(m.modalities["proprio"], "obs_slice", None)
+                if _psl is None:
+                    _dn = self.norm.denorm_obs
+                else:
+                    _mu = self.norm.o_mean[_psl[0]:_psl[1]]
+                    _sd = self.norm.o_std[_psl[0]:_psl[1]]
+                    _dn = lambda o: o * _sd.to(o) + _mu.to(o)   # noqa: E731
+                p_hat = torch.nan_to_num(_dn(dec["proprio"]), nan=10.0, posinf=10.0, neginf=-10.0)
+                p_true = _dn(future["proprio"])
                 # env-polymorphic rollout metrics (WorldEnv.rollout_metrics): torus returns its three errors
                 # (byte-identical tags/values to the old hardcoded calls); other envs return their own set.
                 metrics_fn = self.env.rollout_metrics if self.env is not None else default_rollout_metrics
@@ -302,10 +332,7 @@ class LitActionModel(L.LightningModule):
 
     def _step(self, batch, tag):
         m = self.model
-        obs = {"proprio": batch["obs_seq"]}
-        for name, _ in m.layout:
-            if name != "proprio":
-                obs[name] = batch[name]
+        obs = _obs_dict(m, batch)
         act = batch["act_seq"]                                # (B, L, action_dim), normalized
         L_ = act.shape[1]
         # exclude the FLASH SDPA backend for the frozen-WM context pass: Lightning's val context selects it for

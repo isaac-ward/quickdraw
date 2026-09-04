@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+import torch
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from .transformer import FeedForward, SelfAttention
@@ -74,7 +75,16 @@ class SpaceTimeBlock(nn.Module):
         x = x + self.s_attn(self.s_norm(x).reshape(B * T, N, d), attn_eager).reshape(B, T, N, d)
         # temporal: (B,T,N,d) -> (B*N, T, d), causal over T per slot, then back
         y = self.t_norm(x).permute(0, 2, 1, 3).reshape(B * N, T, d)
-        t = self.t_attn(y, block_mask=temporal_block_mask, attn_eager=attn_eager)
+        if getattr(self, "t_fp32", False):
+            # §8.64: run the temporal attention in fp32 even under bf16 autocast. MEASURED at r10B-ctrl's
+            # dead ep87 checkpoint: identical loss (0.1817), total grad norm 1.76e10 (bf16 Flex backward)
+            # vs 4.25 (fp32). The blow-ups that killed r10B (and r9's ep-159 collapse signature) are a
+            # bf16 FlexAttention BACKWARD overflow under unbounded temporal-logit growth (block-3 max
+            # |logit| reaches ~17k), not an optimization pathology. Default off = bit-identical.
+            with torch.autocast("cuda", enabled=False):
+                t = self.t_attn(y.float(), block_mask=temporal_block_mask, attn_eager=attn_eager).to(x.dtype)
+        else:
+            t = self.t_attn(y, block_mask=temporal_block_mask, attn_eager=attn_eager)
         x = x + t.reshape(B, N, T, d).permute(0, 2, 1, 3)
         # mlp (token-wise)
         return x + self.mlp(self.m_norm(x))
@@ -88,7 +98,11 @@ class SpaceTimeBlock(nn.Module):
         x = x + self.s_attn(self.s_norm(x))                     # spatial, single step (M=B)
         y = self.t_norm(x).reshape(B * N, 1, d)                 # temporal per-slot: (B*N, 1, d)
         positions = torch.full((1,), pos, device=x.device, dtype=torch.long)
-        t = self.t_attn.forward_cached(y, ring, positions)      # (B*N, 1, d)
+        if getattr(self, "t_fp32", False):
+            with torch.autocast("cuda", enabled=False):
+                t = self.t_attn.forward_cached(y.float(), ring, positions).to(x.dtype)
+        else:
+            t = self.t_attn.forward_cached(y, ring, positions)  # (B*N, 1, d)
         x = x + t.reshape(B, N, d)
         return x + self.mlp(self.m_norm(x))
 

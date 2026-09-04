@@ -1,0 +1,44 @@
+# =============================================================================================
+# xtcav_physA — Stage A of the xtcav run-10 plan (record §8.37/§8.43/§8.45): CODEC-ONLY training.
+# bsp32mse with (1) the §8.32 cross-attention decoder, (2) the proprio round-trip anchor switched ON
+# (§8.25: latent_loss_weight defaults to 0 for vectors, which froze the proprio encoder at random
+# init for runs 5–9), and (3) the PHYSICS modality (§8.43): a third, 1-token vector modality reading
+# the 6 extracted physics channels appended to the obs vector by the v7phys corpus (obs_slice).
+# The physics modality must be present FROM STAGE A: adding a modality later changes
+# backbone.slot_emb (34->35 tokens) and breaks every warm start (§8.45 P3).
+#
+# CODEC-ONLY is enforced on the CLI, not here (lambda_flow=0 + every modality weight=0), so this
+# model file is reusable verbatim for Stage B.
+# =============================================================================================
+defaults:
+  - bsp32mse
+  - _self_
+
+modalities:
+  # OmegaConf replaces lists, so the full list is restated (same convention as bsp32mse).
+  # proprio: dims 0:138 of the 145-D v7phys obs vector. obs_slice is REQUIRED now that the vector
+  # carries appended channels — without it proprio would consume the physics block too.
+  - {name: proprio, kind: vector, dim: 138, weight: 1.0, decode_kind: mse, decode_param: x0,
+     decode_arch: mlp, fourier_freqs: 16, obs_slice: [0, 138],
+     linear_skip: true,        # §8.53: the obs vector is near-linear (128 PCs = 99.999%); the hidden-64
+     ln_carrier: true,         # §8.54: closed-form-invertible bag LN via 2 carrier dims (0.032 -> 0.011)
+     #                           GELU MLP alone pinches it AND extrapolates 1.6x worse on run tails
+     #                           (measured 0.112 in-run vs 0.032 with the skip under bag LN)
+     latent_loss_weight: 1}    # §8.25: the ONLY gradient path to a vector encoder; 0 = frozen at init
+  - {name: image, kind: image, weight: 1.0, img_size: [64, 192],
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: unet, decode_base: 32,
+     decode_param: x0, patch: 16, ae_depth: 4,
+     ae_bottleneck: 16,
+     decoder_cond: xattn,      # §8.32: query grid at the (16,48) bottleneck attending over the 32
+     seed_upsample: bilinear,  #   tokens; replaces the 2x2 seed that §8.31 measured at 244 um
+     latent_loss_weight: 10}
+  # physics: the 6 extracted features (sep_um, q_lo, q_hi, row_sep_um, sig_lo_um, sig_hi_um) at
+  # dims 138:144; dim 144 is the extractor-ok flag, consumed by physics_valid_idx (loss mask), not
+  # by any modality. ONE bag token whose latent verifiably carries the features (§8.46 addendum:
+  # read-back R² ≥ 0.995, corr(‖Δz‖,‖Δphysics‖) = 0.92 after LN).
+  - {name: physics, kind: vector, dim: 6, weight: 1.0, decode_kind: mse, decode_param: x0,
+     decode_arch: mlp, obs_slice: [138, 144],
+     latent_loss_weight: 1}    # trains the physics encoder in Stage A; Stage B sets it back to 0
+                               # (trained-frozen, the arm-1f-safe resolution — §8.45 P4)

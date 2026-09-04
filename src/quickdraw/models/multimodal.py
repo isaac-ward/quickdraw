@@ -64,7 +64,7 @@ class FourierMLP(nn.Module):
     bounds the input first -- required, see features.fourier_features."""
 
     def __init__(self, i: int, o: int, h: int, n_freq: int = 0, squash: float = 4.0,
-                 input_squash: str = "none"):
+                 input_squash: str = "none", f_max: float = 100.0):
         super().__init__()
         from .features import fourier_dim, fourier_freqs
         if input_squash not in ("none", "symlog"):
@@ -73,7 +73,10 @@ class FourierMLP(nn.Module):
         self.input_squash = input_squash
         in_dim = i + (fourier_dim(i, n_freq) if n_freq > 0 else 0)
         if n_freq > 0:
-            self.register_buffer("freqs", fourier_freqs(n_freq), persistent=False)
+            # f_max: top band of the ladder. 100.0 = the historical hardcoded value (bit-identical).
+            # Record §8.34 M-H / §8.40 F3: at f_max=100 the top band advances >1/4 cycle between
+            # consecutive shots for >=82% of channels, so those features are shot-to-shot WHITE.
+            self.register_buffer("freqs", fourier_freqs(n_freq, float(f_max)), persistent=False)
         self.net = _mlp(in_dim, o, h)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -109,7 +112,8 @@ class MultiModalSequenceModel(nn.Module):
     def __init__(self, specs: list[ModalitySpec], *, d: int, depth: int, heads: int, window: int,
                  mlp_ratio: float, rope_theta: float, action_dim: int, grad_checkpoint: bool = False,
                  compile_rollout: bool = False, latent_norm: str | bool = "affine",
-                 action_fourier_freqs: int = 0, action_squash: str = "none"):
+                 action_fourier_freqs: int = 0, action_squash: str = "none",
+                 action_fourier_fmax: float = 100.0, action_delta: bool = False):
         super().__init__()
         self.grad_checkpoint = bool(grad_checkpoint)   # checkpoint each rollout-step backbone forward (train only)
         # OPT-IN (default off): torch.compile(step, mode="default") the per-step AR compute (backbone + readout)
@@ -128,8 +132,26 @@ class MultiModalSequenceModel(nn.Module):
         # action -> 1 token. action_fourier_freqs>0 prepends sin/cos features so SMALL action differences are
         # linearly separable (robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ
         # slightly). 0 = off = bit-identical to a plain _mlp.
-        self.act_enc = FourierMLP(action_dim, d, d, n_freq=int(action_fourier_freqs),
-                                  input_squash=str(action_squash))
+        # action_delta (record §8.51/§8.57): append the per-step CHANGE of each action dim, scaled by its
+        # own delta-std, as extra input channels. Why: a commanded 0.25° L2 step is 0.0356 z through the
+        # SETPOINT normalizer (§8.38), and the raw input is measurably ANTI-aligned on the fine-grained
+        # physics target (m19b: −0.061 at t=−3.9, 9/10 seeds negative) while the delta channel flips it
+        # positive on 10/10 seeds at 155× the input displacement. Derived IN-MODEL from the action
+        # sequence (no corpus change, §8.45 confound table); scale set from config (`action_delta_scale`).
+        self.action_delta = bool(action_delta)
+        self.register_buffer("act_delta_scale", torch.ones(action_dim))
+        self.act_enc = FourierMLP(action_dim * (2 if self.action_delta else 1), d, d,
+                                  n_freq=int(action_fourier_freqs),
+                                  input_squash=str(action_squash),
+                                  f_max=float(action_fourier_fmax))
+        if self.action_delta:
+            # ZERO-INIT the delta columns (§8.60): at full lr with no warmup the delta pathway blew up
+            # act_enc 0.04 -> inf inside 3 val cycles (r10B-dl2, 09-02 01:21) while the no-delta arm's
+            # event healed. Zeroed columns make the channel start INERT and grow in — warmup by
+            # initialization, the same zero-init-residual trick as linear_skip/carrier_proj. Setpoint
+            # columns keep their standard init, so action_delta=false stays bit-identical anyway.
+            with torch.no_grad():
+                self.act_enc.net[0].weight[:, action_dim:].zero_()
         self.backbone = SpaceTimeTransformer(d, depth, heads, window, mlp_ratio,
                                              n_slots=self.n_input, rope_theta=rope_theta)
         # How the latent is made scale-free for the dynamics — see resolve_latent_norm for the three options.
@@ -286,7 +308,22 @@ class MultiModalSequenceModel(nn.Module):
         bag = self.encode_state(targets) if pre_z is None else pre_z   # REAL encode (LN incl.); pre_z = the SAME
         #                          encode already computed by the shared-encode fast path (_step), sliced to these
         #                          target frames -- bit-identical at noise_std=0 (see design/accelerations P4).
-        rec = self.to_obs(bag, heads=heads)              # the REAL decode
+        # roundtrip_detach_enc (record §8.61/§8.63): per-modality, decode a DETACHED copy of the bag so
+        # the roundtrip anchors the DECODER at the codec optimum without moving the (frozen) encoder.
+        # Why this exists: Stage B set vector llw=0 to freeze the encoders (arm-1f safety) and thereby
+        # ALSO removed the decoders' only anchor — they drifted off the Stage-A optimum within 3 epochs
+        # (proprio floor 0.018 -> 0.29, physics token 3 -> 100 um). llw>0 + detach = decoder-only anchor.
+        det = {n for n in heads if getattr(self.modalities[n], "roundtrip_detach_enc", False)}
+        if det:
+            off, parts = 0, []
+            for name, n_tok in self.layout:
+                sl = bag[..., off:off + n_tok, :]
+                parts.append(sl.detach() if name in det else sl)
+                off += n_tok
+            bag_dec = torch.cat(parts, dim=-2)
+        else:
+            bag_dec = bag
+        rec = self.to_obs(bag_dec, heads=heads)          # the REAL decode
         # RAW mse + its weight, so the logged series is comparable across runs that sweep latent_loss_weight
         # (every sibling term is logged raw and weighted at the sum). Returning it pre-scaled made the codec
         # panel rescale while the decode panels did not.
@@ -372,6 +409,18 @@ class MultiModalSequenceModel(nn.Module):
         carries the observation, compounding error in data space (the defining DSAR property)."""
         return bag
 
+    def _act_feats(self, a: Tensor) -> Tensor:
+        """(.., T, A) normalized actions -> act_enc input. action_delta=False: identity (bit-identical).
+        True: append (a[t] − a[t−1]) / act_delta_scale along time; the first position gets Δ=0 (no
+        previous action exists inside the context — same semantics at window start and sequence start).
+        Apply to the FULL sequence once per entry point (loss_terms / _rollout_from / forward /
+        one_step_states / action_context), never to mid-sequence slices — a slice would zero the Δ of
+        its first element mid-sequence."""
+        if not self.action_delta:
+            return a
+        dz = torch.cat([torch.zeros_like(a[..., :1, :]), a[..., 1:, :] - a[..., :-1, :]], dim=-2)
+        return torch.cat([a, dz / self.act_delta_scale.to(a)], dim=-1)
+
     def _rollout_step(self, s_win: Tensor, a_win: Tensor, bm, prev_bag: Tensor) -> Tensor:
         """One rollout advance as backbone(+readout): (s_win (B,W,n_state,d), a_win (B,W,2), bm, prev_bag
         (B,n_state,d)) -> next state bag (B,n_state,d). This is the unit wrapped by torch.compile (mode="default")
@@ -400,12 +449,14 @@ class MultiModalSequenceModel(nn.Module):
         (bag_win (B,W,n_state,d), act_win (B,W,2)) -> next bag (B,n_state,d) at the LAST position. Backbone-
         only, so it's identical for every MM model; attn_eager routes through the double-backprop-able
         sdpa(MATH) path used by the contraction penalty's Jacobian power-iteration."""
+        act_win = self._act_feats(act_win)      # window-start Δ=0 (diagnostic path; identity when off)
         h = self.backbone(self._to_input(bag_win, act_win), attn_eager=attn_eager)
         return self.readout(h[:, -1], bag_win[:, -1], act_win[:, -1])
 
     # ---- teacher-forced parallel forward ----
     def forward(self, obs: dict[str, Tensor], act: Tensor) -> Tensor:
         s = self.encode_state(obs)
+        act = self._act_feats(act)
         h = self.backbone(self._to_input(s, act))
         return self.readout(h, s, act)
 
@@ -424,6 +475,7 @@ class MultiModalSequenceModel(nn.Module):
         """Rollout from a PRE-ENCODED context (list of P bags). Lets callers encode the context once and
         roll many action variants from it (MPPI: encode the image context once, share across K candidates).
         use_cache: temporal KV-cache path (inference only) — see `_rollout_cached`."""
+        actions = self._act_feats(actions)   # ONCE, on the full sequence (see _act_feats)
         if use_cache:
             assert p_tf == 0.0 and tf_future is None, "KV-cache rollout is inference-only (no teacher forcing)"
             return self._rollout_cached(list(bag_buf), actions, horizon)
@@ -589,12 +641,14 @@ class MultiModalLSAR(MultiModalSequenceModel):
 
     def __init__(self, specs, *, d, depth, heads, window, mlp_ratio, rope_theta, action_dim,
                  grad_checkpoint: bool = False, compile_rollout: bool = False, latent_norm: bool = True, action_fourier_freqs: int = 0, action_squash: str = "none",
+                 action_fourier_fmax: float = 100.0, action_delta: bool = False,
                  pred_hidden: int = 0, lambda_pred_latent: float = 1.0,
                  collapse: CollapseStrategy | None = None, lambda_reg: float = 1.0, expander_dim: int = 256):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
-                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash)
+                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash,
+                         action_fourier_fmax=action_fourier_fmax, action_delta=action_delta)
         h = pred_hidden or d
         self.predictor = _mlp(d, d, h)                          # per-token residual predictor
         self.lambda_pred_latent = lambda_pred_latent
@@ -691,6 +745,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  latent_norm: str | bool = "affine",   # was `bool = True` -> silently gave LAYERNORM on a direct
                  #                                       construct, contradicting the LOCKED affine default
                  action_fourier_freqs: int = 0, action_squash: str = "none",
+                 action_fourier_fmax: float = 100.0, action_delta: bool = False,
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = True, time_sampling: str = "uniform", flow_hidden: int = 0,
                  flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
@@ -703,7 +758,8 @@ class MultiModalFlow(MultiModalSequenceModel):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
-                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash)
+                         action_fourier_freqs=action_fourier_freqs, action_squash=action_squash,
+                         action_fourier_fmax=action_fourier_fmax, action_delta=action_delta)
         assert predict in ("residual", "absolute")
         self.predict_residual = predict == "residual"
         self.sampling_steps = int(sampling_steps)
@@ -792,7 +848,8 @@ class MultiModalFlow(MultiModalSequenceModel):
             s = (1.0 - lv) * s + lv * eps                        # noised context
             if self.latent_norm:
                 s = _ln(s)                                       # renormalized back onto the sphere
-        a_ctx = act_seq[:, :L - 1]
+        a_ctx = self._act_feats(act_seq)[:, :L - 1]             # features: full-seq Δ, THEN sliced
+        a_ctx_raw = act_seq[:, :L - 1]                          # RAW z-actions: flip detection reads these
         a_emb = self.act_enc(a_ctx)                             # (B,L-1,d)
         if self.training and self.action_dropout > 0.0:        # trained CFG: one mask per (sample, step),
             m = (torch.rand(a_emb.shape[:-1], device=a_emb.device) < self.action_dropout).unsqueeze(-1)
@@ -813,7 +870,7 @@ class MultiModalFlow(MultiModalSequenceModel):
         if (flw > 0.0 or alpha > 0.0) and self.training:
             fd = int(getattr(self, "flip_dim", 1))
             z0 = float(getattr(self, "flip_zero_z", 0.0))
-            sgn = a_ctx[..., fd] - z0                           # (B, L-1); sign = physical sign of S
+            sgn = a_ctx_raw[..., fd] - z0                       # (B, L-1); sign = physical sign of S (RAW, not features)
             prev = torch.cat([sgn[:, :1], sgn[:, :-1]], dim=1)  # step 0 compares with itself (no flip)
             dead = 0.05                                         # z-units; off anchors sit AT z0
             flip = (sgn * prev < 0) & (sgn.abs() > dead) & (prev.abs() > dead)
@@ -826,22 +883,73 @@ class MultiModalFlow(MultiModalSequenceModel):
                 if n_f > 0:
                     n_nf = flip.numel() - n_f
                     w_b = alpha * n_nf.float() / ((1.0 - alpha) * n_f.float())
+                    # flip_weight_cap (§8.63): w_b is UNBOUNDED as n_f -> 1 (~113 at batch 36 x L-1=23 with
+                    # alpha=.12) — a single flip element then dominates the batch gradient. Candidate trigger
+                    # for the LATE act_enc blow-ups (§8.60-§8.62: fired at ep 60-115 THROUGH a 300-step LR
+                    # warmup, so the trigger is state-dependent, not early). None = uncapped = bit-identical.
+                    cap = getattr(self, "flip_weight_cap", None)
+                    if cap is not None:
+                        w_b = w_b.clamp_max(float(cap))
                     w_step = torch.where(flip, w_b.to(sgn), sgn.new_ones(()))
                 # n_f == 0 -> w_step stays None (plain mean; measured P(empty batch) ~ 4.8% on combined)
             else:                                               # legacy constant per-step weight (run 7)
                 w_step = torch.where(flip, sgn.new_full((), flw), sgn.new_ones(()))
+        # ---- PHYSICS-TOKEN weighting (record §8.43; physics_alpha=0 -> inert). --------------------
+        # Why this and not a decode-loss term: `decode_loss` sees a DETACHED predicted bag
+        # (pred_obs_in_loss=false), and `roundtrip_losses` never touches the flow, so the dynamics flow
+        # loss is the ONLY gradient path that reaches `act_enc`. §8.42 measured the consequence of
+        # leaving it uniform: the commanded step explains 0.313% of the context-residual in the raw
+        # 4224-dim latent but ~26% of the separation coordinate, so a uniform MSE over the bag spends
+        # ~1% of its gradient on the only quantity the campaign measures.
+        # flow.loss averages the EVENT dim (d) first, leaving `per` of shape (B, L-1, n_state), so a
+        # per-TOKEN weight needs no change to flow.py -- (B, L-1) weights simply broadcast over tokens.
+        pa = float(getattr(self, "physics_alpha", 0.0))
+        pname = getattr(self, "physics_modality", None)
+        if pa > 0.0 and pname is not None and self.training:
+            off, n_tok = 0, 0
+            for _n, _c in self.layout:
+                if _n == pname:
+                    n_tok = _c
+                    break
+                off += _c
+            if n_tok:
+                B, Lm1 = target.shape[0], target.shape[1]
+                w_tok = target.new_ones(B, Lm1, self.n_state)
+                if w_step is not None:
+                    w_tok = w_tok * w_step.unsqueeze(-1).to(w_tok)   # compose with the flip weighting
+                # composition-invariant share, same closed form as flip_loss_alpha (§8.16): give the
+                # physics token(s) `pa` of the realized loss mass regardless of how many tokens the bag has.
+                w_b = pa * float(self.n_state - n_tok) / ((1.0 - pa) * float(n_tok))
+                w_tok[..., off:off + n_tok] *= w_b
+                # validity mask: extraction fails on 1-33% of frames (92-99% ok on E300, 67-80% on E331).
+                # Zero the token's weight there rather than imputing a value -- record §8.40 F4/F5 documents
+                # impute-plus-mask as an active hazard in this corpus. Same mechanism, no extra plumbing.
+                # validity from the FULL L-window obs dict (arg 3) — NOT future_obs, which is the F-frame
+                # slice and misaligns with the L−1 flow transitions (caught by the r10B smoke, §8.57).
+                v = obs.get("_phys_valid") if isinstance(obs, dict) else None
+                if v is not None:
+                    # TWO-SIDED (§8.57 review P2-1): the residual target z[t]−z[t−1] depends on BOTH
+                    # endpoints; a valid target frame after an imputed context frame is still garbage.
+                    vv = v[:, :Lm1] * v[:, 1:Lm1 + 1]
+                    w_tok[..., off:off + n_tok] *= vv.reshape(B, Lm1, 1).to(w_tok)
+                w_step = w_tok
         l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling, weights=w_step)
         raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function
         # group-loss telemetry (weight 0 = logged, never trained on): the §8.16 collapse early-warning
         # (alarm if EMA of flip/nonflip rises >1.5x its post-build minimum) + realized-share verification.
-        if w_step is not None and getattr(self.flow, "_last_per", None) is not None:
+        if (flip is not None and flip.any() and (~flip).any() and w_step is not None
+                and getattr(self.flow, "_last_per", None) is not None):
+            # flip.any() guard (§8.65): with the token weighting on, w_step is ALWAYS non-None, so this
+            # block runs on ZERO-FLIP batches too — per[flip].mean() over an empty mask is nan, and
+            # lit's `sum(w[k]*raw[k])` propagates 0.0*nan=nan into the TRAINING loss (r12a_s0, ep 7).
             per = self.flow._last_per.mean(dim=tuple(range(2, self.flow._last_per.ndim)))  # (B, L-1)
             lf, lnf = per[flip].mean(), per[~flip].mean()
-            mass_f = (w_step * per)[flip].sum()
+            w_lead = w_step.mean(-1) if w_step.ndim > per.ndim else w_step   # physics path makes it per-token
+            mass_f = (w_lead * per)[flip].sum()
             raw["dynamics/flip_group_loss"], w["dynamics/flip_group_loss"] = lf, 0.0
             raw["dynamics/nonflip_group_loss"], w["dynamics/nonflip_group_loss"] = lnf, 0.0
             raw["dynamics/flip_realized_share"], w["dynamics/flip_realized_share"] = \
-                mass_f / (w_step * per).sum().clamp_min(1e-8), 0.0
+                mass_f / (w_lead * per).sum().clamp_min(1e-8), 0.0
         if l_cons is not None:
             raw["dynamics/latent_shortcut"], w["dynamics/latent_shortcut"] = l_cons, self.lambda_consistency
         if self.action_head_enabled and L >= 3:
@@ -865,7 +973,7 @@ class MultiModalFlow(MultiModalSequenceModel):
         h computation in loss_terms (clean context; DF noise is train-only). For eval_action_distribution / MPPI."""
         z = self.encode_state(obs)                               # (B, L, n_state, d)
         L = z.shape[1]
-        h = self.backbone(self._to_input(z[:, :-1], act_seq[:, :L - 1]))   # (B, L-1, n_input, d)
+        h = self.backbone(self._to_input(z[:, :-1], self._act_feats(act_seq)[:, :L - 1]))   # (B, L-1, n_input, d)
         return h.mean(dim=-2)                                    # (B, L-1, d) pooled per step
 
     def sample_action(self, h_ctx: Tensor, *, deterministic: bool = False, eps: Tensor | None = None) -> Tensor:

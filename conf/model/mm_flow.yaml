@@ -38,6 +38,8 @@ window: 32                 # temporal attention span
 mlp_ratio: 4.0
 rope_theta: 10000.0
 action_dim: 2
+init_from: null   # <run dir | ckpt path>: weights-only warm start (shape-mismatch keys skipped,
+#                   optimizer state untouched, fresh run_dir). See training/setup.py::warm_start.
 lambda_flow: 1.0
 lambda_consistency: 1.0
 # TEACHER-FORCING SCHEDULE — p_tf ramps p_tf_start -> p_tf_end over p_tf_warmup_epochs.

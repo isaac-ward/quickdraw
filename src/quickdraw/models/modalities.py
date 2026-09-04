@@ -56,6 +56,14 @@ class ModalitySpec:
     num_tokens: int = 8
     ae_depth: int = 4
     ae_bottleneck: int = 8   # conv-pyramid bottleneck target (px, short side); 8 = previous behaviour
+    decoder_cond: str = "seed"   # U-Net decoder conditioning (record §8.32): "seed" = the historical 2x2
+    #                              cond_to_spatial seed (bit-identical default) | "xattn" = a learned query grid
+    #                              at the FULL bottleneck resolution cross-attending over the latent tokens.
+    #                              §8.31 measured why: the seed path hands the decoder 384 of the 4096 latent
+    #                              numbers and cannot place the bunch to better than 244 um (the physical signal
+    #                              is 157 um); the two-lobe structure survives only at the bottleneck grid.
+    seed_upsample: str = "nearest"   # up-path F.interpolate mode: "nearest" (bit-identical) | "bilinear"
+    #                                  (§8.29/§8.30: nearest is what turns coarse structure into plateaus).
     channels: int = 3
     # pretrained image AE (TAESD) — issue #12. pretrained=false -> the bespoke AE above (BIT-IDENTICAL default).
     pretrained: bool = False                     # master on/off for the pretrained-AE image trunk
@@ -67,6 +75,38 @@ class ModalitySpec:
     #                              the round-trip is the IDENTITY at step 0 whenever num_tokens*d >= latent floats
     #                              (mode EXACT or PADDED). dense=true swaps the pad for a learned per->d projection
     #                              (mode PROJECTED: dense tokens, no idle decode width, but NO identity guarantee).
+    ln_carrier: bool = False     # VECTOR modalities (record §8.54): make the bag LayerNorm LOSSLESS for this
+    #                              token. LN destroys (mean, std) — 2 scalars/token (the documented −3.51 dB).
+    #                              With this flag the encoder emits d−2 content dims, normalizes them INTERNALLY
+    #                              (mean 0 / biased std 1), and writes the two destroyed scalars into the last 2
+    #                              dims as direction components. The known content statistics then let the
+    #                              decoder undo the outer LN in CLOSED FORM (t = y·s + m with s = 1/std(y[:d−2]),
+    #                              m = −mean(y[:d−2])·s) — measured exact to 7e-7 and worth 0.032 → 0.011
+    #                              heldout roundtrip nRMSE. The bag stays exactly unit-LN'd (the dynamics'
+    #                              scale-free geometry is untouched). Default off = bit-identical.
+    roundtrip_detach_enc: bool = False   # roundtrip anchor trains the DECODER ONLY (encoder detached inside
+    #                              roundtrip_losses). Use with latent_loss_weight>0 on a warm-started run to hold
+    #                              the decode head at the codec optimum while the encoder stays frozen (§8.61:
+    #                              llw=0 froze the encoder but unanchored the decoder, 0.018 -> 0.29 in 3 epochs).
+    linear_skip: bool = False    # VECTOR modalities: parallel LINEAR enc/dec paths beside the MLP trunk/head
+    #                              (record §8.53). The obs vector is a NEAR-LINEAR signal (128 PCs = 99.999% of
+    #                              variance -> a 128-wide linear code is ~lossless), and the hidden-64 GELU MLP
+    #                              both pinches it (0.054 in-distribution) and extrapolates 1.6x worse onto the
+    #                              run-tail heldout (0.088; the in-run 0.112). Measured fix: +linear skip ->
+    #                              0.032 heldout under the bag LayerNorm (3.5x). Default off = bit-identical.
+    obs_slice: tuple[int, int] | list | None = None   # VECTOR modalities: read this [start, stop) slice of the
+    #                              SHARED observation_vector instead of a batch stream of its own. None = the
+    #                              whole vector (bit-identical). Added 2026-08-30 for the physics modality
+    #                              (record §8.43): the loader and the LeRobot schema carry exactly two streams
+    #                              (observation_vector + one camera), so a third modality would otherwise mean
+    #                              a new dataset column, a new loader tuple and new window stacking. Slicing the
+    #                              obs vector gives the physics features their OWN BAG TOKEN -- which is the
+    #                              whole point, since only a token's flow-loss weight reaches `act_enc` -- at
+    #                              zero cost to the data pipeline.
+    fourier_fmax: float = 100.0                  # VECTOR modalities: top band of that ladder. 100.0 = the
+    #                              historical hardcoded value (bit-identical). Record §8.40 F3 measured 60.1%
+    #                              of the 4416 proprio fourier features as shot-to-shot WHITE at f_max=100;
+    #                              lag-1 autocorr falls 0.356 (raw) -> 0.012 (top band). ~8 suits this data.
     fourier_freqs: int = 0                       # VECTOR modalities: sin/cos feature bands prepended to the
     #                                              encoder input (0 = off, bit-identical). See models/features.py.
     latent_loss_weight: float | None = None      # weight of the adapter ROUND-TRIP loss ||up(down(g))-g||^2 (#12).
@@ -125,6 +165,9 @@ class VectorModality(Modality):
     def __init__(self, spec: ModalitySpec, d: int, hidden: int = 64):
         super().__init__()
         self.name, self.n_tokens, self.weight = spec.name, 1, spec.weight
+        _sl = getattr(spec, "obs_slice", None)
+        self.obs_slice = None if _sl is None else (int(_sl[0]), int(_sl[1]))
+        self.roundtrip_detach_enc = bool(getattr(spec, "roundtrip_detach_enc", False))
         _llw = getattr(spec, "latent_loss_weight", None)     # None -> 0.0 = roundtrip OFF (bit-identical for
         self.latent_loss_weight = 0.0 if _llw is None else float(_llw)   # every pre-existing vector run)
         self.noise_std = float(spec.noise_std)
@@ -133,18 +176,63 @@ class VectorModality(Modality):
         # fourier_freqs>0: [raw | sin/cos] before the trunk. Same rationale as the action encoder -- proprio is
         # z-scored and unbounded, and its small step-to-step differences ARE the motion. 0 = off = bit-identical.
         from .multimodal import FourierMLP
-        self.enc = FourierMLP(spec.dim, d, hidden, n_freq=int(getattr(spec, "fourier_freqs", 0) or 0))
+        self.ln_carrier = bool(getattr(spec, "ln_carrier", False))
+        nc = d - 2 if self.ln_carrier else d      # carrier: last 2 dims carry (mean, log std) of the content
+        self.nc = nc
+        self.enc = FourierMLP(spec.dim, nc, hidden, n_freq=int(getattr(spec, "fourier_freqs", 0) or 0),
+                              f_max=float(getattr(spec, "fourier_fmax", 100.0) or 100.0))
         self.decode_steps = int(spec.decode_steps)
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
-        self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
+        self.decode_head = FlowField(dz=spec.dim, h_dim=nc, hidden=hidden,
                                      param=("x0" if no_noise else spec.decode_param),
                                      shortcut=(spec.decode_shortcut and not no_noise), no_noise=no_noise)
+        # linear_skip (record §8.53): parallel linear paths. The decode head then learns the RESIDUAL
+        # target − dec_lin(token) (see decode/decode_loss), so decode() and decode_loss() stay consistent.
+        if bool(getattr(spec, "linear_skip", False)):
+            self.enc_lin = nn.Linear(spec.dim, nc)
+            self.dec_lin = nn.Linear(nc, spec.dim)
+        else:
+            self.enc_lin = self.dec_lin = None
 
     def _encode(self, obs):                      # (M, dim) -> (M, 1, d)
-        return self.enc(obs).unsqueeze(1)
+        z = self.enc(obs)
+        if self.enc_lin is not None:
+            z = z + self.enc_lin(obs)
+        if self.ln_carrier:                       # §8.54: internally normalize; re-encode (mu, log sd) as dims
+            mu = z.mean(dim=-1, keepdim=True)
+            sd = z.std(dim=-1, unbiased=False, keepdim=True).clamp_min(1e-6)
+            z = torch.cat([(z - mu) / sd, mu, sd.log()], dim=-1)
+        return z.unsqueeze(1)
 
-    def _decode_cond(self, flat_tok):             # (M, 1, d) -> (M, d)
-        return flat_tok[:, 0]
+    def _decode_cond(self, flat_tok):             # (M, 1, d) -> (M, nc)
+        y = flat_tok[:, 0]
+        if not self.ln_carrier:
+            return y
+        # closed-form inversion of the bag's outer LN: content dims have mean 0 / biased std 1 by
+        # construction, giving the two constraints that recover the destroyed (mean, std). Identity when
+        # the token was never LN'd (latent_norm=none/affine), so this is norm-agnostic.
+        yc = y[:, :self.nc]
+        s = 1.0 / yc.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
+        m = -yc.mean(dim=1, keepdim=True) * s
+        t = y * s + m
+        return t[:, :self.nc] * t[:, self.nc + 1:].exp() + t[:, self.nc:self.nc + 1]
+
+    def decode(self, tok):
+        out = super().decode(tok)
+        if self.dec_lin is not None:
+            lead = tok.shape[:-2]
+            cond = self._decode_cond(tok.reshape(-1, tok.shape[-2], tok.shape[-1]))
+            out = out + self.dec_lin(cond).reshape(*lead, self.dim)
+        return out
+
+    def decode_loss(self, tok, target):
+        if self.dec_lin is None:
+            return super().decode_loss(tok, target)
+        lead = tok.shape[:-2]
+        flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
+        cond = self._decode_cond(flat)
+        tgt = target.reshape(-1, self.dim) - self.dec_lin(cond)   # head fits the residual; grads reach dec_lin
+        return self.decode_head.loss(cond, tgt)
 
 
 class ImageModality(Modality):
@@ -162,28 +250,58 @@ class ImageModality(Modality):
         self.decode_kind = spec.decode_kind
         self.decode_arch = getattr(spec, "decode_arch", "vit")
         self.encode_arch = getattr(spec, "encode_arch", "vit")
+        # ln_carrier (record §8.54, extended to image tokens §8.55): each of the num_tokens tokens gives up
+        # 2 dims to carry its own (mean, log std), making the bag's per-token LN closed-form invertible.
+        # The AE keeps its native width d (its attention needs d % heads == 0; 126 is not divisible), a
+        # modality-level Linear(d → d−2) projects to content, and the decode head is built at d−2 via a
+        # cfg copy. The rank-(d−2) projection is a STATIC learned subspace the encoder co-adapts to —
+        # unlike the LN it replaces, nothing per-sample is destroyed.
+        self.ln_carrier = bool(getattr(spec, "ln_carrier", False))
+        self.roundtrip_detach_enc = bool(getattr(spec, "roundtrip_detach_enc", False))
         ae_cfg = VisionAEConfig(
             img_size=spec.img_size, patch=spec.patch, d=d, enc_depth=spec.ae_depth,
             dec_depth=spec.ae_depth, num_tokens=spec.num_tokens, channels=spec.channels,
             bottleneck=int(getattr(spec, "ae_bottleneck", 8)),
+            decoder_cond=str(getattr(spec, "decoder_cond", "seed") or "seed"),
+            seed_upsample=str(getattr(spec, "seed_upsample", "nearest") or "nearest"),
             build_decoder=False)                   # encoder-only; the unified decode_head IS the decoder
         # `self.ae` is the encoder AND the cfg-holder the decode head reads (both variants expose .cfg + .encode()).
         self.ae = (ConvImageEncoder(ae_cfg, base=int(getattr(spec, "encode_base", 32)))
                    if self.encode_arch == "conv" else ImageAutoencoder(ae_cfg))
         self.decode_steps = int(spec.decode_steps)
+        if self.ln_carrier:
+            import dataclasses
+            self.carrier_proj = nn.Linear(d, d - 2)
+            _dec_cfg = dataclasses.replace(self.ae.cfg, d=d - 2)   # the head conditions on the CONTENT width
+        else:
+            self.carrier_proj = None
+            _dec_cfg = self.ae.cfg
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         if self.decode_arch == "unet":
-            self.decode_head = ImageUNetFlowHead(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
+            self.decode_head = ImageUNetFlowHead(_dec_cfg, base=int(getattr(spec, "decode_base", 32)),
                                                  param=param, shortcut=sc, no_noise=no_noise)
         else:
-            self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc, no_noise=no_noise)
+            self.decode_head = ImageFlowHead(_dec_cfg, depth=spec.ae_depth, param=param, shortcut=sc, no_noise=no_noise)
 
     def _encode(self, obs):                       # (M, H, W, C) [0,1] -> (M, num_tokens, d)
-        return self.ae.encode(obs)
+        z = self.ae.encode(obs)
+        if self.ln_carrier:                       # §8.55: per-token internal normalize + 2 carrier dims
+            z = self.carrier_proj(z)
+            mu = z.mean(dim=-1, keepdim=True)
+            sd = z.std(dim=-1, unbiased=False, keepdim=True).clamp_min(1e-6)
+            z = torch.cat([(z - mu) / sd, mu, sd.log()], dim=-1)
+        return z
 
-    def _decode_cond(self, flat_tok):             # (M, num_tokens, d) -> (M, num_tokens, d) (the latent tokens)
-        return flat_tok
+    def _decode_cond(self, flat_tok):             # (M, num_tokens, d) -> (M, num_tokens, d[-2]) latent tokens
+        if not self.ln_carrier:
+            return flat_tok
+        nc = flat_tok.shape[-1] - 2               # closed-form LN inversion per token (see VectorModality)
+        yc = flat_tok[..., :nc]
+        sc = 1.0 / yc.std(dim=-1, unbiased=False, keepdim=True).clamp_min(1e-8)
+        mc = -yc.mean(dim=-1, keepdim=True) * sc
+        t = flat_tok * sc + mc
+        return t[..., :nc] * t[..., nc + 1:].exp() + t[..., nc:nc + 1]
 
 
 class _AEHolder:

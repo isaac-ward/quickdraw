@@ -200,6 +200,13 @@ def main(cfg):
     model = build_model(cfg)
     _startup_log(run_dir, f"[startup] model built: {sum(p.numel() for p in model.parameters()) / 1000:.0f}K "
                           f"params (model={cfg.model.name})")
+    # model.init_from=<run dir | ckpt>: WEIGHTS-ONLY warm start into THIS fresh run (§8.45 P3). Distinct from
+    # +resume (a full Lightning resume that CONTINUES the source run_dir — two concurrent arms would clobber
+    # each other there). A run dir resolves to checkpoints/last.ckpt, never best.ckpt (§8.56 F9).
+    _init_from = cfg.model.get("init_from", None)
+    if _init_from:
+        from .training.setup import warm_start
+        warm_start(model, os.path.expanduser(str(_init_from)))
     if torch.cuda.is_available() and not cfg.model.get("modalities"):
         # (multimodal token-bag models skip WHOLE-MODEL compile: the per-batch image gather + ViT AE
         # complicate it.) This compile wraps the PARALLEL forward, which does get a fused FlexAttention kernel.
@@ -244,8 +251,20 @@ def main(cfg):
     # (ood_horizon | ood_visual | ood_geometric | ood_dynamics | control), run every every_epochs
     # best.ckpt monitors the env's declared checkpoint metric (torus: manifold_distance_error, unchanged;
     # default: the generic pointwise_error) — must be a key of env.rollout_metrics.
+    # The MODALITY was hardcoded to "proprio" until 2026-08-30. Record §8.40 F1 measured why that matters on
+    # xtcav: the commanded L2 knob explains 0.0359% of the 138-D proprio vector (max |partial r| 0.068 over all
+    # 138 channels, 0 above 0.1) but 73.4% of the IMAGE separation variance — so best.ckpt was being selected
+    # by a signal that provably cannot see the knob. `trainer.checkpoint_modality` (default "proprio" =
+    # bit-identical) points it at a modality that can.
+    _ck_mod = cfg.trainer.get("checkpoint_modality", None) or getattr(env, "checkpoint_modality", "proprio")
+    _ck_metric = getattr(env, "checkpoint_metric", "pointwise_error")
+    _monitor = f"val/metric/{_ck_mod}/{_ck_metric}"
+    # A monitor key that is never logged makes ModelCheckpoint silently never write best.ckpt, which is the
+    # exact class of silent failure this campaign keeps paying for — print the resolved key so it is auditable.
+    print(f"[checkpoint] best.ckpt monitors {_monitor!r} (mode=min, save_top_k={cfg.trainer.save_top_k})",
+          flush=True)
     ckpt_cb = ModelCheckpoint(dirpath=os.path.join(run_dir, "checkpoints"),
-                              monitor=f"val/metric/proprio/{getattr(env, 'checkpoint_metric', 'pointwise_error')}",
+                              monitor=_monitor,
                               mode="min", save_top_k=cfg.trainer.save_top_k, save_last=False)
     # save_last on the monitored callback only writes last.ckpt when Lightning ALSO saves a top-k file, so
     # once the monitored metric stops improving the newest weights stop being written — a collapsed run then

@@ -36,6 +36,8 @@ class VisionAEConfig:
     num_tokens: int = 8     # latent token-list length (NOT the diffusion step count K)
     channels: int = 3
     mlp_ratio: float = 4.0
+    decoder_cond: str = "seed"      # ConditionalUNet conditioning path: "seed" (bit-identical) | "xattn" (§8.32)
+    seed_upsample: str = "nearest"  # ConditionalUNet up-path interpolate mode: "nearest" (bit-identical) | "bilinear"
     build_decoder: bool = True  # False when a generative flow decode head replaces the mse decoder (no dead weight)
     bottleneck: int = 8     # TARGET spatial size of the conv pyramid's bottleneck, for BOTH ConvImageEncoder and
     #                         ConditionalUNet. 8 = the previous hardcoded value = bit-identical.
@@ -392,8 +394,23 @@ class ConditionalUNet(nn.Module):
         for ch in chs:
             self.downs.append(_FiLMResBlock(prev, ch, d)); prev = ch
         self.bott_hw = (H // (2 ** len(chs)), W // (2 ** len(chs)))   # (8, 8) at 128px
-        self.seed_hw = 2                                       # tokens -> a small 2x2 seed, upsampled to the bottleneck
-        self.cond_to_spatial = nn.Linear(T * d, chs[-1] * self.seed_hw * self.seed_hw)   # (was a dense 8x8 map = the 8M term)
+        # decoder conditioning path (record §8.32). "seed" = historical: 2x2 seed + nearest upsample
+        # (bit-identical default). "xattn" = a learned query grid at FULL bottleneck resolution
+        # cross-attending over the T latent tokens, so every spatial location draws its own mixture of
+        # the whole bag instead of the 384-number summary §8.31 measured (244 um placement error vs the
+        # 157 um physical signal). The grid is built from bott_hw, so the hardcoded-square aspect bug
+        # (32x96 cells on a 1:3 image) disappears with it. Cost at ch=64, d=128: k/v ~16k params +
+        # q table ~49k -- vs the 1.05M Linear it replaces.
+        self.decoder_cond = str(getattr(ae_cfg, "decoder_cond", "seed") or "seed")
+        self.up_mode = str(getattr(ae_cfg, "seed_upsample", "nearest") or "nearest")
+        if self.decoder_cond == "xattn":
+            ch = chs[-1]
+            self.q_pos = nn.Parameter(torch.randn(self.bott_hw[0] * self.bott_hw[1], ch) * 0.02)
+            self.xk = nn.Linear(d, ch)
+            self.xv = nn.Linear(d, ch)
+        else:
+            self.seed_hw = 2                                   # tokens -> a small 2x2 seed, upsampled to the bottleneck
+            self.cond_to_spatial = nn.Linear(T * d, chs[-1] * self.seed_hw * self.seed_hw)   # (was a dense 8x8 map = the 8M term)
         self.mid = _FiLMResBlock(chs[-1], chs[-1], d)
         self.ups, prev = nn.ModuleList(), chs[-1]
         for ch in reversed(chs):
@@ -412,10 +429,16 @@ class ConditionalUNet(nn.Module):
         skips = []
         for down in self.downs:
             h = down(h, g); skips.append(h); h = F.avg_pool2d(h, 2)
-        seed = self.cond_to_spatial(cond.reshape(M, -1)).reshape(M, -1, self.seed_hw, self.seed_hw)
-        h = h + F.interpolate(seed, size=self.bott_hw, mode="nearest")
+        if self.decoder_cond == "xattn":
+            k, v = self.xk(cond), self.xv(cond)                       # (M, T, ch)
+            att = torch.softmax(torch.einsum("qc,mtc->mqt", self.q_pos, k) * k.shape[-1] ** -0.5, -1)
+            spat = torch.einsum("mqt,mtc->mqc", att, v)               # (M, Q, ch), Q = bott_h*bott_w
+            h = h + spat.transpose(1, 2).reshape(M, -1, *self.bott_hw)
+        else:
+            seed = self.cond_to_spatial(cond.reshape(M, -1)).reshape(M, -1, self.seed_hw, self.seed_hw)
+            h = h + F.interpolate(seed, size=self.bott_hw, mode="nearest")
         h = self.mid(h, g)
         for up, skip in zip(self.ups, reversed(skips)):
-            h = F.interpolate(h, scale_factor=2, mode="nearest")
+            h = F.interpolate(h, scale_factor=2, mode=self.up_mode)
             h = up(torch.cat([h, skip], dim=1), g)
         return self.out_conv(F.silu(self.out_norm(h))).permute(0, 2, 3, 1)   # (M,H,W,C)
