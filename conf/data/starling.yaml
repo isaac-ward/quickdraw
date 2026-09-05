@@ -1,0 +1,52 @@
+# =============================================================================================
+# starling — a RECORDED egocentric flight dataset. Select with `data=starling`.
+# Sibling: `data=starling2` (the same recorder, different flights). Both are already in quickdraw's
+# own on-disk format because quickdraw's recorder wrote them; nothing needs converting.
+#
+# WHAT IT IS (from the repo's own summary.json, 2026-09-05):
+#     train  124 episodes x 1726 steps = 214,015 transitions (1.98 h), 205,211 training windows
+#     val     14 episodes x 1734 steps =  24,277 transitions (0.22 h),  23,283 windows
+#   30 Hz. observation_vector 16-dim, action 4-dim, one camera `ego` at 112x192 (H x W).
+#
+# THE FRAME GEOMETRY IS NOT SQUARE and that is the one thing to get right. 112x192 is 12:7. Every
+# robocasa/torus number in the record was measured on a SQUARE frame, so `img_size` here must be the
+# (H, W) tuple form (`vision.img_hw` normalises both) -- passing a single int resizes to a square and
+# silently distorts the geometry the dynamics has to predict. The pyramid arithmetic also has to divide:
+# at (112,192) with ae_bottleneck 7 the encoder reaches 7x12 (4 levels, /16); the halved (56,96) cache
+# pairs with ae_bottleneck 7 -> 7x12 at /8. PAIR img_size AND ae_bottleneck, as up64's header warns.
+#
+# FRAME CACHES are pre-built by `python -m quickdraw._build_starling_cache` (the repos ship the mp4s but
+# not the .npy, unlike robocasa/torus). Two are built: native `ego_native.npy` and `ego_56x96.npy`.
+# `load_fpv_frames` would build them lazily inside the run otherwise, decoding ~475k frames before step 1.
+#
+# NOT SET HERE, because a data config cannot know them -- pass on the CLI:
+#   model.action_dim=4  model.modalities.0.dim=16
+#   model.modalities.1.img_size=[112,192]  +model.modalities.1.ae_bottleneck=7   <- PAIR THESE
+#   environments=recorded    <- there is no simulator for these flights; control/manifold evals are OFF
+#
+# SUBSAMPLE. Left at 1 and NOT copied from robocasa's 5. Record §13 chose 5 because robocasa is 20 Hz and
+# its true per-step image change was 0.61x the codec's own noise floor -- predicting zero motion was the
+# correct answer to the objective. This is 30 Hz EGOCENTRIC flight, where the whole frame moves with the
+# camera, so that measurement does not transfer and the per-step delta has to be measured here before a
+# stride is chosen. `python -m quickdraw.check_dataset` reports it.
+# =============================================================================================
+defaults:
+  - torus
+  - _self_
+
+root: null
+hf_repo: isaac-ronald-ward/starling
+repo_id: starling      # lerobot prefix the splits were WRITTEN with (<repo_id>/<split>)
+cam: ego               # -> videos/observation.images.ego  (torus uses `fpv`)
+
+P: 8
+F: 64
+window_stride: 1       # LOCKED — see torus.yaml
+subsample: 1           # measure before changing; see the header
+
+autobatch: true
+workers: 16
+
+# Torus-only knobs inherited from the parent and INERT on a recorded dataset (there is no simulator to
+# re-render): fpv_fov, composite_grid, action_smooth_window, action_sampler, splits.*. Left rather than
+# deleted so `data=starling` stays a strict overlay on one parent and the diff is readable.
