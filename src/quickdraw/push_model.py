@@ -57,14 +57,54 @@ def _pick_ckpt(run_dir: str, explicit: str | None) -> tuple[str, str]:
     """(path, why). Prefers the preserved best-open-loop checkpoint over best.ckpt -- see the module doc."""
     if explicit:
         return explicit, "explicitly requested via +hub.ckpt"
+    # PICK BY THE OBJECTIVE, from the run's own metrics. This became possible when save_top_k went to -1
+    # (conf/trainer/default.yaml): with every epoch on disk there is no reason to accept whichever epoch a
+    # PROXY metric happened to rank first. best.ckpt tracks `checkpoint_monitor` (val-time L1+LPIPS at
+    # horizon F); the objective is open-loop LPIPS@+128 from the eval suite. Measured, they disagree enough
+    # to cost 8-15%. Reads metrics.jsonl, so it needs no Lightning plumbing and works on finished runs.
+    obj = _best_objective_epoch(run_dir)
+    if obj is not None:
+        ep, key, val = obj
+        cands = glob.glob(os.path.join(run_dir, "checkpoints", "preserved", f"epoch={ep}-step=*.ckpt")) \
+            or glob.glob(os.path.join(run_dir, "checkpoints", f"epoch={ep}-step=*.ckpt"))
+        if cands:
+            return sorted(cands)[-1], f"best {key} = {val:.5f}, at epoch {ep} (chosen from metrics.jsonl)"
+        print(f"[push_model] epoch {ep} is best on {key} ({val:.5f}) but its checkpoint is GONE -- pruned by "
+              f"save_top_k before it was set to -1. Falling back.", flush=True)
     pres = sorted(glob.glob(os.path.join(run_dir, "checkpoints", "preserved", "epoch=*.ckpt")))
     if pres:
-        return pres[-1], ("best OPEN-LOOP LPIPS@+128 epoch, preserved from save_top_k pruning "
-                          "(best.ckpt tracks val mse, which is blind to sharpness)")
+        return pres[-1], "preserved/ checkpoint (objective epoch unavailable)"
     best = os.path.join(run_dir, "checkpoints", "best.ckpt")
     if os.path.exists(best):
-        return best, "best.ckpt (no preserved/ dir; NOTE this is the monitored-metric best, not necessarily best open-loop)"
+        return best, "best.ckpt (NOTE: the MONITORED-metric best, which is a proxy -- not necessarily best open-loop)"
     raise FileNotFoundError(f"no checkpoint in {run_dir}/checkpoints")
+
+
+def _best_objective_epoch(run_dir: str):
+    """(epoch, key, value) of the best raw open-loop LPIPS@+128, or None if the run logged no such metric.
+
+    THE objective (memory/goal-open-loop-sharpness-not-ae-floor): raw open-loop perceptual distance 128
+    prediction steps out. On a multi-head model the FIRST head alphabetically decides -- with two cameras
+    the scene view is the one the model is judged on, and picking per-head would need two checkpoints.
+    """
+    f = os.path.join(run_dir, "logs", "metrics.jsonl")
+    if not os.path.exists(f):
+        return None
+    best = {}
+    with open(f) as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            t = r.get("tag", "")
+            if t.startswith("eval_ood_horizon/open_loop/") and t.endswith("/lpips/@+128"):
+                best.setdefault(t, {})[int(r["step"])] = float(r["value"])
+    if not best:
+        return None
+    key = sorted(best)[0]
+    ep = min(best[key], key=best[key].get)
+    return ep, key, best[key][ep]
 
 
 def _metrics(run_dir: str) -> dict:

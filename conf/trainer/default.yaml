@@ -1,6 +1,19 @@
 max_epochs: 50
 precision: bf16-mixed
-save_top_k: 8    # keep the top-8 epochs by checkpoint_monitor (was 2) so several are available for post-hoc
+save_top_k: -1   # -1 = KEEP EVERY EPOCH, never evict (was 8, and before that 2).
+#                  WHY (2026-09-05, user). save_top_k ranks by `checkpoint_monitor`, which is a PROXY for the
+#                  objective, not the objective: the monitor is L1+LPIPS-vgg on the val AR rollout at horizon
+#                  F, while the project is judged on eval_ood_horizon/open_loop/<head>/lpips/@+128 --
+#                  LPIPS-SQUEEZE at horizon 128 on a different episode set. Measured rank correlation between
+#                  them: rho +0.845 (torus_vl128c), +0.743 (twocam_full). Good, and not good enough --
+#                  the monitor's pick costs +14.5% / +8.1% against the objective's best epoch.
+#                  Under top-k that is not just a bad default, it is DESTRUCTIVE: torus_vl128c epoch 18 was
+#                  the best open-loop epoch ever recorded on that dataset (@+128 0.0858, floor 0.0025) and the
+#                  WORST of its neighbours on the monitor (0.2260 vs 0.2117-0.2191), so it was deleted.
+#                  Keeping everything makes checkpoint selection a POST-HOC decision read off metrics.jsonl
+#                  instead of a bet placed at launch on which metric will matter. Cost: ~140-200 MB/epoch,
+#                  so 6-8 GB for a 40-epoch run, against 6.8 TB free. That is the whole tradeoff.
+#                  Set a positive integer to re-enable pruning if disk ever becomes the binding constraint.
 checkpoint_monitor: null     # null -> AUTO: `val/metric/<image>/mse` when the model has an image modality,
 #                              else `val/metric/proprio/<env.checkpoint_metric>` (recorded: pointwise_error).
 #                              WHY THE AUTO DEFAULT CHANGED (2026-08-24, user): the old fallback was ALWAYS the
