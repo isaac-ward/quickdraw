@@ -26,8 +26,12 @@ WHICH CHECKPOINT. Defaults to `checkpoints/preserved/epoch=*.ckpt` when present,
 open-loop rollout metrics, but best.ckpt tracked `val/metric/<head>/mse` for runs launched before
 2026-09-02, and mse is structurally blind to sharpness (record §22) -- measured on vl_l1x3, its best-mse
 epoch scored open-loop LPIPS@+128 0.1455 while the best-LPIPS epoch scored 0.1370, so best.ckpt pointed
-at a model 6% worse on the metric the run is judged by. `preserved/` holds the best-open-loop-LPIPS epoch,
-copied aside because save_top_k prunes by mse and would have deleted it. Override with `+hub.ckpt=<path>`.
+at a model 6% worse on the metric the run is judged by.
+
+SO THE PICKER DOES NOT USE best.ckpt. `_best_objective_epoch` reads the run's own logs/metrics.jsonl for
+the best raw open-loop LPIPS@+128 and resolves THAT epoch's checkpoint -- possible because save_top_k is
+-1 (conf/trainer/default.yaml) and every epoch survives. `preserved/` and then best.ckpt remain as
+fallbacks for runs that predate that change. Override either with `+hub.ckpt=<path>`.
 
 WHY safetensors AND the raw ckpt. safetensors for loading: no pickle (a .ckpt is arbitrary code execution
 on load), 86 MB instead of 140, and the Hub renders the tensor list. The raw checkpoint as well because
