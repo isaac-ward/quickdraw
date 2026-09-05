@@ -41,12 +41,16 @@ img_head = next((n for n, _ in m.layout if n != "proprio"), None)
 mod = m.modalities[img_head]
 spec_d = {e["name"]: dict(e) for e in OmegaConf.to_container(cfg.model.modalities)}[img_head]
 img_size = mod.ae.cfg.img_size
+# frames come back as a DICT keyed by camera (data/dataset.py). Single-camera script:
+# name the key once rather than indexing position 2 as if there were only ever one view.
+_CAMK = str(cfg.data.get("cam", "fpv"))
 ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                             cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
 rng = np.random.default_rng(0)
 frames = []
 for _ in range(24):
-    _, _, im = ds[int(rng.integers(len(ds)))]
+    _, _, _fr = ds[int(rng.integers(len(ds)))]
+    im = _fr[_CAMK]
     idx = rng.integers(0, len(im), size=8)
     frames.append(torch.from_numpy(im[idx]).float().div(255.0))
 X = torch.cat(frames).to(dev)                                  # (N,H,W,3) real val frames

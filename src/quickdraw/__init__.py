@@ -21,3 +21,20 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXP
 # real 0.1-0.5%, peak-vs-batch looked SUPERLINEAR (fitted intercept -3.0GB vs the true +0.2GB) purely from
 # block-rounding, and the sizer chose batch 15 at 81.4GB where the real allocator supports 17 at 87.4GB.
 _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# Consumer entry point. Imported LAZILY (inside the function) rather than at module scope so that the
+# BLAS/OpenMP thread caps above still run before numpy loads, and so `python -m quickdraw.<anything>`
+# does not pay for torch on every invocation.
+def load_pretrained(*a, **kw):
+    """See quickdraw.pretrained.load_pretrained."""
+    from .pretrained import load_pretrained as _f
+    return _f(*a, **kw)
+
+
+def load_example_context(*a, **kw):
+    """See quickdraw.pretrained.load_example_context."""
+    from .pretrained import load_example_context as _f
+    return _f(*a, **kw)
+
+
+__all__ = ["load_pretrained", "load_example_context"]

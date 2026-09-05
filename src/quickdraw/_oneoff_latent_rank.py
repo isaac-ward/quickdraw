@@ -52,13 +52,20 @@ print(f"[load] {os.path.basename(RUN)} | img {ae.img_size} bott {getattr(ae,'bot
       f"tokens {T} d {d} -> latent {D} floats | decode_arch={mod.decode_arch} latent_norm={m.latent_norm}",
       flush=True)
 
+# frames come back as a DICT keyed by camera (data/dataset.py). Single-camera script:
+
+# name the key once rather than indexing position 2 as if there were only ever one view.
+
+_CAMK = str(cfg.data.get("cam", "fpv"))
+
 ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=ae.img_size,
                             cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
 rng = np.random.default_rng(0)
 fr = []
 per = max(1, NF // max(1, len(ds)))
 for i in range(len(ds)):
-    _, _, im = ds[i]
+    _, _, _fr = ds[i]
+    im = _fr[_CAMK]
     fr.append(torch.from_numpy(im[rng.permutation(len(im))[:per]]).float().div(255.0))
 X = torch.cat(fr)[:NF].to(dev)
 with torch.no_grad():

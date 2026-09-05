@@ -32,7 +32,7 @@ def main():
     steps = int(sys.argv[2]) if len(sys.argv) > 2 else 2000
     P, Fh, B, d = 8, 24, 16, 256
     print(f"[train_mm] loading VAL episodes (obs+act+FPV128) from {root} ...")
-    eps = load_split_episodes_mm(root, "val", img_size=128)
+    eps = load_split_episodes_mm(root, "val", img_size=128, cam={"image": "fpv"})  # key by HEAD name
     norm = Normalizer.from_file(root)
     train_eps, hold = eps[:-4], eps[-4]                         # hold out 1 episode for the rollout viz
     loader = MMWindowLoader(train_eps, P, Fh, norm, batch=B, shuffle=True, device=DEV)
@@ -68,7 +68,8 @@ def main():
 
     # ---- held-out autoregressive rollout ----
     m.eval()
-    o, a, img = hold
+    o, a, _fr = hold
+    img = _fr["image"]
     H = min(Fh, len(o) - P - 1)
     ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[:P])).float()[None].to(DEV),
            "image": torch.from_numpy(img[:P]).float().div(255.0)[None].to(DEV)}

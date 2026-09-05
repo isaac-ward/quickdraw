@@ -1,0 +1,66 @@
+# =============================================================================================
+# vl128_starling — the vl128 recipe carried to the recorded egocentric flight sets.
+# Select with `model=vl128_starling`, paired with `data=starling` or `data=starling2`.
+# Read conf/model/vl128.yaml's header FIRST: every loss/architecture rationale lives there and is
+# unchanged here. This file changes only what the DATA forces, plus one deliberate addition.
+#
+# WHAT THE DATA FORCES
+#   * `modalities.0.dim: 16` and `model.action_dim: 4` (robocasa/torus are 6 and 12/2).
+#   * `img_size: [112, 192]` -- NON-SQUARE, 12:7. This is the one thing that must not be fudged. Every
+#     number in the record was measured on a square frame; passing a bare int resizes to a square and
+#     silently distorts the geometry the dynamics has to predict. `vision.img_hw` takes the tuple form.
+#   * `ae_bottleneck: 7` PAIRED with it, exactly as up64's header insists. The pyramid is
+#     n_levels = log2(min(H,W) // bott), so 7 gives 112//7 = 16 -> 4 levels -> a 7x12 bottleneck grid,
+#     EXACT in both axes. (It is also exact on the halved (56,96) cache: 3 levels, the same 7x12 grid.)
+#     84 readout cells x d128 = 10,752 against a 32x128 = 4,096 latent, i.e. the readout does not choke.
+#
+# THE ONE DELIBERATE ADDITION: `decode_out_act: sigmoid`.
+# Not inherited -- vl128 defaults it to `none` to stay bit-identical to 60 historical robocasa runs, and
+# there is no historical starling baseline to protect, so the safer setting is free here. MEASURED on
+# these frames: 0.26% (starling) / 0.09% (starling-2) of target pixels sit at exactly 1.0, i.e. this is
+# ROBOCASA-LIKE (0.4%), not torus-like (66.9%), so the saturation ratchet that cost torus 9 hours almost
+# certainly does not bite. It is on anyway because a bounded output cannot be wrong and costs nothing
+# measurable, and the range diagnostics (codec/decode range_*) will now say definitively either way.
+#
+# SUBSAMPLE=5, SET ON THE CLI, AND IT IS THE BIGGEST KNOB HERE.
+# `data=starling` ships subsample=1 because the right stride had to be measured, not copied. Two facts:
+#   1. TRACTABILITY dominates. At stride 1 an epoch is 205,211 windows against robocasa's ~35,100 --
+#      5.8x, i.e. ~12 h/epoch. Stride 5 gives ~41,000, which is robocasa-comparable (~2 h/epoch).
+#   2. SNR agrees. §13 chose robocasa's 5 because its per-step image delta was 0.0389, only 0.61x the
+#      codec noise floor. Measured here at 30 Hz: 0.0646 / 0.0745 -- ALREADY above robocasa's stride-1
+#      figure despite the faster rate, because the whole frame moves with the camera. Stride 5 -> 6 Hz,
+#      F=64 spans 10.7 s of flight.
+# So `data.subsample=5` is a launch argument, not a default, and the number to revisit first.
+#
+# NOT COVERED HERE -- pass on the CLI:
+#   data=starling|starling2   data.subsample=5   environments=recorded   data.batch=<n> data.autobatch=false
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+action_dim: 4
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them, so inheriting vl128 and editing
+  # one entry is impossible -- and being explicit is what makes the recipe auditable.
+  - {name: proprio, kind: vector, dim: 16, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  - {name: image, kind: image, weight: 1.0,
+     img_size: [112, 192],    # (H, W) -- NEVER an int here, see the header
+     ae_bottleneck: 7,        # PAIRED with img_size -> an exact 7x12 bottleneck grid
+     pretrained: false,
+     num_tokens: 32,
+     encode_arch: conv,
+     encode_base: 32,
+     decode_kind: mse,
+     decode_arch: up,
+     decode_base: 64,
+     decode_out_act: sigmoid, # <-- the one addition over vl128; see the header
+     decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64,
+     visual_l1: 3.0,
+     visual_l2: 0.0,
+     visual_lpips: 1.0,
+     visual_lpips_net: vgg,
+     visual_frames: 128,
+     latent_loss_weight: 10}

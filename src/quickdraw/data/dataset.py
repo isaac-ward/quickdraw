@@ -172,7 +172,11 @@ def _subsample_episodes(eps, tag: str):
             aa = grp.sum(axis=1)
             if hold:
                 aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the sum
-            out.append((o[:n * s:s], aa) + tuple(x[ph:][:n * s:s] for x in ep[2:]))
+            # extra streams (ep[2:]) are sliced identically. A DICT of streams (the multi-camera frame
+            # bundle) is sliced VALUE-WISE -- without this branch `x[ph:]` on a dict raises TypeError.
+            extra = tuple({k: v[ph:][:n * s:s] for k, v in x.items()} if isinstance(x, dict)
+                          else x[ph:][:n * s:s] for x in ep[2:])
+            out.append((o[:n * s:s], aa) + extra)
     print(f"[subsample] {tag}: stride {s}{f' x {s} PHASES' if all_phases else ''} | {len(eps)} eps "
           f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions SUMMED except "
           f"take-last on dims {hold} | {dropped} eps dropped as too short", flush=True)
@@ -250,50 +254,101 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
     return frames
 
 
-def load_split_episodes_mm(root: str, split: str, img_size: int | tuple[int, int] | None = 128,
-                           cam: str = "fpv", repo_id: str = "torus"):
-    """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled to img_size,
-    uint8), aligned 1:1 with obs steps. Returns list of (obs (T,D), act (T,A), img (T,H,W,3) uint8).
-    The chunked video is read in dataset row order (== obs row order), then split by episode_index.
-    The obs subset (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
+def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_id: str = "torus"):
+    """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled, uint8),
+    aligned 1:1 with obs steps. Returns one entry per episode:
+
+        (obs (T,D), act (T,A), frames)          frames = {key: (T,H,W,3) uint8}   -- ALWAYS a dict
+
+    `cam` may be:
+        "robot0_agentview_left"                  -> {"robot0_agentview_left": frames}
+        ["cam_a", "cam_b"]                       -> {"cam_a": ..., "cam_b": ...}
+        {"cam_scene": "robot0_agentview_left",   -> {"cam_scene": ..., "cam_wrist": ...}
+         "cam_wrist": "robot0_eye_in_hand"}         (a MAPPING lets the caller key by MODALITY HEAD)
+    `img_size` is one size for every camera, or a mapping/sequence keyed/ordered to match `cam`.
+
+    ELEMENT 2 IS A DICT EVEN FOR ONE CAMERA, DELIBERATELY. It used to be a bare array, so every call site
+    wrote `ep[2]` to mean "the camera". With N image heads that pattern silently hands EVERY head the FIRST
+    camera's frames -- a head scored against another camera's pixels produces a plausible WRONG NUMBER
+    rather than a crash, which is the worst failure mode available. Making it a dict turns every such site
+    into an immediate TypeError until it names the head it wants. See design/two_camera_plan.md.
+
+    The chunked video is read in dataset row order (== obs row order), then split by episode_index. The obs
+    subset (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    if isinstance(cam, str):
+        keys, cams = [cam], [cam]
+    elif isinstance(cam, dict):
+        keys, cams = list(cam), [cam[k] for k in cam]
+    else:
+        keys = cams = list(cam)
+    if isinstance(img_size, dict):
+        sizes = [img_size[k] for k in keys]
+    elif img_size is None or isinstance(img_size, (int, tuple)):
+        sizes = [img_size] * len(keys)
+    else:
+        sizes = list(img_size)
+    assert len(sizes) == len(keys), f"img_size/cam length mismatch: {len(sizes)} vs {len(keys)}"
+    assert len(set(keys)) == len(keys), f"duplicate frame keys {keys}"
 
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
     obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
     act_all = np.stack(hf["action"]).astype(np.float32)
-    frames_all = load_fpv_frames(root, split, size=img_size, cam=cam)      # (N, H, W, 3), row order
-    assert len(frames_all) == len(obs_all), f"{cam}/row count mismatch: {len(frames_all)} vs {len(obs_all)}"
+    per_key = {}
+    for k, c, sz in zip(keys, cams, sizes):
+        fr = load_fpv_frames(root, split, size=sz, cam=c)                  # (N, H, W, 3), row order
+        assert len(fr) == len(obs_all), f"{c}/row count mismatch: {len(fr)} vs {len(obs_all)}"
+        per_key[k] = fr
     return _subsample_episodes(
-        [(obs_all[ep_idx == e], act_all[ep_idx == e], frames_all[ep_idx == e]) for e in np.unique(ep_idx)],
-        f"{repo_id}/{split}+{cam}")
+        [(obs_all[ep_idx == e], act_all[ep_idx == e],
+          {k: fr[ep_idx == e] for k, fr in per_key.items()}) for e in np.unique(ep_idx)],
+        f"{repo_id}/{split}+{'+'.join(cams)}")
 
 
 class MMWindowLoader:
-    """The ONE GPU-resident window loader for every model. obs/act windows live on `device`; when an image
-    modality is present (`image_head` set) its FRAME store (uint8, ~3 GB at 128²) is held resident too and
-    gathered per batch by a pure GPU index (no host copy). PROPRIO-ONLY passes `image_head=None` -> no frames
-    are loaded or gathered (episodes are (obs, act) pairs). Yields {obs_seq (B,L,6), act_seq (B,L,2)[,
-    <image_head> (B,L,H,W,3) in [0,1]]}. Window order matches `stack_windows`, so all streams stay aligned."""
+    """The ONE GPU-resident window loader for every model. obs/act windows live on `device`; when image
+    modalities are present (`image_head` set) each one's FRAME store (uint8, ~3 GB at 128²) is held resident
+    too and gathered per batch by a pure GPU index (no host copy). PROPRIO-ONLY passes `image_head=None` ->
+    no frames are loaded or gathered (episodes are (obs, act) pairs).
+
+    N HEADS. `image_head` is a name OR a sequence of names; head i reads episode element `e[2 + i]`, which is
+    the order `load_split_episodes_mm` returns its cameras in. Yields {obs_seq (B,L,6), act_seq (B,L,2),
+    <head> (B,L,H,W,3) in [0,1] per head}. `win_idx` is SHARED across heads -- the same window indices apply
+    to every camera, because all streams come from the same episode row order -- so N heads cost N frame
+    stores but only one index tensor. Window order matches `stack_windows`, so all streams stay aligned."""
 
     def __init__(self, episodes, P: int, F: int, normalizer: Normalizer, batch: int, shuffle: bool, device,
-                 image_head: str | None = None, stride: int = 1):
+                 image_head=None, stride: int = 1):
         L = P + F
-        self.image_head = image_head
+        heads = [] if image_head is None else ([image_head] if isinstance(image_head, str) else list(image_head))
+        # heads index the frame DICT at episode element 2 by NAME -- see load_split_episodes_mm. Positional
+        # access is deliberately impossible: it is what let one camera masquerade as all of them.
+        self.image_head = image_head          # kept verbatim for any caller that inspects it
+        self.heads = heads
         obs_w, act_w = stack_windows([(e[0], e[1]) for e in episodes], P, F, normalizer, stride)
         self.obs, self.act = obs_w.to(device), act_w.to(device)
         self.frames = None
-        if image_head is not None:   # concat all episode frames -> one GPU uint8 store + per-window GLOBAL frame idx
-            frames, starts, off = [], [], 0
-            for e in episodes:
-                o, img = e[0], e[2]
-                frames.append(torch.from_numpy(img))
-                starts.extend(range(off, off + len(o) - L + 1, stride))   # stride matches stack_windows -> streams stay aligned
-                off += len(img)
-            self.frames = torch.cat(frames, 0).to(device)                    # (N_total,H,W,3) uint8, GPU-resident
-            starts = torch.tensor(starts, device=device)
-            self.win_idx = starts[:, None] + torch.arange(L, device=device)[None]
+        if heads:   # per head: concat all episode frames -> one GPU uint8 store; ONE shared per-window index
+            self.frames = {}
+            avail = set(episodes[0][2]) if isinstance(episodes[0][2], dict) else set()
+            for i, h in enumerate(heads):
+                assert h in avail, (
+                    f"image head {h!r} has no frames: the episodes carry {sorted(avail)}. "
+                    f"load_split_episodes_mm must be called with cam={{head: camera}} covering every image "
+                    f"modality -- see training/setup.py:window_loaders")
+                frames, starts, off = [], [], 0
+                for e in episodes:
+                    o, img = e[0], e[2][h]
+                    frames.append(torch.from_numpy(img))
+                    starts.extend(range(off, off + len(o) - L + 1, stride))   # stride matches stack_windows
+                    off += len(img)
+                self.frames[h] = torch.cat(frames, 0).to(device)              # (N_total,H,W,3) uint8, resident
+                if i == 0:                                                    # identical for every head
+                    self.win_idx = torch.tensor(starts, device=device)[:, None] + \
+                                   torch.arange(L, device=device)[None]
         self.batch, self.shuffle, self.device = batch, shuffle, device
         self.N = self.obs.shape[0]
 
@@ -306,7 +361,9 @@ class MMWindowLoader:
             j = order[i: i + self.batch]
             out = {"obs_seq": self.obs.index_select(0, j), "act_seq": self.act.index_select(0, j)}
             if self.frames is not None:
-                out[self.image_head] = self.frames[self.win_idx.index_select(0, j)].float().div_(255.0)  # GPU gather
+                wi = self.win_idx.index_select(0, j)                          # shared across heads
+                for h in self.heads:
+                    out[h] = self.frames[h][wi].float().div_(255.0)            # GPU gather, per head
             yield out
 
 

@@ -35,12 +35,13 @@ def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
     by_ep = defaultdict(list)
     for ei, t in slices[:n_points]:
         by_ep[ei].append(t)
-    img_head = next((n for n, _ in m.layout if n != "proprio"), None)   # single FPV feed's head name
+    img_heads = [n for n, _ in m.layout if n != "proprio"]              # EVERY image head, not just the first
     data_phys, latents = [], []
     for ei, ts in by_ep.items():
-        o, a, im = mm_eps[ei]
-        obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device),
-               img_head: torch.from_numpy(im).float().div(255.0)[None].to(device)}
+        o, a, fr = mm_eps[ei]
+        # encode_state indexes every layout name, so obs must carry every image head or it KeyErrors.
+        obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device)}
+        obs.update({h: torch.from_numpy(fr[h]).float().div(255.0)[None].to(device) for h in img_heads})
         act = norm.norm_act(torch.from_numpy(a)).float()[None].to(device)   # NORMALIZE (every other routine does)
         pred = m(obs, act)                                   # (1,T,n_state,d)
         sel = pred[0, np.array(sorted(ts))]                  # (nt,n_state,d)
@@ -124,7 +125,7 @@ def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device)
     _ln = lambda x: F.layer_norm(x, (x.shape[-1],))
     d, K = m.d, m.sampling_steps
     g = torch.Generator(device=device).manual_seed(seed)
-    img_head = next((n for n, _ in m.layout if n != "proprio"), None)
+    img_heads = [n for n, _ in m.layout if n != "proprio"]              # EVERY image head
     rng = np.random.RandomState(seed)
     slices = [(ei, t) for ei in range(len(mm_eps)) for t in range(P, len(mm_eps[ei][0]) - 1, stride)]
     n_avail = len(slices); rng.shuffle(slices)
@@ -134,10 +135,10 @@ def manifold_clouds(m, norm, mm_eps, *, P, n_points, cube, stride, seed, device)
     dec = m.modalities["proprio"]
     paths_phys, latents = [], []
     for ei, ts in by_ep.items():
-        o, a, im = mm_eps[ei]
+        o, a, fr = mm_eps[ei]
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(device)}
-        if img_head is not None:
-            obs[img_head] = torch.from_numpy(im).float().div(255.0)[None].to(device)
+        # encode_state indexes every layout name -> every image head must be present, not just the first
+        obs.update({h: torch.from_numpy(fr[h]).float().div(255.0)[None].to(device) for h in img_heads})
         act = norm.norm_act(torch.from_numpy(a)).float()[None].to(device)
         z = m.encode_state(obs)                                    # (1, T, n_state, d)
         h_all = m.backbone(m._to_input(z, act))                    # one causal pass -> h at every step

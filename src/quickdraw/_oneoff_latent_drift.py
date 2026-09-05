@@ -56,6 +56,9 @@ m = getattr(model, "_orig_mod", model)
 norm = normalizer(cfg)
 img_head = next((n for n, _ in m.layout if n != "proprio"), None)
 img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+# frames come back as a DICT keyed by camera (data/dataset.py). Single-camera script:
+# name the key once rather than indexing position 2 as if there were only ever one view.
+_CAMK = str(cfg.data.get("cam", "fpv"))
 eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
 P = int(cfg.data.P)
@@ -65,7 +68,8 @@ rng = np.random.default_rng(0)
 picks = []
 for _ in range(200):
     i = int(rng.integers(len(eps_ds)))
-    o, a, im = eps_ds[i]
+    o, a, _fr = eps_ds[i]
+    im = _fr[_CAMK]
     if len(o) > P + HMAX + 2:
         t0 = int(rng.integers(P, len(o) - HMAX - 1))
         picks.append((i, t0))
@@ -84,7 +88,8 @@ def _ln(x):
 drift = {h: {"norm_ratio": [], "cos_true": [], "cos_frozen": [], "cos_frozen_true": [], "var_ratio": []} for h in HZ}
 with torch.no_grad():
     for (ei, t0) in picks:
-        o, a, im = eps_ds[ei]
+        o, a, _fr = eps_ds[ei]
+        im = _fr[_CAMK]
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(dev),
                img_head: torch.from_numpy(im).float().div(255.0)[None].to(dev)}
         act = norm.norm_act(torch.from_numpy(a)).float()[None].to(dev)
@@ -130,7 +135,8 @@ def ol_metrics(K):
     ps, lps = {h: [] for h in HZ}, {h: [] for h in HZ}
     with torch.no_grad():
         for (ei, t0) in picks:
-            o, a, im = eps_ds[ei]
+            o, a, _fr = eps_ds[ei]
+            im = _fr[_CAMK]
             ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[t0 - P + 1:t0 + 1])).float()[None].to(dev),
                    img_head: torch.from_numpy(im[t0 - P + 1:t0 + 1]).float().div(255.0)[None].to(dev)}
             acts = norm.norm_act(torch.from_numpy(a[t0 - P + 1:t0 + HMAX])).float()[None].to(dev)
@@ -170,7 +176,8 @@ frz_p, frz_l, cpy_p, cpy_l, mdl_p, mdl_l = ({h: [] for h in HZ} for _ in range(6
 m.sampling_steps = K_ORIG
 with torch.no_grad():
     for (ei, t0) in picks:
-        o, a, im = eps_ds[ei]
+        o, a, _fr = eps_ds[ei]
+        im = _fr[_CAMK]
         ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[t0 - P + 1:t0 + 1])).float()[None].to(dev),
                img_head: torch.from_numpy(im[t0 - P + 1:t0 + 1]).float().div(255.0)[None].to(dev)}
         acts = norm.norm_act(torch.from_numpy(a[t0 - P + 1:t0 + HMAX])).float()[None].to(dev)

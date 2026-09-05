@@ -67,6 +67,12 @@ def main(cfg):
     img_head = next(n for n, _ in m.layout if hasattr(m.modalities[n], "ae"))
     img_size = m.modalities[img_head].ae.cfg.img_size
 
+    # frames come back as a DICT keyed by camera (data/dataset.py). Single-camera script:
+
+    # name the key once rather than indexing position 2 as if there were only ever one view.
+
+    _CAMK = str(cfg.data.get("cam", "fpv"))
+
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
                                  cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
     rng = np.random.RandomState(0)
@@ -77,9 +83,9 @@ def main(cfg):
           f"| stochastic_eval={cfg.model.diffusion.get('stochastic_eval')} steps={cfg.model.diffusion.get('sampling_steps')}")
 
     ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(eps[ei][0][t - P:t])) for ei, t in slices]).float().to(device),
-           img_head: torch.stack([torch.from_numpy(eps[ei][2][t - P:t]) for ei, t in slices]).float().div(255.0).to(device)}
+           img_head: torch.stack([torch.from_numpy(eps[ei][2][_CAMK][t - P:t]) for ei, t in slices]).float().div(255.0).to(device)}
     a_true = torch.stack([norm.norm_act(torch.from_numpy(eps[ei][1][t - P:t + H])) for ei, t in slices]).float().to(device)
-    gt = torch.stack([torch.from_numpy(eps[ei][2][t:t + H]) for ei, t in slices]).float().div(255.0).to(device)
+    gt = torch.stack([torch.from_numpy(eps[ei][2][_CAMK][t:t + H]) for ei, t in slices]).float().div(255.0).to(device)
 
     # --- action variants. Only indices >= P-1 are touched: those drive the PREDICTED steps.
     g = np.random.RandomState(1)

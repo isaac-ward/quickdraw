@@ -41,7 +41,7 @@ def deltas(eps, codec, strides, n_eps=40):
     for s in strides:
         ds, fr = [], []
         for e in eps[:n_eps]:
-            im = e[2].astype(np.float32) / 255.0
+            im = e[2][cam].astype(np.float32) / 255.0   # frames dict is keyed by camera
             if len(im) <= s:
                 continue
             d = im[s:] - im[:-s]
@@ -70,7 +70,7 @@ tf = load_fpv_frames(root, "val", size=128, cam=cam, max_frames=384, cache=False
 tr, tdb = codec_rmse(torch.from_numpy(tf).float().div(255.0))
 print(f"[torus] TAESD recon: RMSE {tr:.4f} = {tdb:.2f} dB   <-- torus's OWN codec floor\n")
 
-eps = load_split_episodes_mm(root, "val", img_size=128, cam=cam, repo_id="torus")
+eps = load_split_episodes_mm(root, "val", img_size=128, cam=cam, repo_id="torus")  # frames keyed by cam
 print(f"[torus] {len(eps)} val eps, first T={len(eps[0][0])}")
 print("\n=== TORUS: per-step motion vs its own codec floor ===")
 deltas(eps, tr, (1, 2, 4, 8))

@@ -26,6 +26,7 @@ Or read the docs directly:
 
 - **[docs/workflow.md](docs/workflow.md)** — the full pipeline end-to-end, one `uv run` line per step: generate data → push to the Hub → train the world model → action model → interpret (VLM labeling) → reward model → language control.
 - **[docs/byo.md](docs/byo.md)** — run that same pipeline on your *own* environment: recorded data, a required-contract env (or any Gymnasium env, zero code), or a full `WorldEnv`.
+- **[docs/using_pretrained_models.md](docs/using_pretrained_models.md)** — load a published world model from the Hub and imagine with it: install, load, roll out, and how to read a model card. Runnable notebook alongside it.
 
 ## Supported methods
 

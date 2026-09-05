@@ -1,0 +1,23 @@
+# =============================================================================================
+# starling2 — the SECOND recorded egocentric flight set. Select with `data=starling2`.
+# Identical schema and recorder to `data=starling`; read that file's header first, all of it applies.
+#
+# WHAT DIFFERS (from summary.json, 2026-09-05):
+#     train   60 episodes x 3539 steps = 212,359 transitions (1.97 h), 208,099 training windows
+#     val      7 episodes x 3551 steps =  24,855 transitions (0.23 h),  24,358 windows
+#     eval    49 episodes x  234 steps =  11,445 transitions (0.11 h),   7,966 windows   <- EXTRA SPLIT
+#
+# Same total hours as `starling` but HALF the episodes at TWICE the length (3539 vs 1726 steps), so a
+# window at F=64 sees a much smaller fraction of an episode and there is far less episode-boundary
+# diversity per epoch. Worth holding in mind before reading any cross-set comparison as a recipe result.
+#
+# THE `eval` SPLIT IS THE REASON TO PREFER THIS ONE for generalisation work: 49 short held-out episodes,
+# which `starling` does not have. Nothing in quickdraw reads a split named `eval` automatically -- the
+# during-training evals use `val` -- so it needs an explicit pass to use it.
+# =============================================================================================
+defaults:
+  - starling
+  - _self_
+
+hf_repo: isaac-ronald-ward/starling-2
+repo_id: starling-2

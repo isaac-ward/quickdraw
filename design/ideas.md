@@ -202,3 +202,30 @@ says whether the MOVEMENT is action-driven.
 
 Related, more work: Vista (2405.17398) infers the trajectory back out of generated video with an IDM and reports
 L2 to the commanded one (3.785 -> 0.832 with conditioning).
+
+---
+
+## An INPUT-ONLY image modality (a view the model sees but never renders)
+
+Raised while planning two cameras (`design/two_camera_plan.md`, 2026-09-01) and deliberately deferred by the
+user. Logged because the plumbing gap is real and will come up again.
+
+THERE IS NO CONFIG EXPRESSION FOR IT TODAY. Every `ImageModality` builds a decode head unconditionally
+(`modalities.py:255-312`) and `recon_losses` gives every layout entry a weighted `decode/<name>` term
+(`multimodal.py:338-375`). So "input only" currently means `weight: 0` + `latent_loss_weight: 0`, which is
+loss-free but STILL CONSTRUCTS AND RUNS the decoder every step — and the decoder is where the memory is
+(~10.3 of 13.17 GB/sample unchunked, `design/decode_memory.md:15-16`). You pay the entire cost of the thing
+you disabled.
+
+WHAT IT WOULD ACTUALLY NEED: a spec flag (`decode: false`, say) that skips head construction, and then
+guards at the three places that assume every modality can decode — `to_obs` (`multimodal.py:326-336`),
+`recon_losses` (`:338-375`) and `roundtrip_losses` (`:377-421`). All three already loop the layout and gate
+per-name, so the change is small; it is the SPEC-level flag and its interaction with `heads=` partial
+decode that wants thinking about, not the loops.
+
+WHY IT MIGHT BE WORTH IT. The interesting asymmetry is a wrist camera as INPUT with only the fixed scene
+view as OUTPUT: the wrist view carries manipulation detail the third-person view cannot resolve, but it is
+also the hardest thing to predict 128 steps out (it moves with the gripper, so its content is a function of
+the very trajectory we are unsure about). Feeding it in while not being scored on rendering it lets the
+dynamics use the information without paying for its predictability. The reverse — render a view you never
+encode — is the cross-view reconstruction idea, which is a different and stronger claim about the latent.

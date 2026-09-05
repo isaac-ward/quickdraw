@@ -557,11 +557,18 @@ class BestCkptMirror(L.Callback):
         # infer it from the "did not beat" lines (and never confuses it with the val_loss printed per epoch,
         # which is val/loss/total, a DIFFERENT metric). Names the monitored key, direction, and retention.
         _dir = "MAXIMIZES" if str(getattr(self.cb, "mode", "min")) == "max" else "MINIMIZES"
+        k = int(getattr(self.cb, "save_top_k", 0) or 0)
+        # RETENTION is stated separately from SELECTION because they stopped being the same thing when
+        # save_top_k went to -1 (2026-09-05). This banner used to assert pruning unconditionally; under -1
+        # nothing is discarded and best.ckpt is a CONVENIENCE pointer, not the only surviving epoch --
+        # which is the difference between "pick the right monitor or lose work" and "pick it post-hoc".
+        _keep = ("NOTHING is discarded -- every epoch is kept, so a better epoch by any OTHER metric can "
+                 "still be recovered afterwards from logs/metrics.jsonl" if k < 0 else
+                 f"every epoch outside the top-{k} by this metric is DISCARDED")
         self._emit(f"[best-ckpt] SELECTION RULE: best.ckpt = the epoch that {_dir} '{self.cb.monitor}' "
-                   f"(mode={self.cb.mode}, save_top_k={self.cb.save_top_k}). This is NOT the per-epoch 'val_loss' "
-                   f"(=val/loss/total). Every epoch outside the top-{self.cb.save_top_k} by this metric is "
-                   f"DISCARDED; last.ckpt is always the newest epoch. To rank by a different loss, set "
-                   f"trainer.checkpoint_monitor before the run.")
+                   f"(mode={self.cb.mode}, save_top_k={k}). This is NOT the per-epoch 'val_loss' "
+                   f"(=val/loss/total). Retention: {_keep}; last.ckpt is always the newest epoch. To rank by "
+                   f"a different loss, set trainer.checkpoint_monitor before the run.")
 
     def on_validation_end(self, trainer, pl_module):
         bp = self.cb.best_model_path

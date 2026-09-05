@@ -66,6 +66,9 @@ print(f"[load] {os.path.basename(RUN)} missing={len(miss)} unexpected={len(unex)
       f"predict={'residual' if m.predict_residual else 'absolute'}", flush=True)
 
 norm = normalizer(cfg)
+# frames come back as a DICT keyed by camera (data/dataset.py). Single-camera script:
+# name the key once rather than indexing position 2 as if there were only ever one view.
+_CAMK = str(cfg.data.get("cam", "fpv"))
 ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=ae_cfg.img_size,
                            cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
 P = int(cfg.data.P)
@@ -74,7 +77,8 @@ rng = np.random.default_rng(0)
 # ---- frames for head training, with a HELD-OUT split (see TEST 1 note) ----
 tr_f, te_f = [], []
 for i in range(len(ds)):
-    _, _, im = ds[i]
+    _, _, _fr = ds[i]
+    im = _fr[_CAMK]
     idx = rng.permutation(len(im))[:40]
     cut = int(0.75 * len(idx))
     (tr_f if i % 4 else te_f).append(torch.from_numpy(im[idx[:cut] if i % 4 else idx]).float().div(255.0))
@@ -104,7 +108,8 @@ while len(picks) < 6:
 roll_z, roll_gt = {h: [] for h in HZ}, {h: [] for h in HZ}
 with torch.no_grad():
     for ei, t0 in picks:
-        o, a, im = ds[ei]
+        o, a, _fr = ds[ei]
+        im = _fr[_CAMK]
         obs = {"proprio": norm.norm_obs(torch.from_numpy(o)).float()[None].to(dev),
                img_head: torch.from_numpy(im).float().div(255.0)[None].to(dev)}
         act = norm.norm_act(torch.from_numpy(a)).float()[None].to(dev)

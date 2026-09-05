@@ -1,0 +1,90 @@
+# =============================================================================================
+# vl128_2cam — vl128 with TWO camera streams: the fixed scene view AND the wrist view, each with its own
+# encoder, decode head, VisualLoss and roundtrip anchor. Select with `model=vl128_2cam`.
+# See design/two_camera_plan.md for the full change list and what it verified.
+#
+# THIS MUST BE A FILE, not CLI overrides. OmegaConf REPLACES lists rather than merging them, and Hydra's
+# `+` adds KEYS, not list ITEMS -- `model.modalities.2.name=...` cannot work because index 2 does not
+# exist. Per-element edits on entries that DO exist are fine (`model.modalities.1.img_size=96`).
+#
+# THE LATENTS ARE FUSED, and that is the point. Verified in source:
+#     encoders   PRIVATE  -- one per camera, 32 tokens each        multimodal.py:322
+#     bag        concatenated then LayerNormed as a whole          multimodal.py:323-324
+#     dynamics   FUSED    -- spatial attention over ALL 65 tokens  spacetime.py:74
+#     decoders   PRIVATE  -- each reads only bag[..., off:off+n]   multimodal.py:331
+#     anchor     PRIVATE  -- per-modality Dec_i(Enc_i(x_i)) ~ x_i  multimodal.py:377-421
+# So the transition function is forced to model both views jointly -- predicting the wrist view's next
+# tokens is easier using the scene view's, and the transformer will find that -- while each codec stays
+# private. `modalities.py` has promised this since it was written: "Later: image1, image2, ... with no code
+# change." The model side needed none; only the DATA side did (setup.py took the first image spec only).
+#
+# NOT claimed here: nothing forces `cam_scene`'s 32 tokens to CONTAIN wrist information. Rendering one view
+# from the OTHER view's tokens would force genuinely view-agnostic 3-D state in the codec rather than only
+# in the dynamics. That is a small addition on top of this, not part of it.
+#
+# WHY THE WRIST VIEW IS THE INTERESTING SECOND CAMERA. It moves with the gripper, so it resolves
+# manipulation detail the fixed view cannot -- and it is also the hardest thing to predict 128 steps out,
+# because its content is a function of the very trajectory we are unsure about. Measured on the packaged
+# data, its mean frame-to-frame delta is 7.77 against 6.93/7.00 for the two agentview cameras.
+#
+# `cam:` IS REQUIRED ON EVERY IMAGE MODALITY HERE. With one image head an unset `cam` falls back to
+# `data.cam`; with several, that fallback would silently point every head at the SAME camera and each extra
+# head would be scored against the wrong frames -- a plausible WRONG NUMBER rather than a crash. So
+# `window_loaders` asserts on it (training/setup.py).
+#
+# DATA REQUIREMENT: a multi-camera dataset. `isaac-ronald-ward/robocasa-scene4-4h` carries all three
+# RoboCasa cameras (robot0_agentview_left, robot0_agentview_right, robot0_eye_in_hand) as of 25dfe59.
+# Single-camera datasets will fail the loader's `no <cam> mp4s under ...` assert.
+#
+# MEMORY: let autobatch decide -- do NOT pin batch 26 the way the single-camera arms do. A second image
+# modality duplicates the conv encoder, both (chunked) decoder passes and the LPIPS term, AND doubles the
+# state bag (33 -> 65 tokens), which roughly doubles backbone/flow activations inside the ~2.84 GB
+# non-decode bucket too (design/decode_memory.md:15-16). Estimate ~6-7 GB/sample -> batch ~12-14, plus a
+# second resident frame store off the budget. That is an ESTIMATE; the probe models every image spec
+# faithfully (setup.py `synth`, `_resident_frame_bytes`) and prints the real number on the `[batch]` line.
+#
+# CHECKPOINT MONITOR. The default watches the FIRST image head's val mse, so best.ckpt would be blind to
+# the wrist view. Metric keys are already per-head (`val/metric/<name>/mse`, lit.py) and
+# `trainer.checkpoint_monitor` already overrides, so name the head you care about explicitly, e.g.
+#     trainer.checkpoint_monitor=val/metric/cam_scene/mse
+#
+# EVAL IS NOT YET MULTI-HEAD -- see design/two_camera_plan.md phase 2. `eval_ood_horizon` and
+# `eval_ae_floor` LOOP the heads but load ONE camera and feed those frames to every head, so head 2's
+# numbers are scored against camera 1's frames. Until phase 2 lands, read ONLY the first head's eval
+# metrics from a run using this config, and read training losses (`train/loss/decode/<name>`, which ARE
+# per-head and correct) for the second.
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them.
+  - {name: proprio, kind: vector, dim: 6, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+
+  # ---- camera 1: the fixed third-person scene view (what every run to date has trained on) ----
+  - {name: cam_scene, kind: image, cam: robot0_agentview_left,
+     weight: 1.0, img_size: 128,
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}
+
+  # ---- camera 2: the wrist view. Identical settings, so the ONLY difference is the camera ----
+  - {name: cam_wrist, kind: image, cam: robot0_eye_in_hand,
+     weight: 1.0, img_size: 128,
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}
+
+# NOT covered here -- pass on the CLI, as vl128/vl64/up64 document:
+#   data.subsample=<k>   data.F=64   model.action_dim / modalities.0.dim / environments.*
+#   PAIR img_size WITH ae_bottleneck on BOTH image entries:
+#     model.modalities.1.img_size=96 +model.modalities.1.ae_bottleneck=6
+#     model.modalities.2.img_size=96 +model.modalities.2.ae_bottleneck=6
+#   data.autobatch=true   <- deliberately NOT pinned; see MEMORY above

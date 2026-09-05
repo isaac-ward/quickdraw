@@ -1,3 +1,4 @@
 max_epochs: 3      # just enough to exercise the curriculum + checkpoint + eval-callback path
 precision: bf16-mixed
-save_top_k: 1
+save_top_k: -1  # keep every epoch, as trainer/default does — a smoke run is 1-2 epochs, so this costs
+#                 nothing, and leaving ONE profile that still prunes is how the pruning bug comes back.

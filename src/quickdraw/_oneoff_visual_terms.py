@@ -44,12 +44,19 @@ print(f"[load] {os.path.basename(RUN)} missing={len(miss)} unexpected={len(unex)
       f"img_size={ae_cfg.img_size} bottleneck={getattr(ae_cfg,'bottleneck',8)} "
       f"num_tokens={ae_cfg.num_tokens} decode_arch={mod.decode_arch}", flush=True)
 
+# frames come back as a DICT keyed by camera (data/dataset.py). Single-camera script:
+
+# name the key once rather than indexing position 2 as if there were only ever one view.
+
+_CAMK = str(cfg.data.get("cam", "fpv"))
+
 ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=ae_cfg.img_size,
                             cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
 rng = np.random.default_rng(0)
 frames = []
 for i in range(len(ds)):
-    _, _, im = ds[i]
+    _, _, _fr = ds[i]
+    im = _fr[_CAMK]
     idx = rng.permutation(len(im))[:max(1, N_FRAMES // max(len(ds), 1) + 1)]
     frames.append(torch.from_numpy(im[idx]).float().div(255.0))
 X = torch.cat(frames)[:N_FRAMES].to(dev)

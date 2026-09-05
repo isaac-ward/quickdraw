@@ -261,6 +261,16 @@ class LitWorldModel(L.LightningModule):
                     self.log(f"val/metric/{name}/mse", mse)
                     self.log(f"val/metric/{name}/l1", F.l1_loss(dclamp, future[name]))
                     self.log(f"val/metric/{name}/psnr", -10.0 * torch.log10(mse.clamp_min(1e-12)))
+                    # THE MIX THE MODEL IS ACTUALLY TRAINED ON, on the open-loop val rollout. `.../mse` is
+                    # blind to sharpness by construction -- record §22: "MSE loves blur... LPIPS was 0.18 the
+                    # whole time; MSE never saw it" -- so selecting best.ckpt on it selects the least-blurry
+                    # -in-MSE-terms epoch, which is the criterion the perceptual loss exists to replace.
+                    # Measured on vl_l1x3: best val mse was ep15 (OL LPIPS@+128 0.1455) while the best actual
+                    # open-loop LPIPS was ep11 (0.1370) -- best.ckpt pointed at a model 6% worse on the
+                    # metric the run is judged by. This key is what `checkpoint_monitor` now defaults to.
+                    vis = getattr(m.modalities[name], "visual", None)
+                    if vis is not None:
+                        self.log(f"val/metric/{name}/visual", vis(dclamp, future[name]))
                 if hasattr(m, "collapse_diagnostics"):        # latent-collapse (esp. for EMA); on the encoded bag
                     for k, val in m.collapse_diagnostics(obs).items():
                         self.log(f"collapse/{k}", val)
@@ -275,6 +285,47 @@ class LitWorldModel(L.LightningModule):
 
     def on_train_epoch_start(self):
         self._nonfinite_epoch = 0     # reset the per-epoch non-finite counter (see configure_gradient_clipping)
+
+    def on_train_epoch_end(self):
+        """Drain and report each image decoder's RAW output range (visual_loss.pop_diagnostics).
+
+        WHY IT IS REPORTED HERE and not per step. Every consumer of the decoder's output clamps it first --
+        LPIPS validates [0,1], and so do the eval metrics and the image writers -- so an unbounded head can
+        emit +77 while every logged metric reads healthy. `torus_vl128b` did exactly that for 9 hours and the
+        only trace was `roundtrip_image_mse` (weight 0, read by nobody) reading 2.83 where the real, clamped
+        reconstruction error was 0.005. These series are the alarm that was missing.
+
+        The progress.log line is THRESHOLDED, not boolean, and the threshold depends on `decode_out_act`:
+          * "none"    -> out-of-range is possible, so fire on max > 2.0 or min < -1.0. NOT on "any pixel > 1":
+                         32% of torus pixels sit just over 1.0 benignly (median 1.052, 99.3% of them on
+                         targets above 0.98), so a boolean would fire every epoch of a healthy run.
+          * "sigmoid" -> out-of-range is impossible by construction, so that test is dead. The failure mode
+                         becomes PINNING: past |z| ~ 8 the gradient is numerically zero in both directions, so
+                         a pixel driven to the wrong bound is stuck. Fire on frac_hi/frac_lo > 0.9.
+        """
+        mods = getattr(getattr(self, "model", None), "modalities", {}) or {}
+        for name, mod in mods.items():
+            vis = getattr(mod, "visual", None)
+            if vis is None or not hasattr(vis, "pop_diagnostics"):
+                continue                          # vector modalities: plain F.mse_loss, no raw-range failure
+            diag = vis.pop_diagnostics()
+            nonfinite = int(diag.pop("nonfinite", 0))
+            sigmoid = str(getattr(mod, "decode_out_act", "none")) == "sigmoid"
+            alarm = []
+            for site, d in diag.items():
+                for k, v in d.items():
+                    self.log(f"{site}/range_{name}/{k}", float(v))
+                hit = ((d["frac_hi"] > 0.9 or d["frac_lo"] > 0.9) if sigmoid
+                       else (d["max"] > 2.0 or d["min"] < -1.0))
+                if hit:
+                    alarm.append(f"{site} max {d['max']:.2f} min {d['min']:.2f} "
+                                 f"hi {d['frac_hi'] * 100:.1f}% lo {d['frac_lo'] * 100:.1f}%")
+            if alarm:
+                print(f"[range] ep{self.current_epoch} {name} | {' | '.join(alarm)}  -- "
+                      f"{'SIGMOID PINNED at a bound' if sigmoid else 'DECODER OUT OF RANGE'}", flush=True)
+            if nonfinite:
+                print(f"[visual_loss] ep{self.current_epoch} {name}: {nonfinite} non-finite decoder "
+                      f"output(s) into LPIPS this epoch -- sanitised, steps survived.", flush=True)
 
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
         # clip (Trainer sets val=1.0) AND log the total grad norm pre- and post-clip, generically for

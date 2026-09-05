@@ -314,7 +314,10 @@ def main():
           f"K={args.k} stochastic_eval={m.stochastic_eval} vis_thresh={args.vis_thresh} heads={heads} pos={pos} slices={slices}", flush=True)
 
     def load(root):
-        return load_split_episodes_mm(root, "rollout", img_size=img_size, cam="fpv", repo_id="owm")
+        # frames come back as a DICT keyed by camera (data/dataset.py). This script is single-camera, so
+        # flatten to the (obs, act, frames) triples its helpers expect rather than threading a key through.
+        eps = load_split_episodes_mm(root, "rollout", img_size=img_size, cam="fpv", repo_id="owm")
+        return [(o, a, fr["fpv"]) for o, a, fr in eps]
 
     ood, dock_ref = {}, {}
     for ship, port in OOD_SOURCES:
