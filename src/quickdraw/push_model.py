@@ -148,22 +148,48 @@ def _logged_products(run_dir: str, ckpt_path: str, dest: str) -> dict:
     if not os.path.isdir(base):
         print(f"[push_model] no logged eval products for epoch {ep} at {base}", flush=True)
         return {}
-    head = next((d for d in sorted(os.listdir(base)) if d != "proprio"), None)
-    if head is None:
+    # EVERY image head, not just the first. A multi-camera model has one filmstrip and one rollout video
+    # PER HEAD, and shipping only `sorted()[0]` silently dropped `cam_wrist` from the two-camera model --
+    # i.e. half the thing the model does would have been invisible on its page.
+    cams = [d for d in sorted(os.listdir(base)) if d != "proprio"]
+    if not cams:
         return {}
-    src = os.path.join(base, head)
-    want = {"filmstrip.png": "filmstrip_0.png",
-            "filmstrip_2.png": "filmstrip_1.png",
-            "error_vs_step.png": "error_vs_step_avg_log.png",
-            "rollout.mp4": "rollout_0.mp4"}
+    want = {"filmstrip": "filmstrip_0.png",
+            "filmstrip_2": "filmstrip_1.png",
+            "error_vs_step": "error_vs_step_avg_log.png",
+            "rollout": "rollout_0.mp4"}
     out = {}
-    for newname, orig in want.items():
-        p = os.path.join(src, orig)
-        if os.path.exists(p):
-            shutil.copy2(p, os.path.join(dest, newname))
-            out[newname] = newname
-    print(f"[push_model] logged eval products from epoch {ep}: {sorted(out)}", flush=True)
-    return {"epoch": ep, "head": head, "files": out}
+    for head in cams:
+        src = os.path.join(base, head)
+        for key, orig in want.items():
+            sp = os.path.join(src, orig)
+            if not os.path.exists(sp):
+                continue
+            ext = os.path.splitext(orig)[1]
+            newname = f"{head}_{key}{ext}" if len(cams) > 1 else f"{key}{ext}"
+            shutil.copy2(sp, os.path.join(dest, newname))
+            out.setdefault(head, {})[key] = newname
+    print(f"[push_model] logged eval products from epoch {ep}: "
+          f"{ {h: sorted(v) for h, v in out.items()} }", flush=True)
+    return {"epoch": ep, "heads": cams, "files": out}
+
+
+def _repo_id(name: str) -> str:
+    """`<namespace>/<name>`, asking the Hub who we are when the namespace is not already given.
+
+    Falls back to the bare name if there is no token (a dry run on a machine without credentials). The
+    card's embedded <video> src needs the namespace, so getting this wrong renders a 404 rather than an
+    error -- hence the loud warning rather than a silent fallback.
+    """
+    if "/" in name:
+        return name
+    try:
+        from huggingface_hub import HfApi
+        return f"{HfApi().whoami()['name']}/{name}"
+    except Exception as e:
+        print(f"[push_model] could not resolve the Hub namespace ({type(e).__name__}) -- the card's video "
+              f"URL will be WRONG. Pass +hub.name=<namespace>/{name} to fix.", flush=True)
+        return name
 
 
 def _versions() -> dict:
@@ -218,7 +244,7 @@ def _metrics_at(run_dir: str, epoch: int) -> dict:
     return out
 
 
-def _card(name: str, cfg, at_epoch: dict, epoch: int, why_ckpt: str, heads: list[str],
+def _card(name: str, cfg, at_epoch: dict, epoch: int, why_ckpt: str, heads: list[str],   # `name` = FULL repo id
           products: dict | None = None, vers: dict | None = None, dataset: str = "?") -> str:
     """Fill the EDITABLE template at model_card_template.md. Keep prose there, not here."""
     vers = vers or {}
@@ -235,18 +261,34 @@ def _card(name: str, cfg, at_epoch: dict, epoch: int, why_ckpt: str, heads: list
     rows = "\n".join(f"| {desc} | {round(at_epoch[k], 5)} |" for k, desc in want if k in at_epoch) \
            or "| (no eval metrics logged at this epoch) | — |"
 
+    # PRODUCTS. The rollout video is EMBEDDED with a <video> tag, not linked (user, 2026-09-05: "i want you
+    # to include rollout videos (rollout_0) not just filmstrips in the main hugging face page"). A model
+    # card renders raw HTML, but relative srcs do not resolve there -- the tag needs the absolute
+    # `resolve/main` URL, which is why `name` is threaded in. A filmstrip is eight sampled frames; the video
+    # is the whole horizon at frame rate, and drift is a temporal failure, so it is the more honest artifact.
     parts = []
     files = (products or {}).get("files", {})
-    if "filmstrip.png" in files:
-        parts.append(f"![open-loop filmstrip](filmstrip.png)\n\n**Top row predicted, bottom row ground "
-                     f"truth**, over the full +1..+128 open-loop horizon on a held-out validation episode. "
-                     f"This is the run's own logged evaluation artifact at epoch {products['epoch']}.\n")
-    if "filmstrip_2.png" in files:
-        parts.append("A second episode: [`filmstrip_2.png`](filmstrip_2.png).\n")
-    if "error_vs_step.png" in files:
-        parts.append("Error against horizon (log axis): [`error_vs_step.png`](error_vs_step.png).\n")
-    if "rollout.mp4" in files:
-        parts.append("Rollout video: [`rollout.mp4`](rollout.mp4).\n")
+    multi = len(files) > 1
+    for head, f in files.items():
+        if multi:
+            parts.append(f"### `{head}`\n")
+        if "rollout" in f:
+            parts.append(
+                f'<video controls loop muted playsinline width="100%" '
+                f'src="https://huggingface.co/{name}/resolve/main/{f["rollout"]}"></video>\n\n'
+                f"Open-loop rollout, full horizon at frame rate — predicted beside ground truth. If your "
+                f"viewer does not play it inline: [`{f['rollout']}`]({f['rollout']}).\n")
+        if "filmstrip" in f:
+            parts.append(f"![open-loop filmstrip]({f['filmstrip']})\n\n**Top row predicted, bottom row "
+                         f"ground truth**, over the full +1..+128 open-loop horizon on a held-out validation "
+                         f"episode. The run's own logged artifact at epoch {products['epoch']}.\n")
+        extra = []
+        if "filmstrip_2" in f:
+            extra.append(f"a second episode [`{f['filmstrip_2']}`]({f['filmstrip_2']})")
+        if "error_vs_step" in f:
+            extra.append(f"error against horizon [`{f['error_vs_step']}`]({f['error_vs_step']})")
+        if extra:
+            parts.append("Also: " + ", ".join(extra) + ".\n")
     products_md = ("\n".join(parts) + "\n") if parts else ""
 
     with open(CARD_TEMPLATE) as f:
@@ -321,8 +363,12 @@ def main(cfg):
             ep = int(m.group(1)) if m else -1
         at_epoch = _metrics_at(run_dir, ep)
         dataset = str(rcfg.data.get("hf_repo", None) or rcfg.data.get("repo_id", "?"))
+        # FULL repo id (namespace included) is needed BEFORE the card is written: the embedded <video> tag
+        # takes an absolute `resolve/main` URL, and a bare name produces huggingface.co/<name>/... which
+        # 404s. Resolved here rather than at upload time so a dry run renders the same URL as a real push.
+        repo_id = _repo_id(name)
         with open(os.path.join(tmp, "README.md"), "w") as f:
-            f.write(_card(name, rcfg, at_epoch, ep, why, heads, products, vers, dataset))
+            f.write(_card(repo_id, rcfg, at_epoch, ep, why, heads, products, vers, dataset))
 
         sizes = {p: os.path.getsize(os.path.join(tmp, p)) / 1e6 for p in sorted(os.listdir(tmp))}
         print("[push_model] staged:\n" + "\n".join(f"    {k:26s} {v:8.1f} MB" for k, v in sizes.items()),
@@ -337,7 +383,6 @@ def main(cfg):
 
         from huggingface_hub import HfApi
         api = HfApi()
-        repo_id = name if "/" in name else f"{api.whoami()['name']}/{name}"
         api.create_repo(repo_id, repo_type="model", private=private, exist_ok=True)
         # create_repo(exist_ok=True) does NOT change the visibility of a repo that already exists, so a
         # re-push with a different `private` silently kept the old setting -- measured: a push reporting

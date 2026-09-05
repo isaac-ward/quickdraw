@@ -16,6 +16,8 @@ further observations.
 Trained with `quickdraw` (`model={model_name}`, recipe `{recipe}`) on `{dataset}`.
 Image head{plural}: {head_list} at {img_size}px, {num_tokens} latent tokens each.
 
+## What it looks like
+
 {products_md}
 ## Headline numbers
 
@@ -86,4 +88,5 @@ network, excluded from the published weights and rebuilt on demand.
 | `normalization_stats.json` | the training statistics, so the model loads standalone |
 | `example_context.npz` | real context windows plus their ground-truth continuation |
 | `metrics.json` | every logged metric with its eval index |
+| `*rollout.mp4`, `*filmstrip*.png`, `*error_vs_step.png` | the run's own logged eval artifacts at the published epoch, one set per image head |
 | `versions.json` | quickdraw / torch / commit the weights came from |
