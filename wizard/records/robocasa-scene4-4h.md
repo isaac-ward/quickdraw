@@ -1974,6 +1974,102 @@ STILL THE WEAK HALF: the rollout. At matched eval the new runs sit at OL PSNR ~1
 pure-MSE narrow-head run (`dec_up64`) reached 14.9-15.4. The autoencoder improved far more than the
 dynamics did, and `latent_cos` (0.38-0.52) is the metric to watch there.
 
+## 24. TWO CAMERAS BEAT ONE — a wrist view improves the DYNAMICS, and makes the codec slightly worse (09-02/05)
+
+Section 23.7 queued "a SECOND CAMERA input + prediction head" as the top item. Run `twocam_full`
+(`model=vl128_2cam`, 96px) adds `robot0_eye_in_hand` as a second image head alongside
+`robot0_agentview_left`, both encoded into the shared token bag (spacetime spatial attention fuses all
+tokens) and both decoded by their own head. **It holds every open-loop record on this dataset.**
+
+### 24.1 The result, on a basis that does not reward extra evals
+
+`best` is a MINIMUM over evals and is therefore biased low by eval count -- `twocam_full` had 35 draws
+against `st_fh128`'s 22, so best-vs-best flatters it. The late-window median is the honest column.
+
+| run | cams | `visual_l1` | batch | evals | best @+128 | **late-window median** | best floor |
+|---|---|---|---|---|---|---|---|
+| `st_fh128` | 1 | 1.0 | 26 | 22 | 0.1247 (ep16) | 0.1415 | **0.0565** |
+| `vl_l1x3` | 1 | 3.0 | 26 | 25 | 0.1370 (ep11) | 0.1437 | 0.0657 |
+| **`twocam_full`** | **2** | 3.0 | 14 | 35 | **0.1161** (ep29) | **0.1272** | 0.0580 |
+
+**Two cameras win on best (6.9%) and on the median (10.1%).** The median is the number to quote. It also
+wins at MATCHED BUDGET, which is the strongest form: over the first 11 evals only, 0.1267 (ep6) against
+`st_fh128`'s 0.1415 (ep9) and `vl_l1x3`'s 0.1580 (ep9) -- and it got there at epoch 6, not epoch 9.
+
+### 24.2 THE GAIN IS DYNAMICS, NOT RECONSTRUCTION -- and the codec got WORSE
+
+This is the part that matters for where to push next. While @+128 improved, the scene codec DEGRADED:
+floor 0.0580 at ep14 -> **0.0722** at ep34, and it never beat `st_fh128`'s 0.0565. So the second view did
+not buy a better autoencoder; it bought a better rollout on a slightly worse one. That is the FIRST time
+anything on this dataset has moved the dynamics without moving the floor -- every previous win (the
+perceptual loss, section 22; the narrow flow head, section 23) improved the codec and dragged @+128 along
+behind it. Section 23.7's "STILL THE WEAK HALF: the rollout" finally has a lever.
+
+Mechanism, unverified but the obvious one: the wrist camera moves with the gripper, so its tokens encode
+end-effector pose directly rather than leaving it to be inferred from a fixed view. The shared bag then
+carries a stronger state and the transition head has an easier target.
+
+**The wrist head itself is the mirror image, exactly as predicted at launch**: it RECONSTRUCTS best of
+anything in the project (floor **0.0392** at ep29, vs the scene head's 0.0580 and the single-camera record
+of 0.0565) and PREDICTS worst (@+128 0.2629 best, late-median 0.2766, roughly 2.2x the scene head). A
+gripper-mounted view is easy to encode and hard to roll forward, because its content depends on where the
+arm went. Do NOT read the wrist head's @+128 as a regression -- it is a different, harder task.
+
+### 24.3 The comparison is clean -- the dataset was VERIFIED bit-identical
+
+`twocam_full` trains on the LOCAL recording `logs/recording_2026_09_01_05_30_23_robocasa_scene4_4h_3cam`
+while all 60 historical runs used the HF snapshot `isaac-ronald-ward/robocasa-scene4-4h`. Different path,
+so the comparison was checked rather than assumed. Five md5s, all matching:
+
+| file | md5 |
+|---|---|
+| `train/robot0_agentview_left_96.npy` (7.2 GB) | `929469dd...` |
+| `train/data/chunk-000/file-000.parquet` | `dc68d3dd...` |
+| `val/robot0_agentview_left_96.npy` (810 MB) | `df2d517d...` |
+| `val/data/chunk-000/file-000.parquet` | `44e14366...` |
+| `normalization_stats.json` | `90b6537b...` |
+
+The local directory is not a re-recording: it is the SAME 235/26 episodes with `robot0_eye_in_hand_96.npy`
+added beside an untouched agentview file. Same obs/act, same normaliser, same `subsample=5 / P=8 / F=64 /
+window_stride=1 / 96px`.
+
+A full resolved-config diff gives 31 differing keys against `st_fh128`, of which 27 are the second head
+existing at all. The four real ones:
+
+* **`batch` 26 -> 14** (autobatch chose it; two image heads cost memory). THE ONE UNCONTROLLED VARIABLE.
+  It cuts AGAINST `twocam_full` -- a smaller batch is noisier -- so if anything the effect is understated.
+* **`visual_l1` 1.0 -> 3.0.** So `vl_l1x3`, not `st_fh128`, is the loss-matched control. `twocam_full`
+  beats it by 11.5% on the median, which is the cleanest single number in the table.
+* `data.cam` (the legacy field; the real cameras are per-head `modalities[i].cam`) and
+  `checkpoint_monitor` (selection only). Neither affects training.
+
+### 24.4 METHODOLOGY: best-of and short windows misread this run TWICE
+
+Recorded because it cost two wrong calls, both made from real data.
+
+1. **"Plateaued / converged" at ep23**, from best-of: the best was 0.1267 at ep6 and 16 evals had not beaten
+   it. But this metric jitters +-0.02 epoch to epoch, and a MINIMUM only ratchets -- it cannot show a
+   trend. The median over the same span was still falling.
+2. **"Flat, -0.4%"** from a 9-eval median window (ep19-27). Too short. Widening it to ep11-22 -> ep23-34
+   gives **-7.3%**, and the run then set new bests at ep29.
+
+Use MEDIANS over halves of a window long enough to contain several evals, and treat any difference under
+~0.02 on @+128 as noise. Both single-camera runs throw transient spikes too (`st_fh128` ep7 0.1887,
+`vl_l1x3` ep7 0.2550, `twocam_full` ep16 0.3035), so a single bad eval means nothing.
+
+### 24.5 Queue
+
+1. **Sigmoid output head on robocasa** (`+model.modalities.1.decode_out_act=sigmoid`, added `b9d2f85`).
+   On torus this was worth 3.4x on @+128 and 29x on the floor, because 66.9% of torus target pixels are
+   exactly 1.0 and LPIPS scores the CLAMPED image, so it has ZERO gradient above the boundary and the
+   decoder ratcheted out to +77. **Robocasa should NOT have that problem** -- 0.4% saturated targets, and
+   its decoder measures max 1.034 -- which is exactly why the arm is worth running: it separates "bounding
+   the output helps generally" from "it only rescues saturated data". Default is `none`, bit-identical.
+2. **A THIRD camera** (`robot0_agentview_right`). The dataset already carries it and 24.2 says the lever is
+   real; the open question is whether it scales or the wrist view was special because it is gripper-mounted.
+3. **`twocam_full` at `batch=26`** to close 24.3's one confound, if the 10% margin ever needs defending.
+4. `df_scale` -> 0.7, `num_tokens=64`, `visual_l1=5.0` -- carried over from 23.7, all still open.
+
 ## Appendix — folded in from wizard/scripts/*.md (2026-08-11)
 
 These lived next to the launch scripts, where `.gitignore` kept them unsynced. Content preserved verbatim.
