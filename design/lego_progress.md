@@ -306,3 +306,22 @@ restarting Arm A a third time on my own judgment is not the right call.
 - [x] `observation.state` is sample-and-held: 69.9% of rows byte-identical to the previous row,
       effective ~9 Hz against a declared 30 Hz. Quest streams are full-rate (0% repeated), robot state
       stale on 93.5% of samples. The recovered action is the higher-bandwidth signal of the two.
+
+## P9 — multicamera arm: BUILT, DELIBERATELY HELD (decision, user, 2026-09-07)
+
+- [x] Multicamera run folder built on the corrected action:
+      `logs/recording_2026_09_07_05_19_10_lego_v2_mc`, 98 train / 11 val episodes,
+      cameras `head_right`, `gripper_left_top`, `gripper_right_top`.
+- [ ] **HELD until the action verdict.** Do NOT launch it yet. The single-camera pair
+      (`CORRECTED_l1x10_treat` vs `CORRECTED_l1x10_ctrl`, action shuffled) is measuring whether the
+      corrected action contributes anything at all. If the shuffled control matches the treatment, the
+      model is not using the action, and action-conditioning three cameras at 5.4x the epoch cost buys
+      nothing — so that result changes what the multicam arm should even be. Launching it before the
+      verdict would spend the compute to learn nothing extra.
+
+### HF publication state (for reference)
+- `swoosh-data/lego_assemblies_v2`: `private=True`, `gated=manual` — identical to v1. Invisible outside
+  the org (404, not a request page). Sharing means either adding the person to the org, or flipping it
+  public, after which the existing manual gate still makes them request access.
+- The token used here has role `write` in `swoosh-data`, NOT `admin`, so it can upload but probably
+  cannot approve access requests. That needs an org admin.
