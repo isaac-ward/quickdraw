@@ -39,6 +39,8 @@ import os
 
 import numpy as np
 
+from .rotations import EULER_SEQ
+
 # --- constants lifted verbatim from code/src/retriever_data_collection/xarm/direct_teleop.py ---
 # Per-arm Quest-world -> arm-base linear transforms; rows are arm-base axes in Quest coords. Each is the
 # exact-fit Kabsch from that arm's 3 calibration translation deltas (2026-06-17 recording).
@@ -70,14 +72,16 @@ M_TO_MM = 1000.0
 
 
 def load_session(session_dir: str):
-    """One raw session -> dict of parallel arrays at the 100 Hz collection rate."""
+    """One raw session -> dict of parallel arrays at the ~29.5 Hz collection rate.
+
+    (Not 100 Hz, as this said while I believed it. Measured median dt is 0.0339 s.)"""
     f = glob.glob(os.path.join(session_dir, "lerobot_jsonl/data/chunk-000/*.jsonl"))
     if not f:
         raise FileNotFoundError(f"no episode jsonl under {session_dir}")
     out = {k: [] for k in ("p2cb_right", "p2cb_left", "tcp_right", "tcp_left",
                            "quat_right", "quat_left", "rpy_right", "rpy_left",
                            "grip_right", "grip_left", "cgrip_right", "cgrip_left",
-                           "dead_right", "dead_left", "state")}
+                           "dead_right", "dead_left", "state", "t")}
     for line in open(f[0]):
         d = json.loads(line)
         fr, rs = d["frame"], d.get("robot_state_xarm") or {}
@@ -99,7 +103,10 @@ def load_session(session_dir: str):
         out["dead_right"].append(fr.get(DEADMAN_KEY["right"], 0.0))
         out["dead_left"].append(fr.get(DEADMAN_KEY["left"], 0.0))
         out["state"].append(d.get("robot_observation_state_xarm") or [np.nan] * 28)
-    return {k: np.asarray(v, dtype=np.float64) for k, v in out.items()}
+        out["t"].append(d["timestamp"])
+    out = {k: np.asarray(v, dtype=np.float64) for k, v in out.items()}
+    out["t"] -= out["t"][0]                 # session-relative seconds
+    return out
 
 
 def segments(engaged: np.ndarray, min_len: int = MIN_SEG):
@@ -169,7 +176,7 @@ def reconstruct_rot(quat: np.ndarray, rpy: np.ndarray, engaged: np.ndarray, side
         if len(seg) < MIN_SEG:
             continue
         q0 = Rot.from_quat(quat[seg[0]])
-        R0 = Rot.from_euler("xyz", rpy[seg[0] + lag], degrees=True)
+        R0 = Rot.from_euler(EULER_SEQ, rpy[seg[0] + lag], degrees=True)
         rv = -(M @ (Rot.from_quat(quat[seg]) * q0.inv()).as_rotvec().T).T
         tgt[seg] = (Rot.from_rotvec(rv) * R0).as_matrix()
     return tgt, ~np.isnan(tgt[:, 0, 0])
@@ -185,54 +192,157 @@ def hold_mask(engaged: np.ndarray) -> np.ndarray:
     return engaged <= DEADMAN_ON
 
 
-def episode_action(session_dir: str, n_out: int) -> tuple[np.ndarray, np.ndarray]:
-    """One raw session -> (action (n_out, 20) float32, valid (n_out,) bool) on the dataset's 30 Hz grid.
+def align_to_dataset(S: dict, dts: np.ndarray, st: np.ndarray,
+                     search: float = 4.0) -> tuple[np.ndarray, float, float]:
+    """Map each DATASET row onto a RAW-SESSION row. -> (idx (n,), delta_seconds, exact_fraction).
 
-    Per arm: [tcp_xyz_mm(3), 6D(R)(6), grip(1)] = 10, so 20 for the pair -- the ABSOLUTE COMMANDED TCP
-    POSE in the ROBOT BASE frame, the same frame and units as `observation.state`.
+    THE RAW SESSION AND THE EXPORTED EPISODE DO NOT SHARE A TIME ORIGIN. The session log starts before
+    the episode does, by a per-episode offset that is ~0.75-0.85 s on most episodes and ~0 on a few. I
+    originally mapped the two grids PROPORTIONALLY (`arange(n_out) * n_raw / n_out`), which is only
+    correct when both cover the same span, and it silently placed every action row about 24 frames away
+    from the observation it belongs to. Nothing downstream could detect it: the recovery residual is
+    computed entirely in raw index space, so it still read 3.1 mm, while the action column landed on the
+    wrong frames. It surfaced only as an action that failed to predict the motion it had caused --
+    partial R-squared 0.003 against 0.018 for the raw controller pose it was supposed to beat.
+
+    The offset is recovered from the DATA rather than assumed, by grid-searching delta for the value that
+    maximises exact agreement between the dataset's `observation.state` and the raw log's
+    `robot_observation_state_xarm` -- the same field the export was built from, so a correct delta gives
+    a bit-exact match. Measured across all 74 episodes this lifts exact agreement from 3-8 percent to
+    85-90 percent with a median error of 0.0000, and the residual disagreement is rows of the 30 Hz grid
+    that fall between two irregular raw samples, where nearest-in-time is the right answer anyway.
+    """
+    rel, rst = S["t"], S["state"]
+
+    def lookup(delta):
+        want = dts + delta
+        j = np.clip(np.searchsorted(rel, want), 0, len(rel) - 1)
+        jm = np.clip(j - 1, 0, len(rel) - 1)
+        return np.where(np.abs(rel[j] - want) <= np.abs(rel[jm] - want), j, jm)
+
+    def exact(delta):
+        idx = lookup(delta)
+        return float((np.abs(rst[idx] - st).max(1) < 1e-3).mean())
+
+    coarse = np.arange(-search, search, 1 / 120)
+    best = float(coarse[int(np.argmax([exact(d) for d in coarse]))])
+    fine = np.arange(best - 1 / 120, best + 1 / 120, 1 / 2400)      # refine within one coarse cell
+    best = float(fine[int(np.argmax([exact(d) for d in fine]))])
+    return lookup(best), best, exact(best)
+
+
+def episode_pose(session_dir: str, dts: np.ndarray, st: np.ndarray) -> dict:
+    """The COMMANDED TCP POSE, recovered from one raw session onto the dataset's own frame grid.
+
+    `dts` and `st` are the episode's `timestamp` and `observation.state` columns; they are what pins the
+    raw log to the exported grid (see `align_to_dataset`).
+
+    -> {"xyz": (n,2,3) mm, "R": (n,2,3,3), "grip": (n,2), "valid": (n,)}, arms ordered (right, left),
+    in the ROBOT BASE frame -- the same frame and units as `observation.state`.
+
+    This is the single source of truth for the recovery; `episode_action` (6D, for training) and the
+    published v2 `action` column (mm/deg, for humans) are both thin wrappers over it.
 
     WHY ABSOLUTE AND NOT A DELTA, having first built the delta version. `cmd(t) - meas(t)` is better
-    conditioned for conditioning (zero-centred, small) but it does not SUBSAMPLE: summing six such
-    deltas adds six differences taken against six different reference positions, which means nothing,
-    and `last` silently discards the five commands in between. The correct decimated delta would be
-    `cmd(t+s) - meas(t)`, which is neither aggregation. Absolute has no such problem -- `action_aggregate
-    = "last"` is exactly right, because the command standing at the end of the group IS the command --
-    and the delta stays available downstream at zero cost, since the model already holds the state in
-    the same frame. It is also what ABC-130k publishes, so the two datasets stay comparable.
+    conditioned for conditioning (zero-centred, small) but it does not SUBSAMPLE: summing s such deltas
+    adds s differences taken against s different reference positions, which means nothing, and `last`
+    silently discards the s-1 commands in between. The correct decimated delta would be
+    `cmd(t+s) - meas(t)`, which is neither aggregation. Absolute has no such problem -- `last` is exactly
+    right, because the command standing at the end of a group IS the command -- and the delta stays
+    available downstream at zero cost, since the model already holds the state in the same frame. It is
+    also what ABC-130k publishes, so the two datasets stay comparable.
 
-    HOLDS NEED NO SPECIAL CASE. With the deadman released the command is "stay here", so the commanded
-    pose IS the measured pose. That falls out of the representation instead of being encoded as a magic
-    zero, and it is why coverage is 99.9% rather than the 92% the delta version managed.
-    """
+    HOLDS ARE A FORWARD FILL, NOT THE MEASURED POSE. `direct_teleop.py` line 363 `continue`s the whole
+    per-side block when the deadman is up, so NO command is sent and the arm holds the last one -- the
+    gripper included, since it lives inside the same skipped block. So the command during a hold is the
+    last commanded pose, held CONSTANT.
+
+    I first wrote this as `cmd = measured TCP(t)`, reasoning that "stay here" means the current pose.
+    That is wrong twice. It is not what was commanded -- the latched target does not drift, but the
+    measurement does. And it makes the action a near-copy of the state on the ~70 percent of frames that
+    are holds, so the action carries almost nothing the state does not already have. Measured as partial
+    R-squared (what the action adds GIVEN the state) it cost real signal at short horizons, losing to
+    v1's raw controller pose at 33 and 100 ms. The forward fill fixes both.
+
+    BEFORE AN ARM'S FIRST COMMAND it is parked, not commanded, so the faithful target is its own
+    resting pose held constant. That is not a guess: measured across every session the TCP excursion
+    before the first command is a median of 0.0 mm and a maximum of 1.7 mm, so the arm demonstrably does
+    not move. One session never commands its right arm at all, and gets a constant right action for the
+    whole episode -- which is exactly what happened. Using tcp[0] rather than tcp[t] keeps this a single
+    constant per arm per episode, so no measurement drift leaks into the action.
+
+    `valid` is therefore False only where the RECONSTRUCTION itself fails (a calibration gap mid-episode),
+    not merely where the operator was idle."""
     from scipy.spatial.transform import Rotation as Rot
-
-    from .rotations import matrix_to_6d
 
     S = load_session(session_dir)
     n_raw = len(S["tcp_right"])
-    out = np.zeros((n_raw, 20), dtype=np.float64)
-    ok_side = {}
+    idx, delta, frac = align_to_dataset(S, np.asarray(dts, dtype=np.float64),
+                                        np.asarray(st, dtype=np.float64))
+    xyz = np.zeros((n_raw, 2, 3))
+    # IDENTITY, not zeros: rows with no reconstructable command are masked out by `valid` and then
+    # dropped by the episode split, but a zero matrix is not a rotation and scipy's from_matrix
+    # rejects it outright, so the placeholder has to be a legal one.
+    R = np.tile(np.eye(3), (n_raw, 2, 1, 1))
+    grip = np.zeros((n_raw, 2))
+    ok = np.ones(n_raw, dtype=bool)
 
     for k, side in enumerate(("right", "left")):
-        tcp, rpy = S[f"tcp_{side}"], S[f"rpy_{side}"]
-        dead, p2cb, quat = S[f"dead_{side}"], S[f"p2cb_{side}"], S[f"quat_{side}"]
-        tgt, vpos, _ = reconstruct(p2cb, tcp, dead, side)
-        rtgt, vrot = reconstruct_rot(quat, rpy, dead, side)
-        held = hold_mask(dead)
-        cmd = vpos & vrot & ~held           # a reconstructed command
-        b = k * 10
+        dead = S[f"dead_{side}"]
+        tgt, vpos, _ = reconstruct(S[f"p2cb_{side}"], S[f"tcp_{side}"], dead, side)
+        rtgt, vrot = reconstruct_rot(S[f"quat_{side}"], S[f"rpy_{side}"], dead, side)
+        cmd = vpos & vrot & ~hold_mask(dead)            # a freshly issued command
 
-        # commanded pose while the deadman is held
-        out[cmd, b:b + 3] = tgt[cmd]
-        out[cmd, b + 3:b + 9] = matrix_to_6d(rtgt[cmd])
-        out[cmd, b + 9] = S[f"cgrip_{side}"][cmd]
-        # "hold" == commanded pose is the CURRENT pose
-        out[held, b:b + 3] = tcp[held]
-        out[held, b + 3:b + 9] = matrix_to_6d(
-            Rot.from_euler("xyz", rpy[held], degrees=True).as_matrix())
-        out[held, b + 9] = S[f"grip_{side}"][held]
-        ok_side[side] = cmd | held
+        # Forward-fill the last issued command over every frame that is not itself a fresh command.
+        # `ff[i]` is the index of the most recent commanded frame at or before i, or -1 if none yet.
+        ff = np.where(cmd, np.arange(len(cmd)), -1)
+        ff = np.maximum.accumulate(ff)
+        have = ff >= 0                                  # a command has been issued by now
+        src = ff[have]
+        xyz[have, k] = tgt[src]
+        R[have, k] = rtgt[src]
+        grip[have, k] = S[f"cgrip_{side}"][src]
+        # parked: the arm's own resting pose, one constant for the whole pre-command stretch
+        pre = ~have
+        if pre.any():
+            xyz[pre, k] = S[f"tcp_{side}"][0]
+            R[pre, k] = Rot.from_euler(EULER_SEQ, S[f"rpy_{side}"][0:1], degrees=True).as_matrix()[0]
+            grip[pre, k] = S[f"grip_{side}"][0]
+        ok &= have | pre                                # i.e. only a mid-episode failure invalidates
 
-    ok = ok_side["right"] & ok_side["left"]
-    idx = np.clip((np.arange(n_out) * (n_raw / max(n_out, 1))).astype(int), 0, n_raw - 1)
-    return out[idx].astype(np.float32), ok[idx]
+    # Nearest raw sample per dataset row, at the offset `align_to_dataset` recovered -- NOT an
+    # interpolation: a slerp between two commands invents a command that was never issued.
+    return {"xyz": xyz[idx], "R": R[idx], "grip": grip[idx], "valid": ok[idx],
+            "delta": delta, "align_exact": frac}
+
+
+def episode_action(session_dir: str, dts: np.ndarray, st: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """TRAINING form of `episode_pose`: (action (n, 20) float32, valid (n,) bool), n = len(dts).
+
+    Per arm [tcp_xyz_mm(3), 6D(R)(6), grip(1)] = 10, so 20 for the pair. 6D because rpy wraps 702/802
+    times per arm on this data and the quaternion sign flips 29 times; see `rotations.py`."""
+    from .rotations import matrix_to_6d
+
+    P = episode_pose(session_dir, dts, st)
+    out = np.concatenate([
+        np.concatenate([P["xyz"][:, k], matrix_to_6d(P["R"][:, k]), P["grip"][:, k, None]], axis=1)
+        for k in (0, 1)], axis=1)
+    return out.astype(np.float32), P["valid"]
+
+
+def episode_action_native(session_dir: str, dts: np.ndarray, st: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """PUBLISHED form of `episode_pose`: (action (n, 14) float32, valid (n,) bool), n = len(dts).
+
+    Per arm [tcp_xyz_mm(3), tcp_rpy_deg(3), gripper_norm(1)] = 7, so 14 for the pair -- deliberately the
+    SAME convention and units as the first seven columns of each arm's `observation.state` block, so a
+    reader can subtract the two without a conversion. Euler is fine HERE, where the column is read by
+    humans one frame at a time; it is not fine for training, which is what `episode_action` is for."""
+    from scipy.spatial.transform import Rotation as Rot
+
+    P = episode_pose(session_dir, dts, st)
+    out = np.concatenate([
+        np.concatenate([P["xyz"][:, k],
+                        Rot.from_matrix(P["R"][:, k]).as_euler(EULER_SEQ, degrees=True),
+                        P["grip"][:, k, None]], axis=1)
+        for k in (0, 1)], axis=1)
+    return out.astype(np.float32), P["valid"]

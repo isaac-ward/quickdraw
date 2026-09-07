@@ -409,10 +409,14 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
     same frame and units as `observation.state`. Residual against the measured pose 3.4 mm / 1.0 deg,
     R^2 0.2434 (8.2x the published column). See quickdraw#15 and HF discussion #2.
 
-    EPISODES ARE SPLIT AT UNRECOVERABLE FRAMES. 0.07 percent of frames have no reconstructable command
-    (a calibration gap before the first deadman press). Rather than interpolate a command that was never
-    issued, each episode is cut into its maximally-contiguous valid runs, so no training window can ever
-    straddle a gap. 74 episodes -> ~116, and short offcuts below one window are dropped.
+    THE RAW LOG AND THE EXPORTED EPISODE DO NOT SHARE A TIME ORIGIN -- the session starts 0 to 1.0 s
+    earlier, per episode. Placing the recovered command by proportional index (the obvious thing, and
+    what this did first) puts every action row ~24 frames from the observation it caused: measured on the
+    dataset grid, `|cmd(t) - tcp(t+k)|` was 19.9 mm with no lag structure, against 3.3 mm with a clean
+    minimum at k=5 (167 ms, the servo lag) once aligned. The offset is recovered from state content, not
+    assumed. Episodes are still split at any frame where the reconstruction itself fails, so no training
+    window can straddle a gap; with alignment correct that is currently zero frames and all 74 episodes
+    survive whole.
 
     Args: +source.dir=<local snapshot> [+source.name=lego_assemblies]
           [+source.camera=head_right]  -- ONE leaf, or a LIST for a MULTI-CAMERA build. Use hydra's
@@ -462,8 +466,14 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
     for idx in range(n):
         c = idx // chunk
         t = pq.read_table(os.path.join(src, "data", f"chunk-{c:03d}", f"episode_{idx:06d}.parquet"))
-        states = encode_state(np.asarray(t.column("observation.state").to_pylist(), dtype=np.float32))
-        actions, valid = episode_action(os.path.join(raw, ep2sess[str(idx)]), len(states))
+        raw_state = np.asarray(t.column("observation.state").to_pylist(), dtype=np.float32)
+        states = encode_state(raw_state)
+        # `timestamp` and the RAW (unencoded) state are what pin the raw session log to this episode's
+        # frame grid: the session starts up to ~1 s before the episode does, and that offset is
+        # recovered per episode by matching state content. See lego_action.align_to_dataset.
+        actions, valid = episode_action(os.path.join(raw, ep2sess[str(idx)]),
+                                        np.asarray(t.column("timestamp").to_pylist(), dtype=np.float64),
+                                        raw_state)
 
         per_cam = {}
         for cam in cams:
