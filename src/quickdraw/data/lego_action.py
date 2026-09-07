@@ -274,8 +274,9 @@ def episode_pose(session_dir: str, dts: np.ndarray, st: np.ndarray) -> dict:
     whole episode -- which is exactly what happened. Using tcp[0] rather than tcp[t] keeps this a single
     constant per arm per episode, so no measurement drift leaks into the action.
 
-    `valid` is therefore False only where the RECONSTRUCTION itself fails (a calibration gap mid-episode),
-    not merely where the operator was idle."""
+    NOTHING IS DROPPED. `valid` is all-True; `estimated` marks the frames whose command came from the
+    future-pose estimator rather than the teleop transform. Episodes therefore stay whole, which keeps
+    both the training-window count and the evaluable rollout horizon intact."""
     from scipy.spatial.transform import Rotation as Rot
 
     S = load_session(session_dir)
@@ -289,6 +290,7 @@ def episode_pose(session_dir: str, dts: np.ndarray, st: np.ndarray) -> dict:
     R = np.tile(np.eye(3), (n_raw, 2, 1, 1))
     grip = np.zeros((n_raw, 2))
     ok = np.ones(n_raw, dtype=bool)
+    est = np.zeros((n_raw, 2), dtype=bool)      # True where the command is ESTIMATED from tcp(t+lag)
 
     for k, side in enumerate(("right", "left")):
         dead = S[f"dead_{side}"]
@@ -314,16 +316,25 @@ def episode_pose(session_dir: str, dts: np.ndarray, st: np.ndarray) -> dict:
                                          degrees=True).as_matrix()[0]
             grip[~have, k] = S[f"grip_{side}"][0]
 
-        # A HOLD IN WHICH THE ARM MOVES IS NOT A HOLD, AND WE DO NOT KNOW ITS COMMAND.
-        # Teleop is paused, so no command is streamed and the fill says "stay at the last target" --
-        # which is right whenever the arm actually stays. Measured, it sometimes does not: on episode 17
-        # the left arm travels 642 mm across a 3,017-frame stretch with the hand trigger never above
-        # 0.099, having started that stretch 3.6 mm from its last command. Something outside teleop moved
-        # it (a reset, a physical reposition), and no recoverable command explains the motion. Asserting
-        # the fill there is simply false -- it is what made 15 percent of published frames land more than
-        # 100 mm from the pose the arm reached, and 12 of 74 episodes carry a median above 10 mm.
-        # So those runs are marked INVALID rather than filled with a fiction. `valid` exists for exactly
-        # this, and the episode split downstream keeps any training window from straddling one.
+        # WHERE THE COMMAND CANNOT BE RECONSTRUCTED, ESTIMATE IT FROM THE ARM'S OWN FUTURE POSE.
+        # Teleop is deadman-gated, so with the trigger up nothing is streamed and the arm holds its last
+        # target -- the forward fill above. But sometimes the arm moves anyway: on episode 17 the left
+        # arm travels 642 mm across 3,017 such frames with the hand trigger never above 0.099. Something
+        # outside teleop moved it and no teleop command explains the motion.
+        #
+        # I first marked those frames INVALID and split episodes at them. That was the wrong trade. It
+        # dropped 46 percent of frames and fragmented 74 episodes into 109 short runs, taking training
+        # windows from 46,066 to 20,749 -- and measured against the unmasked build the codec came in
+        # about 3.5 dB worse at matched optimizer steps. It also shortened the longest evaluable rollout
+        # from H=461 to H=87, because the eval horizon is capped by the shortest validation episode.
+        # Paying that much for action purity is not worth it.
+        #
+        # The estimator is CALIBRATED, not a placeholder: a commanded pose is answered by the TCP one
+        # servo lag later, and on frames where the command IS known the two agree to 3.17 mm (median,
+        # both arms), with the residual U-shaped in the lag and minimised at exactly this offset. So
+        # `tcp(t + LAG_FRAMES)` is a measured 3 mm estimate of the command, which is far better than any
+        # constant and keeps every frame. `estimated` records where this was used so a consumer can tell
+        # the two apart -- and NOTHING is dropped, so episodes stay whole and the horizon stays long.
         i = 0
         while i < len(cmd):
             if cmd[i]:
@@ -333,13 +344,17 @@ def episode_pose(session_dir: str, dts: np.ndarray, st: np.ndarray) -> dict:
             while j < len(cmd) and not cmd[j]:
                 j += 1
             if np.linalg.norm(tcp_s[i:j] - tcp_s[i], axis=1).max(initial=0.0) > HOLD_MOVE_MM:
-                ok[i:j] = False
+                k_ = np.clip(np.arange(i, j) + LAG_FRAMES, 0, len(tcp_s) - 1)
+                xyz[i:j, k] = tcp_s[k_]
+                R[i:j, k] = Rot.from_euler(EULER_SEQ, S[f"rpy_{side}"][k_], degrees=True).as_matrix()
+                grip[i:j, k] = S[f"grip_{side}"][k_]
+                est[i:j, k] = True
             i = j
 
     # Nearest raw sample per dataset row, at the offset `align_to_dataset` recovered -- NOT an
     # interpolation: a slerp between two commands invents a command that was never issued.
     return {"xyz": xyz[idx], "R": R[idx], "grip": grip[idx], "valid": ok[idx],
-            "delta": delta, "align_exact": frac}
+            "estimated": est[idx].any(1), "delta": delta, "align_exact": frac}
 
 
 def episode_action(session_dir: str, dts: np.ndarray, st: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
