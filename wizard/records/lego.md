@@ -593,6 +593,123 @@ Arm A, at 2.6 h/epoch, already gets a first eval the same night.
 TODO: measure the actual eval cost at Arm A's epoch-5 eval (~23:20 on 08-31) before committing the
 change, so the "1.0%" figure is confirmed on THIS dataset rather than inherited from robocasa.
 
+## 15. THE ACTION, ACTUALLY CORRECT — two bugs that each hid behind a good-looking residual (09-07)
+
+`lego_assemblies_v2` is on the hub (private + manually gated, matching v1) with the action column
+rebuilt. Getting there required finding two bugs AFTER the recovery already measured 3.1 mm, both of
+which the residual was structurally incapable of detecting.
+
+### 15.1 What v1's action actually is, and why it cannot be learned
+
+The published `action` is the raw Quest controller pose in a per-session room frame, metres and
+quaternion — the teleop INPUT, logged before the transform that makes it a robot target. Measured:
+R^2 0.0298 against TCP displacement, against 0.0002 shuffled. Per-session extrinsics differ 26-176 deg,
+so the same action value means different things in different episodes. Not learnable, at any capacity.
+
+`raw_streams/` also carries `right_action_xarm` / `left_action_xarm`, which I checked hoping they were
+the command. They are the same raw controller pose. The command is genuinely not logged anywhere; it
+has to be recomputed from the collection code, which ships inside the dataset.
+
+### 15.2 BUG ONE: the raw log and the exported episode do not share a time origin
+
+`episode_pose` mapped the raw session grid onto the dataset grid PROPORTIONALLY,
+`arange(n_out) * n_raw / n_out`. That is only valid when both cover the same span. They do not: the
+session log starts 0 to 1.0 s before the episode, per episode (median +0.721 s). Every action row landed
+about 24 frames from the observation it caused.
+
+**Nothing could detect this from the residual**, because the residual is computed entirely in raw index
+space — target(t) against tcp(t+lag), both raw — so it kept reading 3.1 mm while the published column
+was misaligned. It surfaced only when I asked a different question: does the action predict the motion
+it caused? Partial R^2 0.003, against 0.018 for the raw controller pose it was supposed to beat. That
+number is what forced the search.
+
+The fix recovers the offset per episode by grid-searching the shift that maximises EXACT agreement
+between the dataset's `observation.state` and the raw log's `robot_observation_state_xarm` — the field
+the export was built from, so a correct shift matches bit-exactly. Exact agreement 3-8% -> 82-87%.
+
+Measured on the dataset grid, `|cmd(t) - tcp(t+k)|`:
+
+    proportional   19.89 mm, FLAT in k -- no lag structure at all
+    time-aligned    3.34 mm, clean U minimised at k=5 = 167 ms = the servo lag
+
+The flatness is the tell. A correct action must show a U at the servo lag; if it does not, it is not
+aligned. **That check is now the acceptance test** and it is cheap — run it on any new action column.
+
+### 15.3 BUG TWO: a hold in which the arm moves is not a hold
+
+Teleop is deadman-gated. `direct_teleop.py:363` `continue`s the whole per-side block when the trigger is
+up, so nothing is streamed and the arm holds its last target. So the hold action is that target held
+constant — a forward fill. (Not the MEASURED pose, which was my first version: that makes the action a
+near-copy of the state on ~70% of frames and cost real signal at short horizons.)
+
+But on a large fraction of released-deadman stretches the arm moves anyway. Episode 17's left arm
+travels **642 mm across 3,017 frames with the hand trigger never above 0.099**, having started that
+stretch 3.6 mm from its last command. I verified the trigger key is present in 100% of those frames and
+really is below threshold — something outside teleop moved the arm. No recoverable command explains it.
+
+Asserting the fill there put 14.9% of published frames more than 100 mm from the pose the arm reached,
+with 12 of 74 episodes carrying a median above 10 mm. Those runs are now marked invalid.
+
+The 20 mm threshold is read off the data: hold-run excursions are sharply bimodal — 171 runs under
+20 mm against 107 over 100 mm, only 25 between — so 20 mm sits in the empty valley, and the frames
+dropped move only 47.3% -> 42.1% across a 20-100 mm sweep. Threshold-insensitive, which is the whole
+point of picking it from a histogram rather than taste.
+
+### 15.4 Final numbers, broken out — because pooling flatters it
+
+At lag 5 on valid frames, both arms, all 74 episodes:
+
+    freshly issued command   44.7% of valid   3.17 mm / 1.46 deg   (p90 15.1 mm)  <-- QUOTE THIS
+    genuine hold             35.1%            2.75 mm / 1.90 deg
+    parked, pre-first-cmd    20.2%            0.00 mm / 0.00 deg   (zero BY CONSTRUCTION)
+    pooled                   100%             2.26 mm / 1.10 deg
+
+I nearly published the pooled 2.26 mm as the headline. It is diluted by the 20% of frames where the
+action IS the arm's own resting pose and the residual is therefore trivially zero. The number that
+tests the reconstruction is 3.17 mm.
+
+Fresh-command lag sweep, the acceptance test:
+
+    k     0    1    2    3    4    5    6    7    8    9   10
+    mm  10.8  8.2  5.7  4.0  3.4  3.2  3.5  4.6  6.8  9.3 11.8
+
+### 15.5 A separate finding: `observation.state` is sample-and-held at ~9 Hz
+
+Labelled 30 Hz, but **69.9% of state rows are byte-identical to the row before**, in runs of median
+length 3. The raw log confirms the asymmetry: Quest pose streams are 0% repeated at ~29.5 Hz, robot
+state is stale on 93.5% of samples. So any velocity or displacement computed from consecutive state
+rows is mostly zeros punctuated by jumps.
+
+This also means the recovered action is the HIGHER-BANDWIDTH signal of the two — it comes from the
+full-rate controller stream. And it explains why the partial-R^2 probes were such a poor instrument
+here: the regression target itself is a staircase. The direct residual + lag-U check is decisive where
+the probe was not, which is the methodological lesson.
+
+It also retroactively justifies `subsample: 6` (5 Hz) — decimating a ~9 Hz state to 5 Hz is near
+Nyquist, whereas the derivation had assumed 30 Hz content.
+
+### 15.6 Cost to training data
+
+74 episodes -> 109 contiguous valid runs at min_run 433 raw frames (one P8/F64/s6 window):
+53.7% of frames, 183,292 frames, **136,204 windows** — still about 3x the 46,066 the earlier full-epoch
+runs trained on. So the mask costs nothing that matters.
+
+### 15.7 What I got wrong along the way
+
+- Claimed "3.4 mm / 1.0 deg, 99% of episodes under 10 mm". True in raw index space, false on the
+  dataset grid, where 12 of 74 episodes were above 10 mm. A residual measured in the wrong coordinate
+  system is not a weaker claim, it is a different claim.
+- Claimed the recovery gave "R^2 0.2434, 8.2x the published column". That compared a DELTA against an
+  ABSOLUTE on a displacement target. On a like-for-like partial R^2 the absolute command does not beat
+  the raw controller pose at all, and I reported the 8.2x for days.
+- `LAG_FRAMES = 5` was justified as "50 ms == pose_smoothing_tau_sec". The raw streams run at ~29.5 Hz,
+  not 100 Hz, so 5 frames is 179 ms. The VALUE is right — a lag sweep gives a clean U minimised at 4-5
+  — but for a different reason: it is the servo tracking lag. Right answer, wrong reason, for days.
+- Created the v2 repo PUBLIC. v1 is private and manually gated; a derived copy would have exposed gated
+  data. Caught before any upload and set private + gated. Check the SOURCE's visibility first.
+- Left the first run-folder rebuild running and launched a second on top of it, so two builds wrote the
+  same directory concurrently — the same collision that poisoned a run in §8. Kill before relaunch.
+
 ## 10. Open items
 
 - The b=4 memory spike (§9) — the highest-value unknown.
@@ -602,4 +719,9 @@ change, so the "1.0%" figure is confirmed on THIS dataset rather than inherited 
 - **Cosmetic:** Arm A's startup prints a torus split inventory (`train 256 traj × 256 steps`) because
   `conf/data/lego.yaml` inherits `torus.yaml`. The real numbers are on the next line
   (`46066 train / 5565 val windows`). Harmless but misleading to a reader.
-- `EULER_SEQ = "xyz"` is unverified and cannot be verified from this dataset (§1b).
+- `EULER_SEQ = "xyz"` — RESOLVED (§15): confirmed by `_euler_xyz_deg_to_quat` in the collection code.
+- Retrain on the corrected action (§15) and compare against `FULL_l1x10_test`, which trained on the
+  uncorrected column. Best config: `vl128_scene` + `ae_bottleneck=16` + `visual_l1=10`.
+- The rollout plateau (§14) is untouched by any of this — it is a codec/dynamics question, not an
+  action question. But every previous open-loop number was measured with a misaligned action, so the
+  action's CONTRIBUTION to it has never actually been tested.

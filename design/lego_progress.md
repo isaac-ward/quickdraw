@@ -268,3 +268,39 @@ restarting Arm A a third time on my own judgment is not the right call.
   non-finite step.
 - **README stats are stale** on the HF dataset (says 65 episodes, metadata says 74) — dataset
   discussion #1.
+
+## P8 — the action, corrected and republished (DONE 2026-09-07)
+
+- [x] Diagnose v1's `action`: raw Quest controller pose, per-session room frame, metres+quaternion.
+      R^2 0.0298 vs TCP displacement (shuffled 0.0002). Not learnable — extrinsics differ 26-176 deg.
+- [x] Check whether the command is logged anywhere: `right_action_xarm`/`left_action_xarm` in
+      `raw_streams/` are the SAME raw controller pose. It is not logged; it must be recomputed.
+- [x] `data/lego_action.py` — replay the teleop transform from the collection code shipped in the
+      dataset. `episode_pose` is the single source of truth; `episode_action` (6D, training) and
+      `episode_action_native` (mm/deg, published) are thin wrappers.
+- [x] Verify the episode->session join: 74/74 by set-IoU of distinct state values (median 1.000,
+      best runner-up 0.015). `raw_streams/episode_to_session.json`.
+- [x] **FIX BUG: time alignment.** Raw log starts 0-1.0 s before the episode, per episode. Proportional
+      index mapping put every action row ~24 frames off. `align_to_dataset` recovers the offset per
+      episode from exact state agreement (3-8% -> 82-87%). Dataset-grid residual 19.89 mm (flat in k)
+      -> 3.34 mm (clean U at k=5 = the servo lag).
+- [x] **FIX BUG: holds in which the arm moves.** Forward-fill the last command (correct per
+      `direct_teleop.py:363`), but invalidate stretches where the arm travels >20 mm with the deadman
+      released — ep17's left arm moves 642 mm across 3,017 such frames. Threshold read off a bimodal
+      histogram (171 runs <20 mm, 107 >100 mm, 25 between).
+- [x] Absolute commanded pose, not a delta — deltas do not decimate under `action_aggregate`.
+- [x] Wire `episode_action` into `processors.py`; split episodes at invalid runs.
+- [x] Acceptance test established: the residual MUST be U-shaped in the lag with a minimum at k=4-6.
+      A flat curve means misaligned. Cheap; run it on any new action column.
+- [x] Rebuild the run folder: 109 runs / 183,292 frames / 136,204 windows (~3x the 46,066 used before).
+- [x] Build + verify `lego_assemblies_v2`: 74 eps, 341,494 frames unchanged, videos and
+      `observation.state` byte-identical, v1's column preserved as `action.quest_raw`, new
+      `action.is_valid`. All structural + physical checks pass; hub round-trip verified.
+- [x] Push to `swoosh-data/lego_assemblies_v2` — **private + manually gated**, matching v1. (Created
+      public by mistake; caught and fixed before any upload.)
+- [ ] Retrain on the corrected action; compare against `FULL_l1x10_test` (trained on the bad column).
+
+### Side finding, documented in v2's README
+- [x] `observation.state` is sample-and-held: 69.9% of rows byte-identical to the previous row,
+      effective ~9 Hz against a declared 30 Hz. Quest streams are full-rate (0% repeated), robot state
+      stale on 93.5% of samples. The recovered action is the higher-bandwidth signal of the two.
