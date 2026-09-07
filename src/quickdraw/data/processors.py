@@ -368,6 +368,22 @@ def _stage_job(job: dict) -> tuple[int, str, int, int]:
     return job["idx"], job["cam"], got, len(job["paths"])
 
 
+def _valid_runs(valid: np.ndarray, min_run: int) -> list[tuple[int, int]]:
+    """Maximally-contiguous True runs of `valid` that are at least `min_run` long, as [start, stop)."""
+    runs, i, n = [], 0, len(valid)
+    while i < n:
+        if not valid[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and valid[j]:
+            j += 1
+        if j - i >= min_run:
+            runs.append((i, j))
+        i = j
+    return runs
+
+
 def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None]:
     """`swoosh-data/lego_assemblies` - LeRobot v2.1, dual xArm7 bimanual VR teleop, 30 Hz, 6 cameras.
 
@@ -383,9 +399,20 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
     frames, so in-memory arrays would push GBs per job through IPC. Staging is resumable - an episode
     with a `.done` marker is skipped, so a re-run after an interrupt costs nothing.
 
-    CAVEAT, measured: `action` is NOT in the state's frame (no Euler convention fits; per-session
-    extrinsics differ by 26-176deg; grippers anti-correlated). Action-conditioning learns noise here.
-    See quickdraw#15. The proprio+image dynamics are unaffected.
+    THE ACTION IS RECONSTRUCTED, NOT READ. The published `action` column is the RAW VR CONTROLLER POSE
+    in a per-session room frame (metres, quaternion), not a robot command: no Euler convention fits it
+    against the state, per-session extrinsics differ by 26-176deg, and the grippers are anti-correlated.
+    Conditioning on it learns noise -- measured R^2 against TCP displacement 0.0298, against 0.0002 for
+    a shuffled control. So we do NOT use it. `data/lego_action.py` replays the teleop transform from the
+    collection code that shipped inside the dataset (`code/xarm/direct_teleop.py`) over the raw Quest
+    streams in `raw_streams/`, recovering the ABSOLUTE COMMANDED TCP POSE in the ROBOT BASE frame -- the
+    same frame and units as `observation.state`. Residual against the measured pose 3.4 mm / 1.0 deg,
+    R^2 0.2434 (8.2x the published column). See quickdraw#15 and HF discussion #2.
+
+    EPISODES ARE SPLIT AT UNRECOVERABLE FRAMES. 0.07 percent of frames have no reconstructable command
+    (a calibration gap before the first deadman press). Rather than interpolate a command that was never
+    issued, each episode is cut into its maximally-contiguous valid runs, so no training window can ever
+    straddle a gap. 74 episodes -> ~116, and short offcuts below one window are dropped.
 
     Args: +source.dir=<local snapshot> [+source.name=lego_assemblies]
           [+source.camera=head_right]  -- ONE leaf, or a LIST for a MULTI-CAMERA build. Use hydra's
@@ -394,7 +421,8 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
           [+source.stage_height=288] [+source.max_episodes=N]."""
     import pyarrow.parquet as pq
 
-    from .rotations import encode_action, encode_state
+    from .lego_action import episode_action
+    from .rotations import encode_state
 
     src_cfg = cfg.get("source", None)
     if src_cfg is None or not src_cfg.get("dir"):
@@ -419,12 +447,23 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
         if f"observation.images.{cam}" not in info["features"]:
             raise ValueError(f"camera {cam!r} is not in this dataset; have {have}")
 
-    episodes, jobs = [], []
+    raw = os.path.join(src, "raw_streams", "extracted")
+    if not os.path.isdir(raw):
+        raise ValueError(f"{raw} is missing -- the commanded action is reconstructed from the raw Quest "
+                         f"streams, so `raw_streams/extracted/` must be present and unpacked")
+    ep2sess = json.load(open(os.path.join(src, "raw_streams", "episode_to_session.json")))
+    # One full training window, in RAW frames, so a run that cannot yield a single window is an
+    # offcut. Read from cfg.data (P/F/subsample live there, not at the top level).
+    _d = cfg.get("data", {}) or {}
+    min_run = int(src_cfg.get("min_run", 0) or ((int(_d.get("P", 8)) + int(_d.get("F", 64)))
+                                                * int(_d.get("subsample", 1) or 1) + 1))
+
+    episodes, jobs, kept, n_raw_frames = [], [], 0, 0
     for idx in range(n):
         c = idx // chunk
         t = pq.read_table(os.path.join(src, "data", f"chunk-{c:03d}", f"episode_{idx:06d}.parquet"))
         states = encode_state(np.asarray(t.column("observation.state").to_pylist(), dtype=np.float32))
-        actions = encode_action(np.asarray(t.column("action").to_pylist(), dtype=np.float32))
+        actions, valid = episode_action(os.path.join(raw, ep2sess[str(idx)]), len(states))
 
         per_cam = {}
         for cam in cams:
@@ -437,8 +476,16 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
                              "mp4": os.path.join(src, "videos", f"chunk-{c:03d}",
                                                  f"observation.images.{cam}",
                                                  f"episode_{idx:06d}.mp4")})
-        episodes.append(Episode(states=states, actions=actions,
-                                frames=per_cam if len(cams) > 1 else per_cam[cams[0]]))
+
+        # Cut at unrecoverable frames. `min_run` is one full training window, so a run that cannot
+        # produce a single window is an offcut, not an episode.
+        for a, b in _valid_runs(valid, min_run):
+            episodes.append(Episode(
+                states=states[a:b], actions=actions[a:b],
+                frames=({k: v[a:b] for k, v in per_cam.items()} if len(cams) > 1
+                        else per_cam[cams[0]][a:b])))
+            kept += b - a
+        n_raw_frames += len(states)
 
     # Decode in PARALLEL across episodes: this is pure 1080p/720p decode, the single longest step in the
     # whole build (~1300 frames/min/core measured -> ~4.5 h for one camera serially, and Arm B needs
@@ -458,6 +505,9 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
                 if k % log_every == 0 or k == len(jobs):
                     print(f"[lego] staged {k}/{len(jobs)}  ({time.time() - t0:.0f}s)", flush=True)
     staged = len(jobs)
+    print(f"[lego] action: RECONSTRUCTED commanded TCP pose (base frame, mm/6D), "
+          f"{100 * kept / max(n_raw_frames, 1):.2f}% of {n_raw_frames} frames kept in "
+          f"{len(episodes)} contiguous runs from {n} episodes (min_run {min_run})", flush=True)
     print(f"[lego] {len(episodes)} episodes, {sum(len(e.states) for e in episodes)} frames @ {fps} Hz | "
           f"state {episodes[0].states.shape[1]}d action {episodes[0].actions.shape[1]}d | "
           f"cams {cams} staged h{stage_h} ({staged} clip(s) newly decoded)", flush=True)

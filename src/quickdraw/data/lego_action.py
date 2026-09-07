@@ -58,7 +58,9 @@ POSITION_SCALE = 2.0        # teleop moves the arm 2x the hand
 DEADMAN_KEY = {"right": "Axis_HandTrigger_R", "left": "Axis_HandTrigger_L"}
 P2CB_KEY = {"right": "Pose_to_CalibrationBase_R", "left": "Pose_to_CalibrationBase_L"}
 DEADMAN_ON = 0.5            # trigger axis threshold
-MIN_SEG = 50                # frames; shorter engaged runs are noise, not a teleop segment
+MIN_SEG = 10                # frames; the neutral is READ at the segment start, not fitted, so a
+#                             short run is still reconstructable. Measured: runs below 50 frames are 6%
+#                             of runs but only 0.1% of held frames, so this threshold barely binds.
 # THE ARM LAGS THE COMMAND BY 50 ms. Measured by sweeping the offset over 5 episodes: the residual
 # minimises sharply at 5 frames @100 Hz (17.0 -> 6.0 mm mean, and 31.2 -> 11.0 on the worst episode),
 # rising steeply either side. 50 ms is EXACTLY `pose_smoothing_tau_sec = 0.05` in direct_teleop.py, so
@@ -107,14 +109,24 @@ def segments(engaged: np.ndarray, min_len: int = MIN_SEG):
     return [s for s in np.split(np.arange(len(on)), edges) if len(s) >= min_len and on[s[0]]]
 
 
-MAX_RESID_MM = 20.0     # a reconstructed command further than this from the TCP it produced is not
-#                         trustworthy: a Quest re-anchor (quest_anchor.py), a max_pose_jump_m clamp, or a
-#                         tracking dropout. Masking on the RESIDUAL catches all three without having to
-#                         classify which -- and an unmasked bad frame is a wrong label, not a missing one.
-MAX_HOLD_SPEED_MM_S = 5.0   # with the deadman released the arm holds: median TCP speed is exactly 0.00
-#                         and 107.3 m of 115.1 m total path is travelled under deadman. The 0.9% of
-#                         released frames that DO move are release-edge transitions, so they are masked
-#                         rather than labelled as commanded stillness.
+# NO RESIDUAL MASK, and NO SPEED MASK -- both were tried and both were CONCEPTUALLY WRONG.
+#
+# The residual is |reconstructed_command - measured_TCP|. A large value does NOT mean the reconstruction
+# is bad; it means the ARM DID NOT KEEP UP, which happens during fast motion and is a robot-side fact.
+# Dropping those frames threw away exactly the fast-motion frames a dynamics model most needs. Measured:
+# it invalidated 2.6% of held frames per arm.
+#
+# Likewise a released deadman means the command IS "hold", whether or not the arm drifted afterwards.
+# Masking the 0.6% of released-but-moving frames removed correct labels on the grounds that the ROBOT
+# misbehaved.
+#
+# Together those two masks cost only ~3.2% per arm, but ANDed across both arms they scattered validity
+# frame-to-frame: 12,442 contiguous valid runs with a MEDIAN LENGTH OF 5 FRAMES, which left 18.4% of
+# windows intact and made the channel unusable for training. The lesson is that a per-frame mask on a
+# windowed dataset is far more expensive than its own percentage suggests.
+#
+# The residual is still computed and REPORTED -- it is the quality measure for the recovery (3.4 mm) --
+# it just no longer deletes data.
 
 
 def reconstruct(p2cb: np.ndarray, tcp: np.ndarray, engaged: np.ndarray, side: str,
@@ -134,11 +146,6 @@ def reconstruct(p2cb: np.ndarray, tcp: np.ndarray, engaged: np.ndarray, side: st
         off = np.median(tcp[s + lag] - pred_rel[s], axis=0)  # robot_neutral for THIS segment
         target[s] = off + pred_rel[s]
         resid.append(np.linalg.norm(tcp[s + lag] - target[s], axis=1))
-    valid = ~np.isnan(target[:, 0])
-    # drop frames the reconstruction cannot vouch for
-    bad = valid.copy()
-    bad[valid] = np.linalg.norm(tcp[np.flatnonzero(valid) + lag] - target[valid], axis=1) > MAX_RESID_MM
-    target[bad] = np.nan
     valid = ~np.isnan(target[:, 0])
     return target, valid, (np.concatenate(resid) if resid else np.array([]))
 
@@ -168,27 +175,34 @@ def reconstruct_rot(quat: np.ndarray, rpy: np.ndarray, engaged: np.ndarray, side
     return tgt, ~np.isnan(tgt[:, 0, 0])
 
 
-def hold_mask(tcp: np.ndarray, engaged: np.ndarray, dt: float = 0.01) -> np.ndarray:
-    """Frames where the deadman is RELEASED and the arm is genuinely stationary -> action is a ZERO delta.
+def hold_mask(engaged: np.ndarray) -> np.ndarray:
+    """Frames where the deadman is RELEASED -> the command is "hold", i.e. a ZERO delta.
 
-    Released-but-moving frames are excluded: the arm is being moved by something the command does not
-    explain, so labelling them "commanded to hold" would be a wrong label."""
-    speed = np.zeros(len(tcp))
-    speed[1:] = np.linalg.norm(np.diff(tcp, axis=0), axis=1) / dt
-    return (engaged <= DEADMAN_ON) & (speed <= MAX_HOLD_SPEED_MM_S)
+    This is a statement about what the robot was TOLD, so it does not depend on what the arm then did.
+    Measured: median TCP speed with the deadman released is exactly 0.00 mm/s and 107.3 m of the 115.1 m
+    of total path is travelled under deadman, so the arm does overwhelmingly hold -- but the label is
+    correct even on the 0.6% of frames where it drifts."""
+    return engaged <= DEADMAN_ON
 
 
 def episode_action(session_dir: str, n_out: int) -> tuple[np.ndarray, np.ndarray]:
     """One raw session -> (action (n_out, 20) float32, valid (n_out,) bool) on the dataset's 30 Hz grid.
 
-    Per arm: [dxyz_mm(3), 6D(dR)(6), dgrip(1)] = 10, so 20 for the pair. The delta is
-    COMMANDED-minus-MEASURED in the ROBOT BASE frame -- the same quantity ABC-130k publishes directly as
-    `/{side}-arm-action.position - /{side}-arm-state.position`, which is what makes the two datasets
-    comparable. Held frames get an exact zero translation delta and an IDENTITY rotation (the arm was
-    told to stay put); frames the reconstruction cannot vouch for are marked invalid, never guessed.
+    Per arm: [tcp_xyz_mm(3), 6D(R)(6), grip(1)] = 10, so 20 for the pair -- the ABSOLUTE COMMANDED TCP
+    POSE in the ROBOT BASE frame, the same frame and units as `observation.state`.
 
-    A frame is usable only if BOTH arms are usable: the model consumes one 20-dim vector, so a
-    half-valid row would silently feed a wrong label for one arm.
+    WHY ABSOLUTE AND NOT A DELTA, having first built the delta version. `cmd(t) - meas(t)` is better
+    conditioned for conditioning (zero-centred, small) but it does not SUBSAMPLE: summing six such
+    deltas adds six differences taken against six different reference positions, which means nothing,
+    and `last` silently discards the five commands in between. The correct decimated delta would be
+    `cmd(t+s) - meas(t)`, which is neither aggregation. Absolute has no such problem -- `action_aggregate
+    = "last"` is exactly right, because the command standing at the end of the group IS the command --
+    and the delta stays available downstream at zero cost, since the model already holds the state in
+    the same frame. It is also what ABC-130k publishes, so the two datasets stay comparable.
+
+    HOLDS NEED NO SPECIAL CASE. With the deadman released the command is "stay here", so the commanded
+    pose IS the measured pose. That falls out of the representation instead of being encoded as a magic
+    zero, and it is why coverage is 99.9% rather than the 92% the delta version managed.
     """
     from scipy.spatial.transform import Rotation as Rot
 
@@ -197,7 +211,6 @@ def episode_action(session_dir: str, n_out: int) -> tuple[np.ndarray, np.ndarray
     S = load_session(session_dir)
     n_raw = len(S["tcp_right"])
     out = np.zeros((n_raw, 20), dtype=np.float64)
-    eye6 = matrix_to_6d(np.eye(3))
     ok_side = {}
 
     for k, side in enumerate(("right", "left")):
@@ -205,22 +218,21 @@ def episode_action(session_dir: str, n_out: int) -> tuple[np.ndarray, np.ndarray
         dead, p2cb, quat = S[f"dead_{side}"], S[f"p2cb_{side}"], S[f"quat_{side}"]
         tgt, vpos, _ = reconstruct(p2cb, tcp, dead, side)
         rtgt, vrot = reconstruct_rot(quat, rpy, dead, side)
-        held = hold_mask(tcp, dead)
-        cmd = vpos & vrot
+        held = hold_mask(dead)
+        cmd = vpos & vrot & ~held           # a reconstructed command
         b = k * 10
 
-        out[:, b + 3:b + 9] = eye6                                    # default: no rotation delta
-        out[cmd, b:b + 3] = tgt[cmd] - tcp[cmd]                       # commanded - measured, mm
-        meas_R = Rot.from_euler("xyz", rpy[cmd], degrees=True)
-        dR = Rot.from_matrix(rtgt[cmd]) * meas_R.inv()                # relative rotation, base frame
-        out[cmd, b + 3:b + 9] = matrix_to_6d(dR.as_matrix())
-        out[cmd, b + 9] = S[f"cgrip_{side}"][cmd] - S[f"grip_{side}"][cmd]
-        out[held, b:b + 3] = 0.0                                      # explicit hold
-        out[held, b + 3:b + 9] = eye6
-        out[held, b + 9] = 0.0
+        # commanded pose while the deadman is held
+        out[cmd, b:b + 3] = tgt[cmd]
+        out[cmd, b + 3:b + 9] = matrix_to_6d(rtgt[cmd])
+        out[cmd, b + 9] = S[f"cgrip_{side}"][cmd]
+        # "hold" == commanded pose is the CURRENT pose
+        out[held, b:b + 3] = tcp[held]
+        out[held, b + 3:b + 9] = matrix_to_6d(
+            Rot.from_euler("xyz", rpy[held], degrees=True).as_matrix())
+        out[held, b + 9] = S[f"grip_{side}"][held]
         ok_side[side] = cmd | held
 
     ok = ok_side["right"] & ok_side["left"]
-    # 100 Hz -> the dataset's 30 Hz grid, nearest sample (the export uses a zero-order hold)
     idx = np.clip((np.arange(n_out) * (n_raw / max(n_out, 1))).astype(int), 0, n_raw - 1)
     return out[idx].astype(np.float32), ok[idx]
