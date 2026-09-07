@@ -89,7 +89,8 @@ subsample_all_phases: false  # OFF, and this is a deliberate reversal -- measure
 #                     the days, turn this back on AND lower max_epochs -- but then accept one eval point,
 #                     or move the eval cadence to steps.
 
-action_aggregate: last   # REQUIRED here, and the default of "sum" would be silently WRONG.
+action_aggregate: last
+action_control: none   # ABLATION ONLY: none | shuffle | zero. See dataset.set_action_control.   # REQUIRED here, and the default of "sum" would be silently WRONG.
 #                     `subsample` has to combine the actions it skips over. The default assumes actions
 #                     are DELTA-like and SUMS them, with an automatic take-last for dims that look binary
 #                     (<=2 unique values). Neither half of that holds on this dataset:

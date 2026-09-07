@@ -128,6 +128,58 @@ def get_action_aggregate() -> str:
     return _ACTION_AGGREGATE
 
 
+_ACTION_CONTROL = "none"
+
+
+def set_action_control(mode: str) -> None:
+    """data.action_control: deliberately DESTROY the action's information, as an ablation. "none" |
+    "shuffle" | "zero".
+
+    This exists to answer "does the action contribute anything at all", which cannot be answered by
+    comparing against an older run on a different dataset build. Train the treatment and the control on
+    the SAME windows with the SAME seed and the only difference is the action's correspondence to the
+    frames, so the gap between them IS the action's contribution.
+
+    "shuffle" (PREFERRED) permutes action rows across the whole split, so the marginal distribution,
+    scale and normalisation statistics are bit-identical to the treatment and only the frame-to-action
+    correspondence is gone. That isolates INFORMATION rather than input statistics.
+
+    "zero" replaces the action with zeros. Simpler, but it also changes the input scale, so a difference
+    could come from that instead of from lost information -- which is why it is not the default choice.
+
+    Applied AFTER subsampling, so it destroys the actions the model actually receives, and per split, so
+    train and val are permuted independently. The seed is fixed, so a control run is reproducible."""
+    global _ACTION_CONTROL
+    mode = str(mode or "none")
+    if mode not in ("none", "shuffle", "zero"):
+        raise ValueError(f"data.action_control must be 'none', 'shuffle' or 'zero', got {mode!r}")
+    _ACTION_CONTROL = mode
+
+
+def get_action_control() -> str:
+    return _ACTION_CONTROL
+
+
+def _apply_action_control(eps, tag: str):
+    """Destroy the action's information per `set_action_control`. Returns eps unchanged when "none"."""
+    if _ACTION_CONTROL == "none" or not eps:
+        return eps
+    lens = [len(e[1]) for e in eps]
+    if _ACTION_CONTROL == "zero":
+        new = [np.zeros_like(e[1]) for e in eps]
+    else:
+        flat = np.concatenate([e[1] for e in eps], 0)
+        # fixed seed: the control is reproducible, and train/val get different permutations because the
+        # tag is folded in
+        rng = np.random.default_rng(abs(hash(("action_control", tag))) % (2 ** 32))
+        flat = flat[rng.permutation(len(flat))]
+        cuts = np.cumsum(lens)[:-1]
+        new = np.split(flat, cuts)
+    print(f"[action_control] {tag}: {_ACTION_CONTROL.upper()} -- the action carries NO information about "
+          f"the frames. This is an ABLATION; do not read its metrics as a model result.", flush=True)
+    return [(e[0], n.astype(e[1].dtype)) + tuple(e[2:]) for e, n in zip(eps, new)]
+
+
 def effective_action_dim(base_dim: int) -> int:
     """The action width a model must expect, given the process-wide stride and aggregation mode.
 
@@ -199,7 +251,7 @@ def _subsample_episodes(eps, tag: str):
     _SUBSAMPLE_USED = True
     s = _SUBSAMPLE
     if s <= 1:
-        return eps
+        return _apply_action_control(eps, tag)
     acts = np.concatenate([e[1] for e in eps], 0)
     if _ACTION_AGGREGATE == "concat":     # LOSSLESS: nothing is aggregated, so the binary detect is moot
         hold = []
@@ -233,7 +285,7 @@ def _subsample_episodes(eps, tag: str):
           f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions "
           f"{f'CONCATENATED {s}x -> width {out[0][1].shape[1] if out else 0} (lossless)' if _ACTION_AGGREGATE == 'concat' else 'TAKE-LAST on every dim' if _ACTION_AGGREGATE == 'last' else f'SUMMED except take-last on dims {hold}'}"
           f" | {dropped} eps dropped as too short", flush=True)
-    return out
+    return _apply_action_control(out, tag)
 
 
 def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
