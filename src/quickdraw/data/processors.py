@@ -414,9 +414,11 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
     what this did first) puts every action row ~24 frames from the observation it caused: measured on the
     dataset grid, `|cmd(t) - tcp(t+k)|` was 19.9 mm with no lag structure, against 3.3 mm with a clean
     minimum at k=5 (167 ms, the servo lag) once aligned. The offset is recovered from state content, not
-    assumed. Episodes are still split at any frame where the reconstruction itself fails, so no training
-    window can straddle a gap; with alignment correct that is currently zero frames and all 74 episodes
-    survive whole.
+    assumed. Episodes are then split at every frame with no trustworthy command, so no training window
+    can straddle one: 74 episodes -> 109 contiguous runs, 53.7 percent of frames, 136,204 windows at
+    P8/F64/subsample 6 -- still about 3x the 46,066 the earlier full-epoch runs trained on. The 46 percent
+    dropped is not reconstruction failure but stretches where the arm demonstrably moved with teleop
+    paused (see lego_action.episode_pose), where no command exists to recover.
 
     Args: +source.dir=<local snapshot> [+source.name=lego_assemblies]
           [+source.camera=head_right]  -- ONE leaf, or a LIST for a MULTI-CAMERA build. Use hydra's

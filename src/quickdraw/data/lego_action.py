@@ -60,7 +60,10 @@ POSITION_SCALE = 2.0        # teleop moves the arm 2x the hand
 DEADMAN_KEY = {"right": "Axis_HandTrigger_R", "left": "Axis_HandTrigger_L"}
 P2CB_KEY = {"right": "Pose_to_CalibrationBase_R", "left": "Pose_to_CalibrationBase_L"}
 DEADMAN_ON = 0.5            # trigger axis threshold
-MIN_SEG = 10                # frames; the neutral is READ at the segment start, not fitted, so a
+MIN_SEG = 10
+HOLD_MOVE_MM = 20.0   # a "hold" in which the arm travels further than this is not a hold at all -- see
+                      # episode_pose. 20 mm is loose against the 3.4 mm recovery precision and tight
+                      # against the 240-640 mm excursions the check actually catches.                # frames; the neutral is READ at the segment start, not fitted, so a
 #                             short run is still reconstructable. Measured: runs below 50 frames are 6%
 #                             of runs but only 0.1% of held frames, so this threshold barely binds.
 # THE ARM LAGS THE COMMAND BY 50 ms. Measured by sweeping the offset over 5 episodes: the residual
@@ -295,20 +298,43 @@ def episode_pose(session_dir: str, dts: np.ndarray, st: np.ndarray) -> dict:
 
         # Forward-fill the last issued command over every frame that is not itself a fresh command.
         # `ff[i]` is the index of the most recent commanded frame at or before i, or -1 if none yet.
-        ff = np.where(cmd, np.arange(len(cmd)), -1)
-        ff = np.maximum.accumulate(ff)
-        have = ff >= 0                                  # a command has been issued by now
-        src = ff[have]
-        xyz[have, k] = tgt[src]
-        R[have, k] = rtgt[src]
-        grip[have, k] = S[f"cgrip_{side}"][src]
-        # parked: the arm's own resting pose, one constant for the whole pre-command stretch
-        pre = ~have
-        if pre.any():
-            xyz[pre, k] = S[f"tcp_{side}"][0]
-            R[pre, k] = Rot.from_euler(EULER_SEQ, S[f"rpy_{side}"][0:1], degrees=True).as_matrix()[0]
-            grip[pre, k] = S[f"grip_{side}"][0]
-        ok &= have | pre                                # i.e. only a mid-episode failure invalidates
+        tcp_s = S[f"tcp_{side}"]
+        ff = np.maximum.accumulate(np.where(cmd, np.arange(len(cmd)), -1))
+        have = ff >= 0
+        src = ff.copy()
+        src[~have] = 0                                  # placeholder; those rows are overwritten below
+        xyz[:, k] = tgt[src]
+        R[:, k] = rtgt[src]
+        grip[:, k] = S[f"cgrip_{side}"][src]
+        # Before the first command the arm is PARKED: its own resting pose, one constant. Not a guess --
+        # the measured excursion over that stretch is a median of 0.0 mm and a max of 1.7 mm.
+        if (~have).any():
+            xyz[~have, k] = tcp_s[0]
+            R[~have, k] = Rot.from_euler(EULER_SEQ, tcp_s[0:1] * 0 + S[f"rpy_{side}"][0:1],
+                                         degrees=True).as_matrix()[0]
+            grip[~have, k] = S[f"grip_{side}"][0]
+
+        # A HOLD IN WHICH THE ARM MOVES IS NOT A HOLD, AND WE DO NOT KNOW ITS COMMAND.
+        # Teleop is paused, so no command is streamed and the fill says "stay at the last target" --
+        # which is right whenever the arm actually stays. Measured, it sometimes does not: on episode 17
+        # the left arm travels 642 mm across a 3,017-frame stretch with the hand trigger never above
+        # 0.099, having started that stretch 3.6 mm from its last command. Something outside teleop moved
+        # it (a reset, a physical reposition), and no recoverable command explains the motion. Asserting
+        # the fill there is simply false -- it is what made 15 percent of published frames land more than
+        # 100 mm from the pose the arm reached, and 12 of 74 episodes carry a median above 10 mm.
+        # So those runs are marked INVALID rather than filled with a fiction. `valid` exists for exactly
+        # this, and the episode split downstream keeps any training window from straddling one.
+        i = 0
+        while i < len(cmd):
+            if cmd[i]:
+                i += 1
+                continue
+            j = i
+            while j < len(cmd) and not cmd[j]:
+                j += 1
+            if np.linalg.norm(tcp_s[i:j] - tcp_s[i], axis=1).max(initial=0.0) > HOLD_MOVE_MM:
+                ok[i:j] = False
+            i = j
 
     # Nearest raw sample per dataset row, at the offset `align_to_dataset` recovered -- NOT an
     # interpolation: a slerp between two commands invents a command that was never issued.
