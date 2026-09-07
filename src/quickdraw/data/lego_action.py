@@ -316,40 +316,42 @@ def episode_pose(session_dir: str, dts: np.ndarray, st: np.ndarray) -> dict:
                                          degrees=True).as_matrix()[0]
             grip[~have, k] = S[f"grip_{side}"][0]
 
-        # WHERE THE COMMAND CANNOT BE RECONSTRUCTED, ESTIMATE IT FROM THE ARM'S OWN FUTURE POSE.
-        # Teleop is deadman-gated, so with the trigger up nothing is streamed and the arm holds its last
-        # target -- the forward fill above. But sometimes the arm moves anyway: on episode 17 the left
-        # arm travels 642 mm across 3,017 such frames with the hand trigger never above 0.099. Something
-        # outside teleop moved it and no teleop command explains the motion.
+        # WHERE THE FILL IS FALSE, ESTIMATE THE COMMAND FROM THE ARM'S OWN FUTURE POSE.
+        # The forward fill above asserts "the arm is sitting at its last commanded target". That is
+        # true almost always -- with the deadman up nothing is streamed and the arm holds -- so the fill
+        # IS the true command and must be kept. But occasionally something outside teleop moves the arm
+        # (a reset, a physical reposition), and there the assertion is simply false.
         #
-        # I first marked those frames INVALID and split episodes at them. That was the wrong trade. It
-        # dropped 46 percent of frames and fragmented 74 episodes into 109 short runs, taking training
-        # windows from 46,066 to 20,749 -- and measured against the unmasked build the codec came in
-        # about 3.5 dB worse at matched optimizer steps. It also shortened the longest evaluable rollout
-        # from H=461 to H=87, because the eval horizon is capped by the shortest validation episode.
-        # Paying that much for action purity is not worth it.
+        # TEST THE ASSERTION PER FRAME, which is the whole point. An earlier version tested it per RUN
+        # and invalidated the entire hold whenever the arm moved anywhere within it, then OR-ed the mask
+        # across both arms. Measured, that flagged 27 percent of arm-frames to handle the 0.82 percent
+        # that are genuinely unexplained -- a 33x inflation -- and cost 46 percent of the dataset,
+        # 3.5 dB of codec and 5x the eval horizon. Frame-level:
         #
-        # The estimator is CALIBRATED, not a placeholder: a commanded pose is answered by the TCP one
-        # servo lag later, and on frames where the command IS known the two agree to 3.17 mm (median,
-        # both arms), with the residual U-shaped in the lag and minimised at exactly this offset. So
-        # `tcp(t + LAG_FRAMES)` is a measured 3 mm estimate of the command, which is far better than any
-        # constant and keeps every frame. `estimated` records where this was used so a consumer can tell
-        # the two apart -- and NOTHING is dropped, so episodes stay whole and the horizon stays long.
-        i = 0
-        while i < len(cmd):
-            if cmd[i]:
-                i += 1
-                continue
-            j = i
-            while j < len(cmd) and not cmd[j]:
-                j += 1
-            if np.linalg.norm(tcp_s[i:j] - tcp_s[i], axis=1).max(initial=0.0) > HOLD_MOVE_MM:
-                k_ = np.clip(np.arange(i, j) + LAG_FRAMES, 0, len(tcp_s) - 1)
-                xyz[i:j, k] = tcp_s[k_]
-                R[i:j, k] = Rot.from_euler(EULER_SEQ, S[f"rpy_{side}"][k_], degrees=True).as_matrix()
-                grip[i:j, k] = S[f"grip_{side}"][k_]
-                est[i:j, k] = True
-            i = j
+        #     commanded (deadman held)              42.6 percent  -> reconstructed
+        #     released, arm AT its last command     56.6 percent  -> forward fill, which is exact
+        #     released, arm moved elsewhere          0.8 percent  -> estimated from tcp(t+lag)
+        #
+        # Using the estimator on the 56.6 percent would be a real loss, not a wash: the fill is the
+        # actual commanded target and is CONSTANT, whereas tcp(t+lag) tracks the measured pose, which is
+        # sample-and-held at ~9 Hz. Substituting it would push the state's staleness into the action and
+        # make the action a near-copy of the state on most frames.
+        # The test is MOTION, not distance-to-target. During a hold the streamed target is the last one
+        # sent, and that IS the command even though the arm sits a little short of it -- servo tracking
+        # error is normal and does not make the fill wrong. What makes it wrong is the arm being MOVED,
+        # which only an agent outside teleop can do. Testing `|tcp - fill| > tol` instead flagged 52
+        # percent of frames, because it was measuring tracking error.
+        w = 3                                               # +-0.1 s, wide enough to clear the ~9 Hz
+        lo = np.clip(np.arange(len(tcp_s)) - w, 0, len(tcp_s) - 1)   # sample-and-hold in the state
+        hi = np.clip(np.arange(len(tcp_s)) + w, 0, len(tcp_s) - 1)
+        moving = np.linalg.norm(tcp_s[hi] - tcp_s[lo], axis=1) > HOLD_MOVE_MM
+        bad = (~cmd) & moving
+        if bad.any():
+            k_ = np.clip(np.arange(len(cmd))[bad] + LAG_FRAMES, 0, len(tcp_s) - 1)
+            xyz[bad, k] = tcp_s[k_]
+            R[bad, k] = Rot.from_euler(EULER_SEQ, S[f"rpy_{side}"][k_], degrees=True).as_matrix()
+            grip[bad, k] = S[f"grip_{side}"][k_]
+            est[bad, k] = True
 
     # Nearest raw sample per dataset row, at the offset `align_to_dataset` recovered -- NOT an
     # interpolation: a slerp between two commands invents a command that was never issued.
