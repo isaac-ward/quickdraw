@@ -691,8 +691,29 @@ Nyquist, whereas the derivation had assumed 30 Hz content.
 ### 15.6 Cost to training data
 
 74 episodes -> 109 contiguous valid runs at min_run 433 raw frames (one P8/F64/s6 window):
-53.7% of frames, 183,292 frames, **136,204 windows** — still about 3x the 46,066 the earlier full-epoch
-runs trained on. So the mask costs nothing that matters.
+53.7% of frames, 183,292 frames.
+
+**CORRECTED WINDOW COUNT.** I twice reported "136,204 windows, about 3x the 46,066 the earlier runs
+used". Wrong, and wrong in the same way as §15.7's residual error: I counted windows in RAW frames and
+compared against a POST-SUBSAMPLE number. The builder's `summary.json` reports `training_windows` at
+stride 1; training then applies `subsample: 6` on top.
+
+    builder reports (stride 1)   159,544 train / 16,009 val
+    after subsample 6            ~20,792 train / ~2,017 val
+    the old FULL runs used        46,066 train /  5,565 val
+
+So the corrected dataset carries **about 45% of the training windows, not 3x** — the 46% frame mask
+costs real data. Which is the honest trade: fewer windows, but every one of them has an action that
+means something.
+
+**This does not touch the treatment-vs-control experiment**, because both arms train on the identical
+20,792 windows. It does mean the comparison against `FULL_l1x10_test` is confounded in the OPPOSITE
+direction from what I said — less data, not more — so if the treatment underperforms it, that is not
+evidence the correction failed.
+
+NOTE: the two live runs' `run_summary.trying_detail` was written before this correction and asserts the
+"3x / 136,204" figure. The runs are otherwise correct; the note is wrong and should be read against
+this section.
 
 ### 15.7 What I got wrong along the way
 

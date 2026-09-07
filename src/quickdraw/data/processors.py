@@ -415,10 +415,13 @@ def lego_assemblies(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[E
     dataset grid, `|cmd(t) - tcp(t+k)|` was 19.9 mm with no lag structure, against 3.3 mm with a clean
     minimum at k=5 (167 ms, the servo lag) once aligned. The offset is recovered from state content, not
     assumed. Episodes are then split at every frame with no trustworthy command, so no training window
-    can straddle one: 74 episodes -> 109 contiguous runs, 53.7 percent of frames, 136,204 windows at
-    P8/F64/subsample 6 -- still about 3x the 46,066 the earlier full-epoch runs trained on. The 46 percent
-    dropped is not reconstruction failure but stretches where the arm demonstrably moved with teleop
-    paused (see lego_action.episode_pose), where no command exists to recover.
+    can straddle one: 74 episodes -> 109 contiguous runs, 53.7 percent of frames, 183,292 frames. That is
+    about 20,800 train windows at P8/F64/subsample 6, against 46,066 for the unmasked build -- roughly
+    45 percent as many, so the mask does cost real data. (Do not read the run folder's
+    `summary.json: training_windows`, 159,544, as the training figure: it is counted at stride 1, before
+    `data.subsample` is applied.) The 46 percent dropped is not reconstruction failure but stretches
+    where the arm demonstrably moved with teleop paused (see lego_action.episode_pose), where no command
+    exists to recover.
 
     Args: +source.dir=<local snapshot> [+source.name=lego_assemblies]
           [+source.camera=head_right]  -- ONE leaf, or a LIST for a MULTI-CAMERA build. Use hydra's

@@ -292,7 +292,9 @@ restarting Arm A a third time on my own judgment is not the right call.
 - [x] Wire `episode_action` into `processors.py`; split episodes at invalid runs.
 - [x] Acceptance test established: the residual MUST be U-shaped in the lag with a minimum at k=4-6.
       A flat curve means misaligned. Cheap; run it on any new action column.
-- [x] Rebuild the run folder: 109 runs / 183,292 frames / 136,204 windows (~3x the 46,066 used before).
+- [x] Rebuild the run folder: 109 runs / 183,292 frames. **Windows: ~20,792 train after subsample 6**
+      (the builder's 159,544 is at stride 1) against 46,066 for the old runs -- i.e. ~45% as many, NOT
+      the "3x more" I first reported. Corrected in record 15.6.
 - [x] Build + verify `lego_assemblies_v2`: 74 eps, 341,494 frames unchanged, videos and
       `observation.state` byte-identical, v1's column preserved as `action.quest_raw`, new
       `action.is_valid`. All structural + physical checks pass; hub round-trip verified.
