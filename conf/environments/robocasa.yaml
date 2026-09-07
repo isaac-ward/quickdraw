@@ -1,0 +1,35 @@
+# RoboCasa kitchen, LIVE simulator (environments/examples/robocasa.py). Select with `environments=robocasa`
+# -- the config GROUP, not `environments.name=robocasa`, which leaves obs_dim/action_dim unresolved
+# (docs/byo.md §1 spells this trap out).
+#
+# Matches `madang6/quickdraw-robocasa-scene4-4h` exactly: 16-dim obs, 12-dim action, 20 Hz, layout 4 /
+# style 4. The obs layout is NOT guessable -- see environments/robocasa_utils.OBS_LAYOUT.
+name: robocasa
+obs_dim: 16        # robocasa_utils.OBS_LAYOUT: base_pos(3) base_quat(4) base_to_eef_pos(3) base_to_eef_quat(4) gripper_qpos(2)
+action_dim: 12     # PandaOmron composite controller
+dt: 0.05           # 20 Hz -> control_freq = 1/dt. Matches the dataset's fps.
+a_max: 1.0         # normalised action range (robosuite composite controllers take [-1, 1])
+
+position_idx: [0, 1, 2]   # world base xyz -> proprio position-trajectory plots. Also returned by the env's
+#                           `position_indices` hook; set here too so a recorded-data run gets it as well.
+
+robot: PandaOmron
+layout_ids: 4
+style_ids: 4
+
+# `task: null` -> sample uniformly from `tasks` at every reset, which is the distribution the model was
+# trained on (the recording mixes all 8). Set a single name to PIN one task when a control eval needs to
+# be interpretable rather than distribution-matched.
+task: null
+tasks: [DeliverStraw, GatherTableware, GetToastedBread, HeatKebabSandwich,
+        LoadDishwasher, MakeIceLemonade, PrepareCoffee, WashFruitColander]
+
+# BOTH published models' cameras. Rendering cost scales per camera (~117 ms/step for two at 256px), so
+# trim this to just the scene view when evaluating a single-head model.
+cameras: [robot0_agentview_left, robot0_eye_in_hand]
+render_size: 256   # what the SIM renders at -- Max's recording rendered 256 and the training cache is an
+out_h: 96          #   AREA downsample of that, so these two MUST stay paired with the training img_size
+out_w: 96          #   (environments/examples/robocasa.py note 4).
+
+floor_extent: [-1.0, 5.0, -5.0, 1.0]   # (x0,x1,y0,y1) plan-view bounds for render_diagnostics, in metres;
+#                                        covers the base positions seen in the dataset (x 0.77..4.54, y -3.85..-0.76)

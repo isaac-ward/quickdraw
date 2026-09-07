@@ -198,6 +198,27 @@ def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
                                f"{repo_id}/{split}")
 
 
+def resize_frames_area(x, hw: tuple[int, int]):
+    """(N,H,W,3) uint8 -> (N,h,w,3) uint8 by AREA (anti-aliased) downsample. numpy or torch in, same out.
+
+    WHY THIS IS SHARED (2026-09-07). Two places must resize camera frames identically: this module, when it
+    builds the `<cam>_<size>.npy` training cache from a dataset's video, and a LIVE environment's
+    `render_obs`, which renders at the simulator's native size and must hand the model frames drawn from the
+    same distribution. If the two use different filters (area vs bilinear vs nearest) nothing raises -- the
+    model simply receives subtly out-of-distribution input and every rollout is quietly worse. So the op
+    lives in ONE function that both call, rather than being written twice and allowed to drift.
+
+    AREA specifically, not bilinear: it averages over the full source footprint of each output pixel, which
+    is the correct antialiasing filter for a large downsample (256 -> 96 here). Bilinear samples 4 taps and
+    aliases thin high-contrast structure -- exactly the ceiling strips and window mullions these datasets
+    are full of."""
+    was_np = not isinstance(x, torch.Tensor)
+    t = torch.from_numpy(np.ascontiguousarray(x)) if was_np else x
+    y = torch.nn.functional.interpolate(t.permute(0, 3, 1, 2).float(), size=tuple(hw), mode="area")
+    y = y.permute(0, 2, 3, 1).round().clamp(0, 255).to(torch.uint8)
+    return y.numpy() if was_np else y
+
+
 def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 128,
                     max_frames: int | None = None, cache: bool = True, cam: str = "fpv"):
     """All egocentric frames for a split (lerobot chunked video, camera `cam`), AREA-downsampled ONCE
@@ -224,9 +245,7 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
             out.append(np.stack(buf))
             buf.clear()
             return
-        x = torch.from_numpy(np.stack(buf)).permute(0, 3, 1, 2).float()       # (b,3,H,W)
-        x = torch.nn.functional.interpolate(x, size=hw, mode="area")           # anti-aliased downsample
-        out.append(x.permute(0, 2, 3, 1).round().clamp(0, 255).to(torch.uint8).numpy())
+        out.append(resize_frames_area(np.stack(buf), hw))    # THE shared op -- see resize_frames_area
         buf.clear()
 
     def _have():

@@ -43,8 +43,41 @@ setting — the `[0,1,2]` fallback only warns and is NOT used for them (it can't
 needs a steppable env: the goal race *and* language steering both execute plans in the env.
 
 Every run prints an `[env-contract]` ✓/✗ report to its `progress.log`, so you can always see which column
-you're in. Two full-contract reference envs ship in `environments/examples/`: `pendulum.py` and
-`torus.py`; `base.py` is the spec. The three sections below walk up the ladder left-to-right.
+you're in. Three reference envs ship in `environments/examples/`; `base.py` is the spec:
+
+| example | the case it shows |
+|---|---|
+| `torus.py` | the **reference** full implementation — analytic batched torch env, every hook |
+| `pendulum.py` | the **full contract in one file**, small enough to read start to finish |
+| `robocasa.py` | a **heavy third-party simulator** — external asset tree, its own construction API, pinned deps, a reset measured in seconds, and a partial contract |
+
+The three sections below walk up the ladder left-to-right.
+
+### If you are wrapping an external simulator, read `robocasa.py` first
+
+Four things bit us there and **none of them raises an error** — each produces an env that resets, steps
+and renders perfectly happily while being subtly wrong:
+
+1. **The observation layout is usually not documented.** `madang6/quickdraw-robocasa-scene4-4h` ships a
+   16-dim `observation.state` with no `names`. It was recovered by fingerprinting the recorded data
+   (unit-norm blocks are quaternions; a mirror-image pair is a two-finger gripper; a dim pinned at 0.70
+   is a floor-mounted base) and then confirmed against a live env. The trap: `robot0_eef_pos` exists, is
+   world-frame and looks right, while the data actually wants `robot0_base_to_eef_pos`. Only the value
+   ranges give it away — hence `smoke/robocasa_env.py`'s "every obs dim inside the dataset's range".
+2. **The simulator's own dependency pins are exact, and it may need a source checkout.** robocasa
+   hard-asserts `numpy == 2.2.5` and `mujoco == 3.3.1`, and needs robosuite from source (the PyPI wheel
+   raises `unexpected keyword argument 'load_model_on_init'`).
+3. **`render_obs` must match the training pipeline's FILTER, not just its size.** If the training cache
+   was an AREA downsample of 256px renders, rendering directly at 96 is a different filter and feeds the
+   model out-of-distribution frames. Use `data.dataset.resize_frames_area`, which the cache builder also
+   calls, so the two cannot drift.
+4. **Numerically stable metrics matter once you read them per step.** The textbook quaternion angle
+   `2*acos(|<q,q'>|)` reports ~1e-3 rad between *identical* float32 quaternions, because `acos` has
+   infinite derivative at 1. `robocasa_utils.quat_angle_error` uses the `atan2` form instead.
+
+Also worth copying: **env-specific machinery lives outside the env file.** `robocasa_utils.py` holds the
+obs packing and the diagnostic drawing, `torus_utils.py` (324 lines) holds the torus geometry — which is
+what keeps each `examples/*.py` short enough to be read as an example.
 
 **Data source is a separate axis.** *Where* the training data comes from — `data_generation` (the env
 generates it) or a `data/processors.py` processor (an existing dump) — is independent of *which env* you
