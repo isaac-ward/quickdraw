@@ -1,7 +1,10 @@
 .git
 logs/
+scratch/
 datasets/
 caches/
+outputs/
 **/__pycache__/
 *.ckpt
 wandb/
+.venv/

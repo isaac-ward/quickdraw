@@ -21,4 +21,18 @@ RUN uv sync
 ENV TORCHINDUCTOR_CACHE_DIR=/caches/inductor \
     HF_HOME=/caches/hf \
     PYVISTA_OFF_SCREEN=true \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MUJOCO_GL=osmesa
+#   MUJOCO_GL=osmesa: mujoco/robosuite offscreen rendering, chosen BEFORE mujoco initialises its GL
+#   context. Without it `robosuite.make(has_offscreen_renderer=True)` dies looking for a display.
+
+# THE SIMULATOR IS NOT IN THIS IMAGE, deliberately. robosuite + robocasa are editable installs of the
+# source checkouts under /caches/sim -- a runtime VOLUME, because they carry ~23 GB of scene assets and
+# because robocasa needs robosuite from SOURCE (the PyPI wheel raises `unexpected keyword argument
+# 'load_model_on_init'`). /caches is not mounted at build time, so the Dockerfile cannot reach them.
+# After ANY rebuild, relink them with:
+#
+#     ./utils/setup_sim.sh
+#
+# Everything else -- including the numpy==2.2.5 and mujoco==3.3.1 that robocasa ASSERTS on exactly --
+# is declared in pyproject.toml and baked in by the `uv sync` above, so a rebuild reproduces it.

@@ -21,6 +21,9 @@ services:
       - ./.env:/app/.env           # live host .env (repo root isn't mounted, so the baked copy is stale);
       #                              also loaded into the env via `env_file: .env` above (needs `up -d` to refresh)
       - ./logs:/app/logs           # run folders, checkpoints, media
+      - ./pyproject.toml:/app/pyproject.toml:ro   # so `uv lock` inside the container sees YOUR edits, not
+      - ./uv.lock:/app/uv.lock                    #   the copy baked at image build (which silently
+      #                                             re-resolved against stale deps and cost an hour)
       - ./scratch:/app/scratch     # big downloaded datasets / working data (gitignored). Beside logs/
       #                              rather than inside it because a dataset is not a log. Adding this
       #                              mount needs `docker compose up -d`, which RECREATES the container

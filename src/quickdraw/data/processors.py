@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -116,7 +117,11 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     `extra_splits` = {split_name: [Episode]} adds EXTRA named splits (e.g. a held-out `eval`
     collection) alongside the normal train/val: each is written to its OWN split directory VERBATIM
     (NO random splitting), encoded/recorded exactly like train/val. Extra splits never affect the
-    train/val random split nor the train-only norm stats."""
+    train/val random split nor the train-only norm stats.
+
+    EVERY split keeps its per-episode preview clips under media/<cam>/<split>/ -- they are how a human
+    (or a Hub visitor) sees what a split actually contains, which is worth the bytes for train and val
+    too, not just for a handful of OOD episodes."""
     log = log or (lambda m: print(m, flush=True))
     has_frames = episodes[0].frames is not None
 
