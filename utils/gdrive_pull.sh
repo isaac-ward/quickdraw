@@ -6,76 +6,108 @@
 # OUTSIDE the repo, and this script never reads or writes it.
 #
 # ----------------------------------------------------------------------------------------------
-# STEP BY STEP -- downloading a big Drive folder, start to finish
+# STEP BY STEP -- downloading a big Drive folder, start to finish. FOLLOW IN THIS ORDER.
+#
+# The awkward bit: Google's OAuth redirect goes to http://127.0.0.1:53682/, which is resolved by
+# the BROWSER. So the machine running `rclone authorize` must be reachable at the browser's own
+# localhost:53682. An SSH tunnel makes that true. Opening a firewall port on the server does NOT
+# work -- the browser never tries to contact the server's IP.
 # ----------------------------------------------------------------------------------------------
 #
-# 0. WHERE THE DATA GOES. Put it in `scratch/` at the repo root: it is gitignored, it sits beside
-#    logs/ rather than inside it (a dataset is not a log), and it is mounted into the container at
-#    /app/scratch so the processors can read it without a second copy.
+# 1. ON THE MACHINE WITH THE BROWSER (your desktop/laptop), open the tunnel FIRST and leave it
+#    running. Nothing prints; that is correct.
 #
-#      mkdir -p scratch
+#      ssh -N -L 53682:127.0.0.1:53682 <your-ssh-host-alias>
 #
-#    NOTE: a NEW mount only takes effect when the container is recreated (`docker compose up -d`),
-#    which KILLS ANY RUNNING TRAINING. The download itself runs on the host and needs no restart;
-#    only the processing step does. Check `docker compose exec app ls /app/scratch` -- if that
-#    errors, the container predates the mount and needs recreating when you can afford it.
+#    If it says "Address already in use", something local already holds 53682 -- usually a stray
+#    rclone on THIS machine. Kill it (Windows: taskkill //F //IM rclone.exe) and retry. Do NOT run
+#    `rclone authorize` on the browser machine as well; running both routes at once is what causes
+#    the port clash and the confusing "Connection refused".
 #
-# 1. AUTHORISE, ON A MACHINE THAT HAS A BROWSER. This box has none, so use rclone's
-#    remote-authorize flow. On your laptop (`brew install rclone` / `apt install rclone`):
+# 2. ON THE TARGET MACHINE (the server the data is going to), with the tunnel from step 1 still up:
 #
 #      rclone authorize "drive" --drive-scope=drive.readonly
 #
-#    A browser opens; sign in as the account that OWNS the folder (sharing it to yourself is not
-#    enough if it lives in someone else's Drive -- see step 6). When it finishes it prints a token
-#    blob starting `{"access_token":...}`. Copy the WHOLE line, braces included.
+#    It prints  http://127.0.0.1:53682/auth?state=XXXX  and then "Waiting for code...".
+#    (`drive.readonly` means the resulting token physically cannot modify or delete the Drive.)
+#    If `rclone` is not on PATH yet, run step 4's `setup` first -- it installs it -- then come back.
 #
-#    Why `drive.readonly`: the token this stores physically cannot modify or delete your Drive.
-#    There is no scenario where a download script needs write access.
+# 3. PASTE THAT LINK INTO THE BROWSER on the machine from step 1. Sign in as the account that OWNS
+#    the folder. Approve. The browser shows "Success! All done."
 #
-# 2. HAND THE TOKEN TO THIS MACHINE. Installs rclone to ~/.local/bin (static binary, no root),
-#    creates the remote, and verifies it with `rclone about`:
+#    THE TOKEN APPEARS IN THE SAME TERMINAL WHERE YOU RAN `rclone authorize` IN STEP 2 -- on the
+#    TARGET machine, not the browser machine. It looks like:
 #
+#      Paste the following into your remote machine --->
+#      {"access_token":"ya29...","refresh_token":"1//0e...","expiry":"..."}
+#      <---End paste
+#
+#    Copy the whole JSON line, both braces included, nothing outside them.
+#
+# 4. ON THE TARGET MACHINE, hand that token to this script. Paste at the `token:` prompt:
+#
+#      cd ~/user_irw/quickdraw
 #      ./utils/gdrive_pull.sh setup
 #
-# 3. LOOK BEFORE YOU LEAP. Always. This prints the directory names, the biggest files, and a TOTAL
-#    SIZE -- which is how you find out it is 400 GB before you start rather than after:
+#    It installs rclone to ~/.local/bin if needed, creates the `gdrive:` remote, and verifies it
+#    with `rclone about` so you know it works before relying on it.
 #
+# 5. LOOK BEFORE YOU LEAP. Always. Directory names, biggest files, and a TOTAL SIZE -- which is how
+#    you learn it is 82 GiB before starting rather than after:
+#
+#      cd ~/user_irw/quickdraw
 #      ./utils/gdrive_pull.sh ls <folder-url-or-id>
 #
-# 4. PULL IT.
+# 6. PULL IT into scratch/ (gitignored, and mounted into the container at /app/scratch):
 #
+#      cd ~/user_irw/quickdraw
 #      ./utils/gdrive_pull.sh pull <folder-url-or-id> scratch/<name>
 #
-#    Interactive, you get a live progress bar. It is RESUMABLE: if it dies at 80%, re-run the
-#    identical command and it continues -- rclone compares sizes/checksums and skips what is done.
+#    Detach anything over a few GB so a dropped SSH session cannot kill it:
 #
-# 5. FOR ANYTHING THAT WILL OUTLAST YOUR SSH SESSION, detach it. Do this for anything over a few
-#    GB; a dropped connection otherwise kills the transfer:
-#
+#      cd ~/user_irw/quickdraw
 #      nohup ./utils/gdrive_pull.sh pull <folder-url-or-id> scratch/<name> \
 #            > scratch/<name>.pull.log 2>&1 &
 #      tail -f scratch/<name>.pull.log
 #
-#    Redirected output automatically switches from the terminal bar to timestamped one-line stats
-#    plus a line per completed file, so the log stays readable instead of filling with escape codes.
+#    Both forms are RESUMABLE: if it dies at 80%, re-run the identical command and it continues.
+#    Redirected output switches from the terminal progress bar to timestamped one-line stats plus a
+#    line per completed file, so the log stays readable instead of filling with escape codes.
 #
-# 6. WHEN IT GOES WRONG
+# 7. ONLY PART OF A FOLDER? Pass rclone filters through with RCLONE_EXTRA. Cheaper and faster than
+#    pulling everything and deleting:
 #
+#      RCLONE_EXTRA='--include campaign2[1-4]-*/**' \
+#        ./utils/gdrive_pull.sh pull <folder-url-or-id> scratch/<name>
+#
+#    Check what a filter selects before committing to it:
+#
+#      ~/.local/bin/rclone size gdrive: --drive-root-folder-id <id> --include 'campaign2[1-4]-*/**'
+#
+# 8. WHEN IT GOES WRONG
+#
+#    "Connection refused" on the tunnel, or auth never completes
+#        Step 2 was not running (or had exited) when the browser hit the tunnel. Tunnel FIRST, then
+#        authorize, then open the link -- and use the state URL from the run that is still waiting.
+#    "Address already in use" on the tunnel
+#        A local rclone holds 53682 on the browser machine. See step 1.
+#    Browser says "Success!" but no token appears
+#        A DIFFERENT rclone answered -- almost always one still running on the browser machine, which
+#        printed the token into its own terminal. Kill it and redo steps 1-3.
 #    "couldn't find directory" / empty listing
-#        The folder is not in the authorised account's Drive. A folder SHARED with you is not in
-#        your Drive tree: open it in the browser and "Add shortcut to Drive", or authorise as the
-#        owning account in step 1.
+#        The folder is not in the authorised account's Drive. A folder SHARED with you is not in your
+#        Drive tree: open it in the browser, "Add shortcut to Drive", or authorise as the owner.
 #    "This file has been identified as malware or spam"
-#        Google's interstitial on large files. `pull` already passes --drive-acknowledge-abuse; if
-#        you hit it with a bare rclone command, add that flag.
-#    Rate-limit / 403 userRateLimitExceeded
-#        Lower the parallelism: RCLONE_ARGS is not read, so edit --transfers/--checkers below, or
-#        add `--tpslimit 10`.
-#    Transfer crawls at a few MB/s
-#        Usually Drive throttling a single large file, not the link. More --transfers does not help
-#        one file; it helps many. Check `ls` output -- one 200 GB tarball will simply be slow.
+#        Google's interstitial on large files. `pull` already passes --drive-acknowledge-abuse.
+#    403 userRateLimitExceeded
+#        Lower parallelism: RCLONE_EXTRA='--tpslimit 10 --transfers 4'.
+#    Transfer crawls
+#        Usually Drive throttling ONE large file. More --transfers helps many files, not one.
 #    Wrong or expired token
-#        ~/.local/bin/rclone config delete gdrive, then redo steps 1-2.
+#        ~/.local/bin/rclone config delete gdrive, then redo steps 1-4.
+#    "shared Google Drive client_id ... being retired" NOTICE
+#        Harmless for now; works through 2026. To silence it, make your own client_id:
+#        https://rclone.org/drive/#making-your-own-client-id
 #
 # ----------------------------------------------------------------------------------------------
 # USAGE
@@ -202,6 +234,8 @@ cmd_pull() {
   # PROGRESS STYLE depends on where output is going, because rclone's --progress redraws the terminal
   # with escape codes -- lovely live, unreadable in a nohup log. So: live bar on a TTY, timestamped
   # one-liners plus a named line per completed file when redirected to a file.
+  # RCLONE_EXTRA: arbitrary extra rclone flags (filters, rate limits) -- see step 7 in the header.
+  local extra=(); [ -n "${RCLONE_EXTRA:-}" ] && read -r -a extra <<< "$RCLONE_EXTRA"
   local prog=(--progress --stats 2s)
   if [ ! -t 1 ]; then
     prog=(--stats 15s --stats-one-line-date -v)
@@ -215,7 +249,7 @@ cmd_pull() {
     --drive-acknowledge-abuse \
     --transfers 8 --checkers 16 --fast-list \
     --retries 10 --low-level-retries 20 \
-    "${prog[@]}"
+    "${extra[@]}" "${prog[@]}"
   echo
   echo "done $(date '+%H:%M:%S'). local size:"
   du -sh "$dest"
