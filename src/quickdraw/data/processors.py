@@ -48,6 +48,18 @@ class Episode:
     #   list[str]  = per-frame image file paths in temporal order (lazy; starling's jpgs)
     #   np.ndarray = (T, H, W, 3) uint8 in-memory frames (robocasa's decoded clips)
     #   None       = no camera -> proprio-only dataset
+    task: str | None = None
+    #   WHAT CONDITION THIS EPISODE WAS RECORDED UNDER, e.g. "campaign5_ood_object". Written to
+    #   lerobot's per-frame `task` field, which is the only free-text label that survives packaging
+    #   (it lands in <split>/meta/tasks.parquet and every episode row references it). None -> the
+    #   dataset name, which is what every processor used to do UNCONDITIONALLY.
+    #
+    #   WHY IT EXISTS (2026-09-08). The published `starling-2` eval split holds 49 episodes drawn from
+    #   four separate OOD campaigns and labels every one of them 'starling-2'. Which episodes were the
+    #   visual shift and which the dynamics shift is now UNRECOVERABLE from the dataset: the raw
+    #   campaign directories say it, the upstream summary.json says it, and this field is where that
+    #   survived to -- except it did not exist, so it was dropped. An OOD split you cannot slice by
+    #   condition is not an OOD split.
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +163,9 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     # 2. write one lerobot dataset per split (parallel), ingesting every camera's clips when present
     lr_jobs = [{"name": sp, "root_split": os.path.join(run_dir, sp), "repo_id": f"{name}/{sp}",
                 "obs": [e.states for e in eps], "act": [e.actions for e in eps], "fps": fps,
-                "hw": hw, "cam": cams, "task": name,
+                "hw": hw, "cam": cams,
+                # PER-EPISODE task labels, falling back to the dataset name for processors that set none.
+                "task": [e.task or name for e in eps],
                 "ego_dir": {c: os.path.join(ego_roots[c], sp) for c in cams} if has_frames else None}
                for sp, eps in split_eps.items()]
     log(f"[lerobot] writing {len(lr_jobs)} split datasets "
@@ -204,9 +218,40 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
 # bespoke processors: parse ONE raw format -> (name, episodes, fps, cam)
 # ---------------------------------------------------------------------------
 
+def _starling_campaigns(src: str, n_eps: int) -> list[str] | None:
+    """Per-episode CAMPAIGN name from the upstream dump's own `summary.json`, or None if unavailable.
+
+    The seamstress exporter writes `episodes: [{episode_index, run_dir, ...}]` where `run_dir` is
+    `<raw_root>/<campaign>/<run_timestamp>` -- so the campaign is the run_dir's parent directory, and
+    that string is the ONLY record of what condition an episode was flown under (e.g.
+    `campaign4_ood_10hz` = a 10 Hz control-rate shift, `campaign5_ood_object` = an object added to the
+    flightroom). `data.npz` does NOT carry it.
+
+    Returns None rather than raising when the summary is missing, mismatched, or has no run_dirs: a
+    dump without it is still perfectly loadable, it just cannot be sliced by condition afterwards.
+    """
+    p = os.path.join(src, "summary.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p) as f:
+            eps = (json.load(f) or {}).get("episodes") or []
+        names = [os.path.basename(os.path.dirname(str(e["run_dir"]))) for e in eps if e.get("run_dir")]
+    except Exception:
+        return None
+    if len(names) != n_eps:
+        print(f"[starling] {p} lists {len(names)} run_dirs for {n_eps} parsed episodes -- NOT using it "
+              f"for campaign labels (the two must line up 1:1 or the labels would be wrong)", flush=True)
+        return None
+    return names
+
+
 def _parse_starling_dir(src: str, cam: str) -> list[Episode]:
     """Parse one flightroom-starling processed folder into canonical Episodes (CONTIGUOUS runs of
-    the episode map; each Episode.frames is that run's jpg paths in temporal order, lazy)."""
+    the episode map; each Episode.frames is that run's jpg paths in temporal order, lazy).
+
+    Each Episode also gets its CAMPAIGN as `task` when the dump's summary.json supplies one -- see
+    `_starling_campaigns` and `Episode.task` for why that matters."""
     npz = np.load(os.path.join(src, "data.npz"))
     states = npz["states"].astype(np.float32)
     actions = npz["actions"].astype(np.float32)
@@ -219,10 +264,17 @@ def _parse_starling_dir(src: str, cam: str) -> list[Episode]:
     ends = np.concatenate((bounds, [len(ep_map)])).tolist()
     assert len(starts) == len(np.unique(ep_map)), "episode ids are not contiguous runs"
 
+    camps = _starling_campaigns(src, len(starts))
+    if camps:
+        import collections
+        c = collections.Counter(camps)
+        print(f"[starling] {src}: campaign labels from summary.json -> "
+              f"{dict(sorted(c.items()))}", flush=True)
     episodes = []
-    for s, e in zip(starts, ends):
+    for k, (s, e) in enumerate(zip(starts, ends)):
         frames = [os.path.join(img_dir, f"{i}.jpg") for i in range(s, e)]
-        episodes.append(Episode(states=states[s:e], actions=actions[s:e], frames=frames))
+        episodes.append(Episode(states=states[s:e], actions=actions[s:e], frames=frames,
+                                task=(camps[k] if camps else None)))
     return episodes
 
 

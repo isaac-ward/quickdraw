@@ -86,7 +86,32 @@ At @+8 on starling-2 it wins 5/6, so the gain is real and short-horizon only. Th
 `latent_cos` is NOT a proxy for the objective on this dataset -- it moved 30% and @+128 did not follow.
 Do not rank arms on it.
 
-### 1.6 Queue
+### 1.6 THE FRAME STRIDE WAS WRONG — copied from robocasa, never measured (09-08)
+
+`subsample=5` was chosen for TRACTABILITY (epoch parity with robocasa: 34k windows vs 205k at stride 1),
+and `conf/data/starling.yaml`'s header said in as many words that §13's SNR argument did not transfer and
+the delta "has to be measured here before a stride is chosen". It never was. Measured now, per-step image
+RMSE on val frames:
+
+| | stride 1 | stride 2 | stride 3 | stride 5 |
+|---|---|---|---|---|
+| **starling** (30 Hz) | 0.0751 | **0.1053** | 0.1248 | **0.1502** <- what we ran |
+| **robocasa** (20 Hz) | 0.0426 | — | — | **0.0997** <- what the recipe was tuned on |
+
+§13 raised robocasa to stride 5 to lift its per-step signal from 0.0389 -- 0.61x its own codec floor,
+where predicting zero motion was the correct answer -- ABOVE that floor. **Starling at stride 1 is already
+0.0751, nearly 2x robocasa's stride 1 and already in the regime §13 was reaching for.** Striding 5 on top
+made every step a 0.1502 jump, 1.5x harder than where this recipe works. That is a plausible first-order
+cause of 1.2's finding that 80% of the dynamics error is spent by step 8, and of 1.3's positional failure:
+we asked the transition head to predict a much larger physical change than it was ever tuned for.
+
+**stride 2 (0.1053) lands almost exactly on robocasa's working difficulty (0.0997).**
+
+READING IT REQUIRES CARE: the stride changes what a horizon MEANS. At stride 5 `@+128` spans 21.3 s; at
+stride 2 it spans 8.5 s. Compare at matched PHYSICAL duration -- stride-5 `@+51` against stride-2 `@+128`
+-- never at matched step count. Cost ~2.5x the epoch.
+
+### 1.7 Queue
 
 1. **`visual_l1: 10.0` on the DEPTH-2 base** (`model=vl128_starling_l1x10`, written 09-07, NOT yet run).
    THE loss arm, and the argument is 1.3. `VisualLoss` trains two sites and the AR decode loss is, per
@@ -106,8 +131,8 @@ Do not rank arms on it.
    unnecessary because obs carries velocity -- true of the PROPRIO state, false of the VISUAL one, since
    what appears next depends on geometry currently out of frame. Better motivated after 1.3 than when it
    was first ranked third.
-3. **`subsample: 5 -> 3`** (6 Hz -> 10 Hz, 167 ms -> 100 ms per step). Makes each positional prediction
-   physically smaller and therefore easier. Costs ~1.7x epoch time and shortens what F=64 spans.
+3. ~~`subsample: 5 -> 3`~~ SUPERSEDED by 1.6 -- measured, and **stride 2** is the principled target, not
+   3. Running as `starling_stride2`.
 4. `flow_arch_heads: 4 -> 8` / `encode_base: 32 -> 48`. Capacity on axes never varied. DEPRIORITISED --
    1.5 is evidence that transition-head capacity is not the binding constraint.
 

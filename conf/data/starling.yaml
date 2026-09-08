@@ -24,11 +24,25 @@
 #   model.modalities.1.img_size=[112,192]  +model.modalities.1.ae_bottleneck=7   <- PAIR THESE
 #   environments=recorded    <- there is no simulator for these flights; control/manifold evals are OFF
 #
-# SUBSAMPLE. Left at 1 and NOT copied from robocasa's 5. Record §13 chose 5 because robocasa is 20 Hz and
-# its true per-step image change was 0.61x the codec's own noise floor -- predicting zero motion was the
-# correct answer to the objective. This is 30 Hz EGOCENTRIC flight, where the whole frame moves with the
-# camera, so that measurement does not transfer and the per-step delta has to be measured here before a
-# stride is chosen. `python -m quickdraw.check_dataset` reports it.
+# SUBSAMPLE. Ships at 1; pass it on the CLI. THE STRIDE CURVE IS NOW MEASURED (2026-09-08) and it says
+# the 5 we ran for a fortnight was WRONG -- copied from robocasa on TRACTABILITY grounds (epoch parity)
+# and never checked. Per-step image RMSE on val frames:
+#
+#     starling  stride 1 (30 Hz,  33 ms)  0.0751      robocasa stride 1 (20 Hz,  50 ms)  0.0426
+#     starling  stride 2 (15 Hz,  67 ms)  0.1053      robocasa stride 5 ( 4 Hz, 250 ms)  0.0997
+#     starling  stride 3 (10 Hz, 100 ms)  0.1248        ^ the regime this recipe was tuned in
+#     starling  stride 5 ( 6 Hz, 167 ms)  0.1502      <- what we ran
+#
+# §13 raised robocasa's stride to 5 to lift its per-step signal from 0.0389 (0.61x its codec floor) ABOVE
+# that floor. Starling at stride 1 is ALREADY 0.0751 -- nearly 2x robocasa's stride 1, and already in the
+# regime §13 was reaching for. Striding 5 on top made each step a 0.1502 jump: 1.5x harder per step than
+# where the recipe demonstrably works, which is a plausible first-order cause of the short-horizon
+# positional failure recorded in wizard/records/starling.md §1.2-1.3.
+#
+# **stride 2 (0.1053) lands almost exactly on robocasa's working difficulty (0.0997)** -- start there.
+# CAVEAT ON READING IT: the stride changes what a horizon MEANS. F=64 spans 10.7 s at stride 5 and 4.3 s
+# at stride 2; @+128 spans 21.3 s vs 8.5 s. Compare at matched PHYSICAL duration -- stride-5 @+51 against
+# stride-2 @+128 -- not at matched step count. Cost: ~2.5x the epoch (85k windows vs 34k).
 # =============================================================================================
 defaults:
   - torus

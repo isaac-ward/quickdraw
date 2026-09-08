@@ -80,7 +80,7 @@ def _read_frames(path: str) -> np.ndarray:
 
 
 def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
-                        fpv_dir=None, fpv_size=256, cam="fpv", task: str = "torus"):
+                        fpv_dir=None, fpv_size=256, cam="fpv", task="torus"):
     """Write episodes to a LeRobotDataset on disk. ISOLATED lerobot API surface.
 
     MULTI-CAMERA. `cam` is a camera name OR a list of them, and `fpv_dir` correspondingly a directory
@@ -94,6 +94,15 @@ def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
     episodes have variable length). `fpv_size`: int (square) or (H, W); all cameras share it.
 
     Passing a bare str + str (the torus/generate path) behaves exactly as before.
+
+    `task`: one string for every episode (the historical behaviour), OR a per-episode sequence of
+    len(obs) strings. WHY PER-EPISODE MATTERS: lerobot's `task` is the ONLY free-text field that
+    survives packaging into `<split>/meta/tasks.parquet`, and a single dataset-wide constant throws
+    away whatever distinguished one recording from another. Measured cost of getting this wrong: the
+    `starling-2` eval split ships 49 episodes drawn from four separate OOD campaigns, every one of them
+    labelled `'starling-2'`, so which episodes were the visual-shift ones and which the dynamics-shift
+    ones is UNRECOVERABLE from the published dataset -- the information existed upstream and was
+    flattened here. Per-episode tasks are how a consumer slices a dataset by condition.
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -109,12 +118,14 @@ def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
         for c in cams:
             features[f"observation.images.{c}"] = {"dtype": "video", "shape": (h, w, 3),
                                                    "names": ["height", "width", "channels"]}
+    tasks = [str(task)] * len(obs) if isinstance(task, str) else [str(t) for t in task]
+    assert len(tasks) == len(obs), f"task list has {len(tasks)} entries for {len(obs)} episodes"
     ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=root, features=features, use_videos=video)
     for i in range(len(obs)):
         # decode every camera's clip for THIS episode up front; they are frame-aligned by construction
         frames = {c: _read_frames(os.path.join(dirs[c], f"ep_{i:04d}.mp4")) for c in cams} if video else None
         for t in range(len(obs[i])):
-            f = {"observation_vector": obs[i][t], "action": act[i][t], "task": task}
+            f = {"observation_vector": obs[i][t], "action": act[i][t], "task": tasks[i]}
             if video:
                 for c in cams:
                     f[f"observation.images.{c}"] = frames[c][t]

@@ -114,6 +114,14 @@ Use **`environments=recorded`** — the config *group*, which carries the dims �
 no fps. `check_dataset` counts the `P+F` training windows and flags any obs/action-dim mismatch **before**
 you burn a run.
 
+**LABEL YOUR CONDITIONS.** Set `Episode.task` to whatever condition the episode was recorded under (a
+campaign name, a perturbation, a pilot) and it lands in `<split>/meta/tasks.parquet`, which is the only
+free-text field that survives packaging — a consumer can then slice the dataset by condition. Leave it
+None and every episode gets the dataset name, which is what every processor did before 2026-09-08 and it
+cost us: the published `starling-2` eval split holds 49 episodes drawn from four separate OOD campaigns,
+all labelled `'starling-2'`, so which were the visual shift and which the dynamics shift is no longer
+recoverable from the dataset. An OOD split you cannot slice by condition is not an OOD split.
+
 Each dataset gets a small bespoke processor (`starling`, `robocasa`, …) that parses its quirks and emits
 the same layout via a shared builder; **non-image** datasets are supported too (a processor yields
 `frames=None` → a proprio-only WM). You get WM training + validation, the `ood_horizon` pointwise metric,
