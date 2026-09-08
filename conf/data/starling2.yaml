@@ -2,18 +2,32 @@
 # starling2 — the SECOND recorded egocentric flight set. Select with `data=starling2`.
 # Identical schema and recorder to `data=starling`; read that file's header first, all of it applies.
 #
-# WHAT DIFFERS (from summary.json, 2026-09-05):
-#     train   60 episodes x 3539 steps = 212,359 transitions (1.97 h), 208,099 training windows
-#     val      7 episodes x 3551 steps =  24,855 transitions (0.23 h),  24,358 windows
-#     eval    49 episodes x  234 steps =  11,445 transitions (0.11 h),   7,966 windows   <- EXTRA SPLIT
+# REBUILT FROM THE RAW ROSBAGS 2026-09-08 (quickdraw.data.processors +processor=starling_bags), at 15 Hz
+# instead of 30, with the OOD/memory campaigns as LABELLED splits. What is on the Hub now:
 #
-# Same total hours as `starling` but HALF the episodes at TWICE the length (3539 vs 1726 steps), so a
-# window at F=64 sees a much smaller fraction of an episode and there is far less episode-boundary
-# diversity per epoch. Worth holding in mind before reading any cross-set comparison as a recipe result.
+#     train                   60 eps x ~1778 steps = 106,708 (118.6 min), 102,448 windows
+#     val                      7 eps x ~1785 steps =  12,492 ( 13.9 min),  11,995 windows
+#     eval_ood_noodle         12 eps x  ~123 steps =   1,475 (  1.6 min),     623 windows
+#     eval_ood_leafblower     12 eps x  ~126 steps =   1,516 (  1.7 min),     664 windows
+#     eval_memory_backwall1   10 eps x  ~127 steps =   1,274 (  1.4 min),     564 windows
+#     eval_memory_backwall2   10 eps x  ~125 steps =   1,250 (  1.4 min),     540 windows
 #
-# THE `eval` SPLIT IS THE REASON TO PREFER THIS ONE for generalisation work: 49 short held-out episodes,
-# which `starling` does not have. Nothing in quickdraw reads a split named `eval` automatically -- the
-# during-training evals use `val` -- so it needs an explicit pass to use it.
+# WHY 15 Hz: the camera (/hires_small_color) runs at ~17 Hz. The previous 30 Hz build therefore
+# DUPLICATED 44% of consecutive frames -- a world model trained on it was asked to predict "nothing
+# changed" on nearly half its steps, and every per-step statistic measured on it was diluted. 15 Hz sits
+# below the camera: measured duplication is now 1.9% on train.
+#
+# EVERY EPISODE CARRIES ITS CAMPAIGN in <split>/meta/tasks.parquet (`campaign21-ood-noodle`, ...), which
+# the previous build lost -- it labelled all 116 episodes 'starling-2', making the OOD conditions
+# unrecoverable from the published data. See data/processors.py Episode.task.
+#
+# THE EVAL SPLITS ARE ~125 STEPS EACH, because the OOD/memory flights are 9.9 s. At P=8 that supports
+# @+96 (104 steps needed) but NOT @+128 (136). This is a property of the recordings, not the processing.
+# They are also a much gentler flight regime than train (|action| 0.017-0.077 vs train's 0.281), so read
+# them as a scene/memory probe rather than a like-for-like generalisation test.
+#
+# Nothing in quickdraw reads a split named eval_* automatically -- the during-training evals use `val` --
+# so these need an explicit pass to score.
 # =============================================================================================
 defaults:
   - starling

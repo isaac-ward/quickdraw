@@ -24,26 +24,29 @@
 #   model.modalities.1.img_size=[112,192]  +model.modalities.1.ae_bottleneck=7   <- PAIR THESE
 #   environments=recorded    <- there is no simulator for these flights; control/manifold evals are OFF
 #
-# SUBSAMPLE. Ships at 1; pass it on the CLI. THE STRIDE CURVE IS NOW MEASURED (2026-09-08) and it says
-# the 5 we ran for a fortnight was WRONG -- copied from robocasa on TRACTABILITY grounds (epoch parity)
-# and never checked. Per-step image RMSE on val frames:
+# SUBSAMPLE. Ships at 1, and on the CURRENT datasets that is the right answer -- pass a different value
+# only with a measurement in hand. THE STRIDE CURVE, measured on the 15 Hz rebuild (2026-09-08):
 #
-#     starling  stride 1 (30 Hz,  33 ms)  0.0751      robocasa stride 1 (20 Hz,  50 ms)  0.0426
-#     starling  stride 2 (15 Hz,  67 ms)  0.1053      robocasa stride 5 ( 4 Hz, 250 ms)  0.0997
-#     starling  stride 3 (10 Hz, 100 ms)  0.1248        ^ the regime this recipe was tuned in
-#     starling  stride 5 ( 6 Hz, 167 ms)  0.1502      <- what we ran
+#     stride 1  15.0 Hz   67 ms/step   RMSE 0.1039   dup 1.9%   F=64 spans  4.3 s   @+128  8.5 s
+#     stride 2   7.5 Hz  133 ms/step   RMSE 0.1383   dup 0.0%   F=64 spans  8.5 s   @+128 17.1 s
+#     stride 3   5.0 Hz  200 ms/step   RMSE 0.1592                                  @+128 25.6 s
+#     stride 5   3.0 Hz  333 ms/step   RMSE 0.1850                                  @+128 42.7 s
 #
-# §13 raised robocasa's stride to 5 to lift its per-step signal from 0.0389 (0.61x its codec floor) ABOVE
-# that floor. Starling at stride 1 is ALREADY 0.0751 -- nearly 2x robocasa's stride 1, and already in the
-# regime §13 was reaching for. Striding 5 on top made each step a 0.1502 jump: 1.5x harder per step than
-# where the recipe demonstrably works, which is a plausible first-order cause of the short-horizon
-# positional failure recorded in wizard/records/starling.md §1.2-1.3.
+#     robocasa's PROVEN regime (record 13)          RMSE 0.0997
+#     the OLD 30 Hz starling-2 at stride 5          RMSE 0.1502              @+128 21.3 s
 #
-# **stride 2 (0.1053) lands almost exactly on robocasa's working difficulty (0.0997)** -- start there.
-# CAVEAT ON READING IT: the stride changes what a horizon MEANS. F=64 spans 10.7 s at stride 5 and 4.3 s
-# at stride 2; @+128 spans 21.3 s vs 8.5 s. Compare at matched PHYSICAL duration -- stride-5 @+51 against
-# stride-2 @+128 -- not at matched step count. Cost: ~2.5x the epoch (85k windows vs 34k).
-# =============================================================================================
+# STRIDE 1 LANDS WITHIN 4% OF ROBOCASA'S PROVEN PER-STEP DIFFICULTY. That is the whole reason the old
+# runs strided at all: the 30 Hz build DUPLICATED 44% of consecutive frames (the camera is ~17 Hz), so
+# its stride-1 delta was diluted to 0.0751 and striding was compensating for a processing artifact
+# rather than for the physics. Rebuilt at 15 Hz -- below the camera -- no compensation is needed.
+#
+# THE TRADE AT STRIDE 1 IS HORIZON COVERAGE, and it is easy to miss: @+128 spans only 8.5 s, where every
+# number quoted before this rebuild was measured over 21.3 s. So a stride-1 score is NOT comparable to
+# the historical 0.2754 / 0.3505. Stride 2 (@+128 = 17.1 s, delta 0.1383 against the old 0.1502) is the
+# closest analogue to those, at half the epoch cost of stride 1.
+#
+# ONE EPOCH: 102,448 windows at stride 1 (~4 h), 51k at stride 2 (~2 h).
+
 defaults:
   - torus
   - _self_
