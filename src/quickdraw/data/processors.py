@@ -377,7 +377,113 @@ def robocasa(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]
     return name, episodes, fps, (cams if multi else cams[0]), None   # no extra splits (seed-0 train/val)
 
 
-PROCESSORS = {"starling": starling, "robocasa": robocasa}
+def _bag_one(job: dict):
+    """One rosbag run -> Episode. Module-level so ProcessPoolExecutor can pickle it."""
+    from .rosbag import read_run
+    st, ac, fr = read_run(job["dir"], target_hz=job["hz"], out_hw=tuple(job["hw"]))
+    return job["campaign"], job["dir"], Episode(states=st, actions=ac, frames=fr, task=job["campaign"])
+
+
+def starling_bags(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None]:
+    """RAW rosbag2 flight recordings -> canonical Episodes, campaign labels intact. NO ROS, NO seamstress.
+
+    This replaces a two-stage path that went through another repo: raw bags -> (seamstress) processed
+    dump -> (here) lerobot. That indirection is why the published starling-2 dataset lost the one thing
+    it most needed -- WHICH CAMPAIGN each episode came from -- and why its `eval` split's provenance took
+    a day to reconstruct and still came out ambiguous. Reading the bags here makes the whole path from
+    flight to dataset auditable in one repo. See data/rosbag.py for the bag format and the topic rates.
+
+    LAYOUT EXPECTED: <dir>/<campaign>/<run_*>/{metadata.yaml,*_0.db3}. One Episode per run, in sorted
+    order, with `Episode.task` set to the campaign directory name -- so the condition survives into
+    <split>/meta/tasks.parquet and a consumer can slice by it (see Episode.task).
+
+    SPLIT POLICY, and it is deliberately name-driven rather than positional:
+      * a campaign matching `eval_globs` (default: anything with "ood" or "memory" in its name) becomes
+        its OWN eval split, named `eval_<campaign suffix>` -- so `campaign21-ood-noodle` lands in
+        `eval_ood_noodle`. Separate splits rather than one pooled `eval` because the loader reads
+        <root>/<split>/ directly, so each is usable today with no new code, mirroring the torus
+        `eval_ood_*` convention; the per-episode task labels then allow finer slicing inside one.
+      * a campaign matching `exclude_globs` (default: "*nothing*") is dropped entirely.
+      * everything else forms the train/val pool, split deterministically by build_recorded_dataset.
+
+    TARGET_HZ defaults to data/rosbag.py's 15.0, BELOW the ~17 Hz camera, so every step is a distinct
+    frame. The published dataset used 30 Hz, which duplicated 44% of consecutive frames (measured) --
+    a world model trained on that is asked to predict "no change" on nearly half its steps.
+
+    Args: +source.dir=<tree of campaign dirs> +source.name=<name>
+          [+source.target_hz=15] [+source.hw=[112,192]] [+source.workers=16]
+          [+source.eval_globs=[*ood*,*memory*]] [+source.exclude_globs=[*nothing*]]
+          [+source.max_runs_per_campaign=N]   <- smoke-test escape hatch
+    """
+    import fnmatch
+    from concurrent.futures import ProcessPoolExecutor
+    from .rosbag import TARGET_HZ_DEFAULT
+
+    sc = cfg.get("source", None)
+    if sc is None or not sc.get("dir"):
+        raise ValueError("pass +source.dir=<tree containing campaign*/run_*/ bag dirs> (+source.name=...)")
+    root = os.path.expanduser(str(sc.dir))
+    name = str(sc.get("name", "starling"))
+    hz = float(sc.get("target_hz", TARGET_HZ_DEFAULT))
+    hw = tuple(int(x) for x in (sc.get("hw", None) or (112, 192)))
+    workers = int(sc.get("workers", 16))
+    max_per = int(sc.get("max_runs_per_campaign", 0) or 0)
+    eval_globs = [str(g) for g in (sc.get("eval_globs", None) or ["*ood*", "*memory*"])]
+    excl_globs = [str(g) for g in (sc.get("exclude_globs", None) or ["*nothing*"])]
+
+    camps = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
+    if not camps:
+        raise ValueError(f"{root} has no campaign subdirectories")
+    jobs, plan = [], {}
+    for c in camps:
+        if any(fnmatch.fnmatch(c, g) for g in excl_globs):
+            plan[c] = "EXCLUDED"
+            continue
+        runs = sorted(d for d in os.listdir(os.path.join(root, c))
+                      if os.path.isdir(os.path.join(root, c, d)))
+        if max_per:
+            runs = runs[:max_per]
+        if not runs:
+            plan[c] = "EXCLUDED (no runs)"
+            continue
+        plan[c] = f"eval_{_split_suffix(c)}" if any(fnmatch.fnmatch(c, g) for g in eval_globs) else "train/val"
+        for rd in runs:
+            jobs.append({"campaign": c, "dir": os.path.join(root, c, rd), "hz": hz, "hw": hw})
+
+    print(f"[starling_bags] {root}: {len(jobs)} runs across {len(camps)} campaigns "
+          f"@ {hz} Hz, {hw[0]}x{hw[1]}", flush=True)
+    for c in camps:
+        print(f"[starling_bags]   {c:32s} -> {plan[c]}", flush=True)
+
+    by_camp: dict[str, list[Episode]] = {}
+    t0 = time.time()
+    with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as ex:
+        for k, (camp, bdir, ep) in enumerate(ex.map(_bag_one, jobs), 1):
+            by_camp.setdefault(camp, []).append(ep)
+            print(f"[starling_bags] {k}/{len(jobs)} {camp}/{os.path.basename(bdir)} "
+                  f"-> {len(ep.states)} steps  ({time.time() - t0:.0f}s)", flush=True)
+
+    main_pool, extra = [], {}
+    for c in camps:
+        eps = by_camp.get(c)
+        if not eps:
+            continue
+        if plan[c] == "train/val":
+            main_pool += eps
+        else:
+            extra[plan[c]] = eps
+    if not main_pool:
+        raise ValueError(f"no train/val campaigns matched in {root} (eval_globs={eval_globs})")
+    return name, main_pool, int(round(hz)), "ego", (extra or None)
+
+
+def _split_suffix(campaign: str) -> str:
+    """`campaign21-ood-noodle` -> `ood_noodle`: drop the campaignNN prefix, dashes to underscores."""
+    tail = campaign.split("-", 1)[1] if "-" in campaign else campaign
+    return tail.replace("-", "_")
+
+
+PROCESSORS = {"starling": starling, "robocasa": robocasa, "starling_bags": starling_bags}
 
 
 @hydra.main(config_path="../../../conf", config_name="config", version_base=None)
