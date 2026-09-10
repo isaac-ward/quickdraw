@@ -1,6 +1,6 @@
-"""One Swoosh right-arm recording -> (states, actions, frames) on a single uniform grid.
+"""One block-stack recording -> (states, actions, frames) on a single uniform grid.
 
-Written for the `longhand` corpus: an xArm7 right arm mounted 45 deg clockwise from vertical,
+Reader for the `isaac-ronald-ward/block-stack` corpus: an xArm7 right arm mounted 45 deg clockwise from vertical,
 teleoperated with an Xbox pad, four USB cameras (two scene, two on the gripper). The collection
 side lives in the `xarm7-data-collection` repo; this file only READS what it wrote.
 

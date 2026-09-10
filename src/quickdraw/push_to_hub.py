@@ -17,6 +17,9 @@ import hydra
 from huggingface_hub import HfApi
 
 
+_ROOT_HINT = [None]   # set by _make_card so _generic_card can look for PROCESSING.md
+
+
 def _generic_card(name: str, s: dict) -> str:
     """Card for a run whose summary.json has NO torus geometry fields (e.g. a data.processors run):
     obs/action dims (from the norm stats), splits, fps — no manifold-specific prose."""
@@ -25,12 +28,26 @@ def _generic_card(name: str, s: dict) -> str:
     norm = s.get("normalization_stats", {})
     obs_dim = len(norm.get("observation_vector", {}).get("mean", [])) or "?"
     act_dim = len(norm.get("action", {}).get("mean", [])) or "?"
-    fps, cam = s.get("fps", "?"), s.get("camera", "cam")
+    fps = s.get("fps", "?")
+    # `camera` is a STR for one camera and a LIST for several. Interpolating the list raw rendered
+    # `observation.images.['scene_left', 'scene_right', ...]` into the published card.
+    cams = s.get("cameras") or s.get("camera") or "cam"
+    cams = [cams] if isinstance(cams, str) else list(cams)
     hw = s.get("image_hw")
     hw_txt = f"{hw[0]}×{hw[1]}×3, video" if hw else "video"
+    cam_lines = "\n".join(
+        f"- **observation.images.{c}** ({hw_txt}): recorded camera stream, stored as MP4, aligned\n"
+        f"  1:1 with the vector frames" for c in cams)
     cfgs = "\n".join(f"  - config_name: {sp}\n    data_files: {sp}/data/**/*.parquet" for sp in splits)
     rows = "\n".join(f"| `{sp}` | {counts[sp]['episodes']} | {counts[sp]['steps_per_episode']} | "
                      f"{counts[sp]['transitions']} |" for sp in splits)
+    # A hand-written PROCESSING.md in the run folder is the authoritative account of how the raw
+    # recordings became this dataset; the generated card should point at it rather than compete.
+    extra = ("\n## How this dataset was produced\n\nSee **[PROCESSING.md](PROCESSING.md)** for the "
+             "full account: source streams and rates, exactly which fields were kept and dropped "
+             "and why, the resampling and synchronisation procedure, the train/val split rule, and "
+             "the verification that images align with state rows.\n"
+             if os.path.exists(os.path.join(_ROOT_HINT[0] or "", "PROCESSING.md")) else "")
     return f"""---
 license: mit
 pretty_name: {name}
@@ -48,8 +65,7 @@ Generated with [quickdraw](https://github.com/isaac-ward/quickdraw) (`data.proce
 
 ## Observation / action
 - **observation_vector** ({obs_dim}): the recorded state
-- **observation.images.{cam}** ({hw_txt}): the recorded camera stream, stored as MP4, aligned 1:1
-  with the vector frames — the image modality for vision models
+{cam_lines}
 - **action** ({act_dim}): the recorded actions, at {fps} Hz
 
 ## Splits
@@ -58,13 +74,14 @@ Generated with [quickdraw](https://github.com/isaac-ward/quickdraw) (`data.proce
 {rows}
 
 Normalization statistics are computed on **train only** and applied to every split.
-"""
+{extra}"""
 
 
 def _make_card(root: str, name: str) -> str:
     """Build a dataset card (README.md) from the run's own summary.json: YAML frontmatter with a HF
     viewer `configs` block (so each split's parquet is browsable) + a human-readable description.
     Torus-generated runs get the full torus card; runs without torus fields get a generic card."""
+    _ROOT_HINT[0] = root
     s = json.load(open(os.path.join(root, "summary.json")))
     counts, split_env, coloring = s["counts"], s["split_env"], s["coloring"]
     splits = list(counts)

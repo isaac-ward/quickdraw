@@ -14,8 +14,8 @@ GROUP — it carries obs_dim/action_dim/dt; override those for non-starling dims
         +source.repo=madang6/quickdraw-robocasa-scene4-4h +source.name=robocasa +source.max_episodes=2
         # all three cameras into one dataset:  +source.camera=all
 
-    python -m quickdraw.data.processors +processor=longhand \\
-        +source.dir=scratch/longhand +source.name=longhand      # Swoosh right-arm teleop
+    python -m quickdraw.data.processors +processor=block_stack \\
+        +source.dir=scratch/longhand +source.name=block_stack   # Swoosh right-arm teleop
         # smoke: +source.max_runs_per_campaign=2 '+source.cameras=[scene_left]' '+source.hw=[96,128]'
 
 Frames per `Episode` may be per-frame image PATHS (lazy; starling's jpgs), an in-memory (T,H,W,3)
@@ -126,7 +126,7 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     encode but still saturate the pool. A single str + array behaves exactly as before.
 
     `val_ids` = indices into `episodes` that go to val, REPLACING the random draw. A processor
-    passes this when the split has to mean something -- `longhand` puts the LONGEST trajectories in
+    passes this when the split has to mean something -- `block_stack` puts the LONGEST trajectories in
     val, because the evaluable open-loop rollout horizon is capped by the SHORTEST val episode, and
     on lego a random split cost 5x the horizon. None -> the historic random VAL_FRAC draw.
 
@@ -518,14 +518,14 @@ def _longest_first_val(lengths: list[int], frac: float, min_eps: int = 2) -> set
 
     WHY "CLOSEST" AND NOT "UNTIL WE CROSS". Accumulating until the target is exceeded always
     overshoots, and overshoots badly when the longest episodes are much longer than the rest --
-    on longhand it turned a 10% request into 16.8%. Choosing the nearest prefix instead can land
+    on block-stack it turned a 10% request into 16.8%. Choosing the nearest prefix instead can land
     either side of the target, which is the honest reading of "about 10%".
 
     WHY A FLOOR OF TWO. A one-episode val set has no across-session variance at all: one
     recording's lighting, object layout and operator mood become the entire validation signal.
     Two is the minimum that can disagree with itself.
 
-    Val will be dominated by whichever campaign recorded long -- for `longhand` that is
+    Val will be dominated by whichever campaign recorded long -- for block-stack that is
     campaign5-play-long, and the operator has accepted that. It means val measures long-horizon
     fidelity rather than being a representative i.i.d. sample; read val loss accordingly.
     """
@@ -545,9 +545,9 @@ def _longest_first_val(lengths: list[int], frac: float, min_eps: int = 2) -> set
     return {order[i] for i in range(best)}
 
 
-def _swoosh_one(job: dict):
-    """One Swoosh run directory -> Episode. Module-level so ProcessPoolExecutor can pickle it."""
-    from .swoosh import read_run
+def _block_stack_one(job: dict):
+    """One block-stack run directory -> Episode. Module-level so ProcessPoolExecutor can pickle it."""
+    from .block_stack import read_run
     st, ac, fr, info = read_run(job["dir"], target_hz=job["hz"], out_hw=tuple(job["hw"]),
                                 cameras=tuple(job["cams"]))
     if len(job["cams"]) == 1:
@@ -556,14 +556,14 @@ def _swoosh_one(job: dict):
                                                 task=job["campaign"]), info
 
 
-def longhand(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None, set[int]]:
-    """Swoosh right-arm teleop recordings -> canonical Episodes. See data/swoosh.py for the format.
+def block_stack(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None, set[int]]:
+    """Swoosh right-arm block-stacking teleop -> canonical Episodes. See data/block_stack.py.
 
     LAYOUT EXPECTED: <dir>/<campaign>/recording_YYYY_MM_DD_HH_MM_SS/{run.json,raw/,video/}.
     One Episode per run, `Episode.task` = the campaign directory name so the condition survives
     into <split>/meta/tasks.parquet.
 
-    SPLIT POLICY for the `longhand` corpus, as specified by the operator:
+    SPLIT POLICY for the block-stack corpus, as specified by the operator:
       * campaigns 1-2, and the non-data folders, are EXCLUDED -- 1-2 are bring-up, `shakedown` and
         `audit` are hardware checks, and `_rt*` are stray test artefacts from the collection repo's
         roundtrip test writing into `campaigns/` and being swept into the Drive sync.
@@ -575,7 +575,7 @@ def longhand(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]
     those are consequences of the action plus the integrator's state, and conditioning on them
     would hand the model the answer. Both remain in the raw run directories.
 
-    Args: +source.dir=<tree of campaign dirs> [+source.name=longhand]
+    Args: +source.dir=<tree of campaign dirs> [+source.name=block_stack]
           [+source.target_hz=30] [+source.hw=[144,192]] [+source.workers=4]
           [+source.cameras=[scene_left,scene_right,gripper_right_bottom,gripper_right_top]]
           [+source.val_frac=0.1]
@@ -590,14 +590,14 @@ def longhand(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]
     """
     import fnmatch
     from concurrent.futures import ProcessPoolExecutor
-    from .swoosh import ALL_CAMERAS, OUT_HW_DEFAULT, TARGET_HZ_DEFAULT, run_seconds
+    from .block_stack import ALL_CAMERAS, OUT_HW_DEFAULT, TARGET_HZ_DEFAULT, run_seconds
 
     sc = cfg.get("source", None)
     if sc is None or not sc.get("dir"):
         raise ValueError("pass +source.dir=<tree containing campaign*/recording_*/ dirs> "
-                         "(+source.name=longhand)")
+                         "(+source.name=block_stack)")
     root = os.path.expanduser(str(sc.dir))
-    name = str(sc.get("name", "longhand"))
+    name = str(sc.get("name", "block_stack"))
     hz = float(sc.get("target_hz", TARGET_HZ_DEFAULT))
     hw = tuple(int(x) for x in (sc.get("hw", None) or OUT_HW_DEFAULT))
     workers = int(sc.get("workers", 4))
@@ -631,28 +631,28 @@ def longhand(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]
             jobs.append({"campaign": c, "dir": os.path.join(root, c, rd), "hz": hz, "hw": hw,
                          "cams": cams})
 
-    print(f"[longhand] {root}: {len(jobs)} runs across {len(camps)} campaigns @ {hz} Hz, "
+    print(f"[block_stack] {root}: {len(jobs)} runs across {len(camps)} campaigns @ {hz} Hz, "
           f"{hw[0]}x{hw[1]}, cameras {cams}", flush=True)
     for c in camps:
-        print(f"[longhand]   {c:26s} -> {plan[c]}", flush=True)
+        print(f"[block_stack]   {c:26s} -> {plan[c]}", flush=True)
     if not jobs:
         raise ValueError(f"no runs survived the exclude globs in {root}")
 
     by_camp: dict[str, list[Episode]] = {}
     worst_sync, t0 = 0.0, time.time()
     with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as ex:
-        for k, (camp, rdir, ep, info) in enumerate(ex.map(_swoosh_one, jobs), 1):
+        for k, (camp, rdir, ep, info) in enumerate(ex.map(_block_stack_one, jobs), 1):
             by_camp.setdefault(camp, []).append(ep)
             se = info["sync_error_s"]
             w = max(v["max"] for v in se.values())
             over = max(v["over"] for v in se.values())
             worst_sync = max(worst_sync, w)
-            print(f"[longhand] {k}/{len(jobs)} {camp}/{info['run']} -> {info['steps']} steps "
+            print(f"[block_stack] {k}/{len(jobs)} {camp}/{info['run']} -> {info['steps']} steps "
                   f"({info['seconds']:.0f}s)  sync max {w * 1000:.0f}ms, {100 * over:.2f}% past bound"
                   f"{'' if info['validation_all_green'] else '  [!] run.json checks NOT all green'}"
                   f"  ({time.time() - t0:.0f}s)", flush=True)
     # 16.7 ms is the half-grid bound at 30 Hz -- the best a nearest-neighbour resample can do.
-    print(f"[longhand] worst single-step nearest-neighbour displacement across all runs: "
+    print(f"[block_stack] worst single-step nearest-neighbour displacement across all runs: "
           f"{worst_sync * 1000:.1f} ms (a stream hiccup shows up here; the per-run "
           f"'past bound' percentage is what indicates a systematic problem)", flush=True)
 
@@ -673,11 +673,11 @@ def longhand(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]
     lens = [len(e.states) for e in main_pool]
     val_ids = _longest_first_val(lens, val_frac)
     v = sorted((lens[i], main_pool[i].task) for i in val_ids)[::-1]
-    print(f"[longhand] val = {len(val_ids)}/{len(main_pool)} episodes, "
+    print(f"[block_stack] val = {len(val_ids)}/{len(main_pool)} episodes, "
           f"{sum(lens[i] for i in val_ids)}/{sum(lens)} frames "
           f"({100 * sum(lens[i] for i in val_ids) / sum(lens):.1f}%), longest first:", flush=True)
     for n, task in v:
-        print(f"[longhand]   {n:6d} steps  {task}", flush=True)
+        print(f"[block_stack]   {n:6d} steps  {task}", flush=True)
 
     return name, main_pool, int(round(hz)), (cams if len(cams) > 1 else cams[0]), (extra or None), val_ids
 
@@ -689,7 +689,7 @@ def _split_suffix(campaign: str) -> str:
 
 
 PROCESSORS = {"starling": starling, "robocasa": robocasa, "starling_bags": starling_bags,
-              "longhand": longhand}
+              "block_stack": block_stack}
 
 
 @hydra.main(config_path="../../../conf", config_name="config", version_base=None)

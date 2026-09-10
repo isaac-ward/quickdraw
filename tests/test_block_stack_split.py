@@ -1,4 +1,4 @@
-"""The longhand train/val split must put the LONG trajectories in val and hit ~90/10 by frames.
+"""The block-stack train/val split must put the LONG trajectories in val and hit ~90/10 by frames.
 
 This is the rule a random seed-0 draw cannot express, and getting it wrong is not loud: the
 dataset builds fine, trains fine, and only the open-loop rollout horizon quietly collapses to

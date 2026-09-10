@@ -1,10 +1,10 @@
-"""A built longhand dataset must agree with the source runs it was built from.
+"""A built block-stack dataset must agree with the source runs it was built from.
 
-Run against a dataset produced by `+processor=longhand`:
+Run against a dataset produced by `+processor=block_stack`:
 
-    QD_LONGHAND_ROOT=logs/recording_..._longhand \\
-    QD_LONGHAND_SRC=scratch/longhand \\
-    .venv/bin/python tests/test_longhand_roundtrip.py
+    QD_BLOCKSTACK_ROOT=logs/recording_..._longhand \\
+    QD_BLOCKSTACK_SRC=scratch/longhand \\
+    .venv/bin/python tests/test_block_stack_roundtrip.py
 
 WHY THE SHIFT SWEEP IS THE POINT. Comparing built frames to source frames and getting a small
 number proves nothing on its own -- a re-encoded video is a few grey levels off everywhere, and
@@ -24,19 +24,19 @@ import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from quickdraw.data.swoosh import read_run          # noqa: E402
+from quickdraw.data.block_stack import read_run          # noqa: E402
 
-DS = os.environ.get("QD_LONGHAND_ROOT", "")
-SRC_ROOT = os.environ.get("QD_LONGHAND_SRC", "scratch/longhand")
+DS = os.environ.get("QD_BLOCKSTACK_ROOT", "")
+SRC_ROOT = os.environ.get("QD_BLOCKSTACK_SRC", "scratch/longhand")
 # val episode 0 = the longest run in the pool, which is what the longest-first split guarantees.
-SRC_RUN = os.environ.get("QD_LONGHAND_RUN",
+SRC_RUN = os.environ.get("QD_BLOCKSTACK_RUN",
                          "campaign5-play-long/recording_2026_09_10_06_43_58")
 SPLIT, EP = "val", 0
 
 
 def _skip_if_unbuilt():
     if not DS or not os.path.isdir(DS):
-        print(f"    SKIP: set QD_LONGHAND_ROOT to a built dataset (got {DS!r})")
+        print(f"    SKIP: set QD_BLOCKSTACK_ROOT to a built dataset (got {DS!r})")
         return True
     return False
 
