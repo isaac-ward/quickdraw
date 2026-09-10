@@ -38,6 +38,19 @@ def _recorded_dt(cfg, fallback: float) -> float:
     return fallback
 
 
+def step_fps(cfg, ecfg) -> float:
+    """The TRUE sample rate of anything the model rolls out, in Hz -- use this for every video of a
+    prediction, never `1/ecfg.dt`.
+
+    `ecfg.dt` is the dataset's FRAME period (`_recorded_dt` reads it from summary.json), because that
+    is what velocity and physics quantities scale with. But ONE autoregressive step spans
+    `data.subsample` frames, so a rollout's frames are `subsample/dt` apart, and encoding them at
+    `1/dt` plays the video back `subsample`x too fast with nothing on screen to give it away.
+    Derived from subsample rather than configured, for the same reason `dt_eff` is (see below): a
+    hand-set rate silently goes stale the moment the stride changes."""
+    return (1.0 / float(ecfg.dt)) / max(1, int(cfg.data.get("subsample", 1) or 1))
+
+
 def env_cfg(cfg):
     """cfg.environments -> the env's config dataclass (torus: TorusConfig, unchanged; recorded: RecordedConfig)."""
     e = cfg.environments

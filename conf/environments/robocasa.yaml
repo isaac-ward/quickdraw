@@ -33,3 +33,8 @@ out_w: 96          #   (environments/examples/robocasa.py note 4).
 
 floor_extent: [-1.0, 5.0, -5.0, 1.0]   # (x0,x1,y0,y1) plan-view bounds for render_diagnostics, in metres;
 #                                        covers the base positions seen in the dataset (x 0.77..4.54, y -3.85..-0.76)
+preview_fps: 30   # mp4 PLAYBACK rate for human-viewing products (eval rollouts, summary videos), in Hz.
+#                   Frames are REPEATED to reach it, never blended, so duration is exact and no pixel the
+#                   model never produced appears (viz.pace). It does NOT touch dataset videos, which are
+#                   data. Set null to encode at the frames' own rate -- which for a strided run is the
+#                   MODEL STEP rate (e.g. 15 Hz data at subsample=4 -> 3.75 Hz, a 34 s clip), not 1/dt.

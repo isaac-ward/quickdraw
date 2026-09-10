@@ -17,7 +17,7 @@ import numpy as np
 from ..controller.run import _plog, run_and_log_control
 from ..environments.registry import make_env
 from ..logging import viz
-from ..training.setup import eval_episodes, image_head_cams, image_head_sizes, resolve_data_root
+from ..training.setup import eval_episodes, image_head_cams, image_head_sizes, resolve_data_root, step_fps
 import torch
 
 from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_curves, proprio_curves
@@ -151,7 +151,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    P, fps = cfg.data.P, round(1.0 / ecfg.dt)
+    P, fps = cfg.data.P, step_fps(cfg, ecfg)
     dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None                  # chunk image decode over horizon (PR #8 bug 2)
 
     def prog(pct, what):
@@ -326,7 +326,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    P, fps = cfg.data.P, round(1.0 / ecfg.dt)
+    P, fps = cfg.data.P, step_fps(cfg, ecfg)
     dev = device if isinstance(device, str) else device.type
 
     def prog(pct, what):
@@ -411,7 +411,7 @@ def _ood_axis(cfg, model, norm, ecfg, writer, device, step, split):
     #                            a .get default is eval'd eagerly, so ecfg.R/.r must not be bare (crashes on non-torus envs)
     s = _openloop_split(cfg, model, norm, writer, device, split, se["R"], se["r"],
                         se.get("init_speed", getattr(ecfg, "init_speed", None)), split, step,
-                        coloring.get(split, "rainbow"), fps=round(1.0 / ecfg.dt))
+                        coloring.get(split, "rainbow"), fps=step_fps(cfg, ecfg))
     return {split: s}
 
 
@@ -865,7 +865,7 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    P, H, fps = cfg.data.P, int(ic["clip_len"]), round(1.0 / ecfg.dt)
+    P, H, fps = cfg.data.P, int(ic["clip_len"]), step_fps(cfg, ecfg)
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
@@ -1169,7 +1169,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     writer.scalar("eval_action_distribution/w1_mean", w1_mean, step)
     prog(70, f"distance (w1={w1:.3f}, w1_mean={w1_mean:.3f})")
 
-    fps = round(1.0 / ecfg.dt)
+    fps = step_fps(cfg, ecfg)
     # POOLED over all episodes per frame (recorded green vs head red), ALL timesteps (no frame cap), +/-win pooled.
     frames = viz.anim_action_distribution(true_a, pred_a, a_max, window=win)
     writer.video("eval_action_distribution/animation_pooled", frames, fps, step)

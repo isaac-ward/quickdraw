@@ -124,9 +124,10 @@ class WandbBackend(_Backend):
 class RunWriter:
     """Fan-out over backends. This is the single place that knows there is more than one sink."""
 
-    def __init__(self, run_dir: str, backends: list[_Backend]):
+    def __init__(self, run_dir: str, backends: list[_Backend], playback_fps: float | None = None):
         self.dir = run_dir  # local mirror dir, so callers can drop summary.json next to the media
         self.backends = backends
+        self.playback_fps = playback_fps  # container rate for video (viz.pace); None -> the true rate
 
     def scalar(self, tag, value, step):
         for b in self.backends:
@@ -141,6 +142,10 @@ class RunWriter:
             b.figure(tag, fig, step)
 
     def video(self, tag, frames, fps, step):
+        # Retime ONCE here, not per backend, so the local mirror and the wandb run are identical
+        # (this module's no-divergence rule). `fps` from callers is the frames' TRUE sample rate --
+        # for a rollout that is the model's STEP rate, not the dataset's capture rate.
+        frames, fps = viz.pace(frames, fps, self.playback_fps)
         for b in self.backends:
             b.video(tag, frames, fps, step)
 
@@ -178,4 +183,8 @@ def make_writer(run_dir: str, cfg, job_type: str) -> RunWriter:
         backends.append(WandbBackend(run))
     except Exception as e:  # offline / missing key -> local-only, don't crash the run
         print(f"[writer] wandb disabled ({type(e).__name__}: {e}); logging locally only")
-    return RunWriter(local.dir, backends)  # .dir = the local clone folder (<run_dir>/logs)
+    # Playback rate is a property of the ENVIRONMENT (it knows what its frames mean), so it is read
+    # from environments.preview_fps; absent -> viz.PREVIEW_FPS, explicit null -> the true rate.
+    env = cfg.get("environments", None)
+    pf = env.get("preview_fps", viz.PREVIEW_FPS) if env is not None else viz.PREVIEW_FPS
+    return RunWriter(local.dir, backends, playback_fps=pf)  # .dir = the local clone (<run_dir>/logs)

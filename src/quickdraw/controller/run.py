@@ -19,6 +19,7 @@ import numpy as np
 from ..environments.base import SceneOverlay, wants_diagnostics
 from ..environments.registry import make_env
 from ..logging import viz
+from ..training.setup import step_fps
 from .mppi import MPPIConfig, run_control
 
 
@@ -133,7 +134,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     _plog(writer, f"[eval_control @ep{step}] MPPI done: {res['n_chunks']} replans over {res['n_steps']} steps "
                   f"-> {mppi_chunk_s * 1000:.0f} ms/chunk ({mppi_chunk_hz:.1f} hz)")
     R, r = getattr(ecfg, "R", None), getattr(ecfg, "r", None)   # torus geometry; None for a generic env
-    fps = round(1.0 / ecfg.dt)
+    fps = step_fps(cfg, ecfg)
     from ..evaluation.products import log_image_head, product_tag
 
     # controllers present: 'pred' (learned) always; 'true' (oracle) only in the goal race (oracle on).
@@ -403,7 +404,7 @@ def _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, devic
     mppi_chunk_hz = 1.0 / mppi_chunk_s if mppi_chunk_s > 0 else 0.0
     _plog(writer, f"[eval_control @ep{step}] MPPI done: {res['n_chunks']} replans over {res['n_steps']} steps "
                   f"-> {mppi_chunk_s * 1000:.0f} ms/chunk ({mppi_chunk_hz:.1f} hz)")
-    fps = round(1.0 / ecfg.dt)
+    fps = step_fps(cfg, ecfg)
     kinds = [k for k in ("true", "pred") if k in res]
     labels = {"true": "oracle", "pred": "learned"}
     NP = res["n_plot"]

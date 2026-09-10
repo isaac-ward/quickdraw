@@ -78,6 +78,8 @@ def _encode_ep(job: dict):
         seq = [f[..., :3] for f in frames]
     else:
         seq = [imageio.imread(p)[..., :3] for p in frames]
+    # NO playback_fps: these clips ARE the dataset (data/generate.py reads them back frame-for-frame,
+    # and data/dataset.py trains off them), so they stay at the true capture rate. See viz.pace.
     viz.save_mp4(job["out"], seq, job["fps"])
     return job["out"]
 

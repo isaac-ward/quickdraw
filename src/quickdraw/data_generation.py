@@ -39,6 +39,9 @@ def _render_fpv(job: dict):
     viz.fpv_frames call; a generic env, e.g. gym:*, supplies its own frames with no torus params)."""
     env = make_env(job["env_name"], job["scfg"], batch=1)
     frames = env.render_obs(torch.as_tensor(job["obs"])).cpu().numpy()
+    # NO playback_fps here: this clip is INGESTED into the lerobot dataset (write_lerobot_split reads it
+    # back frame-for-frame), so it is DATA at the capture rate. Retiming it would inject duplicate frames
+    # into training. Only human-viewing products (summary videos, eval rollouts) get paced.
     viz.save_mp4(job["out"], frames, job["fps"])
     return job["out"]
 
@@ -73,7 +76,8 @@ def _render_summary(job: dict):
     slog("video...")
     frames = viz.animate_frames(scfg.R, scfg.r, job["coloring"], trajs, title=title,
                                 smooth_window=job["smooth"], log=slog)
-    viz.save_mp4(os.path.join(job["sv"], f"{job['name']}.mp4"), frames, job["fps"])
+    viz.save_mp4(os.path.join(job["sv"], f"{job['name']}.mp4"), frames, job["fps"],
+                 playback_fps=job.get("playback_fps"))   # eyeball product, not ingested -> pace it
     slog("done")
     return job["name"]
 
@@ -89,7 +93,8 @@ def main(cfg):
             f.write(msg + "\n")
 
     ecfg = env_cfg(cfg)
-    fps, size = round(1.0 / ecfg.dt), viz.FPV_SIZE
+    fps, size = round(1.0 / ecfg.dt), viz.FPV_SIZE   # generation renders at the CAPTURE rate (no subsample)
+    playback_fps = cfg.environments.get("preview_fps", viz.PREVIEW_FPS)
     fov, grid, n_plot = float(cfg.data.fpv_fov), int(cfg.data.composite_grid), int(cfg.data.n_plot_trajectories)
     n_cells = grid * grid
     media = os.path.join(run_dir, "media")
@@ -143,7 +148,8 @@ def main(cfg):
             summary_jobs.append({"name": name, "scfg": {"R": scfg.R, "r": scfg.r, "dt": scfg.dt,
                                  "gamma": scfg.gamma, "a_max": scfg.a_max, "init_speed": scfg.init_speed},
                                  "coloring": coloring, "fps": fps, "pos": pos, "avec": avec, "sp": sp, "sv": sv,
-                                 "smooth": int(cfg.data.action_smooth_window), "log_path": log_path})
+                                 "smooth": int(cfg.data.action_smooth_window), "log_path": log_path,
+                                 "playback_fps": playback_fps})
         log(f"[summary] rendering {len(summary_jobs)} split summary plots+videos FIRST (check media/summary_*)...")
         with ProcessPoolExecutor(max_workers=min(len(summary_jobs), workers)) as ex:
             for k, done in enumerate(ex.map(_render_summary, summary_jobs), 1):

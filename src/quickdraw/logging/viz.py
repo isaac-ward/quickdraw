@@ -27,6 +27,11 @@ EVAL_VIEW_PAD = _PAD  # eval plots use the same tight ~±1.3 framing as summarie
 N_SEG = 16          # discrete hue bands around the ring
 FPV_FOV = 103.5     # egocentric camera FOV (deg); VTK default is 30
 FPV_SIZE = 256      # egocentric video resolution (px, square)
+PREVIEW_FPS = 30    # DEFAULT container playback rate for every mp4 (Hz), overridable per environment via
+#                     `environments.preview_fps` (null -> encode at the frames' own rate). This is a
+#                     PRESENTATION rate only: `pace` repeats frames to reach it and never blends, so
+#                     wall-clock duration is preserved exactly. 30 because a container rate below ~24
+#                     stutters in browsers and in wandb regardless of how many unique frames it carries.
 SURFACE_EPS = 0.02  # absolute outward lift for trajectory lines/arrows (no z-fighting, any R,r)
 ACTION_SMOOTH_WINDOW = 18  # default boxcar window for action-arrow smoothing (config can override)
 TORUS_OPACITY = 0.6  # legacy default still passed by some callers; _build overrides it with the constants below
@@ -499,12 +504,45 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
 
 
 # ------------------------- public: videos -------------------------
-def save_mp4(path, frames, fps, quality=9):
+def pace(frames, fps: float, playback_fps: float | None = None):
+    """Retime `frames` from their TRUE sample rate `fps` (Hz) to a container rate a person can watch,
+    by REPEATING frames (nearest-neighbour in time). Returns `(frames, out_fps)`.
+
+    Three different rates get conflated in world-model code, and keeping them apart is this
+    function's whole job:
+      * the dataset's CAPTURE rate      (1/dt, read from the dataset's summary.json)
+      * the model's STEP rate           (capture / data.subsample -- what rollout frames ACTUALLY are;
+                                         see training.setup.step_fps)
+      * the PLAYBACK rate               (how fast a human should watch it -- `PREVIEW_FPS`)
+    Encoding a strided rollout at the capture rate plays it back `subsample`x too fast, and does so
+    silently -- there is no artifact to notice, the video is simply wrong about time.
+
+    REPETITION, NOT INTERPOLATION, is deliberate. A rollout video is EVIDENCE about prediction
+    accuracy, so a blended intermediate frame would be pixels the model never produced. The
+    consequence, stated plainly: this fixes rate lies and low-container-fps stutter, and does NOT add
+    unique frames. A 3.75 Hz rollout still looks stepped at 30 fps playback, because 3.75 unique
+    frames per second is what that arm predicts; the only real cure for that is a smaller frame stride.
+    Duration is exact for non-integer ratios (128 steps at 3.75 Hz = 34.13 s at any playback rate).
+    """
+    fps = float(fps)
+    if not playback_fps or float(playback_fps) <= fps:
+        return frames, fps
+    n = len(frames)
+    out_n = max(1, int(round(n * float(playback_fps) / fps)))
+    idx = np.minimum((np.arange(out_n) * (fps / float(playback_fps))).astype(int), n - 1)
+    return [frames[i] for i in idx], float(playback_fps)
+
+
+def save_mp4(path, frames, fps, quality=9, playback_fps=None):
+    """`fps` is the TRUE sample rate of `frames`; `playback_fps` is the container rate to encode at
+    (see `pace`). playback_fps=None -> encode at the true rate, fractional rates included."""
     import imageio.v2 as imageio
 
+    frames, fps = pace(frames, fps, playback_fps)
     # macro_block_size=2: pad odd dims up to even (libx264 requires divisible-by-2), no 16-px padding.
     # quality (0-10, higher = sharper/larger): default high so summary videos aren't mushy.
-    imageio.mimwrite(path, list(frames), fps=max(1, int(round(fps))), macro_block_size=2, quality=quality)
+    # fps stays FLOAT: rounding it silently retimed strided rollouts (3.75 -> 4 is 6.7% too fast).
+    imageio.mimwrite(path, list(frames), fps=max(1e-3, fps), macro_block_size=2, quality=quality)
 
 
 def stitch_grid_video(paths, out_path, grid, fps):
