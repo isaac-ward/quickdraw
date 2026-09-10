@@ -165,7 +165,48 @@ hiccups (2 and 1 respectively, `dt > 3× median`), not a systematic rate problem
 What would be alarming and is not present: `over` near 100%, or `max` several times the
 stream's own period.
 
-## 6. Still open
+## 6. The built dataset
+
+`logs/recording_2026_09_10_10_04_45_longhand` — 4.4 GB of splits + 2.8 GB of preview media.
+Build took 44 min (56 runs read on 6 workers, 224 clips encoded, 4 lerobot splits written).
+
+| split | episodes | frames | hours | windows (P=8,F=64) | shortest ep |
+|---|---|---|---|---|---|
+| train | 43 | 172,835 | 1.600 | 169,782 | 621 |
+| val | 2 | 34,799 | 0.322 | 34,657 | **16,606** |
+| eval_purple_play | 5 | 9,048 | 0.084 | 8,693 | – |
+| eval_purple_stack | 6 | 5,323 | 0.049 | 4,897 | – |
+
+Train's LONGEST episode is 15,996 steps and val's SHORTEST is 16,606 — the longest-first split
+is strictly ordered, which is the invariant that matters.
+
+`check_dataset` passes: obs_dim 17, action_dim 5, all splits fit `P+F`.
+
+### Verified against the source, not just self-consistent
+
+`tests/test_longhand_roundtrip.py`, run on val episode 0 (18,193 steps):
+
+- **states and actions are bit-exact** — `max |diff| == 0.0` between the parquet and a fresh
+  `read_run` of the source directory. No silent recast, reorder or truncation.
+- **frames align with rows.** Mean |Δpixel| against the source at integer shifts −3…+3:
+
+  | camera | −3 | −2 | −1 | **0** | +1 | +2 | +3 |
+  |---|---|---|---|---|---|---|---|
+  | scene_left | 6.81 | 5.69 | 4.31 | **3.02** | 4.24 | 5.55 | 6.61 |
+  | gripper_right_top | 5.46 | 4.59 | 3.76 | **3.28** | 3.84 | 4.66 | 5.51 |
+
+  The residual 3/255 at shift 0 is AV1 re-encode loss. **The shape is the actual result**: a
+  strict minimum at 0 rising cleanly either side. A small number alone would prove nothing —
+  a dataset misaligned by one row also scores "small" on a slow scene, which is exactly how
+  lego's misalignment survived into training. The test asserts both the argmin AND that the
+  curve is steep enough to discriminate, so it cannot pass vacuously.
+
+**Note for training on this box:** lerobot's own loader needs `torchcodec`, which cannot load
+here (`libavutil.so.60` missing). quickdraw's `data/dataset.py` reads the mp4s with imageio
+instead, so training is unaffected — but anything reaching for `LeRobotDataset` directly will
+fail until ffmpeg's shared libs are installed.
+
+## 7. Still open
 
 - [ ] Should `campaign4-rgb` / `campaign6-combos` / `campaign7-precision` be pooled (current
       behaviour, one distribution) or should the model condition on campaign? The label is
@@ -184,4 +225,4 @@ reader) and `longhand()` (processor); added an optional `val_ids` override plus 
 provenance to the shared builder. Split confirmed at 90/10 longest-first, landing at 83/17 with
 both val episodes ~9–10 min. `tests/test_longhand_split.py` 8/8. Two smoke builds green
 end-to-end (4 splits, obs_dim 17, action_dim 5, campaign labels intact); full 4-camera build
-running.
+complete and verified: bit-exact vectors and a strict frame-alignment minimum at shift 0.
