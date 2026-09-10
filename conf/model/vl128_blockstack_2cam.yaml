@@ -1,0 +1,94 @@
+# =============================================================================================
+# vl128_blockstack_2cam — the robocasa record-holding recipe (`vl128_2cam`, record §24) transplanted
+# onto `block-stack`: a Swoosh xArm7 right arm doing block manipulation, four cameras, 30 Hz.
+# Select with `model=vl128_blockstack_2cam`.
+#
+# WHAT IS INHERITED, AND WHY IT IS NOT RE-DERIVED. Every value below other than the dims, the cameras
+# and the resolution comes from `vl128_2cam`, which holds every open-loop record on robocasa
+# (@+128 late-window median 0.1272 against 0.1415 single-camera, and it wins at matched budget).
+# Those settings were each bought with an experiment -- `decode_arch: up` (§20), the reconstruction
+# loss mix (§22), the narrow flow head (§23), the second camera (§24). Changing any of them here
+# would confound the transplant with a re-litigation.
+#
+# THE FOUR THINGS THAT DIFFER FROM ROBOCASA, all forced by the dataset:
+#
+#  1. `proprio.dim: 17`, `action_dim: 5` (robocasa: 6 and 12). See the block-stack PROCESSING.md.
+#     Dims 3:9 of the observation are a 6D rotation and are NOT z-scored -- the dataset's
+#     normalization_stats.json ships mean 0 / std 1 for them, so nothing here needs to know.
+#
+#  2. `img_size: [96, 128]` -- NON-SQUARE, 3:4, matching the source 144x192 exactly. NEVER an int:
+#     an int squashes the frame to square, which is the mistake `vl128_starling` calls out and which
+#     cost a whole lego run. `ae_bottleneck: 6` is PAIRED with it (96/16), giving an exact 6x8 grid.
+#
+#  3. The cameras. `cam_scene: scene_left` is the fixed third-person view; `cam_wrist:
+#     gripper_right_top` is the gripper-mounted analogue of robocasa's `robot0_eye_in_hand`.
+#     Chosen on measured motion, not by name -- see below.
+#
+#  4. `decode_out_act` is LEFT AT `none`. Measured on this data: 0.00% of scene pixels and 0.07% of
+#     gripper pixels are saturated. Sigmoid was worth 3.4x on torus because 66.9% of its targets sit
+#     exactly at 1.0 and LPIPS scores the clamped image; robocasa at 0.4% was already marginal. At
+#     0.0% there is nothing for it to rescue. Robocasa queue item 1 does not transfer.
+#
+# THE RATE IS THE LAUNCH ARGUMENT, AND IT IS THE WHOLE BALL GAME (record §13). Frame-delta RMSE
+# measured on val ep0 at 96px, against the ~0.06 codec floor those runs operate at:
+#
+#     stride   Hz    scene_left   scene_right   gripper_bottom   gripper_top
+#          1  30.0   0.0153 0.24x  0.0193 0.30x  0.0267 0.42x    0.0266 0.42x
+#          5   6.0   0.0467 0.73x  0.0546 0.86x  0.0756 1.19x    0.0780 1.23x
+#          6   5.0   0.0514 0.81x  0.0597 0.94x  0.0833 1.31x    0.0860 1.35x
+#         10   3.0   0.0652 1.02x  0.0745 1.17x  0.1076 1.69x    0.1100 1.73x
+#         30   1.0   0.0862 1.35x  0.1004 1.58x  0.1655 2.60x    0.1636 2.57x
+#
+# At native 30 Hz the per-step motion is 0.24x the floor -- WORSE than the 0.61x that made every early
+# robocasa run predict zero motion, because block-stack's scene cameras are bolted down while
+# robocasa's move. Do not launch this at `subsample=1`. `subsample=6` puts the gripper view at 1.35x
+# (exactly robocasa's post-subsample operating point) and the scene view at 0.81x; `subsample=10`
+# puts them at 1.73x and 1.02x. Subsampling is nearly FREE here -- long episodes mean stride 10 still
+# retains 84% of training windows, where on robocasa it changed epoch cost 4-5x.
+#
+# The gripper cameras carry 1.7x the motion of the scene cameras, so a single stride cannot put both
+# heads at the same SNR. That is inherent, and it is why `cam_wrist` is `gripper_right_top` (the
+# highest-motion view) rather than a second scene view.
+#
+# EVAL IS NOT MULTI-HEAD YET (see vl128_2cam's header): eval loads ONE camera and feeds those frames
+# to every head, so head 2's eval numbers are scored against head 1's frames. Read ONLY cam_scene's
+# eval metrics, and read `train/loss/decode/cam_wrist` for the second head.
+#
+#   python -m quickdraw.train model=vl128_blockstack_2cam environments=recorded \
+#       data.root=<block-stack run dir> data.repo_id=block_stack \
+#       data.subsample=6 data.F=64 data.autobatch=true \
+#       trainer.checkpoint_monitor=val/metric/cam_scene/mse
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+action_dim: 5
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them.
+  - {name: proprio, kind: vector, dim: 17, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+
+  # ---- camera 1: the fixed third-person scene view ----
+  - {name: cam_scene, kind: image, cam: scene_left,
+     weight: 1.0,
+     img_size: [96, 128],     # (H, W) -- 3:4, matches the 144x192 source. NEVER an int.
+     ae_bottleneck: 6,        # PAIRED with img_size -> an exact 6x8 bottleneck grid
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}
+
+  # ---- camera 2: the gripper view. Identical settings, so the ONLY difference is the camera ----
+  - {name: cam_wrist, kind: image, cam: gripper_right_top,
+     weight: 1.0,
+     img_size: [96, 128],
+     ae_bottleneck: 6,
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}
