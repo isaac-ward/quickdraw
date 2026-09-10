@@ -113,7 +113,7 @@ answer to "where does the arm go next". Both remain in the raw recordings.
 | idx | dims | field | source | transform |
 |---|---|---|---|---|
 | 0:3 | 3 | `ee_{x,y,z}_mm` | `pose_world_xyz_mm` | none; mm, world frame |
-| 3:9 | 6 | `ee_rot6_*` | `pose_base_mm_deg[3:6]` | RPY → rotation matrix → world frame → first two columns |
+| 3:9 | 6 | `ee_rot6_*` | `pose_base_mm_deg[3:6]` | RPY → rotation matrix → world frame → first two columns (**not z-scored**, see below) |
 | 9 | 1 | `gripper` | `gripper_pos` | `(x − closed)/(open − closed)`, **1 = open** |
 | 10:17 | 7 | `joint{1..7}_rad` | `joints_real_deg` | degrees → radians |
 
@@ -141,12 +141,37 @@ The full 6D is kept anyway, because it is exact and assumption-free: a pure-yaw
 reconstruction `R = Rz(θ) · R₀` fits to mean 0.096° but **max 11.3°**, so there are real tilt
 excursions that a 2-dim yaw encoding would discard.
 
-**Consumers should be aware** that `ee_rot6_2` and `ee_rot6_5` have std ≈ 0.003 — roughly 100×
-smaller than the other dims. The `normalization_stats.json` shipped here is a plain z-score,
-which therefore amplifies those two by ~324× and ~302×, turning sensor noise into a
-full-amplitude channel. **If you z-score this state vector, floor those two standard
-deviations or drop the two dims.** The parquet holds exact raw values, so any normalisation
-scheme can be recomputed.
+### The rotation dimensions are NOT z-scored
+
+`normalization_stats.json` gives dims **3–8** (`ee_rot6_0` … `ee_rot6_5`) `mean = 0, std = 1`,
+i.e. they pass through unchanged. Every other dimension is z-scored on the train split as usual.
+This is deliberate.
+
+A 6D rotation is six numbers in [−1, 1] obeying `|c0| = |c1| = 1` and `c0 · c1 = 0` — that
+coupling is the entire reason the representation is worth using. Per-dim z-scoring multiplies
+each of the six by a *different* factor. On this corpus those factors would have been
+`[3.5, 7.0, 324.4, 4.9, 2.5, 301.6]`, because yaw about the world vertical leaves the bottom row
+of the rotation matrix invariant, so `ee_rot6_2` and `ee_rot6_5` (the two bottom-row entries
+present in the 6D encoding) barely move.
+
+Measured on this data, that scaling turns exactly-orthonormal columns into a mess:
+
+| | \|c0\| | \|c1\| | max \|c0 · c1\| |
+|---|---|---|---|
+| raw | 1.000 – 1.000 | 1.000 – 1.000 | 0.000000 |
+| if z-scored per dim | 0.469 – 24.935 | 0.456 – 42.226 | 786.87 |
+| **as shipped** | **1.000 – 1.000** | **1.000 – 1.000** | **0.000000** |
+
+It would also have amplified sensor jitter: for `ee_rot6_2` the high-frequency residual is 119%
+of that dim's total variation, so after a 324× z-score the noise alone would be 1.25 σ — a
+full-amplitude input channel carrying nothing.
+
+Per-dim z-scoring is right for dims that are independent and differ in unit or scale (mm vs
+radians). It is wrong for a group of dims that jointly encode one geometric object.
+**If you recompute normalization statistics yourself, preserve this.**
+
+Action dimensions are all well-conditioned (std 0.33–0.57, amplification 1.8–3.0×) and are
+z-scored normally.
 
 ## 6. What was dropped
 
@@ -224,8 +249,6 @@ vacuously.
 
 ## 9. Known issues
 
-- **`normalization_stats.json` z-scores two near-constant rotation dims** — see §5. Floor them
-  or drop them; the parquet values are exact.
 - **`media/`** holds per-episode preview clips at build resolution. They duplicate the split
   videos and exist so a human can see what a split contains; they are not needed for training.
 - **LeRobot's own reader needs `torchcodec`**, which needs ffmpeg's shared libraries. Any

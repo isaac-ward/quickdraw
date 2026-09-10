@@ -58,14 +58,41 @@ def generate_episodes(env, n_traj: int, steps: int, seed: int, device="cpu",
     return obs, act
 
 
-def compute_norm_stats(obs: np.ndarray, act: np.ndarray) -> dict:
-    """Mean/std over the train split (flattened over traj & time)."""
+def compute_norm_stats(obs: np.ndarray, act: np.ndarray,
+                       obs_identity: "list[int] | None" = None,
+                       act_identity: "list[int] | None" = None) -> dict:
+    """Mean/std over the train split (flattened over traj & time).
+
+    `obs_identity` / `act_identity` list dims to LEAVE ALONE -- written as mean 0, std 1, so
+    data/dataset.Normalizer passes them through unchanged. Use it for dims that are already
+    bounded AND geometrically coupled to each other.
+
+    WHY THIS EXISTS. A 6D rotation (the first two columns of a rotation matrix) is six numbers in
+    [-1, 1] obeying |c0| = |c1| = 1 and c0 . c1 = 0. Z-scoring scales each of the six by a
+    DIFFERENT factor, and on the block-stack corpus those factors are
+    [3.5, 7.0, 324.4, 4.9, 2.5, 301.6] -- because yaw about the world vertical leaves the bottom
+    row of the rotation matrix invariant, so two of the six barely move. Measured on real data,
+    that turns exactly-orthonormal columns (norms 1.000, dot 0.0000) into norms spanning
+    0.47-42.2 with dots up to 786.9. The very structure the 6D representation exists to expose is
+    destroyed before the model sees it, and the two near-constant dims additionally have their
+    sensor jitter amplified to 1.25 and 0.26 sigma.
+
+    Per-dim z-scoring is right for dims that are independent and differ in unit or scale (mm vs
+    radians). It is wrong for a group of dims that together encode one geometric object.
+    """
     o = obs.reshape(-1, obs.shape[-1])
     a = act.reshape(-1, act.shape[-1])
     eps = 1e-6
+    o_mean, o_std = o.mean(0), o.std(0) + eps
+    a_mean, a_std = a.mean(0), a.std(0) + eps
+    for arr_m, arr_s, idx, n in ((o_mean, o_std, obs_identity, o.shape[-1]),
+                                 (a_mean, a_std, act_identity, a.shape[-1])):
+        for i in (idx or []):
+            assert 0 <= int(i) < n, f"identity dim {i} out of range for width {n}"
+            arr_m[int(i)], arr_s[int(i)] = 0.0, 1.0
     return {
-        "observation_vector": {"mean": o.mean(0).tolist(), "std": (o.std(0) + eps).tolist()},
-        "action": {"mean": a.mean(0).tolist(), "std": (a.std(0) + eps).tolist()},
+        "observation_vector": {"mean": o_mean.tolist(), "std": o_std.tolist()},
+        "action": {"mean": a_mean.tolist(), "std": a_std.tolist()},
     }
 
 

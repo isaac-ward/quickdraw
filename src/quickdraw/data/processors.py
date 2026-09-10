@@ -112,7 +112,8 @@ def _frame_hw(frames) -> tuple[int, int]:
 
 def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, log=None,
                            extra_splits: dict[str, list[Episode]] | None = None,
-                           val_ids: set[int] | None = None) -> str:
+                           val_ids: set[int] | None = None,
+                           obs_identity: list[int] | None = None) -> str:
     """Turn canonical `Episode`s into a standard recorded run folder. Returns the run_dir.
 
     make_run_dir -> deterministic ~10% val split BY EPISODE (seed 0) of `episodes` into train/val ->
@@ -129,6 +130,10 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     passes this when the split has to mean something -- `block_stack` puts the LONGEST trajectories in
     val, because the evaluable open-loop rollout horizon is capped by the SHORTEST val episode, and
     on lego a random split cost 5x the horizon. None -> the historic random VAL_FRAC draw.
+
+    `obs_identity` lists observation dims to leave UNNORMALIZED (mean 0, std 1) -- see
+    compute_norm_stats. Pass it for a group of dims that jointly encode one geometric object,
+    such as a 6D rotation, where per-dim scaling would break the coupling between them.
 
     `extra_splits` = {split_name: [Episode]} adds EXTRA named splits (e.g. a held-out `eval`
     collection) alongside the normal train/val: each is written to its OWN split directory VERBATIM
@@ -217,7 +222,7 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     train_act = np.concatenate([e.actions for e in split_eps["train"]])
     coloring = {sp: ("camera" if has_frames else "vector") for sp in split_eps}
     write_meta(run_dir, ecfg, splits_meta, {sp: dict(dims) for sp in split_eps}, coloring, fps,
-               compute_norm_stats(train_obs, train_act))
+               compute_norm_stats(train_obs, train_act, obs_identity=obs_identity))
 
     counts = {}
     for sp, eps in split_eps.items():
@@ -556,7 +561,7 @@ def _block_stack_one(job: dict):
                                                 task=job["campaign"]), info
 
 
-def block_stack(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None, set[int]]:
+def block_stack(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None, dict]:
     """Swoosh right-arm block-stacking teleop -> canonical Episodes. See data/block_stack.py.
 
     LAYOUT EXPECTED: <dir>/<campaign>/recording_YYYY_MM_DD_HH_MM_SS/{run.json,raw/,video/}.
@@ -590,7 +595,8 @@ def block_stack(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episo
     """
     import fnmatch
     from concurrent.futures import ProcessPoolExecutor
-    from .block_stack import ALL_CAMERAS, OUT_HW_DEFAULT, TARGET_HZ_DEFAULT, run_seconds
+    from .block_stack import (ALL_CAMERAS, OUT_HW_DEFAULT, STATE_KEYS, TARGET_HZ_DEFAULT,
+                              run_seconds)
 
     sc = cfg.get("source", None)
     if sc is None or not sc.get("dir"):
@@ -679,7 +685,12 @@ def block_stack(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episo
     for n, task in v:
         print(f"[block_stack]   {n:6d} steps  {task}", flush=True)
 
-    return name, main_pool, int(round(hz)), (cams if len(cams) > 1 else cams[0]), (extra or None), val_ids
+    # dims 3:9 are the 6D rotation: bounded, mutually constrained, and NOT to be z-scored.
+    rot = list(range(STATE_KEYS.index("ee_rot6_0"), STATE_KEYS.index("ee_rot6_5") + 1))
+    print(f"[block_stack] leaving obs dims {rot} (the 6D rotation) unnormalized -- per-dim "
+          f"z-scoring would break |c|=1 and c0.c1=0", flush=True)
+    return (name, main_pool, int(round(hz)), (cams if len(cams) > 1 else cams[0]),
+            (extra or None), {"val_ids": val_ids, "obs_identity": rot})
 
 
 def _split_suffix(campaign: str) -> str:
@@ -723,13 +734,14 @@ def main(cfg):
 
     with contextlib.redirect_stdout(_Tee(sys.stdout)):
         out = PROCESSORS[str(proc)](cfg)
-    # 6th element is OPTIONAL: a processor-chosen val index set (longhand's longest-first split).
-    # Processors that return five keep build_recorded_dataset's historic random draw.
+    # 6th element is OPTIONAL: extra kwargs for build_recorded_dataset (block_stack passes its
+    # longest-first `val_ids` and the rotation dims to leave unnormalized). Processors that
+    # return five keep the historic random split and plain per-dim z-scoring.
     name, episodes, fps, cam, extra_splits = out[:5]
-    val_ids = out[5] if len(out) > 5 else None
+    build_opts = out[5] if len(out) > 5 else {}
 
     run_dir = build_recorded_dataset(name, episodes, fps, cam, log=log, extra_splits=extra_splits,
-                                     val_ids=val_ids)
+                                     **build_opts)
     with open(os.path.join(run_dir, "progress.log"), "w") as f:
         f.write("\n".join(log_lines) + "\n")
 
