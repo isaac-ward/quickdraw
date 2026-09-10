@@ -20,9 +20,12 @@
 #     an int squashes the frame to square, which is the mistake `vl128_starling` calls out and which
 #     cost a whole lego run. `ae_bottleneck: 6` is PAIRED with it (96/16), giving an exact 6x8 grid.
 #
-#  3. The cameras. `cam_scene: scene_left` is the fixed third-person view; `cam_wrist:
+#  3. The cameras. `cam_scene: scene_right` is the fixed third-person view; `cam_wrist:
 #     gripper_right_top` is the gripper-mounted analogue of robocasa's `robot0_eye_in_hand`.
-#     Chosen on measured motion, not by name -- see below.
+#     Chosen on measured motion, not by name: scene_right carries 26% more frame-to-frame change
+#     than scene_left (0.0193 vs 0.0153 at stride 1), and gripper_right_top is the highest-motion
+#     view of the four. Since eval is not multi-head yet, cam_scene is the head every eval number
+#     comes from, so its SNR is what the stride must be chosen for.
 #
 #  4. `decode_out_act` is LEFT AT `none`. Measured on this data: 0.00% of scene pixels and 0.07% of
 #     gripper pixels are saturated. Sigmoid was worth 3.4x on torus because 66.9% of its targets sit
@@ -41,10 +44,28 @@
 #
 # At native 30 Hz the per-step motion is 0.24x the floor -- WORSE than the 0.61x that made every early
 # robocasa run predict zero motion, because block-stack's scene cameras are bolted down while
-# robocasa's move. Do not launch this at `subsample=1`. `subsample=6` puts the gripper view at 1.35x
-# (exactly robocasa's post-subsample operating point) and the scene view at 0.81x; `subsample=10`
-# puts them at 1.73x and 1.02x. Subsampling is nearly FREE here -- long episodes mean stride 10 still
-# retains 84% of training windows, where on robocasa it changed epoch cost 4-5x.
+# robocasa's move. DO NOT LAUNCH THIS AT `subsample=1`.
+#
+# CHOOSING THE STRIDE WHEN THE FLOOR IS UNKNOWN. The ratios above divide by robocasa's 0.0637;
+# block-stack's own codec floor is not known until a run reports `eval_ae_floor` at ep0, and it is
+# plausibly LOWER (a bolted-down camera on a plain table should encode more easily than a rendered
+# kitchen), which would raise every ratio. cam_scene = scene_right, pooled over a val and a train
+# episode:
+#
+#     stride   Hz   F=64     rmse    /0.0637  /0.057  /0.045
+#          6   5.0  14.4s   0.0523     0.82x   0.92x   1.16x
+#          8   3.8  19.2s   0.0599     0.94x   1.05x   1.33x
+#         10   3.0  24.0s   0.0659     1.03x   1.16x   1.46x
+#         12   2.5  28.8s   0.0706     1.11x   1.24x   1.57x
+#         15   2.0  36.0s   0.0762     1.20x   1.34x   1.69x
+#
+# The error is ASYMMETRIC: landing BELOW the floor is the degenerate failure of record 13 (predicting
+# zero is the correct solution to the objective), while landing above it merely makes the task harder.
+# So err high. Strides 10 and 15 are the pair that stay >= 1.0x across the ENTIRE plausible floor
+# range, which no lower stride does -- stride 6 is 0.82-0.92x if the floor is robocasa-like.
+#
+# Subsampling is nearly FREE here -- long episodes mean stride 10 still retains 84% of training
+# windows (stride 15, 76%), where on robocasa it changed epoch cost 4-5x.
 #
 # The gripper cameras carry 1.7x the motion of the scene cameras, so a single stride cannot put both
 # heads at the same SNR. That is inherent, and it is why `cam_wrist` is `gripper_right_top` (the
@@ -70,7 +91,7 @@ modalities:
   - {name: proprio, kind: vector, dim: 17, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
 
   # ---- camera 1: the fixed third-person scene view ----
-  - {name: cam_scene, kind: image, cam: scene_left,
+  - {name: cam_scene, kind: image, cam: scene_right,
      weight: 1.0,
      img_size: [96, 128],     # (H, W) -- 3:4, matches the 144x192 source. NEVER an int.
      ae_bottleneck: 6,        # PAIRED with img_size -> an exact 6x8 bottleneck grid
