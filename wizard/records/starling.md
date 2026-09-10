@@ -88,6 +88,16 @@ Do not rank arms on it.
 
 ### 1.6 THE FRAME STRIDE WAS WRONG — copied from robocasa, never measured (09-08)
 
+> **CORRECTION (09-10): every number in this section is diluted.** It was measured on the 30 Hz
+> build, which was resampled UP from a ~17 Hz camera and so carried **44% duplicate consecutive
+> frames**. A duplicate contributes a per-step delta of exactly zero, so every RMSE below is pulled
+> toward zero by roughly that fraction, and the stride recommendation drawn from it is wrong. On the
+> rebuilt 15 Hz data (1.9% duplicates) the same physical step durations measure: stride 1 = 0.104
+> (67 ms), stride 2 = 0.138 (133 ms), stride 3 = 0.159 (200 ms), stride 4 = 0.174 (267 ms). The
+> argument of this section SURVIVES -- stride 1 at 0.104 is within 4% of robocasa's working 0.0997,
+> so no striding is needed -- but the winning stride does not: what §1.7.3 targets is stride 3, the
+> whole stride nearest the 167 ms every historical flight number was actually trained at.
+
 `subsample=5` was chosen for TRACTABILITY (epoch parity with robocasa: 34k windows vs 205k at stride 1),
 and `conf/data/starling.yaml`'s header said in as many words that §13's SNR argument did not transfer and
 the delta "has to be measured here before a stride is chosen". It never was. Measured now, per-step image
@@ -113,7 +123,11 @@ stride 2 it spans 8.5 s. Compare at matched PHYSICAL duration -- stride-5 `@+51`
 
 ### 1.7 Queue
 
-1. **`visual_l1: 10.0` on the DEPTH-2 base** (`model=vl128_starling_l1x10`, written 09-07, NOT yet run).
+1. ~~**`visual_l1: 10.0` on the DEPTH-2 base**~~ (`model=vl128_starling_l1x10`) -- **RUN, TIED, CLOSED.**
+   11 evals on the OLD 30 Hz build, best @+128 **0.2761 at ep9** against the base's 0.2754, and the AE
+   floor did NOT degrade. That is the refutation condition stated below firing in the inert direction:
+   the pixel/perceptual balance is flat across 3.0->10.0, so the mix is not the lever. Original argument
+   kept verbatim below because it was a good argument that lost to a measurement.
    THE loss arm, and the argument is 1.3. `VisualLoss` trains two sites and the AR decode loss is, per
    design/flow.md, the ONLY autoregressive gradient in the model -- so the mix is a lever on the DYNAMICS,
    not just the codec. vl64.yaml's header already names this failure: "a loss blind to spatial
@@ -131,8 +145,23 @@ stride 2 it spans 8.5 s. Compare at matched PHYSICAL duration -- stride-5 `@+51`
    unnecessary because obs carries velocity -- true of the PROPRIO state, false of the VISUAL one, since
    what appears next depends on geometry currently out of frame. Better motivated after 1.3 than when it
    was first ranked third.
-3. ~~`subsample: 5 -> 3`~~ SUPERSEDED by 1.6 -- measured, and **stride 2** is the principled target, not
-   3. Running as `starling_stride2`.
+3. **`data.subsample=3` on the rebuilt 15 Hz build** (`experiment=s2_sub3`) -- **QUEUED 09-10, waiting on
+   a GPU.** Nothing is pre-empted for it: a host-side watcher polls both accelerators every 120 s and
+   launches on the first one that has sat under 20 GB for three consecutive polls, i.e. only once
+   `s2_sub1` or `s2_sub4` has finished by itself. Log: `scratch/queue_s2_sub3.log`.
+   WHY 3, having argued for 2. §1.6 was measured on the 30 Hz build, where 44% of consecutive frames
+   were duplicates; the per-step deltas in that table are diluted and the stride it recommends is
+   therefore wrong. On the rebuilt 15 Hz data the OLD leaderboard's own step duration (167 ms, from
+   subsample 5 at 30 Hz) is **stride 2.5**, which is not an integer. Stride 3 (200 ms, per-step image
+   RMSE 0.159, @+128 spanning 25.6 s) is the whole stride nearest it, and it brackets from the HARDER
+   side -- which is where the matched-duration comparison between the two running arms already points:
+   stride 4 beats stride 1 at every physical duration past ~2 s (4.27 s: 0.2580 vs 0.3093; 8.53 s:
+   0.3298 vs 0.3533). It is also the only stride whose 128-step score can be quoted against the
+   historical 21.3 s numbers without a duration caveat.
+   ~~`starling_stride2`~~ was launched 09-08 and STOPPED at ep3 (3 evals, best 0.3473) to free its
+   accelerator for the two current arms. Stride 2 is unmeasured, not refuted.
+   REFUTED IF the three strides are non-monotone in @+128 at matched physical duration -- that would
+   mean per-step difficulty is not the axis and §1.6's whole framing is wrong.
 4. `flow_arch_heads: 4 -> 8` / `encode_base: 32 -> 48`. Capacity on axes never varied. DEPRIORITISED --
    1.5 is evidence that transition-head capacity is not the binding constraint.
 
