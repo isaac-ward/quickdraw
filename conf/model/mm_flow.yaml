@@ -229,6 +229,19 @@ action_head:
   #                           co-shapes the trunk; detachF beat detachT on every axis, see detach_gradient below).
   #                           Set false for the leaner no-head baseline. (Post-hoc on a frozen ckpt still valid.)
   weight: 1.0               # weight of the action-flow loss in the total training loss
+  chunk: 1                  # how many consecutive POST-SUBSAMPLE actions the prior predicts JOINTLY.
+  #   1 = the next action only, bit-identical to every run before 2026-09-10. K>1 widens the flow's TARGET
+  #   to K*action_dim and predicts the whole chunk as ONE vector, so it is a genuine joint over lead times
+  #   (an MLP velocity on a flat vector couples every component) rather than K independent marginals -- the
+  #   distinction that matters if you sample a chunk and expect it to be internally coherent. The alternative
+  #   design, conditioning on a lead-time index and drawing each k separately, gives marginals and lets k=0
+  #   and k=1 come from different modes of the pilot's behaviour; that is why this is a flatten.
+  #   PHYSICAL SPAN = chunk * subsample / fps. On starling-2 (15 Hz): chunk=8 spans 0.53 s at subsample=1,
+  #   1.6 s at 3, 2.13 s at 4. Note that with data.action_aggregate=sum a single post-subsample action is
+  #   ALREADY a blur of `subsample` raw commands, so chunk extends FORWARD in time while
+  #   action_aggregate=concat recovers the detail WITHIN each window -- orthogonal knobs.
+  #   NOT `diffusion.chunk`/FlowField(chunk=), which is a gradient-checkpoint batch split.
+  #   Needs data.P + data.F >= chunk + 2 (there must be room for one full chunk after the context).
   shortcut: false           # PURE RECTIFIED FLOW for the action prior — NOT default-on like the dynamics
   #   (diffusion.shortcut) / decode shortcuts, because the action prior is fundamentally different from
   #   OBSERVATION prediction. Those predict observations: given state+action the next state is (near-)

@@ -231,7 +231,7 @@ def build_model(cfg):
                     f"head_dim={head_dim}. Pick d/heads giving head_dim in {{16,32,64}} (e.g. d=192/heads=12 -> 16), "
                     f"or disable compile_rollout (eager has no such constraint).")
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
-                      mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=m.get("action_dim", 2),
+                      mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=effective_action_dim(cfg),
                       grad_checkpoint=bool(m.get("grad_checkpoint", False)),
                       compile_rollout=compile_rollout,
                       latent_norm=m.get("latent_norm", "layernorm"),
@@ -363,6 +363,7 @@ def build_model(cfg):
                                        action_head_weight=float(ahg("weight", 1.0)),
                                        action_head_shortcut=bool(ahg("shortcut", True)),
                                        action_head_detach_gradient=bool(ahg("detach_gradient", False)),
+                                       action_head_chunk=int(ahg("chunk", 1)),
                                        dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)),
                                        # default 1.0 (always-clean) so an old config adopted by
                                        # run_standalone rebuilds the behaviour it TRAINED under.
@@ -449,7 +450,7 @@ def autobatch_find(cfg, device, log=print) -> int:
     # below fires, and that message already names autobatch_reserve_gb as the thing to lower.
     P, F = int(cfg.data.P), int(cfg.data.F); L = P + F
     de = int(cfg.model.get("detach_every", 16)); rf = float(cfg.model.get("recon_frac", 1.0))
-    specs = _modality_specs(cfg); adim = int(cfg.model.get("action_dim", 2))
+    specs = _modality_specs(cfg); adim = effective_action_dim(cfg)
     # AFTER specs: _resident_frame_bytes closes over it (defining the budget earlier raised NameError -- caught
     # by running the verification, which reported "could not size the resident frame store" and silently fell
     # back to the blind reserve, exactly the kind of quiet degradation this whole pass is about).
@@ -806,8 +807,22 @@ def resolve_data_root(cfg) -> str:
     return _hf_root_cache[repo]
 
 
+def effective_action_dim(cfg) -> int:
+    """`model.action_dim` AS THE MODEL SEES IT. `data.action_aggregate=concat` keeps all `subsample` raw
+    actions of each kept step instead of folding them into one, so the action vector is subsample x wider.
+    DERIVED, never hand-set: a hand-set width goes stale the moment subsample changes, and the failure is a
+    shape error deep in the first batch rather than at config time."""
+    a = int(cfg.model.get("action_dim", 2))
+    if str(cfg.data.get("action_aggregate", "sum")) == "concat":
+        a *= max(1, int(cfg.data.get("subsample", 1) or 1))
+    return a
+
+
 def normalizer(cfg) -> Normalizer:
-    return Normalizer.from_file(resolve_data_root(cfg)).subset_obs()   # subset via the process-wide set_obs_keep
+    n = Normalizer.from_file(resolve_data_root(cfg)).subset_obs()   # subset via the process-wide set_obs_keep
+    if str(cfg.data.get("action_aggregate", "sum")) == "concat":    # one step carries `subsample` raw actions
+        n = n.tile_act(int(cfg.data.get("subsample", 1) or 1))
+    return n
 
 
 def image_head_cams(cfg) -> dict[str, str]:

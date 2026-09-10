@@ -263,7 +263,9 @@ class MultiModalSequenceModel(nn.Module):
         # proposal (never fed back into the WM). Only present when action_head.enabled -> show it so the head is visible.
         if getattr(self, "action_head_enabled", False) and getattr(self, "action_flow", None) is not None:
             rows.append(("action_flow (learned action prior)",
-                         f"context h -> (B,T,{self.act_enc.in_raw}) action dist", npar(self.action_flow)))
+                         f"context h -> (B,T,{self.act_enc.in_raw}"
+                         + (f"x{self.action_head_chunk} chunk" if self.action_head_chunk > 1 else "")
+                         + ") action dist", npar(self.action_flow)))
         if getattr(self, "predictor_q", None) is not None:
             rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
         # decode heads (predicted tokens -> obs)
@@ -921,6 +923,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
+                 action_head_chunk: int = 1,
                  dynamics_detach_encoder: bool = False, p_tf_dynamics: float | None = 1.0, **kw):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
@@ -986,8 +989,14 @@ class MultiModalFlow(MultiModalSequenceModel):
         #          in the model). Replaces the old `dynamics_follows_p_tf` bool: false == 1.0, true == None.
         # design/flow.md, record section 18.
         self.p_tf_dynamics = None if p_tf_dynamics is None else float(p_tf_dynamics)
+        # ACTION CHUNK: how many consecutive POST-SUBSAMPLE actions the prior predicts JOINTLY. 1 reproduces
+        # every run before 2026-09-10 bit-for-bit. K>1 widens the flow's TARGET to K*action_dim -- one flow over
+        # the concatenated chunk, which is a genuine joint (the MLP velocity of each component sees all
+        # K*action_dim components). NOT FlowField(chunk=), which is a gradient-checkpoint batch split.
+        self.action_head_chunk = max(1, int(action_head_chunk))
         if self.action_head_enabled:
-            self.action_flow = FlowField(action_dim, h_dim=d, hidden=(flow_hidden or d), cond="concat",
+            self.action_flow = FlowField(action_dim * self.action_head_chunk, h_dim=d,
+                                         hidden=(flow_hidden or d), cond="concat",
                                          shortcut=action_head_shortcut)
 
     def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
@@ -1057,20 +1066,43 @@ class MultiModalFlow(MultiModalSequenceModel):
         raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function
         if l_cons is not None:
             raw["dynamics/latent_shortcut"], w["dynamics/latent_shortcut"] = l_cons, self.lambda_consistency
-        if self.action_head_enabled and L >= 3:
-            # action-flow PRIOR: predict a[t] from the PREVIOUS-step pooled context h[t-1] (leak-free — h[t-1]
-            # never attended to a[t]). Pool the backbone context over the bag's tokens -> one vector per step.
+        if self.action_head_enabled:
+            # action-flow PRIOR: predict the next action (or the next `action_head_chunk` actions, jointly)
+            # from the PREVIOUS-step pooled context h[t-1] -- leak-free, h[t-1] never attended to what it
+            # predicts. Pool the backbone context over the bag's tokens -> one vector per step.
             # detach_gradient=True -> detach so the action task does NOT reshape the WM trunk.
             h_ctx = h.mean(dim=-2)                              # (B, L-1, d): per-step context (all input tokens)
-            cond = h_ctx[:, :-1]                                # h[t-1], aligned to predict a[t] for t=1..L-2
-            if self.action_head_detach_gradient:
-                cond = cond.detach()
-            a_target = act_seq[:, 1:L - 1].detach()             # normalized a[1..L-2] (never the a[t] in cond)
-            l_aflow, l_acons = self.action_flow.loss(cond, a_target, time_sampling=self.time_sampling)
-            raw["action/flow"], w["action/flow"] = l_aflow, self.action_head_weight
-            if l_acons is not None:
-                raw["action/shortcut"], w["action/shortcut"] = l_acons, self.action_head_weight
+            cond, a_target = self.action_pairs(h_ctx, act_seq)   # the ONE alignment (guards short windows)
+            if cond is not None:
+                if self.action_head_detach_gradient:
+                    cond = cond.detach()
+                l_aflow, l_acons = self.action_flow.loss(cond, a_target, time_sampling=self.time_sampling)
+                raw["action/flow"], w["action/flow"] = l_aflow, self.action_head_weight
+                if l_acons is not None:
+                    raw["action/shortcut"], w["action/shortcut"] = l_acons, self.action_head_weight
         return raw, w
+
+    def action_pairs(self, h_ctx: Tensor, act_seq: Tensor):
+        """THE one place the action prior's `h[t-1] -> a[t .. t+K-1]` alignment lives. Returns
+        `(cond, target)`, or `(None, None)` when the window is too short to form one chunk.
+
+        `h_ctx` (B, L-1, d) is the pooled per-step backbone context; `act_seq` (B, >=L, action_dim) the
+        NORMALIZED actions. L is taken from `h_ctx` (not from act_seq, which callers may hand in longer).
+        Row t of the result pairs context h[t] -- which saw states <= t and actions < t+1, so it never saw
+        anything it predicts -- with `[a[t+1], a[t+2], ... a[t+K]]` flattened to K*action_dim, time-major.
+        N = L-1-K rows. At K=1 this is exactly `cond = h_ctx[:, :-1]`, `target = act_seq[:, 1:L-1]`.
+
+        It exists because that alignment used to be written out three times -- the joint loss here, the
+        frozen-WM loss in training/lit.py, and the eval in evaluation/routines.py. They agree by luck at
+        K=1 and would silently diverge at K>1, and two of the three are training losses."""
+        K, L = self.action_head_chunk, h_ctx.shape[1] + 1
+        if L < K + 2:                                            # not even one chunk fits in the window
+            return None, None
+        A = act_seq[:, 1:L - 1]                                  # (B, L-2, a): a[1..L-2]
+        if K > 1:
+            W = A.unfold(1, K, 1)                                # (B, L-1-K, a, K) sliding windows
+            A = W.permute(0, 1, 3, 2).reshape(A.shape[0], W.shape[1], K * A.shape[-1])
+        return h_ctx[:, :A.shape[1]], A.detach()
 
     def action_context(self, obs, act_seq) -> Tensor:
         """Per-step pooled backbone context for the action prior. Returns (B, L-1, d): entry k is h[k], the
@@ -1083,8 +1115,9 @@ class MultiModalFlow(MultiModalSequenceModel):
 
     def sample_action(self, h_ctx: Tensor, *, deterministic: bool = False, eps: Tensor | None = None) -> Tensor:
         """Sample from the learned action PRIOR given a per-step context vector `h_ctx` (..., d) — the pooled
-        backbone context h[t-1]. Returns NORMALIZED actions (..., action_dim); the caller denorms. For the
-        eval_action_distribution routine + the MPPI proposal. Requires action_head_enabled."""
+        backbone context h[t-1]. Returns NORMALIZED actions (..., action_dim * action_head_chunk), i.e. the
+        chunk flattened time-major; reshape to (..., K, action_dim) for per-lead-time use. The caller denorms.
+        For the eval_action_distribution routine + the MPPI proposal. Requires action_head_enabled."""
         return self.action_flow.sample(h_ctx, steps=self.sampling_steps, deterministic=deterministic, eps=eps)
 
 
