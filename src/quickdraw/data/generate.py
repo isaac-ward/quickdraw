@@ -144,5 +144,11 @@ def write_meta(root_dir: str, base_env: TorusConfig, splits, split_env: dict, co
         json.dump(stats, f, indent=2)
     with open(os.path.join(root_dir, "dataset_card.json"), "w") as f:
         json.dump({"base_env": asdict(base_env), "split_env": split_env, "coloring": coloring,
-                   "splits": {k: {"n_traj": int(v["n_traj"]), "steps": int(v["steps"]), "seed": int(v["seed"])}
+                   # `split_rule` records HOW train/val were chosen -- "random, seed 0" or a
+                   # processor's own rule. Without it a longest-first split is indistinguishable
+                   # from a random one after the fact, and the two mean very different things
+                   # when you read a val number.
+                   "splits": {k: {"n_traj": int(v["n_traj"]), "steps": int(v["steps"]),
+                                  "seed": int(v["seed"]),
+                                  **({"split_rule": str(v["split_rule"])} if "split_rule" in v else {})}
                               for k, v in splits.items()}, "fps": fps}, f, indent=2)

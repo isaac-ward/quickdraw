@@ -14,15 +14,22 @@ GROUP — it carries obs_dim/action_dim/dt; override those for non-starling dims
         +source.repo=madang6/quickdraw-robocasa-scene4-4h +source.name=robocasa +source.max_episodes=2
         # all three cameras into one dataset:  +source.camera=all
 
+    python -m quickdraw.data.processors +processor=longhand \\
+        +source.dir=scratch/longhand +source.name=longhand      # Swoosh right-arm teleop
+        # smoke: +source.max_runs_per_campaign=2 '+source.cameras=[scene_left]' '+source.hw=[96,128]'
+
 Frames per `Episode` may be per-frame image PATHS (lazy; starling's jpgs), an in-memory (T,H,W,3)
 uint8 array (robocasa's decoded clips), or None (no camera -> proprio-only world model). Non-image
 datasets skip the media/ encode entirely and write vector-only lerobot splits."""
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -35,7 +42,8 @@ from ..environments.recorded import RecordedConfig
 from ..logging import viz
 from ..utils.logging import make_run_dir
 
-VAL_FRAC = 0.1       # ~10% of episodes -> val (deterministic, by episode)
+VAL_FRAC = 0.1       # ~10% -> val. By EPISODE for the random default; by FRAMES where a
+                     # processor supplies its own val_ids (see _longest_first_val).
 SPLIT_SEED = 0       # deterministic episode split
 _P, _F = 8, 64       # conf/data/torus.yaml defaults; only for the informational `training_windows` count
 
@@ -103,7 +111,8 @@ def _frame_hw(frames) -> tuple[int, int]:
 
 
 def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, log=None,
-                           extra_splits: dict[str, list[Episode]] | None = None) -> str:
+                           extra_splits: dict[str, list[Episode]] | None = None,
+                           val_ids: set[int] | None = None) -> str:
     """Turn canonical `Episode`s into a standard recorded run folder. Returns the run_dir.
 
     make_run_dir -> deterministic ~10% val split BY EPISODE (seed 0) of `episodes` into train/val ->
@@ -115,6 +124,11 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     camera gets its own media/<cam>/ tree and its own observation.images.<cam> video key in every
     split. Encoding is one flat job list across (camera x episode), so N cameras cost N times the
     encode but still saturate the pool. A single str + array behaves exactly as before.
+
+    `val_ids` = indices into `episodes` that go to val, REPLACING the random draw. A processor
+    passes this when the split has to mean something -- `longhand` puts the LONGEST trajectories in
+    val, because the evaluable open-loop rollout horizon is capped by the SHORTEST val episode, and
+    on lego a random split cost 5x the horizon. None -> the historic random VAL_FRAC draw.
 
     `extra_splits` = {split_name: [Episode]} adds EXTRA named splits (e.g. a held-out `eval`
     collection) alongside the normal train/val: each is written to its OWN split directory VERBATIM
@@ -131,8 +145,17 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     t0 = time.time()
 
     # deterministic ~VAL_FRAC val split BY EPISODE (seed SPLIT_SEED), preserving processor order
-    n_val = max(1, round(VAL_FRAC * len(episodes)))
-    val_ids = set(np.random.default_rng(SPLIT_SEED).choice(len(episodes), size=n_val, replace=False).tolist())
+    if val_ids is None:
+        n_val = max(1, round(VAL_FRAC * len(episodes)))
+        val_ids = set(np.random.default_rng(SPLIT_SEED).choice(len(episodes), size=n_val, replace=False).tolist())
+        split_rule = f"random, seed {SPLIT_SEED}"
+    else:
+        val_ids = {int(i) for i in val_ids}
+        bad = [i for i in val_ids if not 0 <= i < len(episodes)]
+        assert not bad, f"val_ids out of range for {len(episodes)} episodes: {bad}"
+        assert val_ids, "val_ids was given but empty -- that would leave val with no episodes"
+        assert len(val_ids) < len(episodes), "val_ids covers every episode -- train would be empty"
+        split_rule = "explicit (processor-chosen)"
     split_eps = {"train": [ep for k, ep in enumerate(episodes) if k not in val_ids],
                  "val": [ep for k, ep in enumerate(episodes) if k in val_ids]}
     # extra named splits (e.g. a held-out `eval` collection): kept in their OWN dir, verbatim, no split
@@ -144,7 +167,7 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     split_desc = ", ".join(f"{sp} {len(eps)}" for sp, eps in split_eps.items())
     log(f"[recorded] {name}: {len(all_eps)} episodes / {sum(len(e.states) for e in all_eps)} frames "
         f"({'proprio-only' if not has_frames else f'{hw[0]}x{hw[1]}'} @ {fps} Hz) -> "
-        f"{split_desc} (train/val seed {SPLIT_SEED})")
+        f"{split_desc} (train/val: {split_rule})")
 
     workers = int(os.environ.get("GEN_WORKERS") or (os.cpu_count() or 4))
     cams = [cam] if isinstance(cam, str) else list(cam)
@@ -187,7 +210,7 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
     act_dim = episodes[0].actions.shape[-1]
     ecfg = RecordedConfig(obs_dim=obs_dim, action_dim=act_dim, dt=1.0 / fps)
     dims = {"obs_dim": ecfg.obs_dim, "action_dim": ecfg.action_dim, "dt": ecfg.dt}
-    splits_meta = {sp: {"n_traj": len(eps), "seed": SPLIT_SEED,
+    splits_meta = {sp: {"n_traj": len(eps), "seed": SPLIT_SEED, "split_rule": split_rule,
                         "steps": int(round(np.mean([len(e.states) for e in eps])))}
                    for sp, eps in split_eps.items()}
     train_obs = np.concatenate([e.states for e in split_eps["train"]])
@@ -484,13 +507,189 @@ def starling_bags(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Epi
     return name, main_pool, int(round(hz)), "ego", (extra or None)
 
 
+def _longest_first_val(lengths: list[int], frac: float, min_eps: int = 2) -> set[int]:
+    """The LONGEST episodes, as the prefix whose frame share lands CLOSEST to `frac`.
+
+    WHY LONGEST-FIRST AND NOT RANDOM. Open-loop rollout evaluation can only run as far as the
+    SHORTEST validation episode -- past that there is no ground truth left to score against. On
+    the lego corpus a random seed-0 draw happened to pull a short episode into val and capped
+    every long-horizon number at a fifth of the horizon the data actually supported. Putting the
+    long trajectories in val costs ~the same frames either way and buys the horizon back directly.
+
+    WHY "CLOSEST" AND NOT "UNTIL WE CROSS". Accumulating until the target is exceeded always
+    overshoots, and overshoots badly when the longest episodes are much longer than the rest --
+    on longhand it turned a 10% request into 16.8%. Choosing the nearest prefix instead can land
+    either side of the target, which is the honest reading of "about 10%".
+
+    WHY A FLOOR OF TWO. A one-episode val set has no across-session variance at all: one
+    recording's lighting, object layout and operator mood become the entire validation signal.
+    Two is the minimum that can disagree with itself.
+
+    Val will be dominated by whichever campaign recorded long -- for `longhand` that is
+    campaign5-play-long, and the operator has accepted that. It means val measures long-horizon
+    fidelity rather than being a representative i.i.d. sample; read val loss accordingly.
+    """
+    n = len(lengths)
+    if n <= min_eps:
+        return {int(np.argmax(lengths))} if n else set()
+    total = sum(lengths)
+    order = sorted(range(n), key=lambda i: (-lengths[i], i))
+    cum, best, best_err = 0, min_eps, None
+    for k in range(1, n):                      # k = prefix size; never all n (train must survive)
+        cum += lengths[order[k - 1]]
+        if k < min_eps:
+            continue
+        err = abs(cum / total - frac)
+        if best_err is None or err < best_err:
+            best, best_err = k, err
+    return {order[i] for i in range(best)}
+
+
+def _swoosh_one(job: dict):
+    """One Swoosh run directory -> Episode. Module-level so ProcessPoolExecutor can pickle it."""
+    from .swoosh import read_run
+    st, ac, fr, info = read_run(job["dir"], target_hz=job["hz"], out_hw=tuple(job["hw"]),
+                                cameras=tuple(job["cams"]))
+    if len(job["cams"]) == 1:
+        fr = fr[job["cams"][0]]
+    return job["campaign"], job["dir"], Episode(states=st, actions=ac, frames=fr,
+                                                task=job["campaign"]), info
+
+
+def longhand(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Episode]] | None, set[int]]:
+    """Swoosh right-arm teleop recordings -> canonical Episodes. See data/swoosh.py for the format.
+
+    LAYOUT EXPECTED: <dir>/<campaign>/recording_YYYY_MM_DD_HH_MM_SS/{run.json,raw/,video/}.
+    One Episode per run, `Episode.task` = the campaign directory name so the condition survives
+    into <split>/meta/tasks.parquet.
+
+    SPLIT POLICY for the `longhand` corpus, as specified by the operator:
+      * campaigns 1-2, and the non-data folders, are EXCLUDED -- 1-2 are bring-up, `shakedown` and
+        `audit` are hardware checks, and `_rt*` are stray test artefacts from the collection repo's
+        roundtrip test writing into `campaigns/` and being swept into the Drive sync.
+      * campaigns 3-7 form the train/val pool, split 90/10 BY FRAMES with the LONGEST trajectories
+        reserved for val (see _longest_first_val for why).
+      * campaigns 8-9 are held out entirely as `eval_<suffix>` splits, structured identically.
+
+    ACTION = THE XBOX CONTROLLER, five axes. Not the commanded pose and not the SDK arguments --
+    those are consequences of the action plus the integrator's state, and conditioning on them
+    would hand the model the answer. Both remain in the raw run directories.
+
+    Args: +source.dir=<tree of campaign dirs> [+source.name=longhand]
+          [+source.target_hz=30] [+source.hw=[144,192]] [+source.workers=4]
+          [+source.cameras=[scene_left,scene_right,gripper_right_bottom,gripper_right_top]]
+          [+source.val_frac=0.1]
+          [+source.eval_globs=[campaign8*,campaign9*]]
+          [+source.exclude_globs=[campaign1*,campaign2*,_rt*,shakedown,audit]]
+          [+source.max_runs_per_campaign=N]   <- smoke-test escape hatch
+
+    WORKERS DEFAULTS TO 4, NOT 16. Each worker holds every decoded camera for a whole episode in
+    memory; the longest run here is 639 s, which at 30 Hz and 144x192 is 1.6 GB per camera, so
+    four cameras on sixteen workers would ask for ~100 GB. Raise it only alongside fewer cameras
+    or a smaller hw.
+    """
+    import fnmatch
+    from concurrent.futures import ProcessPoolExecutor
+    from .swoosh import ALL_CAMERAS, OUT_HW_DEFAULT, TARGET_HZ_DEFAULT, run_seconds
+
+    sc = cfg.get("source", None)
+    if sc is None or not sc.get("dir"):
+        raise ValueError("pass +source.dir=<tree containing campaign*/recording_*/ dirs> "
+                         "(+source.name=longhand)")
+    root = os.path.expanduser(str(sc.dir))
+    name = str(sc.get("name", "longhand"))
+    hz = float(sc.get("target_hz", TARGET_HZ_DEFAULT))
+    hw = tuple(int(x) for x in (sc.get("hw", None) or OUT_HW_DEFAULT))
+    workers = int(sc.get("workers", 4))
+    max_per = int(sc.get("max_runs_per_campaign", 0) or 0)
+    val_frac = float(sc.get("val_frac", VAL_FRAC))
+    cams = [str(c) for c in (sc.get("cameras", None) or ALL_CAMERAS)]
+    eval_globs = [str(g) for g in (sc.get("eval_globs", None) or ["campaign8*", "campaign9*"])]
+    excl_globs = [str(g) for g in (sc.get("exclude_globs", None) or
+                                   ["campaign1*", "campaign2*", "_rt*", "shakedown", "audit"])]
+    bad = [c for c in cams if c not in ALL_CAMERAS]
+    if bad:
+        raise ValueError(f"unknown camera(s) {bad}; known: {list(ALL_CAMERAS)}")
+
+    camps = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))
+    if not camps:
+        raise ValueError(f"{root} has no campaign subdirectories")
+    jobs, plan = [], {}
+    for c in camps:
+        if any(fnmatch.fnmatch(c, g) for g in excl_globs):
+            plan[c] = "EXCLUDED"
+            continue
+        runs = sorted(d for d in os.listdir(os.path.join(root, c))
+                      if os.path.isfile(os.path.join(root, c, d, "run.json")))
+        if max_per:
+            runs = runs[:max_per]
+        if not runs:
+            plan[c] = "EXCLUDED (no runs)"
+            continue
+        plan[c] = f"eval_{_split_suffix(c)}" if any(fnmatch.fnmatch(c, g) for g in eval_globs) else "train/val"
+        for rd in runs:
+            jobs.append({"campaign": c, "dir": os.path.join(root, c, rd), "hz": hz, "hw": hw,
+                         "cams": cams})
+
+    print(f"[longhand] {root}: {len(jobs)} runs across {len(camps)} campaigns @ {hz} Hz, "
+          f"{hw[0]}x{hw[1]}, cameras {cams}", flush=True)
+    for c in camps:
+        print(f"[longhand]   {c:26s} -> {plan[c]}", flush=True)
+    if not jobs:
+        raise ValueError(f"no runs survived the exclude globs in {root}")
+
+    by_camp: dict[str, list[Episode]] = {}
+    worst_sync, t0 = 0.0, time.time()
+    with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as ex:
+        for k, (camp, rdir, ep, info) in enumerate(ex.map(_swoosh_one, jobs), 1):
+            by_camp.setdefault(camp, []).append(ep)
+            se = info["sync_error_s"]
+            w = max(v["max"] for v in se.values())
+            over = max(v["over"] for v in se.values())
+            worst_sync = max(worst_sync, w)
+            print(f"[longhand] {k}/{len(jobs)} {camp}/{info['run']} -> {info['steps']} steps "
+                  f"({info['seconds']:.0f}s)  sync max {w * 1000:.0f}ms, {100 * over:.2f}% past bound"
+                  f"{'' if info['validation_all_green'] else '  [!] run.json checks NOT all green'}"
+                  f"  ({time.time() - t0:.0f}s)", flush=True)
+    # 16.7 ms is the half-grid bound at 30 Hz -- the best a nearest-neighbour resample can do.
+    print(f"[longhand] worst single-step nearest-neighbour displacement across all runs: "
+          f"{worst_sync * 1000:.1f} ms (a stream hiccup shows up here; the per-run "
+          f"'past bound' percentage is what indicates a systematic problem)", flush=True)
+
+    main_pool, extra = [], {}
+    for c in camps:
+        eps = by_camp.get(c)
+        if not eps:
+            continue
+        if plan[c] == "train/val":
+            main_pool += eps
+        else:
+            extra[plan[c]] = eps
+    if not main_pool:
+        raise ValueError(f"no train/val campaigns matched in {root} (eval_globs={eval_globs})")
+
+    # 90/10 by FRAMES, longest first. Sorting by run_seconds would double-read the timestamps;
+    # the episodes are already built, so their true step counts are the exact thing to rank on.
+    lens = [len(e.states) for e in main_pool]
+    val_ids = _longest_first_val(lens, val_frac)
+    v = sorted((lens[i], main_pool[i].task) for i in val_ids)[::-1]
+    print(f"[longhand] val = {len(val_ids)}/{len(main_pool)} episodes, "
+          f"{sum(lens[i] for i in val_ids)}/{sum(lens)} frames "
+          f"({100 * sum(lens[i] for i in val_ids) / sum(lens):.1f}%), longest first:", flush=True)
+    for n, task in v:
+        print(f"[longhand]   {n:6d} steps  {task}", flush=True)
+
+    return name, main_pool, int(round(hz)), (cams if len(cams) > 1 else cams[0]), (extra or None), val_ids
+
+
 def _split_suffix(campaign: str) -> str:
     """`campaign21-ood-noodle` -> `ood_noodle`: drop the campaignNN prefix, dashes to underscores."""
     tail = campaign.split("-", 1)[1] if "-" in campaign else campaign
     return tail.replace("-", "_")
 
 
-PROCESSORS = {"starling": starling, "robocasa": robocasa, "starling_bags": starling_bags}
+PROCESSORS = {"starling": starling, "robocasa": robocasa, "starling_bags": starling_bags,
+              "longhand": longhand}
 
 
 @hydra.main(config_path="../../../conf", config_name="config", version_base=None)
@@ -498,15 +697,39 @@ def main(cfg):
     proc = cfg.get("processor", None)
     if proc is None or str(proc) not in PROCESSORS:
         raise ValueError(f"pass +processor=<{'|'.join(PROCESSORS)}> (got {proc!r})")
-    name, episodes, fps, cam, extra_splits = PROCESSORS[str(proc)](cfg)
-
     log_lines = []
 
     def log(msg):
         print(msg, flush=True)
         log_lines.append(msg)
 
-    run_dir = build_recorded_dataset(name, episodes, fps, cam, log=log, extra_splits=extra_splits)
+    # Tee the PROCESSOR's own stdout into progress.log too. Which campaigns were excluded, which
+    # episodes went to val and why is the part of the record you actually want six months later,
+    # and it was previously terminal-only -- it never reached the dataset folder at all.
+    class _Tee(io.TextIOBase):
+        def __init__(self, real):
+            self.real, self.buf = real, ""
+
+        def write(self, t):
+            self.real.write(t)
+            self.buf += t
+            while "\n" in self.buf:
+                line, self.buf = self.buf.split("\n", 1)
+                log_lines.append(line)
+            return len(t)
+
+        def flush(self):
+            self.real.flush()
+
+    with contextlib.redirect_stdout(_Tee(sys.stdout)):
+        out = PROCESSORS[str(proc)](cfg)
+    # 6th element is OPTIONAL: a processor-chosen val index set (longhand's longest-first split).
+    # Processors that return five keep build_recorded_dataset's historic random draw.
+    name, episodes, fps, cam, extra_splits = out[:5]
+    val_ids = out[5] if len(out) > 5 else None
+
+    run_dir = build_recorded_dataset(name, episodes, fps, cam, log=log, extra_splits=extra_splits,
+                                     val_ids=val_ids)
     with open(os.path.join(run_dir, "progress.log"), "w") as f:
         f.write("\n".join(log_lines) + "\n")
 
