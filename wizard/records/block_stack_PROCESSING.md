@@ -143,35 +143,94 @@ excursions that a 2-dim yaw encoding would discard.
 
 ### The rotation dimensions are NOT z-scored
 
-`normalization_stats.json` gives dims **3–8** (`ee_rot6_0` … `ee_rot6_5`) `mean = 0, std = 1`,
-i.e. they pass through unchanged. Every other dimension is z-scored on the train split as usual.
-This is deliberate.
+`normalization_stats.json` gives dims **3-8** (`ee_rot6_0` ... `ee_rot6_5`) `mean = 0, std = 1`,
+so they pass through unchanged. Every other dimension is z-scored on the **train split only**.
+This is deliberate, and it is the one thing about this dataset worth reading before you train.
 
-A 6D rotation is six numbers in [−1, 1] obeying `|c0| = |c1| = 1` and `c0 · c1 = 0` — that
-coupling is the entire reason the representation is worth using. Per-dim z-scoring multiplies
-each of the six by a *different* factor. On this corpus those factors would have been
-`[3.5, 7.0, 324.4, 4.9, 2.5, 301.6]`, because yaw about the world vertical leaves the bottom row
-of the rotation matrix invariant, so `ee_rot6_2` and `ee_rot6_5` (the two bottom-row entries
-present in the 6D encoding) barely move.
+#### Why
 
-Measured on this data, that scaling turns exactly-orthonormal columns into a mess:
+A 6D rotation is six numbers in [-1, 1] obeying `|c0| = |c1| = 1` and `c0 . c1 = 0`, where
+`c0 = dims[3:6]` and `c1 = dims[6:9]`. That coupling is the entire reason the representation is
+worth using instead of Euler angles.
 
-| | \|c0\| | \|c1\| | max \|c0 · c1\| |
+Per-dim z-scoring multiplies each of the six by a *different* factor. Here those factors would
+have been `[3.5, 7.0, 324.4, 4.9, 2.5, 301.6]`. Two of them are enormous because **yaw about the
+world vertical leaves the bottom row of the rotation matrix invariant** -- and `ee_rot6_2` and
+`ee_rot6_5` *are* two entries of that bottom row (`c0_z` and `c1_z`). The teleop scheme only ever
+rotates about world vertical, so those two are structurally pinned, not merely quiet.
+
+Measured on the train split, applying a per-dim z-score would do this:
+
+| | \|c0\| | \|c1\| | max \|c0 . c1\| |
 |---|---|---|---|
-| raw | 1.000 – 1.000 | 1.000 – 1.000 | 0.000000 |
-| if z-scored per dim | 0.469 – 24.935 | 0.456 – 42.226 | 786.87 |
-| **as shipped** | **1.000 – 1.000** | **1.000 – 1.000** | **0.000000** |
+| raw values in the parquet | 1.000 - 1.000 | 1.000 - 1.000 | 0.000000 |
+| if z-scored per dim | 0.469 - 24.935 | 0.456 - 42.226 | 786.87 |
+| **with the shipped stats** | **1.000 - 1.000** | **1.000 - 1.000** | **0.000000** |
 
-It would also have amplified sensor jitter: for `ee_rot6_2` the high-frequency residual is 119%
-of that dim's total variation, so after a 324× z-score the noise alone would be 1.25 σ — a
-full-amplitude input channel carrying nothing.
+A model cannot learn `|c| = 1` from a representation whose norm ranges 0.47 to 42. Secondarily it
+would amplify sensor jitter: `ee_rot6_2`'s high-frequency residual is **119 percent of that dim's
+total variation**, so after a 324x scaling the noise alone would be 1.25 sigma -- a
+full-amplitude input channel carrying no information.
 
-Per-dim z-scoring is right for dims that are independent and differ in unit or scale (mm vs
+Per-dim z-scoring is correct for dims that are independent and differ in unit or scale (mm vs
 radians). It is wrong for a group of dims that jointly encode one geometric object.
-**If you recompute normalization statistics yourself, preserve this.**
 
-Action dimensions are all well-conditioned (std 0.33–0.57, amplification 1.8–3.0×) and are
-z-scored normally.
+#### What this means for you
+
+- **Using the shipped `normalization_stats.json`: nothing to do.** Apply `(x - mean) / std` to
+  the whole vector; the rotation dims are already `(x - 0) / 1`.
+- **Recomputing statistics yourself: preserve this.** Compute mean/std over train, then overwrite
+  dims 3-8 with `mean = 0, std = 1`. If you z-score them you will silently destroy the rotation
+  structure -- nothing will raise an error.
+- **The third column is not stored** because it is recoverable exactly: `c2 = cross(c0, c1)`.
+- **Only want a scalar heading?** `theta = atan2(c2_y, c2_x)`. But note the tool tilt is not
+  perfectly constant: a pure-yaw reconstruction `R = Rz(theta) . R0` fits to mean 0.096 deg and
+  **max 11.3 deg**, so a 2-dim yaw encoding does discard something real.
+
+```python
+import json, numpy as np
+s = json.load(open("normalization_stats.json"))["observation_vector"]
+mean, std = np.array(s["mean"]), np.array(s["std"])   # std[3:9] == 1, mean[3:9] == 0
+
+x_norm = (x - mean) / std                             # x: (..., 17) raw from the parquet
+x_back = x_norm * std + mean
+
+c0, c1 = x[..., 3:6], x[..., 6:9]                     # exactly orthonormal
+c2 = np.cross(c0, c1)                                 # the missing third column
+R  = np.stack([c0, c1, c2], axis=-1)                  # full 3x3 world-frame rotation
+```
+
+#### The shipped statistics in full
+
+| dim | field | mean | std | treatment |
+|---|---|---|---|---|
+| 0 | `ee_x_mm` | 523.3354 | 70.80737 | z-scored |
+| 1 | `ee_y_mm` | -95.1079 | 88.21514 | z-scored |
+| 2 | `ee_z_mm` | 119.5620 | 70.93004 | z-scored |
+| 3 | `ee_rot6_0` | 0.0000 | 1.00000 | **identity — passes through unchanged** |
+| 4 | `ee_rot6_1` | 0.0000 | 1.00000 | **identity — passes through unchanged** |
+| 5 | `ee_rot6_2` | 0.0000 | 1.00000 | **identity — passes through unchanged** |
+| 6 | `ee_rot6_3` | 0.0000 | 1.00000 | **identity — passes through unchanged** |
+| 7 | `ee_rot6_4` | 0.0000 | 1.00000 | **identity — passes through unchanged** |
+| 8 | `ee_rot6_5` | 0.0000 | 1.00000 | **identity — passes through unchanged** |
+| 9 | `gripper` | 0.8738 | 0.17055 | z-scored |
+| 10 | `joint1_rad` | -2.1194 | 0.27059 | z-scored |
+| 11 | `joint2_rad` | -1.1055 | 0.22719 | z-scored |
+| 12 | `joint3_rad` | 1.9915 | 0.21618 | z-scored |
+| 13 | `joint4_rad` | 1.2705 | 0.33514 | z-scored |
+| 14 | `joint5_rad` | 1.3487 | 0.37235 | z-scored |
+| 15 | `joint6_rad` | 0.8736 | 0.34489 | z-scored |
+| 16 | `joint7_rad` | 1.0363 | 0.28585 | z-scored |
+
+| dim | action | mean | std | treatment |
+|---|---|---|---|---|
+| 0 | `move_x` | 0.0004 | 0.45708 | z-scored |
+| 1 | `move_y` | -0.0080 | 0.56608 | z-scored |
+| 2 | `height` | -0.0031 | 0.38903 | z-scored |
+| 3 | `yaw` | -0.0002 | 0.33113 | z-scored |
+| 4 | `gripper` | 0.5106 | 0.41864 | z-scored |
+
+Action dims are all well-conditioned (amplification 1.8-3.0x) and z-scored normally.
 
 ## 6. What was dropped
 

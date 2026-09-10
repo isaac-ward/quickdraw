@@ -85,15 +85,56 @@ def compute_norm_stats(obs: np.ndarray, act: np.ndarray,
     eps = 1e-6
     o_mean, o_std = o.mean(0), o.std(0) + eps
     a_mean, a_std = a.mean(0), a.std(0) + eps
-    for arr_m, arr_s, idx, n in ((o_mean, o_std, obs_identity, o.shape[-1]),
-                                 (a_mean, a_std, act_identity, a.shape[-1])):
+    diag = {}
+    for tag, x, arr_m, arr_s, idx in (("observation_vector", o, o_mean, o_std, obs_identity),
+                                      ("action", a, a_mean, a_std, act_identity)):
+        keep = set()
         for i in (idx or []):
-            assert 0 <= int(i) < n, f"identity dim {i} out of range for width {n}"
+            assert 0 <= int(i) < x.shape[-1], f"identity dim {i} out of range for {tag}"
             arr_m[int(i)], arr_s[int(i)] = 0.0, 1.0
+            keep.add(int(i))
+        diag[tag] = _concentration_warn(tag, x, arr_s, keep)
     return {
         "observation_vector": {"mean": o_mean.tolist(), "std": o_std.tolist()},
         "action": {"mean": a_mean.tolist(), "std": a_std.tolist()},
+        # Advisory only; no consumer reads it. Kept so a dataset records what its own build knew.
+        "concentration_diagnostic": diag,
     }
+
+
+# std/range below this = the dim sits at one value with rare excursions, so z-scoring it mostly
+# amplifies noise. Scale-free (units cancel) and offset-free, unlike 1/std, which is 1000x
+# different for the same quantity in metres and millimetres. A Gaussian sits near 0.17; on the
+# block-stack corpus the two structurally-pinned rotation dims scored 0.013 and 0.016 while the
+# lowest healthy dim scored 0.072, so 0.05 separates them with margin on both sides.
+CONCENTRATION_WARN = 0.05
+
+
+def _concentration_warn(tag: str, x: np.ndarray, std: np.ndarray, exempt: set) -> dict:
+    """Flag dims that are effectively constant, so nobody ships a 300x noise amplifier by accident.
+
+    THIS ONLY WARNS. Whether a near-constant dim should be left unnormalized, dropped, or kept as
+    is depends on what it MEANS, and only the processor knows that -- hence `obs_identity` rather
+    than an automatic rule. What is not acceptable is the failure being silent: models/features.py
+    documents robocasa action dims whose std floors near 1e-6, turning a real 0.5 deviation into
+    5e5, and that was found by debugging a model rather than by building a dataset.
+    """
+    rng = x.max(0) - x.min(0)
+    ratio = np.where(rng > 0, std / np.maximum(rng, 1e-12), 0.0)
+    bad = [int(i) for i in np.argsort(ratio)
+           if i not in exempt and ratio[i] < CONCENTRATION_WARN and rng[i] > 0]
+    if bad:
+        print(f"[norm] WARNING: {len(bad)} {tag} dim(s) are near-constant and will be z-scored "
+              f"anyway (std/range < {CONCENTRATION_WARN}):", flush=True)
+        for i in bad:
+            print(f"[norm]   dim {i:3d}  std {std[i]:.6g}  range {rng[i]:.6g}  "
+                  f"std/range {ratio[i]:.4f}  -> x{1 / std[i]:.0f} amplification", flush=True)
+        print("[norm]   Mostly noise gets amplified. If these dims jointly encode one geometric "
+              "object (a 6D rotation, a quaternion), pass them as obs_identity/act_identity.",
+              flush=True)
+    return {"std_over_range": [round(float(v), 6) for v in ratio],
+            "flagged_dims": bad, "threshold": CONCENTRATION_WARN,
+            "exempt_dims": sorted(exempt)}
 
 
 def _read_frames(path: str) -> np.ndarray:
