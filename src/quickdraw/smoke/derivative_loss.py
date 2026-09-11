@@ -107,5 +107,66 @@ d2 = _losses(BASE + ["+model.modalities.1.derivative_weight=0.5"])
 chk("the guard is PER-MODALITY (image on, proprio still noised, no raise)",
     "derivative/image" in d2 and "derivative/proprio" not in d2)
 
+
+# ---- FRAME ALIGNMENT: the silent-bug class ------------------------------------------------------
+# If decode_loss's `reshape(-1, ...)` and `view(*lead, ...)` disagreed about layout, the term would
+# difference the WRONG frames -- a different episode, or a shuffled time axis -- and every check above
+# would still pass, because they all feed (B,F,...) directly. This is the one place the plumbing could be
+# wrong with nothing noticing.
+_B, _F, _H, _W, _C = 3, 5, 4, 4, 3
+_t = torch.zeros(_B, _F, _H, _W, _C)
+for _b in range(_B):
+    for _i in range(_F):
+        _t[_b, _i] = _b * 100 + _i                       # every frame a DISTINCT constant
+_flat = _t.reshape(-1, _H, _W, _C)                       # what decode_loss hands the head
+_back = _flat.view(_B, _F, _H, _W, _C)                   # what decode_loss hands derivative_loss
+chk("flatten -> view is the identity", torch.equal(_back, _t))
+chk("row b*F+t really IS frame [b, t]",
+    all(torch.equal(_flat[b * _F + i], _t[b, i]) for b in range(_B) for i in range(_F)))
+chk("temporal difference is exactly 1.0 everywhere (no seam, no shuffle)",
+    bool(((_back[:, 1:] - _back[:, :-1]) == 1.0).all()))
+_df = _flat[1:] - _flat[:-1]
+chk("  (differencing FLAT rows WOULD fabricate seams -- confirming the hazard is real)",
+    int((_df != 1.0).any(dim=(1, 2, 3)).sum()) == _B - 1)
+
+# ---- A TRAINING STEP, minus Lightning and the GPU -----------------------------------------------
+_opt_cfg = BASE + ["model.modalities.0.decode_kind=mse",      # eligibility, see the guard check above
+                   "+model.modalities.0.derivative_weight=0.5",
+                   "+model.modalities.1.derivative_weight=0.5"]
+with initialize_config_dir(config_dir="/app/conf", version_base=None):
+    _c = compose(config_name="config", overrides=_opt_cfg)
+_m = build_model(_c)
+_opt = torch.optim.AdamW(_m.parameters(), lr=1e-4)
+torch.manual_seed(0)
+_o = {"proprio": torch.randn(2, 6, _c.model.modalities[0].dim),
+      "image": torch.rand(2, 6, 112, 192, 3)}
+_before = {k: v.detach().clone() for k, v in _m.named_parameters() if v.requires_grad}
+_rec, _w = _m.recon_losses(_m.encode_state(_o), _o)
+_loss = sum(_w[k] * _rec[k] for k in _rec)
+chk("total loss with the term ON is finite", torch.isfinite(_loss).item(), f"{float(_loss):.4f}")
+_loss.backward()
+chk("gradients reach parameters and are all finite",
+    all(torch.isfinite(v.grad).all() for v in _m.parameters() if v.grad is not None))
+chk("  ...including the DECODER and the ENCODER",
+    any("decode_head" in k and v.grad is not None and float(v.grad.abs().sum()) > 0
+        for k, v in _m.named_parameters())
+    and any(".ae" in k and v.grad is not None and float(v.grad.abs().sum()) > 0
+            for k, v in _m.named_parameters()))
+_opt.step()
+chk("optimizer.step() moves parameters",
+    sum(1 for k, v in _m.named_parameters()
+        if v.requires_grad and not torch.equal(v.detach(), _before[k])) > 0)
+with torch.autocast("cpu", dtype=torch.bfloat16):        # the real run is precision=bf16-mixed
+    _r2, _w2 = _m.recon_losses(_m.encode_state(_o), _o)
+    _l2 = sum(_w2[k] * _r2[k] for k in _r2)
+chk("bf16 autocast: the term computes and stays finite",
+    torch.isfinite(_l2).item() and torch.isfinite(_r2["derivative/image"]).item(),
+    f"{float(_r2['derivative/image']):.4f}")
+for _mod in _m.modalities.values():
+    _mod.derivative_weight = 0.0
+_r0, _w0 = _m.recon_losses(_m.encode_state(_o), _o)
+chk("turning the weight off changes the total (the term is load-bearing)",
+    abs(float(sum(_w0[k] * _r0[k] for k in _r0)) - float(_loss)) > 1e-6)
+
 print(f"\n{ok} passed, {bad} failed")
 sys.exit(1 if bad else 0)

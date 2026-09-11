@@ -10,6 +10,89 @@ One sentence: today the loss asks *"does each predicted frame look like the true
 
 ---
 
+## 0. HOW TO USE IT (read this first if you are picking this up cold)
+
+**IMPLEMENTED AND PUSHED as of 2026-09-11.** Off by default and byte-identical to not having it.
+`python -m quickdraw.smoke.derivative_loss` -> 26 checks.
+
+### Turn it on
+
+```bash
+# block-stack baseline (term OFF) -- this recipe already sets decode_kind=mse on BOTH heads
+uv run python -m quickdraw.train_world_model \
+    model=vl128_blockstack data=block_stack environments=recorded data.subsample=8 \
+    trainer.max_epochs=40 eval.during_train.every_epochs=1 experiment=blockstack_base \
+    +run_summary.problem=... (all 5 fields)
+
+# the ARM -- add the weight. Nothing else changes.
+    +model.modalities.0.derivative_weight=<w>      # proprio
+    +model.modalities.1.derivative_weight=<w>      # image
+```
+
+`data.subsample=8` is MEASURED, not copied -- see conf/data/block_stack.yaml's header table. At stride 1
+the per-step image delta is 0.44x robocasa's stride-1 value, which record section 13 already judged too
+small to learn from, so a first-order term there would be differencing almost pure noise.
+
+### The eligibility rule, which will bite you if you skip it
+
+`derivative_weight > 0` REQUIRES `decode_kind: mse` on that modality, and RAISES otherwise with a message
+naming the knob. `vl128_blockstack` already sets it on both heads; every other recipe leaves proprio on
+`decode_kind: flow`, so on those you must add `model.modalities.0.decode_kind=mse` or restrict the weight
+to the image head. Why: a noised decoder has no clean single-pass prediction, and 62% of a temporal
+difference of its predictions is the sampled tau rather than the motion (measured, §5.1).
+
+### Choosing the weight (do NOT sweep it)
+
+Measure instead. `derivative/<m>` and `decode/<m>` are both logged raw, so run one step and set the weight
+so the derivative contributes ~25% of the decode term. On random 112x192 data the raw values were
+`derivative/image` 1.03 against `decode/image` 1.66; the real ratio on block-stack frames will differ, so
+measure it there. `derivative_strides` is LOCKED at `[1]` (§2.1) -- do not sweep that either.
+
+### What to read, in this order
+
+1. **`eval_ood_horizon/open_loop/<head>/lpips/@+128` at matched epochs against the baseline.** THE
+   objective. It decides. Everything else is diagnosis.
+2. `motion_ratio` / `latent_motion_ratio` -- the TRIPWIRE. A difference-matching term is mean-seeking, and
+   the mean of "the block might go left or right" is NO MOTION, so an over-weighted term FREEZES the
+   prediction. If either falls below the `weight=0` baseline, the weight is too high (§7).
+3. `derivative/<head>` itself -- only to confirm it is being optimised, never as a result.
+
+**The trap, written down in advance:** a mechanism metric improving while `@+128` does not is exactly what
+`latent_cos` did for the depth-4 arm (it moved 30% at every matched epoch and won `@+128` at 2/7). Do not
+rank the arm on anything but `@+128`.
+
+### Diagnose the BASELINE before running the arm
+
+The premise is that the rollout FLICKERS. Two quantities settle whether this term is even aimed at the
+right failure, both computable post-hoc from the logged `raw_filmstrip_frames_*.npz` (no eval-path code):
+
+| `||dpred|| / ||dtrue||` | `cos(dpred, dtrue)` | diagnosis | does this term help? |
+|---|---|---|---|
+| low | high | smooth but too slow -- under-moving | yes |
+| ~1 | low | **incoherent -- this IS flicker** | **yes, the target case** |
+| low | low | both | yes |
+| ~1 | high | the motion is fine | **no -- the premise is wrong, stop** |
+
+`motion_ratio` is already the first column. The second column is the missing one and is what the loss
+actually optimises.
+
+### What is verified, and what is NOT
+
+**Verified** (26 checks, `smoke/derivative_loss.py`): identical sequences score exactly 0; a CONSTANT
+OFFSET scores ~0 while the per-frame term on the same pair scores 0.4110 (this is the property that proves
+it measures MOTION, not POSITION); `strides=(1,)` equals the hand-written two-liner to the last digit;
+episode seams are impossible by construction (and the test confirms that differencing flat rows WOULD
+fabricate them); `flatten -> view` preserves frame order and a time-REVERSED prediction scores > 0 so the
+zero checks are not vacuous; the guard raises per-modality; a full forward -> weighted sum -> backward ->
+`optimizer.step()` runs with gradients reaching both encoder and decoder, all finite; the same under
+`bf16` autocast; and turning the weight off changes the total.
+
+**NOT verified, because it needs a GPU:** the feature has never run inside a real Lightning training loop.
+Untested: multi-epoch stability, interaction with `autobatch` and `decode_chunk_train`, peak memory with
+the term on (the pair sampler is DESIGNED to keep feature-net cost equal to the ordinary LPIPS term's --
+`frames // 2` pairs -- but that is reasoned, not measured), and `bf16-mixed` on CUDA rather than CPU
+autocast. Expect the first real run to surface something here; the memory figure is the most likely.
+
 ## 1. Why flicker is currently free
 
 The objective is `sum_t d(x_hat_t, x_t)` — **separable over t**. No term's value depends on the PAIR
