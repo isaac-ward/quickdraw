@@ -145,9 +145,20 @@ Each step has a verification, per `CLAUDE.md` §4. Steps 1-3 are the term; 4-5 a
    `derivative_weight` spec field defaulting to 0.0.
    -> **verify:** with all `derivative_weight = 0`, a 2-epoch run is bit-identical to `main` (same seed,
    same loss curve). Non-zero weight makes `derivative/<m>` appear in `metrics.jsonl` for every modality.
-4. **Get the block env into the pipeline.** `swoosh-data/lego_assemblies` is in the HF cache but there is
-   **no processor** for it (`data/processors.py` has `starling`, `robocasa`, `starling_bags`) and no local
-   recording. Alternatively use one of robocasa's stacking tasks, which needs no processor.
+4. **Get the block env into the pipeline.** The dataset is **`isaac-ronald-ward/block-stack`** (NOT
+   `swoosh-data/lego_assemblies`, which was a wrong guess). It was written by quickdraw's own recorder --
+   root `normalization_stats.json` / `summary.json` / `dataset_card.json`, lerobot splits -- so it should
+   need **no processor at all**, only a `conf/data/block_stack.yaml`, exactly as `starling` did.
+       fps 30 | observation_vector 17-dim | action 5-dim | 4.64 GB
+       FOUR cameras at 144x192 (non-square, 4:3): scene_left, scene_right,
+                                                  gripper_right_bottom, gripper_right_top
+       train 43 eps x 4019 steps = 172,835 transitions (169,782 windows)
+       val    2 eps x 17400      =  34,799
+       eval_purple_play  5 eps   =   9,048      <- extra OOD-ish splits
+       eval_purple_stack 6 eps   =   5,323
+   Note the val split is only **2 episodes** (very long ones) -- thin for evaluation, so read val numbers
+   with that in mind. `img_size` must be the `[144, 192]` tuple form, paired with an `ae_bottleneck` that
+   divides both axes. Four cameras means `vl128_2cam`'s N-arbitrary multi-head path applies unchanged.
    -> **verify:** `check_dataset` reports the window count and no dim mismatch.
 5. **Baseline first, then the arm.** Train the existing recipe on the block env and read `motion_ratio` /
    `latent_motion_ratio` across horizon BEFORE adding the term.
