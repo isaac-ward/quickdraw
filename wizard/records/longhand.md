@@ -206,7 +206,105 @@ here (`libavutil.so.60` missing). quickdraw's `data/dataset.py` reads the mp4s w
 instead, so training is unaffected — but anything reaching for `LeRobotDataset` directly will
 fail until ffmpeg's shared libs are installed.
 
-## 7. Still open
+## 8. Training runs
+
+### Live: the stride bracket
+
+Both arms are `vl128_blockstack_2cam` — robocasa's record-holding `vl128_2cam` (record §24) with
+only what the dataset forces changed: proprio 17 / action 5, `img_size [96,128]` non-square at 3:4
+to match the 144×192 source, `ae_bottleneck 6`. Cameras `scene_right` + `gripper_right_top`,
+`action_aggregate=mean`, evals every 2 epochs, autobatch chose 13. **The one variable is the
+temporal stride.** Launched 2026-09-11 03:19/03:21.
+
+| arm | GPU | stride | rate | F=64 spans | windows | s/epoch |
+|---|---|---|---|---|---|---|
+| `bs_stride10` | 0 | 10 | 3 Hz | 24.0 s | 84% | ~4300 |
+| `bs_stride15` | 1 | 15 | 2 Hz | 36.0 s | 76% | ~2800 |
+
+**Why stride is the first variable.** Record §13: robocasa at 20 Hz had per-step motion 0.61× its
+codec's own error floor, so predicting zero motion was the correct solution to the objective, and
+every early run did exactly that. Measured here, native 30 Hz gives **0.30×** on `scene_right` —
+worse, because these scene cameras are bolted down while robocasa's move. Any camera or loss
+comparison run below the floor returns a null result that means nothing.
+
+**Why 10 and 15.** Block-stack's own codec floor is unknown until ep0's `eval_ae_floor`. Across the
+plausible range (0.045–0.0637) these two are the only pair that stay ≥ 1.0× throughout; stride 6
+would be 0.82–0.92× if the floor is robocasa-like. The error is asymmetric — below the floor is
+degenerate, above it merely harder — so err high.
+
+**Read `eval_ae_floor` on `cam_scene` first.** And read only `cam_scene`'s eval metrics: eval is
+not multi-head yet, so `cam_wrist`'s are scored against the wrong camera's frames
+(`train/loss/decode/cam_wrist` is the valid one for that head).
+
+### Pinned, NOT queued: the action-aggregation sweep
+
+`./wizard/scripts/blockstack-aggregate.sh <subsample>` — **run by hand once the bracket reports**,
+passing the winning stride. It refuses to start while training is running, and requires the stride.
+
+It was briefly armed as an auto-firing queue at a hardcoded `subsample=10`, which presupposed the
+answer the bracket exists to give. The within-window variance separating `mean` from `concat` is
+itself stride-dependent, so the test must follow the bracket rather than race it.
+
+| arm | GPU | `action_aggregate` | model sees |
+|---|---|---|---|
+| `bs_agg_sub<N>_sum` | 0 | `sum` | action_dim 5 |
+| `bs_agg_sub<N>_concat` | 1 | `concat` | action_dim 5 × N |
+
+The bracket supplies the `mean` leg, completing a three-way sweep.
+
+**The default aggregation is wrong for this data.** block-stack actions are Xbox stick POSITIONS —
+the same class as starling's `joy_axis_*` — not the EEF deltas summing was written for. Lag-1
+autocorrelation is 0.96–0.99 on every axis, so summing scales rather than cancels, and
+`normalization_stats.json` is computed on raw stride-1 actions and never sees the aggregation:
+
+| stride | rule | action z-std | max \|z\| |
+|---|---|---|---|
+| 10 | `sum` (default) | 7.6 – 9.6 | 30.2 |
+| 15 | `sum` (default) | 11.0 – 14.2 | 45.3 |
+| 10 | `mean` | 0.76 – 0.96 | 3.0 |
+| 15 | `mean` | 0.74 – 0.95 | 3.0 |
+
+Under `sum` the two bracket arms would have differed in action input scale by ~1.5×, confounding
+the stride comparison itself. Caught only by pulling `ba8ff09` from main.
+
+**What each leg does and does not measure.** `sum` is exactly N × `mean`, so they carry identical
+information — that arm isolates whether input SCALE alone hurts, not what the aggregation
+preserves. There is no clamp in the way (`action_fourier_freqs=0`, `action_squash=none`), so a
+linear `act_enc` could absorb the factor with smaller weights; what is left is optimization. Expect
+a modest effect. `mean` vs `concat` is the information-bearing comparison: `concat` keeps the
+within-window variance `mean` discards — 14.7% of `move_x` at stride 10, 22.7% at stride 15.
+
+Robocasa §12 found the model responds to action DISTRIBUTION, not ORDER. Within-window ordering is
+exactly concat's advantage, so concat winning would mean §12 does not hold here. A tie is a real
+result, not a null.
+
+**Cross-launch caveat:** `sum` vs `concat` is a matched pair; the `mean` leg comes from the bracket,
+a different launch, and this repo sets no training seed — treat a small mean-vs-anything gap as
+noise.
+
+### After that
+
+1. **Four cameras** (robocasa queue item 2: does the camera lever scale, or was the wrist view
+   special because it is gripper-mounted?). Block-stack can uniquely answer this — two scene and
+   two gripper views. Run at the winning stride and aggregation.
+2. `decode_out_act=sigmoid` is **already ruled out**: 0.00% of scene and 0.07% of gripper pixels are
+   saturated here, against torus's 66.9% where it was worth 3.4× and robocasa's already-marginal
+   0.4%. Robocasa queue item 1 does not transfer.
+
+### Things that cost time, worth not repeating
+
+- `check_val_every_n_epoch` is the VAL cadence ONLY. The eval SUITE is
+  `eval.during_train.every_epochs` (default 10, plus `at_epochs: [5,15]`). Setting only the first
+  left evals at {5,9,15,19,29,39,49} — 7 over a 50-epoch run, nothing for the first five epochs.
+- `WANDB_API_KEY` lives in `~/.env`, outside the repo. A launch script that does not source it logs
+  locally only, and says so in one line nobody notices for hours.
+- `pkill -f <pattern>` matches the calling shell's OWN command line whenever the pattern's literal
+  text appears anywhere in that command. This killed the shell mid-script three times, each time
+  leaving every step after it silently unrun. Use a bracket pattern AND keep the literal string out
+  of the rest of the line.
+- Editing a running bash script corrupts it — bash reads by byte offset as it executes.
+
+## 9. Still open
 
 - [ ] Should `campaign4-rgb` / `campaign6-combos` / `campaign7-precision` be pooled (current
       behaviour, one distribution) or should the model condition on campaign? The label is
