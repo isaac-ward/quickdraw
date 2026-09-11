@@ -1124,7 +1124,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
 
     with torch.no_grad():                                        # no grad: this eval also runs on the TRAINING GPU
         h_ctx = m.action_context(ctx, act)                       # (E,L-1,d): h[k] predicts a[k+1] (leak-free)
-        pred_norm = m.sample_action(h_ctx).cpu()                 # (E,L-1,2) head, 1/context
+        pred_norm = m.sample_action(h_ctx).cpu()                 # (E,L-1,K*a) head, 1 chunk/context
     # obs at each action's state (E,L-1,obs_dim), for the env's OPTIONAL by-state split hook (item 3).
     obs_stack = np.stack([o[1:L] for o, _, _ in eps]).astype(np.float32)
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
@@ -1137,9 +1137,15 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     # marginals are estimated the same way and are directly comparable. Smoothness comes from #EPISODES (more
     # distinct contexts), NOT more samples/context: the head is sharp per context, so extra draws per context just
     # stack onto the same few spikes. n_ep is capped by the val split (here 64).
-    true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()           # (E,L-1,2) recorded a[1..L-1]
-    pred_a = norm.denorm_act(pred_norm).numpy()                  # (E,L-1,2) head, 1/context (sampled under no_grad)
-    prog(50, "head sampling")
+    K = int(getattr(m, "action_head_chunk", 1))
+    true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()           # (E,L-1,a) recorded a[1..L-1]
+    # A CHUNKED head predicts [a[t], a[t+1], ... a[t+K-1]] per context. The products below are all about the
+    # NEXT action, so they use LEAD TIME 0 -- identical to the whole output when K=1. The other lead times are
+    # scored as w1/lead_<k> scalars further down rather than folded in here, because pooling them would mix K
+    # different prediction problems into one histogram and quietly flatter the head.
+    pred_chunk = pred_norm.reshape(*pred_norm.shape[:-1], K, -1) if K > 1 else None
+    pred_a = norm.denorm_act(pred_chunk[..., 0, :] if K > 1 else pred_norm).numpy()   # (E,L-1,a) lead time 0
+    prog(50, "head sampling" + (f" (chunk K={K}, products use lead time 0)" if K > 1 else ""))
 
     # PRIMARY product: per-dim marginals (dataset/env-agnostic — no a_max/state-split/geometry needed).
     fig = viz.fig_action_marginals(true_a, pred_a, names=action_names)
@@ -1160,6 +1166,14 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     q = np.linspace(0.0, 1.0, 512)
     w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a| (vs recorded)
     writer.scalar("eval_action_distribution/true_pred_w1", w1, step)
+    if K > 1:
+        # Per-LEAD-TIME W1: does the chunk stay faithful as it reaches further ahead? Slot k is scored against
+        # the recorded action k steps later, so each is a like-for-like 1D-Wasserstein on pooled |a|.
+        for k in range(K):
+            pk = np.linalg.norm(norm.denorm_act(pred_chunk[:, :true_a.shape[1] - k, k, :]).numpy(), axis=-1)
+            tk = np.linalg.norm(true_a[:, k:], axis=-1)
+            wk = float(np.mean(np.abs(np.quantile(tk.reshape(-1), q) - np.quantile(pk.reshape(-1), q))))
+            writer.scalar(f"eval_action_distribution/w1/lead_{k}", wk, step)
     # per-dim W1 (item 4b): `live` skips constant dims (W1~=0) so w1_mean isn't flattered by dead dims.
     w1_per_dim = [float(np.mean(np.abs(np.quantile(true_a[..., i], q) - np.quantile(pred_a[..., i], q))))
                   for i in range(true_a.shape[-1])]

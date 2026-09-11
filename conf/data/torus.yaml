@@ -34,6 +34,24 @@ subsample: 1   # FRAME stride: keep every Nth frame and AGGREGATE the actions ac
                # with integrated EEF deltas (2506.09985), HMA 2 Hz (2502.04296), IRASim ~4 fps (2406.14540).
                # Applied inside BOTH episode loaders (data/dataset.py) rather than threaded through their ~12
                # call sites, so eval can never silently run at a different rate than training.
+action_aggregate: sum   # HOW the skipped frames' actions fold into the kept step's action (only used when
+#   subsample > 1). `sum` is the historical default and the ONLY correct rule for DELTA actions: robocasa's
+#   EEF/rotation deltas compose additively over the skipped frames, so the sum IS the net displacement.
+#   It is WRONG for ABSOLUTE commands. starling's `joy_axis_*` are stick POSITIONS, and a pilot's stick is so
+#   autocorrelated that summing s of them scales the std by essentially exactly s -- measured on starling-2,
+#   normalized |z| std 1.00 / 2.05 / 3.13 / 4.21 at stride 1/2/3/4 with excursions to 12.2 sigma, because
+#   normalization_stats.json is computed on the RAW actions at generation time and never sees the aggregation.
+#     sum     net effect over the window. Delta/velocity actions.                      (historical default)
+#     mean    average command over the window. Absolute commands; = sum/s, so z std returns to ~1.
+#     last    the command in effect at the kept frame. Absolute commands, causal reading.
+#     first   the command in effect when the kept transition starts.
+#     concat  all s raw actions kept as an s*action_dim vector. LOSSLESS, no aggregation assumption, and one
+#             strided step then carries a genuine s-action chunk. model action_dim is DERIVED s x wider
+#             (training.setup.effective_action_dim) and the stats tile to match (Normalizer.tile_act), so
+#             unlike sum it has no normalization mismatch.
+#   Binary/near-binary dims (auto-detected, <=2 unique values) always take-last under sum/mean, since summing
+#   a +-1 gripper would give +-5. CHANGING THIS REDEFINES WHAT AN ACTION IS: it invalidates comparison with
+#   every run trained under a different rule, so it belongs in a new numbered record section.
 batch: 1024    # fast baseline: 515K model + F=64 full BPTT fits ~51 GB at this batch. OVERRIDDEN at startup
                #   by the autobatch finder below (unless autobatch=false) — this is only the fallback/floor.
 autobatch: true            # DEFAULT ON (2026-08-05): probe the AR step at startup + set data.batch to the

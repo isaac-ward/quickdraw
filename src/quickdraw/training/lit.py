@@ -474,8 +474,9 @@ class LitActionModel(L.LightningModule):
         from torch.nn.attention import SDPBackend, sdpa_kernel
         with torch.no_grad(), sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):  # frozen WM: contexts only
             h_ctx = m.action_context(obs, act)                # (B, L-1, d): h[k] predicts a[k+1] (leak-free)
-        cond = h_ctx[:, :-1]                                  # h[t-1], aligned to predict a[t] for t=1..L-2
-        a_target = act[:, 1:L_ - 1].detach()                  # a[1..L-2] — same alignment as loss_terms
+        cond, a_target = m.action_pairs(h_ctx, act)           # THE shared alignment (see MultiModalFlow)
+        assert cond is not None, (f"data.P+data.F={L_} is too short for action_head.chunk="
+                                  f"{m.action_head_chunk}; need L >= chunk+2")
         l_flow, l_cons = m.action_flow.loss(cond, a_target, time_sampling=m.time_sampling)
         loss = l_flow if l_cons is None else l_flow + l_cons
         self.log(f"{tag}/loss/action/flow", l_flow)

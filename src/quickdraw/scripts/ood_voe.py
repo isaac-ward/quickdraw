@@ -45,9 +45,10 @@ SEED = 0
 def load_model(run_dir, ckpt_arg, device):
     cfg = OmegaConf.create(json.load(open(os.path.join(run_dir, "logs", "config.json"))))
     from quickdraw.training.setup import build_model, load_checkpoint, normalizer, env_cfg
-    from quickdraw.data.dataset import set_subsample, set_obs_keep
+    from quickdraw.data.dataset import set_action_aggregate, set_subsample, set_obs_keep
     from quickdraw.environments.registry import make_env
     set_subsample(int(cfg.data.get("subsample", 1) or 1))
+    set_action_aggregate(str(cfg.data.get("action_aggregate", "sum")))   # beside the stride: same one-shot rule
     set_obs_keep(cfg.data.get("obs_keep", None))
     model = build_model(cfg).to(device)
     ckpt = run_dir if ckpt_arg in (None, "best") else (

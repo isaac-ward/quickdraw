@@ -38,6 +38,15 @@ class Normalizer:
             self.o_mean, self.o_std = self.o_mean[t], self.o_std[t]
         return self
 
+    def tile_act(self, k: int):
+        """Repeat the action stats k times, for `data.action_aggregate=concat` where one kept step carries k
+        raw actions laid out time-major ([slot0 dims..., slot1 dims..., ...]). Each slot holds the RAW action
+        distribution the stats were computed on, so tiling is exactly right -- and it is the reason concat has
+        no normalization mismatch, unlike sum. No-op for k<=1."""
+        if int(k) > 1:
+            self.a_mean, self.a_std = self.a_mean.repeat(int(k)), self.a_std.repeat(int(k))
+        return self
+
     def norm_obs(self, o):
         return (o - self.o_mean.to(o)) / self.o_std.to(o)
 
@@ -87,6 +96,43 @@ def set_subsample(n: int) -> None:
 
 def get_subsample() -> int:
     return _SUBSAMPLE
+
+
+# HOW the actions of the skipped frames are folded into the kept step's action. `sum` is the historical
+# behaviour and the ONLY correct rule for DELTA actions (robocasa's EEF/rotation deltas compose additively
+# over the skipped frames, so the sum IS the net displacement). It is WRONG for ABSOLUTE commands: starling's
+# `joy_axis_*` are stick POSITIONS, and a pilot's stick is so autocorrelated that summing s of them scales the
+# std by essentially exactly s -- measured on starling-2, normalized |z| std 1.00 / 2.05 / 3.13 / 4.21 at
+# stride 1/2/3/4, with excursions to 12.2 sigma, because normalization_stats.json is computed on the RAW
+# actions at dataset-generation time and never sees the aggregation.
+#   sum     net effect over the window. Delta/velocity actions.                          (historical default)
+#   mean    average command over the window. Absolute commands; = sum/s, so it restores z std ~= 1.
+#   last    the command in effect at the kept frame. Absolute commands, causal reading.
+#   first   the command in effect when the kept transition STARTS.
+#   concat  all s raw actions, kept as an s*action_dim vector. LOSSLESS -- no aggregation assumption at
+#           all -- and it makes one strided step carry a genuine s-action chunk. Widens the action vector,
+#           so training.setup.effective_action_dim derives model action_dim and Normalizer.tile_act tiles
+#           the stats to match.
+_ACTION_AGGREGATE = "sum"
+_AGGREGATES = ("sum", "mean", "last", "first", "concat")
+
+
+def set_action_aggregate(mode: str) -> None:
+    """Set the process-wide action-aggregation rule (data.action_aggregate). Set ONCE at startup, beside
+    set_subsample, and for the same reason: a mid-process change would mix rules between the training
+    windows and the eval episodes, and the metrics would silently measure a different problem."""
+    global _ACTION_AGGREGATE
+    mode = str(mode)
+    if mode not in _AGGREGATES:
+        raise ValueError(f"data.action_aggregate must be one of {_AGGREGATES}, got {mode!r}")
+    if _SUBSAMPLE_USED and mode != _ACTION_AGGREGATE:
+        raise RuntimeError(f"data.action_aggregate changed {_ACTION_AGGREGATE!r} -> {mode!r} AFTER episodes "
+                           "were already loaded; train and eval would use different rules. Set it at startup.")
+    _ACTION_AGGREGATE = mode
+
+
+def get_action_aggregate() -> str:
+    return _ACTION_AGGREGATE
 
 
 _SUBSAMPLE_ALL_PHASES = False
@@ -150,7 +196,7 @@ def _subsample_episodes(eps, tag: str):
     logged -- on this dataset that is the flag at dim 4 and the gripper at dim 11."""
     global _SUBSAMPLE_USED
     _SUBSAMPLE_USED = True
-    s = _SUBSAMPLE
+    s, mode = _SUBSAMPLE, _ACTION_AGGREGATE
     if s <= 1:
         return eps
     acts = np.concatenate([e[1] for e in eps], 0)
@@ -169,17 +215,29 @@ def _subsample_episodes(eps, tag: str):
                 dropped += 1
                 continue
             grp = a[:n * s].reshape(n, s, -1)
-            aa = grp.sum(axis=1)
-            if hold:
-                aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the sum
+            if mode == "sum":
+                aa = grp.sum(axis=1)
+            elif mode == "mean":
+                aa = grp.mean(axis=1)
+            elif mode == "last":
+                aa = grp[:, -1].copy()                # .copy(): grp[:, -1] is a VIEW into the episode's array
+            elif mode == "first":
+                aa = grp[:, 0].copy()
+            else:                                     # concat: (n, s, dim) -> (n, s*dim), time-major
+                aa = grp.reshape(n, -1).copy()
+            if hold and mode in ("sum", "mean"):
+                aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the aggregate.
+                #   Unnecessary for last/first (already one raw action) and wrong for concat (nothing to fix).
             # extra streams (ep[2:]) are sliced identically. A DICT of streams (the multi-camera frame
             # bundle) is sliced VALUE-WISE -- without this branch `x[ph:]` on a dict raises TypeError.
             extra = tuple({k: v[ph:][:n * s:s] for k, v in x.items()} if isinstance(x, dict)
                           else x[ph:][:n * s:s] for x in ep[2:])
             out.append((o[:n * s:s], aa) + extra)
     print(f"[subsample] {tag}: stride {s}{f' x {s} PHASES' if all_phases else ''} | {len(eps)} eps "
-          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions SUMMED except "
-          f"take-last on dims {hold} | {dropped} eps dropped as too short", flush=True)
+          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions {mode.upper()}"
+          + (f" except take-last on dims {hold}" if hold and mode in ("sum", "mean") else "")
+          + (f" -> action_dim x{s}" if mode == "concat" else "")
+          + f" | {dropped} eps dropped as too short", flush=True)
     return out
 
 

@@ -63,7 +63,12 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
             fpv = {"coloring": coloring, "fov": float(cfg.data.fpv_fov), "size": int(img_size)}
             _plog(writer, f"[eval_control @ep{step}] multimodal: FPV render in the MPPI loop (coloring={coloring}, size={img_size})")
         else:                                      # generic env: mppi falls back to env.render_obs in the loop
-            fpv = {"size": int(img_size)}
+            # NOT int(): a non-square image head carries img_size as an (H, W) TUPLE (starling is (112,192)),
+            # and coercing it raised `int() argument must be ... not 'tuple'` BEFORE control ever reached the
+            # env -- so every starling run logged a misleading TypeError instead of the real reason (a
+            # recorded env has no simulator to step). Only the torus branch above consumes `size`, as a
+            # square int for FPVRenderer; the generic path renders through env.render_obs and never reads it.
+            fpv = {"size": img_size}
             _plog(writer, f"[eval_control @ep{step}] multimodal: in-loop image context via env.render_obs (size={img_size})")
 
     # language steering: request + reward head -> the LEARNED controller maximizes R(latent, request) with the

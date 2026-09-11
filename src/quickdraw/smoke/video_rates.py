@@ -1,10 +1,17 @@
-"""Three rates, kept apart: dataset CAPTURE, model STEP, and mp4 PLAYBACK.
+"""Preview mp4s: 30 UNIQUE frames per second, and an honest statement of how fast that is.
 
-The measured failure this guards: `s2_sub4` trains at `data.subsample=4` on 15 Hz data, so one
-autoregressive step spans 267 ms -- but every eval video was encoded at `round(1/ecfg.dt)` = 15 fps,
-i.e. FOUR TIMES real speed, with nothing on screen to give it away. A 34 s prediction played in 8.5 s.
-`training.setup.step_fps` fixes the rate; `viz.pace` then retimes for viewing by REPEATING frames, so
-duration stays exact and no pixel the model never produced ever appears in evidence about the model.
+Two separate things, both of which were wrong at some point:
+
+1. THE RATE. Every video of a prediction used to be encoded at round(1/ecfg.dt), the dataset's FRAME
+   period -- but one autoregressive step spans `data.subsample` frames. s2_sub4 trains at subsample=4 on
+   15 Hz data, so its rollouts played at FOUR TIMES real speed with nothing on screen to say so.
+   `training.setup.step_fps` derives the true step rate the way dt_eff already does.
+
+2. THE PLAYBACK. Encoding at that true rate is honest and unwatchable: 128 steps at 3.75 Hz is a
+   34-second slideshow. An earlier attempt repeated frames to reach a 30 fps container, which preserved
+   duration, added no unique frames, and -- at a non-integer repeat ratio -- made the cadence UNEVEN,
+   i.e. judder. So previews now encode ONE FRAME PER CONTAINER FRAME at `preview_fps`: 30 unique frames a
+   second, even cadence, and the resulting speed-up is printed to progress.log once per run.
 
     python -m quickdraw.smoke.video_rates
 """
@@ -42,61 +49,70 @@ class _Sink:
 def main() -> int:
     blank = [np.zeros((4, 4, 3), np.uint8)]
 
-    # 1. the model's step rate folds in the frame stride -- the actual bug
+    # ---- 1. the model's step rate folds in the frame stride: the original bug ----
     e = SimpleNamespace(dt=1.0 / 15.0)
     for sub, want in [(1, 15.0), (2, 7.5), (3, 5.0), (4, 3.75), (5, 3.0), (None, 15.0)]:
         got = step_fps(OmegaConf.create({"data": {"subsample": sub}}), e)
         check(f"step_fps at subsample={sub} is {want} Hz", abs(got - want) < 1e-9, f"got {got}")
 
-    # 2. pacing preserves WALL-CLOCK DURATION, including for non-integer ratios
-    for n, fps, pb in [(128, 3.75, 30), (128, 15.0, 30), (100, 7.5, 30), (128, 5.0, 24), (128, 3.75, None)]:
-        out, of = viz.pace(blank * n, fps, pb)
-        check(f"{n}f @{fps}Hz -> @{of}Hz keeps duration {n / fps:.3f}s",
-              abs(len(out) / of - n / fps) < 1.0 / fps, f"got {len(out) / of:.3f}s")
+    # ---- 2. ONE frame per container frame: never repeat, never drop, never interpolate ----
+    for n, true_fps in [(136, 3.75), (136, 5.0), (136, 15.0), (50, 30.0)]:
+        s = _Sink()
+        RunWriter("/tmp", [s], playback_fps=30).video("t", blank * n, true_fps, 0)
+        check(f"{n}f @{true_fps} Hz -> {n}f @30 fps ({n / 30:.2f}s, {30 / true_fps:.1f}x real time)",
+              s.got == [(n, 30.0)], str(s.got))
+    check("a 136-step rollout is 4.53 s at 30 fps, not 34 s", abs(136 / 30 - 4.53) < 0.01)
 
-    # 3. it REPEATS, never invents or reorders or drops -- the reason a rollout video stays evidence
-    f = [np.full((2, 2, 3), i, np.uint8) for i in range(10)]
-    out, _ = viz.pace(f, 3.0, 30)
-    vals = [int(x[0, 0, 0]) for x in out]
-    check("every output frame is an input frame (nothing blended)", set(vals) <= set(range(10)))
-    check("time order preserved", vals == sorted(vals))
-    check("no unique frame is dropped", len(set(vals)) == 10, f"{len(set(vals))}/10")
-    check("endpoints preserved", vals[0] == 0 and vals[-1] == 9, f"{vals[0]}..{vals[-1]}")
-    out, of = viz.pace(f, 60.0, 30)
-    check("a source FASTER than playback is left alone (never decimated)", out is f and of == 60.0)
-    check("playback == true rate is a no-op", viz.pace(f, 30.0, 30)[0] is f)
-    check("playback None is a no-op (true rate survives)", viz.pace(f, 7.0, None) == (f, 7.0))
-
-    # 4. RunWriter paces ONCE, so the local mirror and wandb cannot diverge
-    a, b = _Sink(), _Sink()
-    RunWriter("/tmp", [a, b], playback_fps=30).video("t", blank * 128, 3.75, 0)
-    check("RunWriter retimes 128f @3.75Hz -> 1024f @30Hz", a.got == [(1024, 30.0)], str(a.got))
-    check("both backends receive the IDENTICAL paced video", a.got == b.got)
+    # ---- 3. the cadence is EVEN, which is what repetition could not give ----
+    # (implied by one-frame-per-frame: there is no repeat ratio at all, integer or otherwise)
     s = _Sink()
-    RunWriter("/tmp", [s], playback_fps=None).video("t", blank * 128, 3.75, 0)
-    check("environments.preview_fps: null -> encode at the true rate", s.got == [(128, 3.75)], str(s.got))
+    RunWriter("/tmp", [s], playback_fps=30).video("t", blank * 137, 3.75, 0)  # awkward count, still 1:1
+    check("an awkward frame count still maps 1:1 (no rounding, no drift)", s.got == [(137, 30.0)], str(s.got))
 
-    # 5. it survives an actual encode (a fractional rate used to be rounded: 3.75 -> 4, 6.7% fast)
+    # ---- 4. both backends get the SAME video, and the speed-up is stated once ----
+    a, b = _Sink(), _Sink()
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "logs"), exist_ok=True)
+        w = RunWriter(os.path.join(d, "logs"), [a, b], playback_fps=30)
+        w.video("t", blank * 136, 3.75, 0)
+        w.video("t2", blank * 136, 3.75, 0)
+        check("both backends receive the identical video", a.got == b.got)
+        check("the speed-up is stated ONCE, not per video", w._said_speed and len(a.got) == 2)
+        log = open(os.path.join(d, "progress.log")).read()
+        check("and it lands in progress.log, naming the factor and the true rate",
+              "8.00x REAL TIME" in log and "3.75 Hz" in log and "267 ms/step" in log, log.strip()[-90:])
+
+    # ---- 5. real time is still available, and is the no-op path ----
+    s = _Sink()
+    RunWriter("/tmp", [s], playback_fps=None).video("t", blank * 136, 3.75, 0)
+    check("preview_fps: null -> encode at the true step rate (real time, 36.3 s)",
+          s.got == [(136, 3.75)], str(s.got))
+    s = _Sink()
+    w = RunWriter("/tmp", [s], playback_fps=30)
+    w.video("t", blank * 50, 30.0, 0)
+    check("a clip already at the container rate says nothing", s.got == [(50, 30.0)] and not w._said_speed)
+
+    # ---- 6. it survives a real encode, and a fractional true rate is not rounded ----
     import imageio.v2 as iio
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "x.mp4")
-        fr = [np.random.randint(0, 255, (112, 192, 3), dtype=np.uint8) for _ in range(40)]
+        fr = [np.random.randint(0, 255, (112, 192, 3), dtype=np.uint8) for _ in range(136)]
         viz.save_mp4(p, fr, 3.75, playback_fps=30)
         m = iio.get_reader(p).get_meta_data()
-        check("encoded at 30 fps with the true duration",
-              abs(m["fps"] - 30) < 0.1 and abs(m["duration"] - 40 / 3.75) < 0.2,
+        check("encoded 30 fps / 4.53 s with every frame distinct",
+              abs(m["fps"] - 30) < 0.1 and abs(m["duration"] - 136 / 30) < 0.15,
               f"{m['fps']} fps, {m['duration']}s")
         viz.save_mp4(p, fr, 3.75)
-        check("an unpaced fractional rate is NOT rounded",
+        check("an unpaced fractional rate is NOT rounded (3.75 -> 4 was 6.7% fast)",
               abs(iio.get_reader(p).get_meta_data()["fps"] - 3.75) < 0.05)
 
-    # 6. dataset videos are DATA: the ingestion paths must not pass playback_fps
+    # ---- 7. dataset videos are DATA: the ingestion paths must never be retimed ----
     import inspect
     from ..data import processors
     from .. import data_generation
     for mod, fn in [(data_generation, "_render_fpv"), (processors, "_encode_ep")]:
         src = inspect.getsource(getattr(mod, fn))
-        check(f"{mod.__name__}.{fn} does NOT pace (its clips are ingested into the dataset)",
+        check(f"{mod.__name__}.{fn} does NOT retime (its clips are ingested into the dataset)",
               "playback_fps" not in src.split("viz.save_mp4")[-1].split(")")[0])
 
     print(f"\n{ok} passed, {bad} failed")
