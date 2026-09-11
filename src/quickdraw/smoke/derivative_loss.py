@@ -5,7 +5,15 @@ term measures MOTION rather than POSITION, and it is the property the per-frame 
 
     python -m quickdraw.smoke.derivative_loss
 """
+import os
+import pathlib
 import sys
+
+# The repo's conf/, resolved from THIS file rather than hardcoded. It was "/app/conf", the path
+# inside the Docker image: outside the container hydra raises MissingConfigException, the 15
+# config-dependent checks (byte-identicality, the eligibility guard, the training step) never run,
+# and the script exits 1 having printed only PASS lines -- which reads as a pass.
+_CONF = str(pathlib.Path(__file__).resolve().parents[3] / "conf")
 
 import torch
 import torch.nn.functional as F
@@ -71,7 +79,7 @@ from hydra import initialize_config_dir, compose
 from ..training.setup import build_model
 
 def _losses(ov, seed=0):
-    with initialize_config_dir(config_dir="/app/conf", version_base=None):
+    with initialize_config_dir(config_dir=_CONF, version_base=None):
         c = compose(config_name="config", overrides=ov)
     torch.manual_seed(seed); m = build_model(c).eval()
     torch.manual_seed(seed + 1)
@@ -133,7 +141,7 @@ chk("  (differencing FLAT rows WOULD fabricate seams -- confirming the hazard is
 _opt_cfg = BASE + ["model.modalities.0.decode_kind=mse",      # eligibility, see the guard check above
                    "+model.modalities.0.derivative_weight=0.5",
                    "+model.modalities.1.derivative_weight=0.5"]
-with initialize_config_dir(config_dir="/app/conf", version_base=None):
+with initialize_config_dir(config_dir=_CONF, version_base=None):
     _c = compose(config_name="config", overrides=_opt_cfg)
 _m = build_model(_c)
 _opt = torch.optim.AdamW(_m.parameters(), lr=1e-4)
