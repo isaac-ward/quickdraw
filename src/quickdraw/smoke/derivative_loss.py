@@ -62,5 +62,50 @@ try:
     chk("raises if the time axis was flattened away", False)
 except AssertionError:
     chk("raises if the time axis was flattened away", True)
+
+# ---- the WIRING: dispatch is polymorphic, defaults are inert, noised heads raise -------------------
+import json
+
+from hydra import initialize_config_dir, compose
+
+from ..training.setup import build_model
+
+def _losses(ov, seed=0):
+    with initialize_config_dir(config_dir="/app/conf", version_base=None):
+        c = compose(config_name="config", overrides=ov)
+    torch.manual_seed(seed); m = build_model(c).eval()
+    torch.manual_seed(seed + 1)
+    b, f = 2, 5
+    im = [x for x in c.model.modalities if x.kind == "image"][0]
+    h, w_ = (im.img_size, im.img_size) if isinstance(im.img_size, int) else tuple(im.img_size)
+    o = {"proprio": torch.randn(b, f, c.model.modalities[0].dim)}
+    for x in c.model.modalities:
+        if x.kind == "image":
+            o[x.name] = torch.rand(b, f, h, w_, 3)
+    rec, wt = m.recon_losses(m.encode_state(o), o)
+    return {k: (float(v), float(wt[k])) for k, v in sorted(rec.items())}
+
+BASE = ["model=vl128_starling", "data=starling", "environments=recorded"]
+d0 = _losses(BASE)
+chk("default config: NO derivative term at all (feature is inert)",
+    not any("derivative" in k for k in d0))
+try:
+    _losses(BASE + ["+model.modalities.0.derivative_weight=0.5"])
+    chk("noised head + weight RAISES", False)
+except ValueError as e:
+    chk("noised head + weight RAISES, message names decode_kind and the 62%",
+        "decode_kind='mse'" in str(e) and "62%" in str(e))
+d1 = _losses(BASE + ["model.modalities.0.decode_kind=mse",
+                     "+model.modalities.0.derivative_weight=0.5",
+                     "+model.modalities.1.derivative_weight=0.5"])
+chk("derivative/proprio AND derivative/image both appear, one code path",
+    "derivative/proprio" in d1 and "derivative/image" in d1,
+    f"proprio {d1.get('derivative/proprio',(0,))[0]:.4f} image {d1.get('derivative/image',(0,))[0]:.4f}")
+chk("  weights travel with the losses",
+    d1["derivative/proprio"][1] == 0.5 and d1["derivative/image"][1] == 0.5)
+d2 = _losses(BASE + ["+model.modalities.1.derivative_weight=0.5"])
+chk("the guard is PER-MODALITY (image on, proprio still noised, no raise)",
+    "derivative/image" in d2 and "derivative/proprio" not in d2)
+
 print(f"\n{ok} passed, {bad} failed")
 sys.exit(1 if bad else 0)

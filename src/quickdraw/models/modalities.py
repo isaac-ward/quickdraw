@@ -94,6 +94,22 @@ class ModalitySpec:
     #                           the 25 historical runs. vgg is also what VQGAN/LDM/IRIS/SoftVQ all hardcode.
     #                           The LPIPS net is a pretrained VGG16 -- a LOSS network, not a codec, so the
     #                           bespoke-codec rule stands, but it IS a pretrained dependency.
+    derivative_weight: float = 0.0   # FIRST-ORDER term: match the CHANGE between consecutive steps, not
+    #                           just each step (design/derivative_loss.md). 0.0 = OFF, and off is
+    #                           bit-identical to not having the feature. WHY IT EXISTS: the objective is
+    #                           sum_t d(x_hat_t, x_t), SEPARABLE over t, so no term's value depends on the
+    #                           PAIR (t, t+1) and temporal incoherence is free -- a stationary object the
+    #                           prediction loses for one frame costs ONE frame of error. This term costs it
+    #                           twice, at the vanish and at the reappear, and is the only thing in the loss
+    #                           that can tell wrong-but-coherent from wrong-and-incoherent.
+    #                           REQUIRES decode_kind='mse' (see decode_loss): a noised decoder has no clean
+    #                           single-pass prediction, and differencing its predictions measures the tau
+    #                           draw rather than the motion -- measured at 62% tau noise.
+    derivative_strides: tuple = (1,)  # LOCKED at (1,). arXiv 2102.05822 §4.5 tested K>1 and found results
+    #                           "almost identical", AND our per-frame term already catches the drift a
+    #                           larger K would add (it IS being in the wrong place). Do not sweep it; the
+    #                           plural form exists so a reader need not re-derive the generalisation to
+    #                           learn it was considered. See design/derivative_loss.md §2.1.
     visual_frames: int = 128   # visual_lpips>0: score LPIPS on a random subset of this many frames per step
     #                           instead of all B*F (2048 at batch 32 / F 64), which would dominate the step. A
     #                           random subset is an unbiased estimate of the same expectation. 0 -> all frames.
@@ -246,10 +262,37 @@ class Modality(nn.Module):
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         tgt = target.reshape(-1, *target.shape[len(lead):])
         cond = self._decode_cond(flat)
+        want_d = float(getattr(self, "derivative_weight", 0.0) or 0.0) > 0.0
+        if want_d and not self.decode_head.no_noise:
+            raise ValueError(
+                f"derivative_weight > 0 on modality {self.name!r} requires decode_kind='mse' (it is "
+                f"{self.decode_kind!r}). A noised decoder has no clean single-pass prediction, so a "
+                f"temporal difference of its predictions measures the sampled tau rather than the motion "
+                f"-- measured at 62% tau noise. Set model.modalities.<i>.decode_kind=mse. "
+                f"See design/derivative_loss.md §5.1.")
         if self.decode_head.no_noise:
             pred = self.decode_head.predict(cond, tgt)          # ONE forward, and it escapes
-            return self.recon_loss(pred, tgt, site="decode"), None, None
+            recon = self.recon_loss(pred, tgt, site="decode")
+            deriv = self.derivative_loss(pred.view(*lead, *tgt.shape[1:]),
+                                         target.view(*lead, *tgt.shape[1:])) if want_d else None
+            return recon, None, deriv
         return (*self.decode_head.loss(cond, tgt, recon_loss=self.recon_loss), None)
+
+    def derivative_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        """FIRST-ORDER term: match the CHANGE between consecutive steps. Both (B, F, ...) -> scalar.
+
+        Base = MSE on the temporal difference, which is correct for ANY vector modality and needs no
+        feature network. `ImageModality` overrides it with the shared VisualLoss in temporal mode, because
+        an image has a perceptual part a 16-vector does not.
+
+        ONE call site (`decode_loss`) dispatches to whichever of these two the modality actually is, so
+        nothing downstream branches on modality type -- the same polymorphism `recon_loss` already uses."""
+        t = tuple(self.derivative_strides) or (1,)
+        out = pred.new_zeros(())
+        for k in (int(x) for x in t):
+            if 1 <= k < pred.shape[1]:
+                out = out + F.mse_loss(pred[:, k:] - pred[:, :-k], target[:, k:] - target[:, :-k])
+        return out
 
     def recon_loss(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
         """The reconstruction loss used at BOTH sites that train this modality's decoder: the AR decode loss
@@ -285,6 +328,8 @@ class VectorModality(Modality):
         from .multimodal import FourierMLP
         self.enc = FourierMLP(spec.dim, d, hidden, n_freq=int(getattr(spec, "fourier_freqs", 0) or 0))
         self.decode_steps = int(spec.decode_steps)
+        self.derivative_weight = float(getattr(spec, "derivative_weight", 0.0) or 0.0)
+        self.derivative_strides = tuple(getattr(spec, "derivative_strides", (1,)) or (1,))
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
         self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
@@ -323,6 +368,8 @@ class ImageModality(Modality):
         self.ae = (ConvImageEncoder(ae_cfg, base=int(getattr(spec, "encode_base", 32)))
                    if self.encode_arch == "conv" else ImageAutoencoder(ae_cfg))
         self.decode_steps = int(spec.decode_steps)
+        self.derivative_weight = float(getattr(spec, "derivative_weight", 0.0) or 0.0)
+        self.derivative_strides = tuple(getattr(spec, "derivative_strides", (1,)) or (1,))
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         # ONE VisualLoss, registered ONCE here as a child of this modality. `recon_loss` below hands the SAME
@@ -400,6 +447,16 @@ class ImageModality(Modality):
         flag = over if latent > cap else "under the cap"
         print(f"[codec] {self.name}: latent {spec.num_tokens}x{d} = {latent} floats | decoder readout {cap} "
               f"({how}) | {pct:.0f}% of cap -- {flag}", flush=True)
+
+    def derivative_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        """The shared VisualLoss in TEMPORAL mode -- same instance, same net, same w_l1:w_lpips ratio.
+
+        NOT `self.visual(dp, dg)`. That would be the embedding OF the difference: it would hand VGG a
+        signed, sparse, near-zero tensor it was never trained on. `temporal()` takes the difference OF the
+        embeddings instead, so every input to the net is a real frame. For the pixel part the two readings
+        coincide (differencing commutes with the identity), which is why the distinction is easy to miss.
+        See visual_loss.temporal and design/derivative_loss.md §2."""
+        return self.visual.temporal(pred, target, strides=self.derivative_strides)
 
     def recon_loss(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
         """The shared mix (models/visual_loss.py). Same instance, same weights, both sites.
