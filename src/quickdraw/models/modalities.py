@@ -221,15 +221,35 @@ class Modality(nn.Module):
         return obs.reshape(*lead, *obs.shape[1:])
 
     def decode_loss(self, tok: Tensor, target: Tensor):
-        """Per-head decode loss via the unified head: mse (no_noise) -> (recon_loss, None); flow -> (flow-matching, shortcut).
+        """Per-head decode loss. Returns `(main, shortcut|None, derivative|None)`.
 
         The head scores its clean prediction with `self.recon_loss`, which is the SAME object the roundtrip
-        anchor uses -- see recon_loss below. Passing it into the head (rather than re-decoding outside) means
-        no second decoder forward, which matters because the decoder is ~78% of per-sample memory."""
+        anchor uses -- see recon_loss below. No second decoder forward, which matters because the decoder is
+        ~78% of per-sample memory.
+
+        TWO ROUTES, and the split is on `no_noise`, never on the modality:
+
+        * `no_noise` (decode_kind='mse') -- DECODE ONCE, SCORE TWICE. `predict()` hands back the clean
+          prediction, so a temporal term can score the same tensor with no extra forward. This is the
+          shape the roundtrip anchor has always had (`to_obs` then `recon_loss`); the decode site was the
+          odd one out in hiding its prediction. Bit-identical to the old single call by construction: the
+          same two operations in the same order (see flow.TransportHead.predict).
+        * noised (decode_kind='flow') -- the original single call, untouched. Such a head has no clean
+          single-pass prediction, so there is nothing for a second term to score (design/derivative_loss.md
+          §5.1 measures the consequence: 62% of a temporal difference of its predictions is the tau draw).
+
+        The third return value is the DERIVATIVE term and is always None until `derivative_weight` is set
+        (design/derivative_loss.md §5). It travels back separately rather than being folded into `main` so
+        it keeps its own logged series and its own weight -- the same rule the rest of the loss dict
+        follows, and the reason `codec/roundtrip_*_mse` is logged at weight 0 rather than summed in."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         tgt = target.reshape(-1, *target.shape[len(lead):])
-        return self.decode_head.loss(self._decode_cond(flat), tgt, recon_loss=self.recon_loss)
+        cond = self._decode_cond(flat)
+        if self.decode_head.no_noise:
+            pred = self.decode_head.predict(cond, tgt)          # ONE forward, and it escapes
+            return self.recon_loss(pred, tgt, site="decode"), None, None
+        return (*self.decode_head.loss(cond, tgt, recon_loss=self.recon_loss), None)
 
     def recon_loss(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
         """The reconstruction loss used at BOTH sites that train this modality's decoder: the AR decode loss

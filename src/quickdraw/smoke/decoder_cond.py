@@ -67,7 +67,7 @@ print(f"       base {p0:,} | +inject {pi:,} | +xattn {px:,} | both {npar(both):,
 
 # ---- gradients actually reach the new modules ----
 for tag, m in (("inject", inj), ("xattn", xa)):
-    m.zero_grad(); loss, _ = m.decode_loss(Z, X); loss.backward()
+    m.zero_grad(); loss, _, _ = m.decode_loss(Z, X); loss.backward()
     mods = m.decode_head.inject if tag == "inject" else list(m.decode_head.xattn.values())
     gs = [p.grad for mm in mods for p in mm.parameters() if p.grad is not None]
     check(f"gradient reaches every {tag} module", len(gs) > 0 and all(torch.isfinite(g).all() for g in gs)

@@ -90,7 +90,7 @@ for kind in ("mse", "flow"):
     every = max(1, STEPS // 5)
     for it in range(STEPS):
         i = torch.randint(0, Z.shape[0], (16,), device=dev)
-        loss, _ = h.decode_loss(Z[i], X[i])
+        loss, _, _ = h.decode_loss(Z[i], X[i])
         opt.zero_grad(); loss.backward(); opt.step()
         hist.append(float(loss.detach()))
         # TRAJECTORY, not just the endpoint: the flow head has the harder objective (denoise at EVERY tau,
