@@ -90,6 +90,25 @@ def main() -> int:
         check("an unpaced fractional rate is NOT rounded",
               abs(iio.get_reader(p).get_meta_data()["fps"] - 3.75) < 0.05)
 
+    # 5b. the WATCHABILITY FLOOR: a crawl is sped up by a stated factor, a fast clip is untouched
+    for true_fps, floor, want in [(3.75, 12, 12.0), (5.0, 12, 12.0), (15.0, 12, 15.0), (30.0, 12, 30.0),
+                                  (3.75, 0, 3.75), (3.75, None, 3.75)]:
+        got = viz.playback_rate(true_fps, floor)
+        check(f"playback_rate({true_fps} Hz, floor {floor}) = {want}", got == want, f"got {got}")
+    check("a clip above the floor is NEVER slowed down", viz.playback_rate(30.0, 12) == 30.0)
+    r = viz.playback_rate(3.75, 12)
+    check("128 steps at 3.75 Hz: 34.1 s real time -> 10.7 s at the floor",
+          abs(128 / 3.75 - 34.13) < 0.1 and abs(128 / r - 10.67) < 0.1, f"{128 / r:.2f}s")
+    a, b = _Sink(), _Sink()
+    w = RunWriter("/tmp", [a, b], playback_fps=30, preview_min_fps=12)
+    w.video("t", blank * 128, 3.75, 0)
+    check("RunWriter applies the floor: 128f @3.75Hz -> 30 fps over 10.7 s",
+          a.got == [(320, 30.0)], str(a.got))
+    check("and announces the speed-up exactly once", w._said_speed)
+    s2 = _Sink()
+    RunWriter("/tmp", [s2], playback_fps=30, preview_min_fps=0).video("t", blank * 128, 3.75, 0)
+    check("preview_min_fps=0 -> honest real time (34.1 s)", s2.got == [(1024, 30.0)], str(s2.got))
+
     # 6. dataset videos are DATA: the ingestion paths must not pass playback_fps
     import inspect
     from ..data import processors

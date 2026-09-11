@@ -27,6 +27,15 @@ EVAL_VIEW_PAD = _PAD  # eval plots use the same tight ~±1.3 framing as summarie
 N_SEG = 16          # discrete hue bands around the ring
 FPV_FOV = 103.5     # egocentric camera FOV (deg); VTK default is 30
 FPV_SIZE = 256      # egocentric video resolution (px, square)
+PREVIEW_MIN_FPS = 12  # DEFAULT floor on UNIQUE frames per second in a preview (Hz), i.e. the watchability
+#                       floor. A clip whose true rate is below this is played back FASTER THAN REAL TIME by
+#                       a stated factor (viz.playback_rate) rather than crawling: a 128-step rollout at
+#                       stride 4 on 15 Hz data is 3.75 Hz, which is a 34-second slideshow at real time and
+#                       ~11 s at this floor. 0/None -> always real time. A clip already above the floor is
+#                       untouched, so stride 1 (15 Hz) never speeds up. Overridable per environment via
+#                       `environments.preview_min_fps`. This is a DECLARED speed-up, not a rate lie: the
+#                       factor is logged per run, and it is separate from PREVIEW_FPS below, which is only
+#                       the container rate and adds no unique frames.
 PREVIEW_FPS = 30    # DEFAULT container playback rate for every mp4 (Hz), overridable per environment via
 #                     `environments.preview_fps` (null -> encode at the frames' own rate). This is a
 #                     PRESENTATION rate only: `pace` repeats frames to reach it and never blends, so
@@ -504,6 +513,20 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
 
 
 # ------------------------- public: videos -------------------------
+def playback_rate(fps: float, min_fps: float | None = None) -> float:
+    """The rate to DECLARE a clip at, given its true sample rate `fps` and a watchability floor `min_fps`.
+
+    Honest real-time playback of a strided rollout is unwatchable: 128 steps at 3.75 Hz is a 34-second
+    slideshow, and no amount of frame repetition adds unique frames (see `pace`). The fix is not to lie
+    about the rate -- that is the bug this module just removed -- but to declare a SPEED-UP: the clip plays
+    faster than real time, by a stated factor, the way any timelapse does. Returns max(fps, min_fps), so
+    the speed factor is `returned / fps` and a clip already above the floor is untouched.
+
+    min_fps is a floor on UNIQUE frames per second, which is what perceived smoothness actually depends on;
+    the container rate is a separate knob (`PREVIEW_FPS`) and does not affect it."""
+    return max(float(fps), float(min_fps or 0.0))
+
+
 def pace(frames, fps: float, playback_fps: float | None = None):
     """Retime `frames` from their TRUE sample rate `fps` (Hz) to a container rate a person can watch,
     by REPEATING frames (nearest-neighbour in time). Returns `(frames, out_fps)`.
