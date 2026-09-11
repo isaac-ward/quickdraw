@@ -110,6 +110,32 @@ class TransportHead(nn.Module):
         return torch.cat(outs, 0)
 
     # ---- training ----
+    def predict(self, cond: Tensor, target: Tensor) -> Tensor:
+        """The CLEAN prediction this head's reconstruction loss scores. `no_noise` heads ONLY.
+
+        WHY THIS IS PUBLIC (2026-09-11). The prediction used to exist only inside `loss()`, so a second
+        term could not score it without a second decoder forward -- and the image decoder is ~78% of
+        per-sample memory (design/decode_memory.md), so that is not affordable. Exposing it lets
+        `Modality.decode_loss` decode ONCE and hand the same tensor to both the reconstruction term and
+        the derivative term (design/derivative_loss.md §5.0). The roundtrip anchor already works this way
+        (`to_obs` then `recon_loss`), so this makes the decode site consistent rather than special.
+
+        This is a pure extraction: `loss()`'s no_noise branch below and `_sample()`'s no_noise branch
+        computed this IDENTICAL expression in two places. Both now route here, so there is one copy.
+        `_chunked_velocity`, not `velocity`, so `decode_chunk_train`'s checkpointed chunking is unchanged.
+
+        RAISES for a noised parameterisation, deliberately. Such a head denoises from `x_tau` at a `tau`
+        sampled PER ELEMENT, so it has no single clean prediction, and differencing its predictions across
+        time measures the tau draw rather than the motion -- measured at 62% tau noise on a trained
+        proprio head (design/derivative_loss.md §5.1). To make a head eligible, set `decode_kind: mse`."""
+        if not self.no_noise:
+            raise ValueError(
+                f"predict() requires a no_noise decoder; this head is param={self.param!r} with a noise "
+                f"curriculum. A noised parameterisation has no clean single-pass prediction. Set "
+                f"decode_kind='mse' on the modality to make it eligible (see design/derivative_loss.md)")
+        return self._chunked_velocity(torch.zeros_like(target),
+                                      self._temb(target.new_ones(self._tau_shape(target))), cond, None)
+
     def loss(self, cond: Tensor, target: Tensor, *, time_sampling: str = "uniform",
              recon_loss=None) -> tuple[Tensor, Tensor | None]:
         """param="v": rectified flow-matching ||net - (eps-target)||^2 (+ shortcut self-consistency).
@@ -130,9 +156,7 @@ class TransportHead(nn.Module):
         rl = recon_loss if recon_loss is not None else F.mse_loss
         ts = self._tau_shape(target)
         if self.no_noise:                             # mse decode: deterministic cond->target, no noise curriculum
-            pred = self._chunked_velocity(x0 := torch.zeros_like(target),
-                                          self._temb(target.new_ones(ts)), cond, None)
-            return rl(pred, target), None
+            return rl(self.predict(cond, target), target), None   # ONE copy of the formula -- see predict()
         tau = self._sample_time(ts, target.device, target.dtype, time_sampling)
         eps = torch.randn_like(target)
         x_tau = (1.0 - tau) * target + tau * eps      # straight (rectified) path
@@ -169,8 +193,10 @@ class TransportHead(nn.Module):
         committed prediction. `event_shape`/`lead` let heads with different target shapes reuse this."""
         ts = tuple(lead) + (1,) * self.event_dims
         if self.no_noise:                             # mse decode: one deterministic cond->target prediction (x=0, tau=1)
-            out = self._chunked_velocity(cond.new_zeros(tuple(lead) + tuple(event_shape)),
-                                         self._temb(cond.new_ones(ts)), cond, None)
+            # Routed through predict() so the formula lives in ONE place. `predict` only uses its second
+            # argument for shape/dtype/device (zeros_like + a ones tau of the matching shape), so handing it
+            # the zeros tensor itself is exactly equivalent to the inline version this replaced.
+            out = self.predict(cond, cond.new_zeros(tuple(lead) + tuple(event_shape)))
             return (out, [out]) if record_path else out
         if eps is None:
             shp = tuple(lead) + tuple(event_shape)
