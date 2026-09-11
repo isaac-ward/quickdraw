@@ -124,13 +124,23 @@ class WandbBackend(_Backend):
 class RunWriter:
     """Fan-out over backends. This is the single place that knows there is more than one sink."""
 
-    def __init__(self, run_dir: str, backends: list[_Backend], playback_fps: float | None = None,
-                 preview_min_fps: float | None = None):
+    def __init__(self, run_dir: str, backends: list[_Backend], playback_fps: float | None = None):
         self.dir = run_dir  # local mirror dir, so callers can drop summary.json next to the media
         self.backends = backends
-        self.playback_fps = playback_fps  # container rate for video (viz.pace); None -> the true rate
-        self.preview_min_fps = preview_min_fps  # unique-frames/s floor (viz.playback_rate); None -> real time
-        self._said_speed = False          # the speed-up is announced ONCE per run, never silently applied
+        self.playback_fps = playback_fps  # container rate for video; None -> the frames' own true rate
+        self._said_speed = False          # the speed-up is stated ONCE per run, never silently applied
+
+    def _plog(self, msg: str):
+        """Append to the run's TOP-LEVEL progress.log (and stdout), matching controller.run._plog: self.dir
+        is <run_dir>/logs, so its parent is the run_dir where progress.log lives."""
+        import time
+        msg = f"[{time.strftime('%m-%d %H:%M:%S')}] {msg}"
+        print(msg, flush=True)
+        try:
+            with open(os.path.join(os.path.dirname(self.dir.rstrip("/")), "progress.log"), "a") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
 
     def scalar(self, tag, value, step):
         for b in self.backends:
@@ -145,18 +155,19 @@ class RunWriter:
             b.figure(tag, fig, step)
 
     def video(self, tag, frames, fps, step):
-        # Retime ONCE here, not per backend, so the local mirror and the wandb run are identical
-        # (this module's no-divergence rule). `fps` from callers is the frames' TRUE sample rate --
-        # for a rollout that is the model's STEP rate, not the dataset's capture rate.
-        rate = viz.playback_rate(fps, self.preview_min_fps)   # declared rate: real time, or a stated speed-up
-        if rate > fps and not self._said_speed:
+        # ONE frame per container frame: never repeated, dropped or interpolated, so `preview_fps` means
+        # that many UNIQUE frames a second with a perfectly even cadence. `fps` from callers is the frames'
+        # TRUE sample rate -- for a rollout the model's STEP rate, not the dataset's capture rate -- so
+        # encoding at the container rate plays the clip faster than real time by exactly that ratio.
+        # Decided ONCE here, not per backend, so the local mirror and the wandb run cannot diverge.
+        rate = float(self.playback_fps or fps)
+        if rate != fps and not self._said_speed:
             self._said_speed = True
-            print(f"[writer] previews play at {rate / fps:.2f}x real time ({fps:.2f} Hz true step rate is "
-                  f"below the {self.preview_min_fps:g} Hz watchability floor; set environments.preview_min_fps=0 "
-                  f"for real time)", flush=True)
-        frames, fps = viz.pace(frames, rate, self.playback_fps)
+            self._plog(f"[previews] mp4s encode at {rate:g} fps, one frame per step, so they play "
+                       f"{rate / fps:.2f}x REAL TIME (true step rate {fps:.2f} Hz = "
+                       f"{1000.0 / fps:.0f} ms/step). Set environments.preview_fps=null for real time.")
         for b in self.backends:
-            b.video(tag, frames, fps, step)
+            b.video(tag, frames, rate, step)
 
     def scene(self, tag, scene: dict, step):
         for b in self.backends:
@@ -196,5 +207,4 @@ def make_writer(run_dir: str, cfg, job_type: str) -> RunWriter:
     # from environments.preview_fps; absent -> viz.PREVIEW_FPS, explicit null -> the true rate.
     env = cfg.get("environments", None)
     pf = env.get("preview_fps", viz.PREVIEW_FPS) if env is not None else viz.PREVIEW_FPS
-    mf = env.get("preview_min_fps", viz.PREVIEW_MIN_FPS) if env is not None else viz.PREVIEW_MIN_FPS
-    return RunWriter(local.dir, backends, playback_fps=pf, preview_min_fps=mf)  # .dir = <run_dir>/logs
+    return RunWriter(local.dir, backends, playback_fps=pf)  # .dir = the local clone (<run_dir>/logs)

@@ -9,14 +9,11 @@ gamma: 0.3        # velocity damping. 0.3 caps top speed (~7, terminal 22) so lo
 a_max: 4.0        # max action magnitude (doubled: more thrust authority to speed up AND brake hard)
 init_speed: 1.0
 mass: 0.6         # inertia: action / mass. Lowered -> a_max/mass authority 1.0 -> 6.7x (snappy accel+decel)
-preview_fps: 30   # mp4 PLAYBACK rate for human-viewing products (eval rollouts, summary videos), in Hz.
-#                   Frames are REPEATED to reach it, never blended, so duration is exact and no pixel the
-#                   model never produced appears (viz.pace). It does NOT touch dataset videos, which are
-#                   data. Set null to encode at the frames' own rate -- which for a strided run is the
-#                   MODEL STEP rate (e.g. 15 Hz data at subsample=4 -> 3.75 Hz, a 34 s clip), not 1/dt.
-preview_min_fps: 12   # floor on UNIQUE frames per second in a preview (Hz). A clip whose TRUE step rate is
-#                       below this plays back faster than real time by a stated factor, announced once per
-#                       run; one already above it is untouched. At 15 Hz data: stride 1 (15 Hz) real time,
-#                       stride 3 (5 Hz) 2.4x, stride 4 (3.75 Hz) 3.2x -- a 34 s slideshow becomes ~11 s.
-#                       0 -> always real time. Distinct from preview_fps, which is only the container rate
-#                       and adds no unique frames, so it cannot fix a crawl on its own.
+preview_fps: 30   # mp4 container rate for human-viewing products (eval rollouts, summary videos), in Hz.
+#                   ONE FRAME PER CONTAINER FRAME: frames are never repeated, interpolated or dropped, so
+#                   this is 30 UNIQUE frames per second with an even cadence. A preview therefore plays
+#                   FASTER THAN REAL TIME when the true step rate is lower -- on 15 Hz data that is 2x at
+#                   stride 1, 6x at stride 3, 8x at stride 4 -- and the factor is printed to progress.log
+#                   once per run. Set null to encode at the true step rate (real time), which for a strided
+#                   run is a slideshow: 128 steps at 3.75 Hz is 34 s. Does NOT touch dataset videos, which
+#                   are data (see viz.save_mp4 and data/processors.py).
