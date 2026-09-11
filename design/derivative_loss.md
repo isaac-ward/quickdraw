@@ -231,61 +231,131 @@ For vl128 today `D_image = 3.0*L1 + 1.0*LPIPS-vgg + 0.0*L2`, and `Dot_image` inh
 
 ## 5. Implementation plan
 
-Each step has a verification, per `CLAUDE.md` §4. Step 0 is the symmetry refactor, 1-3 are the term,
-4-5 are the experiment. **Do step 0 first**, so the derivative term lands into a symmetric structure
-rather than adding a fourth thing to an asymmetric one.
+### 5.0 DECODE ONCE, CONSUME TWICE — and the anchor already works this way
 
-0. **`VectorLoss` + `Modality.dist`, removing every loss override (§3.1).** New
-   `models/vector_loss.py` with `forward` and `temporal`; `Modality.__init__` builds `self.dist` from spec
-   fields; `recon_loss` becomes one non-overridden method; `ImageModality`'s `recon_loss` override is
-   DELETED. New spec fields `vector_l2` (default 1.0) and `vector_l1` (default 0.0) so the constructed
-   default is exactly `F.mse_loss`.
-   -> **verify, and this gate is non-negotiable:** a 2-epoch run on a fixed seed is **bit-identical** to
-   `main` — same `train/loss/*` and `val/loss/*` at every step, not merely close. This path carries 25+
-   historical runs and a silent change to it would invalidate every comparison in
-   `wizard/records/*.md`. Also: `smoke/visual_loss.py` 22/22, and a new assert that
-   `VectorLoss(w_l2=1.0)(a, b) == F.mse_loss(a, b)` exactly.
+The decoded prediction currently never escapes the head: `decode_loss` (`modalities.py:223`) flattens
+`(B,F)` away and calls `decode_head.loss(...)`, which builds `pred` internally and returns only a scalar.
+A second decoder forward is not an option -- the decoder is **~78% of per-sample memory**.
 
-1. **`VisualLoss._layer_features(x)`** — extract the per-layer unit-normalised VGG maps that `_lpips_term`
-   already computes implicitly through torchmetrics (`net.net` is `_NoTrainLpips` with `.net = Vgg16`,
-   `.L = 5`, `.chns = [64,128,256,512,512]`, plus `scaling_layer`). Refactor `_lpips_term` to use it.
-   -> **verify:** `smoke/visual_loss.py` still passes 22/22 and `_lpips_term` returns bit-identical values
-   on a fixed seed. This step must change no number.
-2. **`temporal(pred, target, strides=(1,))` on BOTH distance classes** — the §2 formula for `VisualLoss`,
-   the same mix on `Delta_k` for `VectorLoss`. `(B, F, ...)` input, **contiguous-segment** subsample (§6).
-   -> **verify:** four checks, and the third is the one that proves the term measures MOTION and not
-   POSITION.
-     (a) identical sequences -> exactly 0.
-     (b) a sequence against itself shifted one step -> > 0.
-     (c) **a constant-offset sequence (`p = g + c`) -> ~0**, because a constant offset has zero temporal
-         difference. If this is not ~0 the implementation is measuring position, not motion.
-     (d) `strides=(1,)` on a 2-frame input equals the hand-written `mse(p[:,1:]-p[:,:-1], ...)`.
-3. **`Modality.derivative_loss` + `derivative/<m>` in `recon_losses`**, with `derivative_weight`
-   (default `0.0`) and `derivative_strides` (**LOCKED at `[1]`** — see §2.1; do not sweep it). No
-   overrides — step 0 removed the need.
-   -> **verify:** with all `derivative_weight = 0`, a 2-epoch run is bit-identical to `main`. Non-zero
-   weight makes `derivative/<m>` appear in `metrics.jsonl` for **every** modality, proprio included, with
-   no per-modality code.
-4. **Get the block env into the pipeline.** The dataset is **`isaac-ronald-ward/block-stack`** (NOT
-   `swoosh-data/lego_assemblies`, which was a wrong guess). It was written by quickdraw's own recorder --
-   root `normalization_stats.json` / `summary.json` / `dataset_card.json`, lerobot splits -- so it should
-   need **no processor at all**, only a `conf/data/block_stack.yaml`, exactly as `starling` did.
-       fps 30 | observation_vector 17-dim | action 5-dim | 4.64 GB
-       FOUR cameras at 144x192 (non-square, 4:3): scene_left, scene_right,
-                                                  gripper_right_bottom, gripper_right_top
-       train 43 eps x 4019 steps = 172,835 transitions (169,782 windows)
-       val    2 eps x 17400      =  34,799
-       eval_purple_play  5 eps   =   9,048      <- extra OOD-ish splits
-       eval_purple_stack 6 eps   =   5,323
-   Note the val split is only **2 episodes** (very long ones) -- thin for evaluation, so read val numbers
-   with that in mind. `img_size` must be the `[144, 192]` tuple form, paired with an `ae_bottleneck` that
-   divides both axes. Four cameras means `vl128_2cam`'s N-arbitrary multi-head path applies unchanged.
-   -> **verify:** `check_dataset` reports the window count and no dim mismatch.
-5. **Baseline first, then the arm.** Train the existing recipe on the block env and read `motion_ratio` /
-   `latent_motion_ratio` across horizon BEFORE adding the term.
-   -> **verify:** if those are far below 1.0 the model under-moves and this term targets it; if they are
-   near 1.0 while the frames still flicker, the motion is INCOHERENT rather than INSUFFICIENT and the
-   correspondence idea in §8 is the better fit. Either reading is worth having before spending a GPU.
+The fix is to decode OUTSIDE the loss and let both terms consume it. **The roundtrip anchor already does
+exactly this** (`roundtrip_losses`: `to_obs(...)` then `recon_loss(rec[n], ...)`), so the decode site is
+the odd one out and this removes an inconsistency rather than adding a mechanism.
+
+```python
+# flow.py -- a pure extraction: loss()'s no_noise branch and _sample()'s no_noise branch
+#            already compute this IDENTICAL tensor in two places.
+def predict(self, cond, target):
+    if not self.no_noise:
+        raise ValueError("predict() is only defined for no_noise decoders; a noised "
+                         "parameterisation has no clean prediction (see loss()'s docstring)")
+    return self._chunked_velocity(torch.zeros_like(target),
+                                  self._temb(target.new_ones(self._tau_shape(target))), cond, None)
+
+# modalities.py -- ONE decoder forward, TWO consumers
+def decode_loss(self, tok, target):
+    lead = tok.shape[:-2]                                      # (B, F)
+    flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
+    tgt  = target.reshape(-1, *target.shape[len(lead):])
+    cond = self._decode_cond(flat)
+    if self.decode_head.no_noise:
+        pred  = self.decode_head.predict(cond, tgt)            # <-- escapes
+        recon = self.recon_loss(pred, tgt, site="decode")
+        deriv = self.derivative_loss(pred.view(*lead, *tgt.shape[1:]),
+                                     target.view(*lead, *tgt.shape[1:]))   # time axis RESTORED
+        return recon, None, deriv
+    main, sc = self.decode_head.loss(cond, tgt, recon_loss=self.recon_loss)
+    return main, sc, None                                      # noised decoders: no derivative
+```
+
+Beats threading a `lead` kwarg through `TransportHead.loss` and returning a dict: no signature change on
+`recon_loss`, no Tensor-vs-dict polymorphism, noised decoders bit-identical and untouched, and still
+exactly one decoder forward. The only churn is `decode_loss`'s arity 2 -> 3, which has ONE call site.
+
+### 5.1 ONLY `no_noise` DECODERS -- and that currently EXCLUDES PROPRIO
+
+`no_noise = (decode_kind == "mse")`. Measured across every recipe (2026-09-11):
+
+| head | `decode_kind` | `param` | `no_noise` | derivative? |
+|---|---|---|---|---|
+| `image` / `cam_scene` / `cam_wrist` | **mse** | x0 | **True** | **yes** |
+| `proprio` (vl128, vl128_starling, vl128_2cam) | **flow** | x0 | **False** | **no** |
+
+The noised `x0` branch denoises from `x_tau` at a `tau` sampled PER ELEMENT with fresh `eps`, so a temporal
+difference of those predictions is dominated by the sampling noise, not by motion. `param="v"` predicts a
+velocity field and has no clean prediction at all (`recon_loss` is already documented as ignored there).
+
+**So the "every modality gets it free" property is aspirational, not actual.** It becomes true the moment a
+vector head runs `decode_kind: mse`; until then the base `Modality.derivative_loss` exists and is correct
+but is never reached in our recipes. Enabling `derivative_weight > 0` on a noised head must RAISE, never
+silently no-op. Three ways to unblock proprio later, all deferred:
+
+* **share `tau` across the time axis** within a window, so both frames were noised at the same level. Small
+  change, but it alters proprio's noise curriculum -> not bit-identical -> needs its own experiment.
+* **a second DETERMINISTIC decode for proprio only** (`decode(tok, commit=True)`). The 78%-memory argument
+  is about the IMAGE decoder; proprio's is a tiny MLP on a 16-vector, so decoding twice there is nearly
+  free. Mildly odd (the derivative would score a different tensor than the recon term) but defensible.
+* **switch proprio to `decode_kind: mse`.** A recipe change with unknown consequences; the flow decode is
+  presumably there for a reason.
+
+### 5.2 The checklist
+
+**BIT-IDENTICAL IS THE GOVERNING CONSTRAINT.** Steps 1-3 must not change a single logged number, and step
+4 must not change one when `derivative_weight = 0`. The gate below is a byte comparison of the loss series,
+not a visual check, because 25+ historical runs and every finding in `wizard/records/*.md` are written
+against these paths.
+
+- [ ] **1. `TransportHead.predict()`** — extract from `loss()`'s `no_noise` branch and have `loss()` call
+      it, so there is ONE copy. Raise for noised parameterisations. Must use `_chunked_velocity` so
+      `decode_chunk_train` memory behaviour is unchanged.
+      - [ ] verify: `predict()` returns a tensor bit-identical to what `loss()` computed internally, fixed seed
+      - [ ] verify: `smoke/multimodal.py` 10/10, `smoke/decode_recon.py` no NEW failures (1 pre-existing)
+- [ ] **2. `decode_loss` decodes once, returns `(recon, shortcut, deriv)`**; `recon_losses` unpacks the
+      third value and ignores it when `None`. Noised heads keep the existing single-call path.
+      - [ ] verify: **2-epoch run, fixed seed, `metrics.jsonl` loss series byte-identical to `main`**
+- [ ] **3. `Modality.derivative_loss`** base (MSE on the temporal difference) + `ImageModality` override
+      (`self.visual.temporal(...)`). New spec fields `derivative_weight` (default **0.0**) and
+      `derivative_strides` (**LOCKED `[1]`**, §2.1). Assert `no_noise` when weight > 0.
+      - [ ] verify: default config -> 2-epoch run still byte-identical to `main`
+      - [ ] verify: `derivative_weight > 0` on a `flow` head RAISES with a message naming `decode_kind`
+- [ ] **4. `VisualLoss._layer_features(x)`** — extract the per-layer unit-normalised VGG maps that
+      `_lpips_term` computes implicitly through torchmetrics (`net.net` is `_NoTrainLpips`, `.net = Vgg16`,
+      `.L = 5`, `.chns = [64,128,256,512,512]`). Refactor `_lpips_term` to use it.
+      - [ ] verify: `smoke/visual_loss.py` 22/22 and `_lpips_term` bit-identical on a fixed seed
+- [ ] **5. `VisualLoss.temporal(pred, target, strides=(1,))`** — `w_l1 * L1(dp, dg)` plus the
+      DIFFERENCE-OF-EMBEDDINGS feature term (§2), contiguous-PAIR subsample (§6), reshape-then-difference
+      never flat-row differencing (§6).
+      - [ ] verify: identical sequences -> **exactly 0**
+      - [ ] verify: one-step-shifted sequence -> **> 0**
+      - [ ] verify: **constant offset `p = g + c` -> ~0** <- THE check that proves it measures MOTION, not POSITION
+      - [ ] verify: `strides=(1,)` equals the hand-written `l1(p[:,1:]-p[:,:-1], g[:,1:]-g[:,:-1])`
+      - [ ] verify: episode-seam check — a (B=2, F=4) input gives 3 differences per episode, never 7
+- [ ] **6. `smoke/derivative_loss.py`** — all of step 5's checks plus: the term appears in `recon_losses`
+      output for every `no_noise` head; weight 0 contributes exactly 0.0 to the total.
+- [ ] **7. `conf/data/block_stack.yaml`** — `isaac-ronald-ward/block-stack`, `cam` per head,
+      `img_size: [144, 192]` paired with `ae_bottleneck: 9` (144/16 = 9, 192/16 = 12 -> exact 9x12 grid at
+      4 levels). Probably NO processor needed (recorder-written, root `normalization_stats.json`).
+      - [ ] verify: `check_dataset` reports the window count with no obs/action dim mismatch (17 / 5)
+      - [ ] verify: frames load, `frames == steps` per split, normalizer round-trips
+- [ ] **8. BASELINE run on block-stack with `derivative_weight = 0`**, and read `motion_ratio` /
+      `latent_motion_ratio` across horizon BEFORE the arm.
+      - [ ] verify: far below 1.0 -> under-moving, this term targets it. Near 1.0 while frames still
+            flicker -> the motion is INCOHERENT not INSUFFICIENT, and patch-correspondence (§8) is the
+            better fit. **Either reading is worth having before spending a second GPU.**
+- [ ] **9. The arm.** Sweep `derivative_weight` upward from small.
+      - [ ] verify: `@+128` against the step-8 baseline at matched epochs (the objective, per
+            `wizard/records/starling.md`)
+      - [ ] verify: **`motion_ratio` is the TRIPWIRE** — if it falls below the `d=0` baseline the term is
+            over-weighted and is freezing the prediction (§7)
+- [ ] **10. Record it** as a new numbered section in `wizard/records/block-stack.md` (a new file; the
+      convention is one record per dataset), whichever way it goes.
+
+### 5.3 Deferred, deliberately out of this build
+
+* **`VectorLoss` + the composition refactor (§3.1).** It drops OFF the critical path under 5.0 — the
+  polymorphism needed is just `derivative_loss`, so the symmetry cleanup is an independent later change
+  with its own bit-identical gate. Doing it first would put the riskiest edit in front of the experiment.
+* **Unblocking proprio** (§5.1) — three options, none needed to test the hypothesis.
+* **Multi-stride, higher order, cycle consistency, optical-flow warping** — §8.
 
 ## 6. Gotchas, all of them real
 
