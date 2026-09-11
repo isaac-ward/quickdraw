@@ -57,56 +57,78 @@ L_dt =  w_l1    * L1(dp, dg)
       + w_lpips * sum_l  || (phi_l(p_{t+1}) - phi_l(p_t)) - (phi_l(g_{t+1}) - phi_l(g_t)) ||^2
 ```
 
-### 2.1 STRIDE: the same term over longer gaps, and it is nearly free
+### 2.1 STRIDE IS LOCKED AT 1 — settled by prior art AND by our own loss structure
 
-Generalise the difference to a stride `k`:  `Delta_k x_t = x_{t+k} - x_t`, and sum over a set of strides:
+The difference generalises to a stride `k`:  `Delta_k x_t = x_{t+k} - x_t`. Both forms are just "the
+difference between two frames"; `k` only changes **how far apart those two frames are**, and therefore
+**which timescale of motion the term can see**:
 
-```
-L_dt = sum_k  beta_k * d( Delta_k pred , Delta_k true )
-```
+* **`Delta_1`, a short gap** — fast changes show strongly, slow ones barely register (a slow drift moves
+  almost nothing in one step). A HIGH-PASS filter on motion: sensitive to jitter and FLICKER, nearly blind
+  to drift.
+* **`Delta_k`, a long gap** — a slow drift has had k steps to accumulate and becomes visible, while fast
+  jitter partly cancels across the gap. A LOW-PASS filter: sensitive to DRIFT, insensitive to jitter.
 
-**Default is `strides=(1,)`** — the plain single-step difference, which is all the flicker fix needs. The
-generalisation exists because each stride measures a DIFFERENT error structure:
+**`derivative_strides` SHOULD BE LOCKED AT `[1]`.** Two independent reasons, and neither is a guess:
 
-| stride | catches |
-|---|---|
-| k=1 | local motion — FLICKER |
-| k=8 | accumulated displacement over ~1.3 s at 6 Hz — DRIFT that each adjacent step hides |
-| k=F | total displacement across the window — did the trajectory end up in the right place RELATIVE to where it started |
+1. **Measured, in the literature.** `Frame Difference-Based Temporal Loss for Video Stylization`
+   (arXiv 2102.05822) is the paper that formalises this loss, and §4.5 tests exactly this knob: *"using the
+   difference between two frames that are separated by an interval of K frames where K > 1 should work as
+   well as using K = 1. This was verified by the experiments... the stylization results of models trained
+   with different K are almost identical to each other."* The generalisation has been tried and does not
+   pay.
+2. **Our own loss structure already covers what large `k` would add.** A large `k` catches DRIFT — but a
+   drifting prediction IS in the wrong place, and the existing per-frame term penalises precisely that. So
+   `per-frame + Delta_1` already spans both failures: the per-frame term catches WRONG PLACE, `Delta_1`
+   catches WRONG MOTION. `Delta_k` is redundant with a term we already have.
 
-These are not redundant with the per-frame loss, and the reason is sharp. A prediction offset by a CONSTANT
-`c` at every frame pays `c` per frame under the per-frame loss and **exactly zero** under every `Delta_k`,
-because the offset cancels. A prediction that DRIFTS LINEARLY pays a growing per-frame cost, a small
-constant `Delta_1` cost, and a large `Delta_F` cost. So:
+So `derivative_strides: [1]` is a **locked config value**, in the same category as
+`accumulate_grad_batches=1` and `data.window_stride=1`: written down, justified, and not to be swept. The
+plural signature `strides=(1,)` stays in the API only so a future reader does not have to re-derive the
+generalisation to know it was considered and rejected.
 
-```
-order 0 (existing)   absolute state at each time
-Delta_1              local smoothness / motion
-Delta_k, k large     accumulated displacement over that horizon
-```
+**A SECOND, DIFFERENT AXIS — order, deferred.** `Delta^2 x_t = (x_{t+2} - x_{t+1}) - (x_{t+1} - x_t)` is
+acceleration-like rather than displacement-like. Both are "multiple steps" and they are NOT the same
+generalisation. For flicker, first order is the right tool; order 2 is over-engineering until something
+measured asks for it.
 
-a temporal multi-resolution decomposition, mirroring the `@+1 / @+8 / @+16 / @+32 / @+64 / @+128` structure
-the eval already reports.
+### 2.2 PRIOR ART: this loss is not novel, and that is useful
 
-**Why it is nearly free:** compute `phi_l` ONCE for a contiguous block of frames and every stride within
-that block is then indexing and subtraction — no extra network passes. The number of strides costs nothing;
-only the feature computation does. This is what supersedes pair-sampling in §6.
+Searched 2026-09-11. The formulation is established, has a name, and its open questions are already answered.
 
-**The caveat, and it grows with k:** the mean-seeking risk of §7 gets WORSE at large stride. The average
-64-step displacement of "the block might go left or right" is zero, so a large `beta_k` at large `k` pushes
-hard toward a frozen prediction. `beta_k` should decay with `k`; start with `k` in {1} and only widen to
-{1, 4, 16} if drift shows up separately from flicker.
+* **`Frame Difference-Based Temporal Loss for Video Stylization`** (arXiv 2102.05822) — THE closest prior
+  art, essentially identical. Their eq (5)-(7):
+  `L_temp = (1/2N(T-1)) sum_t || phi(I~_t) - phi(I_t) ||^2` with `phi(x_t) = f_l(x_{t+1}) - f_l(x_t)`.
+  `l = 0` is the pixel frame difference (**P-FDB**), `l > 0` takes the difference in FEATURE space
+  (**F-FDB**), and the weighted sum is **C-FDB**. That is our formulation exactly, including the
+  pixel/feature split — and note `f_l(x_{t+1}) - f_l(x_t)` is the DIFFERENCE OF EMBEDDINGS, independently
+  confirming §2's choice. Two further findings worth having: they positioned FDB as the cheap FLOW-FREE
+  replacement for the optical-flow-based (OFB) temporal loss and found the two roughly level in a human
+  study (38.6% vs 40.7% preference); and they observed the anti-flicker property EMERGENTLY — a region
+  occluded by a pillar and then reappearing was stylized consistently with no explicit long-term
+  mechanism, which they attribute to *"learned resistance to the disturbance of input: if the input stays
+  the same, the stylized output is also trained to stay the same."*
+* **`Temporal Gradient Matching`**, in Video Depth Anything (arXiv 2501.12375) — the same idea for depth:
+  the change in depth between adjacent predicted frames should match the change in the ground truth,
+  explicitly without optical flow.
+* **NOT this, despite the name:** `Gradient Difference Loss` (Mathieu, Couprie, LeCun, arXiv 1511.05440,
+  the canonical video-prediction-loss paper) is a loss on SPATIAL image gradients for edge sharpness. It is
+  about blur, not temporal coherence. Easy to conflate; they are unrelated.
 
-**A second, DIFFERENT axis, deferred:** ORDER, i.e. `Delta^2 x_t = (x_{t+2} - x_{t+1}) - (x_{t+1} - x_t)`,
-which is acceleration-like rather than displacement-like. Both are "multiple steps" and they are not the
-same generalisation. For flicker, first order is the right tool; order 2 is over-engineering until there is
-a measured reason.
+**What appears genuinely untested is the SETTING, not the loss.** Every use found — stylization, depth,
+restoration — applies it where the network SEES BOTH input frames and transforms them. Ours is a
+free-running autoregressive rollout with no access to the truth, at the site that is simultaneously the
+only autoregressive gradient into a learned dynamics model (`design/flow.md`). Whether the term behaves
+the same there is open, and the interesting claim would be about what it does to the DYNAMICS rather than
+to the frames. Do not describe the loss itself as novel.
 
-**Use RAW unit-normalised VGG features, not LPIPS's learned per-layer weights.** Those weights were fitted
-to match HUMAN JUDGEMENTS OF IMAGE SIMILARITY. Nothing calibrates them for temporal-difference similarity;
-borrowing a calibration across tasks is the kind of thing that looks rigorous and is not. LPIPS already
-normalises activations to unit length per spatial position before its linear layer — stop there. Make the
-weighting a flag if it is worth ablating.
+**And if it underperforms, the better-targeted next step is NOT a fancier derivative.** For autoregressive
+rollout drift specifically, the 2025-26 direction is CYCLE CONSISTENCY — roll forward from ground truth,
+then reverse-generate back to reconstruct the initial state and penalise the error (`Cycle-World`,
+arXiv 2607.11836; `LIVE`, arXiv 2602.03747, which claims forward drift can be strictly bottlenecked by the
+cycle objective). That constrains the whole trajectory rather than adjacent pairs. Persistent spatial
+memory is the other direction (`Persistent Robot World Models`, arXiv 2603.25685), and is the same bet as
+`design/gaussian_splat_decoder.md`.
 
 ## 3. Where it goes
 
@@ -238,8 +260,9 @@ rather than adding a fourth thing to an asymmetric one.
      (c) **a constant-offset sequence (`p = g + c`) -> ~0**, because a constant offset has zero temporal
          difference. If this is not ~0 the implementation is measuring position, not motion.
      (d) `strides=(1,)` on a 2-frame input equals the hand-written `mse(p[:,1:]-p[:,:-1], ...)`.
-3. **`Modality.derivative_loss` + `derivative/<m>` in `recon_losses`**, with `derivative_weight` and
-   `derivative_strides` spec fields (defaults `0.0` and `[1]`). No overrides — step 0 removed the need.
+3. **`Modality.derivative_loss` + `derivative/<m>` in `recon_losses`**, with `derivative_weight`
+   (default `0.0`) and `derivative_strides` (**LOCKED at `[1]`** — see §2.1; do not sweep it). No
+   overrides — step 0 removed the need.
    -> **verify:** with all `derivative_weight = 0`, a 2-epoch run is bit-identical to `main`. Non-zero
    weight makes `derivative/<m>` appear in `metrics.jsonl` for **every** modality, proprio included, with
    no per-modality code.
@@ -276,13 +299,12 @@ permutation of the flattened rows. Pick 128 of `B*F = 1344` and you get `(b=3,t=
 `(b=14,t=6)`...; differencing consecutive entries computes `frame(b=3,t=17) - frame(b=0,t=52)`, two frames
 from DIFFERENT EPISODES at unrelated times. Not a derivative — noise.
 
-Fix: **sample contiguous SEGMENTS, not pairs.** e.g. 8 segments of 16 consecutive frames = 128 frames,
-exactly the existing budget. Compute `phi_l` once per segment and then EVERY stride up to 15 is free
-indexing (§2.1), which is strictly better than the 64-pairs scheme an earlier draft of this document
-proposed — same cost, and it unlocks the multi-stride generalisation instead of foreclosing it. Segment
-count vs length is the knob: more segments = more episodes represented, longer segments = larger strides
-available. (A pixel-only version can just use all frames, since a subtraction and an L1 are free; the
-feature part cannot.)
+Fix: **sample contiguous PAIRS `(t, t+1)`.** 64 pairs = 128 frames, exactly the existing budget, same
+VGG cost as today, adjacency preserved. With `derivative_strides` LOCKED at `[1]` (§2.1) pairs are all
+that is needed — an earlier draft of this document proposed contiguous SEGMENTS so that larger strides
+would be available for free, which is true but pointless once the stride is locked. Prefer pairs: they are
+simpler and they spread across more episodes for the same frame budget. (A pixel-only version can just use
+all frames, since a subtraction and an L1 are free; the feature part cannot.)
 
 **Never difference adjacent rows of the FLAT tensor.** In the flat layout row `b*F + (F-1)` is followed by
 `(b+1)*F + 0`, which crosses an episode boundary and fabricates a huge spurious delta at every seam.
@@ -323,10 +345,20 @@ column rather than the loss value.
   was superseded by §3.1 because it preserves the existing asymmetry (configurable distance for images,
   hardcoded MSE for vectors) rather than removing it, and because composition gives a new modality both
   terms for free where inheritance needs a decision per modality.
-* **64 contiguous PAIRS as the subsample** — superseded by contiguous SEGMENTS (§6), which cost the same
-  and make every stride free rather than only stride 1.
+* **Multi-stride (`Delta_k`, k > 1)** — REJECTED on two independent grounds (§2.1): arXiv 2102.05822 §4.5
+  tested it and found results "almost identical" across K, and our per-frame term already catches the
+  drift that large K would add. `derivative_strides` is LOCKED at `[1]`.
+* **Contiguous SEGMENTS as the subsample** — an intermediate draft, motivated by making every stride free.
+  Pointless once the stride is locked; contiguous PAIRS are simpler and spread over more episodes (§6).
 * **Higher ORDER differences** (`Delta^2`, acceleration-like) — a different axis from stride, deferred
   until there is a measured reason; first order is what flicker calls for (§2.1).
+* **Optical-flow warping loss** — the established STRONGER temporal loss, which FDB was introduced to
+  replace cheaply (roughly level in a human study, 38.6% vs 40.7%). Deferred because it needs a flow
+  estimator in the training loop; revisit if the derivative term underdelivers.
+* **Cycle consistency** (`Cycle-World` arXiv 2607.11836, `LIVE` arXiv 2602.03747) — roll forward from
+  ground truth, reverse-generate back, penalise the reconstruction of the initial state. Constrains the
+  WHOLE trajectory rather than adjacent pairs, and is the better-targeted method for autoregressive drift
+  specifically. **This is the next step if the derivative term underperforms**, not a fancier derivative.
 * **LPIPS's learned per-layer weights** — §2. Calibrated for a different task.
 * **Patch-correspondence consistency** (feature-space flow: match the ground truth's patch->patch
   correspondence field). Strictly more expressive — it catches *incoherent* motion, not just *wrong*
