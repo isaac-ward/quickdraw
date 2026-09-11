@@ -206,102 +206,118 @@ here (`libavutil.so.60` missing). quickdraw's `data/dataset.py` reads the mp4s w
 instead, so training is unaffected — but anything reaching for `LeRobotDataset` directly will
 fail until ffmpeg's shared libs are installed.
 
-## 8. Training runs
+## 8. Training runs — the stride ablation
 
-### Live: the stride bracket
+`vl128_blockstack_2cam` throughout: robocasa's record-holding `vl128_2cam` (record §24) with only
+what the dataset forces changed — proprio 17 / action 5, `img_size [96,128]` non-square at 3:4 to
+match the 144×192 source, `ae_bottleneck 6`. Cameras `scene_right` + `gripper_right_top`,
+`action_aggregate=mean`, evals every 2 epochs. **The one variable is the temporal stride.**
 
-Both arms are `vl128_blockstack_2cam` — robocasa's record-holding `vl128_2cam` (record §24) with
-only what the dataset forces changed: proprio 17 / action 5, `img_size [96,128]` non-square at 3:4
-to match the 144×192 source, `ae_bottleneck 6`. Cameras `scene_right` + `gripper_right_top`,
-`action_aggregate=mean`, evals every 2 epochs, autobatch chose 13. **The one variable is the
-temporal stride.** Launched 2026-09-11 03:19/03:21.
+### 8.1 First bracket: strides 10 and 15 (2026-09-11 03:19 → 17:40, killed)
 
-| arm | GPU | stride | rate | F=64 spans | windows | s/epoch |
-|---|---|---|---|---|---|---|
-| `bs_stride10` | 0 | 10 | 3 Hz | 24.0 s | 84% | ~4300 |
-| `bs_stride15` | 1 | 15 | 2 Hz | 36.0 s | 76% | ~2800 |
+| | `l1_mean` @ep9 | ae_floor RMSE | motion_ratio | median of halves |
+|---|---|---|---|---|
+| **stride10** | **0.0327** | 0.0347 | 0.858 | 0.0349 → 0.0327 (**−6.3%**) |
+| stride15 | 0.0361 | 0.0373 | 0.823 | 0.0348 → 0.0361 (**+3.6%**) |
 
-**Why stride is the first variable.** Record §13: robocasa at 20 Hz had per-step motion 0.61× its
-codec's own error floor, so predicting zero motion was the correct solution to the objective, and
-every early run did exactly that. Measured here, native 30 Hz gives **0.30×** on `scene_right` —
-worse, because these scene cameras are bolted down while robocasa's move. Any camera or loss
-comparison run below the floor returns a null result that means nothing.
+**stride10 won by 9.4% at matched epoch 9.** Judged against this data's own noise, not robocasa's
+±0.02 rule (calibrated on values 4× larger): settled epoch-to-epoch jitter is **σ = 0.00054**, so
+the gap is **6.3σ**. stride10 also won at matched real time at 275 s, 411 s and 550 s.
 
-**Why 10 and 15.** Block-stack's own codec floor is unknown until ep0's `eval_ae_floor`. Across the
-plausible range (0.045–0.0637) these two are the only pair that stay ≥ 1.0× throughout; stride 6
-would be 0.82–0.92× if the floor is robocasa-like. The error is asymmetric — below the floor is
-degenerate, above it merely harder — so err high.
+stride15 peaked around ep5–7 and regressed for ~12 epochs after — the GameNGen pattern §13 cites
+(below ~10⁷ examples, quality peaks early then degrades), with fewer windows and a harder problem.
 
-**Read `eval_ae_floor` on `cam_scene` first.** And read only `cam_scene`'s eval metrics: eval is
-not multi-head yet, so `cam_wrist`'s are scored against the wrong camera's frames
-(`train/loss/decode/cam_wrist` is the valid one for that head).
+**`motion_ratio` 0.82–0.86 in both.** Robocasa's degenerate failure was 0.13, so neither run hedged
+to zero. The bracket's actual purpose — stay above the floor — succeeded.
 
-### Pinned, NOT queued: the action-aggregation sweep
+### 8.2 The thing the first bracket could not know at launch
 
-`./wizard/scripts/blockstack-aggregate.sh <subsample>` — **run by hand once the bracket reports**,
-passing the winning stride. It refuses to start while training is running, and requires the stride.
+**The measured codec floor is ~0.0350 RMSE** (`eval_ae_floor/cam_scene/mse_mean`, √, ep9). The
+bracket was chosen to span 0.045–0.0637. So it was not conservative, it was *low*:
 
-It was briefly armed as an auto-firing queue at a hardcoded `subsample=10`, which presupposed the
-answer the bracket exists to give. The within-window variance separating `mean` from `concat` is
-itself stride-dependent, so the test must follow the bracket rather than race it.
-
-| arm | GPU | `action_aggregate` | model sees |
+| | floor | frame-delta | achieved SNR |
 |---|---|---|---|
-| `bs_agg_sub<N>_sum` | 0 | `sum` | action_dim 5 |
-| `bs_agg_sub<N>_concat` | 1 | `concat` | action_dim 5 × N |
+| stride10 | 0.0347 | 0.0659 | **1.90×** |
+| stride15 | 0.0352 | 0.0762 | **2.16×** |
+| | | | *1.24–1.36× = robocasa's productive zone* |
 
-The bracket supplies the `mean` leg, completing a three-way sweep.
+Both landed **above** the zone, not below it. Erring high was right in principle — below the floor
+is the degenerate failure — and overshot in fact. And the ordering confirms the direction: the
+**lower**-SNR arm won, so the optimum is further down.
+
+At the measured floor: stride 5 → 1.36× (the robocasa-equivalent point), stride 6 → 1.49×,
+stride 3 → 1.02×, stride 1 → 0.44× (below the floor).
+
+### 8.3 Second bracket: strides 1 and 5 (launched 2026-09-11 17:50)
+
+| arm | GPU | stride | rate | F=64 spans | SNR | batch |
+|---|---|---|---|---|---|---|
+| `bs_stride1` | 0 | 1 | 30 Hz | 2.4 s | **0.44×** | 11 |
+| `bs_stride5` | 1 | 5 | 6 Hz | 12.0 s | **1.36×** | 13 |
+
+stride 5 is the predicted optimum. **stride 1 is a deliberate below-floor anchor** — record §13
+predicts the degenerate zero-motion solution there, and `motion_ratio` collapsing toward 0.13 would
+confirm the mechanism holds on this dataset rather than only on robocasa. Autobatch chose 11 rather
+than 13 for stride 1; note it when reading the comparison.
+
+With §8.1's retained logs this gives a **1 / 5 / 10 / 15** ablation. Caveat: 10 and 15 were killed
+at ep9/ep17, so comparisons beyond ep9 are not matched across all four.
+
+### 8.4 Then
+
+1. **Action aggregation** — `./wizard/scripts/blockstack-aggregate.sh <winning stride>`, by hand.
+   See §8.5. Do not run it before the stride is settled: the within-window variance separating
+   `mean` from `concat` is itself stride-dependent (14.7% of `move_x` at stride 10, 22.7% at 15).
+2. **Four cameras** (robocasa queue item 2 — does the camera lever scale, or was the wrist view
+   special for being gripper-mounted?). Block-stack can uniquely answer it: two scene, two gripper.
+3. `decode_out_act=sigmoid` **already ruled out**: 0.00% of scene and 0.07% of gripper pixels
+   saturated, against torus's 66.9% (worth 3.4×) and robocasa's marginal 0.4%.
+
+### 8.5 The action-aggregation sweep (pinned, not queued)
+
+| arm | `action_aggregate` | model sees |
+|---|---|---|
+| `bs_agg_sub<N>_sum` | `sum` | action_dim 5 |
+| `bs_agg_sub<N>_concat` | `concat` | action_dim 5 × N |
 
 **The default aggregation is wrong for this data.** block-stack actions are Xbox stick POSITIONS —
-the same class as starling's `joy_axis_*` — not the EEF deltas summing was written for. Lag-1
-autocorrelation is 0.96–0.99 on every axis, so summing scales rather than cancels, and
-`normalization_stats.json` is computed on raw stride-1 actions and never sees the aggregation:
+starling's `joy_axis_*` class — not the EEF deltas summing was written for. Lag-1 autocorrelation is
+0.96–0.99 on every axis, so summing scales rather than cancels, and `normalization_stats.json` is
+computed on raw stride-1 actions and never sees the aggregation:
 
 | stride | rule | action z-std | max \|z\| |
 |---|---|---|---|
 | 10 | `sum` (default) | 7.6 – 9.6 | 30.2 |
 | 15 | `sum` (default) | 11.0 – 14.2 | 45.3 |
 | 10 | `mean` | 0.76 – 0.96 | 3.0 |
-| 15 | `mean` | 0.74 – 0.95 | 3.0 |
 
-Under `sum` the two bracket arms would have differed in action input scale by ~1.5×, confounding
-the stride comparison itself. Caught only by pulling `ba8ff09` from main.
+Under `sum` the two bracket arms would have differed in action input scale by ~1.5×, confounding the
+stride comparison itself. Caught only by pulling `ba8ff09` from main.
 
-**What each leg does and does not measure.** `sum` is exactly N × `mean`, so they carry identical
-information — that arm isolates whether input SCALE alone hurts, not what the aggregation
-preserves. There is no clamp in the way (`action_fourier_freqs=0`, `action_squash=none`), so a
-linear `act_enc` could absorb the factor with smaller weights; what is left is optimization. Expect
-a modest effect. `mean` vs `concat` is the information-bearing comparison: `concat` keeps the
-within-window variance `mean` discards — 14.7% of `move_x` at stride 10, 22.7% at stride 15.
+`sum` is exactly N × `mean` — identical information, so that arm isolates whether input SCALE alone
+hurts. No clamp is in the way (`action_fourier_freqs=0`, `action_squash=none`), so a linear `act_enc`
+could absorb the factor; expect a modest effect. `mean` vs `concat` is the information-bearing
+comparison. Robocasa §12 found the model uses action DISTRIBUTION not ORDER, which is exactly
+concat's advantage — concat winning would mean §12 does not hold here. A tie is a real result.
 
-Robocasa §12 found the model responds to action DISTRIBUTION, not ORDER. Within-window ordering is
-exactly concat's advantage, so concat winning would mean §12 does not hold here. A tie is a real
-result, not a null.
-
-**Cross-launch caveat:** `sum` vs `concat` is a matched pair; the `mean` leg comes from the bracket,
-a different launch, and this repo sets no training seed — treat a small mean-vs-anything gap as
-noise.
-
-### After that
-
-1. **Four cameras** (robocasa queue item 2: does the camera lever scale, or was the wrist view
-   special because it is gripper-mounted?). Block-stack can uniquely answer this — two scene and
-   two gripper views. Run at the winning stride and aggregation.
-2. `decode_out_act=sigmoid` is **already ruled out**: 0.00% of scene and 0.07% of gripper pixels are
-   saturated here, against torus's 66.9% where it was worth 3.4× and robocasa's already-marginal
-   0.4%. Robocasa queue item 1 does not transfer.
-
-### Things that cost time, worth not repeating
+### 8.6 Things that cost time, worth not repeating
 
 - `check_val_every_n_epoch` is the VAL cadence ONLY. The eval SUITE is
-  `eval.during_train.every_epochs` (default 10, plus `at_epochs: [5,15]`). Setting only the first
-  left evals at {5,9,15,19,29,39,49} — 7 over a 50-epoch run, nothing for the first five epochs.
-- `WANDB_API_KEY` lives in `~/.env`, outside the repo. A launch script that does not source it logs
-  locally only, and says so in one line nobody notices for hours.
+  `eval.during_train.every_epochs` (default 10 + `at_epochs: [5,15]`). Setting only the first left
+  evals at {5,9,15,19,...} — nothing for the first five epochs.
+- **There is no `@+128`.** Horizons are derived from episode length: `@+1,8,16,32,64,412,824,1236,
+  1651` at stride 10. Robocasa's headline number does not exist here; use `l1_mean`, or convert
+  steps to seconds (`steps × stride / 30`) before comparing across strides.
+- `metrics.jsonl` is LONG format (`step`/`tag`/`value`), not one object per epoch.
+- `WANDB_API_KEY` lives in `~/.env`, outside the repo. A script that does not source it logs locally
+  only and says so in one line nobody notices for hours.
 - `pkill -f <pattern>` matches the calling shell's OWN command line whenever the pattern's literal
-  text appears anywhere in that command. This killed the shell mid-script three times, each time
-  leaving every step after it silently unrun. Use a bracket pattern AND keep the literal string out
-  of the rest of the line.
+  text appears anywhere in that command. Killed the shell mid-script three times, each time leaving
+  every later step silently unrun.
+- A launch script with no argument guard, run bare to test it, **launched a duplicate run onto a
+  busy GPU**. Both bracket scripts now refuse without arguments and refuse while training is live.
+- An apostrophe in any `run_summary` value breaks the hydra-level quoting
+  (`"+run_summary.x='$VAL'"`) and fails with a bare grammar error naming one character. Guarded.
 - Editing a running bash script corrupts it — bash reads by byte offset as it executes.
 
 ## 9. Still open
