@@ -18,6 +18,7 @@ import numpy as np
 
 from ..environments.base import SceneOverlay, wants_diagnostics
 from ..environments.registry import make_env
+from ..environments.torus_utils import TorusConfig
 from ..logging import viz
 from ..training.setup import step_fps
 from .mppi import MPPIConfig, run_control
@@ -54,7 +55,13 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
     if img_head is not None:                       # only render FPV when there's a real image head
         img_size = next((mod.ae.cfg.img_size for mod in core.modalities.values() if hasattr(mod, "ae")), 128)
-        if hasattr(ecfg, "R"):                     # torus: the FPVRenderer fast path (parity-critical, unchanged)
+        # TORUS TEST BY TYPE, not by attribute. `hasattr(ecfg, "R")` was not a torus test: RecordedConfig
+        # carries R/r/init_speed as INERT PLACEHOLDERS (environments/recorded.py, "train_world_model reads
+        # e.R / e.r / e.init_speed unconditionally"), so it was True for every recorded env and sent drone
+        # runs down the torus FPVRenderer path. There they hit int(img_size) on a (112,192) tuple and raised
+        # a TypeError, which the callback treats as a BUG (counted toward the fatal streak) instead of the
+        # NotImplementedError clean-skip it has for "this env has no simulator" -- the actual reason.
+        if isinstance(ecfg, TorusConfig):          # torus: the FPVRenderer fast path (parity-critical, unchanged)
             try:
                 from ..training.setup import resolve_data_root
                 coloring = json.load(open(os.path.join(resolve_data_root(cfg), "dataset_card.json"))).get("coloring", {}).get("train", "rainbow")

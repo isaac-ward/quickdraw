@@ -366,10 +366,13 @@ class MultiModalSequenceModel(nn.Module):
                 wts["decode/proprio"] = float(mod.weight)
                 off += n
                 continue
-            main, sc = mod.decode_loss(bag[..., off:off + n, :], dtgt[name])
+            main, sc, deriv = mod.decode_loss(bag[..., off:off + n, :], dtgt[name])
             out[f"decode/{name}"], wts[f"decode/{name}"] = main, float(mod.weight)
             if sc is not None:                                  # flow decoders only
                 out[f"decode/{name}_shortcut"], wts[f"decode/{name}_shortcut"] = sc, float(mod.weight)
+            if deriv is not None:                               # first-order term, off unless weighted
+                out[f"derivative/{name}"] = deriv
+                wts[f"derivative/{name}"] = float(getattr(mod, "derivative_weight", 0.0))
             off += n
         rt, rtw = self.roundtrip_losses(targets, pre_z=pre_z_targets, anchor=anchor)   # codec/roundtrip_<name>
         out.update(rt); wts.update(rtw)

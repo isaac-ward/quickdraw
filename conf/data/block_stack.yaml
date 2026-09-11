@@ -1,0 +1,85 @@
+# =============================================================================================
+# block_stack — recorded teleoperation of a Swoosh right arm (UFACTORY xArm 7) doing block
+# manipulation. Select with `data=block_stack`. Already in quickdraw's own on-disk format
+# (recorder-written: root normalization_stats.json / summary.json / dataset_card.json, lerobot v3.0
+# splits), so nothing needs converting.
+#
+# WHAT IT IS (from the repo's own summary.json + PROCESSING.md, 2026-09-11):
+#     train              43 eps x 4019 steps = 172,835 transitions   169,782 windows
+#     val                 2 eps x 17400      =  34,799                34,657
+#     eval_purple_play     5 eps x 1810      =   9,048                 8,693
+#     eval_purple_stack    6 eps x  887      =   5,323                 4,897
+#   30 Hz. observation_vector 17-dim, action 5-dim, FOUR cameras at 144x192 (H x W, 4:3).
+#
+# THE VAL SPLIT IS ONLY TWO EPISODES (very long ones). Thin for evaluation -- read any val number
+# with that in mind. `eval_purple_play` / `eval_purple_stack` are the more interesting held-out
+# targets, and nothing in quickdraw reads a split by those names automatically.
+#
+# THE OBSERVATION LAYOUT IS DOCUMENTED (PROCESSING.md §5), so unlike robocasa it needed no recovery:
+#     0:3    ee_{x,y,z}_mm      world frame, MILLIMETRES
+#     3:9    ee_rot6_*          6-D rotation (first two columns of R). NOT z-scored -- the normaliser
+#                               passes these through (mean 0, std 1), which is correct: they are
+#                               components of unit vectors and already ~unit scale.
+#     9      gripper            (x - closed)/(open - closed), 1 = OPEN
+#     10:17  joint{1..7}_rad    radians
+#   action = [move_x, move_y, height, yaw, gripper] -- the RAW HUMAN JOYSTICK, deliberately not the
+#   commanded pose: target[t] = target[t-1] + stick * rate * dt, so feeding the command would hand a
+#   world model the answer to "where does the arm go next".
+#
+# CAMERAS. `scene_left` is the default because it is FIXED. The two gripper cameras move with the
+# gripper, so on those the frame difference is dominated by camera egomotion -- the regime that makes
+# a first-order loss a poor fit (design/derivative_loss.md §9). Only the two scene cameras have
+# pre-built frame caches (`python -m quickdraw._build_frame_cache block-stack`); decoding the gripper
+# pair would cost ~37 GB for frames the derivative experiment should not use.
+#
+# IMAGE GEOMETRY IS NOT SQUARE: 144x192 is 4:3. `img_size` must be the (H, W) tuple form -- a bare int
+# resizes to a square and silently distorts the frame. Pair it with `ae_bottleneck: 9`, which divides
+# BOTH axes exactly: 144/16 = 9 and 192/16 = 12, so 4 levels give an exact 9x12 bottleneck grid.
+#
+# SUBSAMPLE: MEASURED, and the answer is 8 -- NOT robocasa's 5. Per-step image RMSE on scene_left,
+# 400 sampled within-episode pairs per stride (2026-09-11):
+#
+#     stride    1      2      4      8     16     32     64
+#     RMSE   0.0171 0.0291 0.0404 0.0572 0.0719 0.0817 0.0892
+#     xRC1     0.44   0.75   1.04   1.47   1.85   2.10   2.29      (RC1 = robocasa stride 1, 0.0389)
+#
+# Record section 13's criterion is the per-step delta against the CODEC's own noise floor: robocasa's
+# stride-1 delta of 0.0389 was 0.61x its floor and was JUDGED TOO SMALL -- predicting zero motion was the
+# correct answer to the objective, which is what every run did. Block-stack at stride 1 is 0.44x THAT, so
+# roughly a quarter of the floor: a fixed camera watching an arm move slowly at 30 Hz barely changes.
+# Stride 8 (0.0572) reaches 1.47x robocasa's stride-1 value and 0.66x the 0.0864 robocasa ADOPTED; stride
+# 16 reaches 0.83x of it but leaves only ~7,700 windows per epoch (4019/16 = 251 frames per episode, minus
+# P+F). Stride 8 leaves ~18,500. So 8 is the balance of "motion the dynamics can see" against "enough
+# windows to learn from", and 16 is the fallback if the delta still looks small against the measured floor.
+# Beyond 32 the delta saturates -- past ~1 s the scene has changed as much as it is going to.
+#
+# THIS MATTERS DOUBLY FOR THE DERIVATIVE TERM (design/derivative_loss.md): at stride 1 a first-order term
+# would be differencing almost pure noise, so the stride choice is a precondition for that experiment, not
+# an independent knob. Caveat: the floor comparison uses robocasa's numbers as a proxy; block-stack's own
+# codec floor is only measurable after a run, and step 9 of the plan reads it.
+#
+# NOT COVERED HERE -- pass on the CLI:
+#   model.action_dim=5  model.modalities.0.dim=17
+#   model.modalities.1.img_size=[144,192]  +model.modalities.1.ae_bottleneck=9   <- PAIR THESE
+#   environments=recorded   data.subsample=<k>
+# =============================================================================================
+defaults:
+  - torus
+  - _self_
+
+root: null
+hf_repo: isaac-ronald-ward/block-stack
+repo_id: block-stack     # lerobot prefix the splits were WRITTEN with (<repo_id>/<split>)
+cam: scene_left          # -> videos/observation.images.scene_left. FIXED camera; see the header.
+
+P: 8
+F: 64
+window_stride: 1         # LOCKED — see torus.yaml
+subsample: 1             # CHOOSE ON THE CLI — see the header
+
+autobatch: true
+workers: 16
+
+# Torus-only knobs inherited from the parent and INERT on a recorded dataset (there is no simulator to
+# re-render): fpv_fov, composite_grid, action_smooth_window, action_sampler, splits.*. Left rather than
+# deleted so `data=block_stack` stays a strict overlay on one parent and the diff is readable.

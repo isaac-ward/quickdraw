@@ -124,6 +124,56 @@ class VisualLoss(nn.Module):
             self._net = _lpips_net(device, net_type=self.lpips_net)
         return self._net
 
+    def _sanitise(self, p: Tensor) -> Tensor:
+        """Decoder output -> a tensor a frozen feature net can be fed. SHARED by every feature-space term.
+
+        torchmetrics is built with normalize=True, i.e. it expects [0,1] and VALIDATES it, raising on
+        anything outside. A plain clamp() would zero the gradient exactly where the decoder overshoots,
+        which is where we most want it pulled back -- hence a STRAIGHT-THROUGH clamp: forward value
+        clipped, backward pass the identity.
+
+        BUT THE NAIVE STRAIGHT-THROUGH IS NUMERICALLY UNSAFE, and it killed a run (torus_vl128, 2026-09-02,
+        dead 7.5 h before anyone noticed). `p + (p.clamp(0,1) - p)` is exact only for moderate magnitudes.
+        Measured: 1e8 -> 0.0 (catastrophic cancellation) and +-inf or nan -> NaN. A FRESH decoder at step 0
+        is unbounded and can emit exactly those, and then torchmetrics raises mid-training-step. So:
+        sanitise the non-finites FIRST, then straight-through, then a final clamp as a belt.
+
+        THIS LIVES IN ONE PLACE ON PURPOSE. It is a hard-won fix whose correctness is not obvious from
+        reading it, so a second copy would drift. Every term that feeds a frozen net calls this one."""
+        finite = torch.isfinite(p)
+        if not bool(finite.all()):
+            # COUNTED, and the count is drained per EPOCH by pop_diagnostics -- this used to be a one-shot
+            # `_warned_nonfinite` per PROCESS, so a run taking thousands of these printed one line.
+            n = self._nonfinite_calls = int(getattr(self, "_nonfinite_calls", 0)) + 1
+            if n <= 3:                     # first few in detail; the per-epoch total comes from the report
+                print(f"[visual_loss] NON-FINITE decoder output into a feature net "
+                      f"({int((~finite).sum())}/{p.numel()} elements) -- sanitised so the step survives. "
+                      f"This is a symptom, not the disease: check grad/norm_preclip and the decode loss.",
+                      flush=True)
+            p = torch.nan_to_num(p, nan=0.5, posinf=1.0, neginf=0.0)
+        return (p + (p.clamp(0.0, 1.0) - p).detach()).clamp(0.0, 1.0)
+
+    def _layer_features(self, x: Tensor) -> list[Tensor]:
+        """(M,H,W,C) in [0,1] -> the LPIPS backbone's 5 per-layer UNIT-NORMALISED feature maps.
+
+        WHY THIS IS NOT USED BY `_lpips_term`. That method calls the torchmetrics metric as a BLACK BOX,
+        which is correct and tested; reproducing its internals here to "share code" would risk changing a
+        number that 25+ historical runs are ranked on. These two share the NETWORK (one process-level cache
+        keyed by (device, net_type) in evaluation/openloop) and the sanitise guard above -- not the
+        distance. They compute different functions of the same features.
+
+        RAW unit-normalised features, NOT LPIPS's learned per-layer weights. Those weights were fitted to
+        match HUMAN JUDGEMENTS OF IMAGE SIMILARITY; nothing calibrates them for the similarity of temporal
+        DIFFERENCES, and borrowing a calibration across tasks is the kind of thing that looks rigorous and
+        is not. `_normalize_tensor` is torchmetrics' own, so the normalisation matches LPIPS exactly."""
+        from torchmetrics.functional.image.lpips import _normalize_tensor
+        net = self._lpips(x.device)
+        if net is None:
+            return []
+        inner = net.net                                        # _NoTrainLpips: .net = Vgg16, .L = 5
+        feats = inner.net.forward(inner.scaling_layer(x.permute(0, 3, 1, 2).float()))
+        return [_normalize_tensor(f) for f in feats]
+
     def _subsample(self, pred: Tensor, target: Tensor):
         """Random subset of frames. LPIPS on all B*F frames (2048 at batch 32 / F 64) would dominate the step;
         a random subset is an unbiased estimate of the same expectation. Applies at BOTH sites -- the anchor
@@ -152,18 +202,7 @@ class VisualLoss(nn.Module):
         # So: sanitise the non-finites FIRST, then straight-through, then a final clamp as a belt. That last
         # clamp is a NO-OP for any value already inside [0,1], so it does not touch the gradient in the region
         # that matters -- it only catches precision artifacts, which have no meaningful gradient anyway.
-        finite = torch.isfinite(p)
-        if not bool(finite.all()):
-            # COUNTED, and the count is drained per EPOCH by pop_diagnostics -- this used to be a one-shot
-            # `_warned_nonfinite` per PROCESS, so a run taking thousands of these printed one line.
-            n = self._nonfinite_calls = int(getattr(self, "_nonfinite_calls", 0)) + 1
-            if n <= 3:                     # first few in detail; the per-epoch total comes from the report
-                print(f"[visual_loss] NON-FINITE decoder output into LPIPS "
-                      f"({int((~finite).sum())}/{p.numel()} elements) -- sanitised so the step survives. "
-                      f"This is a symptom, not the disease: check grad/norm_preclip and the decode loss.",
-                      flush=True)
-            p = torch.nan_to_num(p, nan=0.5, posinf=1.0, neginf=0.0)
-        pc = (p + (p.clamp(0.0, 1.0) - p).detach()).clamp(0.0, 1.0)
+        pc = self._sanitise(p)
         out = net(pc.permute(0, 3, 1, 2).float(), t.permute(0, 3, 1, 2).clamp(0, 1).float())
         # RESET, every call. LearnedPerceptualImagePatchSimilarity is a stateful torchmetrics Metric: every
         # __call__ appends the batch score to `all_scores`, and the net is cached for the whole process, so
@@ -202,6 +241,75 @@ class VisualLoss(nn.Module):
         if self.w_lpips:
             loss = loss + self.w_lpips * self._lpips_term(pred, target)
         return loss
+
+    # ---- the FIRST-ORDER term (design/derivative_loss.md) ------------------------------------------
+    def _pairs(self, pred: Tensor, target: Tensor, stride: int):
+        """(B,F,...) -> four (n,...) tensors: pred_t, pred_{t+k}, true_t, true_{t+k}. CONTIGUOUS pairs.
+
+        WHY PAIRS AND NOT `_subsample`. `_subsample` is `randperm` over the FLATTENED B*F rows. Pick 128 of
+        1344 and you get (b=3,t=17), (b=0,t=52), (b=14,t=6)...; differencing consecutive entries of that
+        would compute frame(b=3,t=17) - frame(b=0,t=52) -- two frames from DIFFERENT EPISODES at unrelated
+        times. Not a derivative, noise. So the sampler picks (b, t) and takes (t, t+k) together.
+
+        `self.frames` is the budget in FRAMES, so n_pairs = frames // 2 keeps the feature-net cost equal to
+        the ordinary LPIPS term's. Indexing along dim 1 also means episode seams are impossible by
+        construction -- differencing adjacent rows of the flat tensor would fabricate a huge spurious delta
+        at every b -> b+1 boundary."""
+        B, F = pred.shape[:2]
+        nt = F - stride
+        if nt <= 0:
+            return None
+        n = max(1, int(self.frames) // 2) if self.frames else B * nt
+        bi = torch.randint(0, B, (n,), device=pred.device)
+        ti = torch.randint(0, nt, (n,), device=pred.device)
+        return pred[bi, ti], pred[bi, ti + stride], target[bi, ti], target[bi, ti + stride]
+
+    def temporal(self, pred: Tensor, target: Tensor, strides=(1,)) -> Tensor:
+        """Distance between TEMPORAL DIFFERENCES of two sequences. Both (B, F, H, W, C) in [0,1].
+
+            w_l1    * L1(dp, dg)
+          + w_lpips * sum_l || (phi_l(p_t+k) - phi_l(p_t)) - (phi_l(g_t+k) - phi_l(g_t)) ||^2
+
+        DIFFERENCE OF EMBEDDINGS, never embedding of differences. `self(dp, dg)` would be the latter: it
+        would run VGG on a signed, sparse, near-zero tensor it was never trained on, and the features would
+        be meaningless. Here every input to the net is a real frame. For the PIXEL term the two readings are
+        identical (f = identity, differencing commutes), which is why the distinction is easy to miss.
+
+        `strides` is LOCKED at (1,) in config (design/derivative_loss.md §2.1): arXiv 2102.05822 §4.5
+        tested K > 1 and found results "almost identical", and our per-frame term already catches the drift
+        a larger K would add. The plural signature exists so a reader need not re-derive the generalisation
+        to learn it was considered.
+
+        Why this is not `w_l2`: a temporal difference image is SPARSE -- almost all zero, with a blob where
+        something moved. L1 does not let a few large values dominate and its constant gradient keeps small
+        motions visible; L2 squares, so the biggest change swamps the rest."""
+        # RANK 5 exactly. (B,F,H,W,C) is 5-D; the flattened (B*F,H,W,C) the other loss sites use is 4-D,
+        # and a rank>=3 check could not tell them apart -- which is the whole failure this guards against,
+        # since a flattened input would silently difference frames from different episodes.
+        assert pred.dim() == 5 and pred.shape[:2] == target.shape[:2], (
+            f"temporal() needs (B, F, H, W, C) sequences, got {tuple(pred.shape)} vs "
+            f"{tuple(target.shape)}. A 4-D input means the time axis was already flattened away "
+            f"(see design/derivative_loss.md §6)")
+        total = pred.new_zeros(())
+        for k in (strides if isinstance(strides, (list, tuple)) else (strides,)):
+            k = int(k)
+            if k < 1 or k >= pred.shape[1]:
+                continue
+            if self.w_l1:                                      # PIXEL part: all frames, a subtraction + L1
+                dp = pred[:, k:] - pred[:, :-k]
+                dg = target[:, k:] - target[:, :-k]
+                total = total + self.w_l1 * F.l1_loss(dp, dg)
+            if self.w_lpips:                                   # FEATURE part: sampled contiguous pairs
+                got = self._pairs(pred, target, k)
+                if got is None:
+                    continue
+                p0, p1, g0, g1 = got
+                fp0, fp1 = self._layer_features(self._sanitise(p0)), self._layer_features(self._sanitise(p1))
+                fg0 = self._layer_features(g0.clamp(0, 1))
+                fg1 = self._layer_features(g1.clamp(0, 1))
+                for a0, a1, b0, b1 in zip(fp0, fp1, fg0, fg1):
+                    total = total + self.w_lpips * ((a1 - a0) - (b1 - b0)).pow(2).mean()
+        return total
 
     @torch.no_grad()
     def terms(self, pred: Tensor, target: Tensor) -> dict[str, float]:
