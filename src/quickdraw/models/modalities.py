@@ -110,6 +110,23 @@ class ModalitySpec:
     #                           larger K would add (it IS being in the wrong place). Do not sweep it; the
     #                           plural form exists so a reader need not re-derive the generalisation to
     #                           learn it was considered. See design/derivative_loss.md §2.1.
+    visual_dino_v3: float = 0.0   # DINOv3 PER-PATCH COSINE, local by construction. 0.0 = OFF and
+    #                           byte-identical to not having it. LPIPS reduces with a spatial mean
+    #                           over frames that are 84.6% static here, diluting the moving region 5x;
+    #                           a per-patch cosine normalises WITHIN each patch, so a dim 4-pixel block
+    #                           counts as much as a bright table texture. Runs ALONGSIDE visual_lpips,
+    #                           not instead of it -- set visual_lpips=0 to swap. See models/dino_loss.py.
+    visual_dino_v3_net: str = "vits16"      # vits16 | vitsplus16 | vitb16 | vitl16. ViT-S/16 is 0.61x
+    #                           the FLOPs of the VGG16 LPIPS already pays for: a conv net pays per
+    #                           pixel, a ViT per patch, and 96x128 is only 48 patches.
+    visual_dino_v3_layer: int = -1          # -1 = the FINAL block. PixelGen found the last block best
+    #                           and MULTIPLE layers actively harmful ("conflicting supervision"), the
+    #                           opposite of LPIPS's 5-layer sum. Do not stack.
+    visual_dino_v3_patch_weight: str = "none"   # none = plain mean over patches (the published P-DINO
+    #                           form, and the default). true|max weight each patch by the motion in it,
+    #                           for the TEMPORAL form only, where 72.2% of patches are static and their
+    #                           cosine is noise (measured). Detached, so freezing cannot shrink its own
+    #                           weight. See design/dino_loss.md section 3.
     visual_frames: int = 128   # visual_lpips>0: score LPIPS on a random subset of this many frames per step
     #                           instead of all B*F (2048 at batch 32 / F 64), which would dominate the step. A
     #                           random subset is an unbiased estimate of the same expectation. 0 -> all frames.
@@ -382,7 +399,11 @@ class ImageModality(Modality):
                                  w_l1=float(getattr(spec, "visual_l1", 0.0) or 0.0),
                                  w_lpips=float(getattr(spec, "visual_lpips", 0.0) or 0.0),
                                  lpips_net=str(getattr(spec, "visual_lpips_net", "vgg")),
-                                 frames=int(getattr(spec, "visual_frames", 128) or 0))
+                                 frames=int(getattr(spec, "visual_frames", 128) or 0),
+                                 w_dino_v3=float(getattr(spec, "visual_dino_v3", 0.0) or 0.0),
+                                 dino_v3_net=str(getattr(spec, "visual_dino_v3_net", "vits16")),
+                                 dino_v3_layer=int(getattr(spec, "visual_dino_v3_layer", -1)),
+                                 dino_v3_patch_weight=str(getattr(spec, "visual_dino_v3_patch_weight", "none")))
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         # EXPLICIT dispatch with a RAISE on anything unknown. This used to be `if unet ... else vit`, so a
         # typo'd or newly-added decode_arch SILENTLY built the ViT head and the run "tested" nothing at all.

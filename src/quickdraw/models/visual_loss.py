@@ -140,6 +140,41 @@ class LpipsTerm(_Term):
                 for a0, a1, b0, b1 in zip(fp0, fp1, fg0, fg1)]
 
 
+class DinoV3Term(_Term):
+    """DINOv3 per-patch cosine. LOCAL BY CONSTRUCTION -- see models/dino_loss.py for the why.
+
+    Sampled pairs like LPIPS (`full_sequence = False`): the backbone is the cost. Fails SOFT when the
+    weights are unavailable (the repo is gated), contributing nothing rather than crashing a run.
+    """
+
+    name = "dino_v3"
+    full_sequence = False
+
+    def weight(self, vl): return vl.w_dino_v3
+
+    def _tok(self, vl, x):
+        from .dino_loss import get_net, patch_tokens
+        return patch_tokens(get_net(vl.dino_v3_net, x.device), x, vl.dino_v3_layer)
+
+    def pointwise(self, vl, p, t):
+        from .dino_loss import patch_cosine
+        p, t = vl._subsample(p, t)                 # the same frame budget LPIPS gets
+        fp, fg = self._tok(vl, vl._sanitise(p)), self._tok(vl, t.clamp(0, 1))
+        # PLAIN MEAN here, never the weight: f_p is never near zero, so the weight would only
+        # re-introduce the magnitude bias the cosine exists to remove.
+        return None if fp is None else patch_cosine(fp, fg)
+
+    def difference(self, vl, p0, p1, g0, g1):
+        """DIFFERENCE OF EMBEDDINGS, never the embedding of a difference -- a ViT handed a signed,
+        near-zero tensor it never saw in training produces meaningless features."""
+        from .dino_loss import weighted_patch_cosine
+        fp0, fp1 = self._tok(vl, vl._sanitise(p0)), self._tok(vl, vl._sanitise(p1))
+        if fp0 is None:
+            return None
+        fg0, fg1 = self._tok(vl, g0.clamp(0, 1)), self._tok(vl, g1.clamp(0, 1))
+        return weighted_patch_cosine(fp1 - fp0, fg1 - fg0, vl.dino_v3_patch_weight)
+
+
 class VisualLoss(nn.Module):
     """w_l2*L2 + w_l1*L1 + w_lpips*LPIPS(net). Inputs (M,H,W,C) in [0,1].
 
@@ -149,16 +184,24 @@ class VisualLoss(nn.Module):
     """
 
     def __init__(self, *, w_l2: float = 1.0, w_l1: float = 0.0, w_lpips: float = 0.0,
-                 lpips_net: str = "vgg", frames: int = 128):
+                 lpips_net: str = "vgg", frames: int = 128,
+                 w_dino_v3: float = 0.0, dino_v3_net: str = "vits16",
+                 dino_v3_layer: int = -1, dino_v3_patch_weight: str = "none"):
         super().__init__()
         self.w_l2, self.w_l1, self.w_lpips = float(w_l2), float(w_l1), float(w_lpips)
         self.lpips_net, self.frames = str(lpips_net), int(frames)
+        # TWO WEIGHTS, not a mode switch: `w_lpips=0, w_dino_v3=1` swaps them, but leaving both
+        # nonzero runs both, which is what PixelGen found best (LPIPS for local texture, DINO for
+        # semantics). An enum could not express that.
+        self.w_dino_v3 = float(w_dino_v3)
+        self.dino_v3_net, self.dino_v3_layer = str(dino_v3_net), int(dino_v3_layer)
+        self.dino_v3_patch_weight = str(dino_v3_patch_weight)
         self._net = None                      # built lazily on first use: it needs a device, and constructing
         #                                       it in __init__ would download weights during a --help.
         self._diag: dict = {}                 # per-site RAW output range, drained per epoch -- see range_stats
         # ONE list, both reductions. Adding a term here makes it apply to the decode loss, the
         # roundtrip anchor AND the derivative term, for every modality that owns a VisualLoss.
-        self._terms: list[_Term] = [L2Term(), L1Term(), LpipsTerm()]
+        self._terms: list[_Term] = [L2Term(), L1Term(), LpipsTerm(), DinoV3Term()]
 
     # ---- diagnostics ----
     # WHY THIS EXISTS (2026-09-03). The decoder head is an unbounded nn.Conv2d and NOTHING here reads its raw
@@ -434,4 +477,5 @@ class VisualLoss(nn.Module):
 
     def extra_repr(self) -> str:
         return (f"w_l2={self.w_l2}, w_l1={self.w_l1}, w_lpips={self.w_lpips}, "
+                f"w_dino_v3={self.w_dino_v3}, "
                 f"lpips_net={self.lpips_net!r}, frames={self.frames}")
