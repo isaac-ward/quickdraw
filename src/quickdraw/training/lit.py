@@ -161,6 +161,21 @@ class LitWorldModel(L.LightningModule):
         # fixed stride) -> every frame gets recon gradient over an epoch (unbiased). The DYNAMICS loss (flow /
         # pred_latent, below) stays on all F frames regardless. frac=1.0 (default) = decode all frames.
         frac = self.recon_frac if tag == "train" else 1.0
+        # RECON_FRAC x DERIVATIVE: the first-order term differences ADJACENT decoded frames, and the subset
+        # below is a randperm -- so under frac<1 the "adjacent" rows are frames t=17 and t=52 of the rollout,
+        # and the term would silently compute a difference over a random time gap instead of one step. It
+        # would not error, log oddly, or look wrong; it would just optimise nonsense. design/derivative_loss.md
+        # asks for this assert and it was never added. Raise at the first step rather than train on garbage.
+        if frac < 1.0 and any(float(getattr(mod, "derivative_weight", 0.0) or 0.0) > 0.0
+                              for mod in getattr(m, "modalities", {}).values()):
+            hot = [n for n, mod in m.modalities.items()
+                   if float(getattr(mod, "derivative_weight", 0.0) or 0.0) > 0.0]
+            raise ValueError(
+                f"model.recon_frac={frac} < 1.0 with derivative_weight > 0 on {hot}. The first-order term "
+                f"differences ADJACENT decoded frames, but recon_frac<1 decodes a RANDOM subset of the "
+                f"rollout, so the 'adjacent' pairs would span arbitrary time gaps and the term would "
+                f"optimise noise silently. Set model.recon_frac=1.0 (vl128_starling does; bsp32mse.yaml "
+                f"sets 0.25 and is inherited by several recipes), or set derivative_weight=0.")
         if frac < 1.0:
             Tf = recon_src.shape[1]; k = max(1, int(round(frac * Tf)))
             idx = torch.randperm(Tf, device=recon_src.device)[:k]
