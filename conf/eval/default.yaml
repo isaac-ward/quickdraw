@@ -14,6 +14,15 @@ closed_loop_horizon: 256   # caps the rollout horizon for the CLOSED-LOOP modes 
 #                            X steps), so a shorter horizon captures it; and cl_1 at full H is n_ep*H context-encodes
 #                            = slow. Set null/0 to use the full `horizon` for closed-loop too.
 n_episodes: 64             # episodes averaged per OOD open-loop eval (proprio-only; image heads use 8, decode cost)
+manifold_max_steps: 1024   # cap on the per-episode length eval_manifold FORWARDS. Its cost scales with
+#                            EPISODE LENGTH, not with the 8000-point sample cap: manifold_predictions runs
+#                            the model over each selected episode WHOLE. block-stack val holds two very long
+#                            episodes (3,638 and 3,321 steps at stride 5), so every eval forwarded ~2 GB of
+#                            resident frames across two image heads plus activations over the full T -- it
+#                            asked for 6.5 GiB on top of a training process holding 89 GiB and OOMed, dying
+#                            every eval. A projection wants a REPRESENTATIVE latent sample, not every step:
+#                            2 x 1024 gives ~2,000 points, well above what UMAP/t-SNE need for structure.
+#                            0/null = no cap (the old behaviour).
 ae_floor_episodes: 2       # val trajectories for eval_ae_floor (the encode->decode ceiling; #12). Cheap -> keep small.
 decode_chunk: 64           # eval_ood_horizon decodes the rolled-out latents to images in chunks of this many
 #                            timesteps so the U-Net decoder peak is bounded (batch x chunk), NOT batch x horizon

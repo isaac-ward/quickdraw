@@ -429,7 +429,26 @@ def eval_ood_dynamics(cfg, model, norm, ecfg, writer, device, step=0):
 
 def eval_control(cfg, model, norm, ecfg, writer, device, step=0):
     """Dual MPPI control (oracle vs learned) through a random sequence of 8 goals. Multimodal models plan
-    with an FPV context rendered in the loop (run_and_log_control handles it)."""
+    with an FPV context rendered in the loop (run_and_log_control handles it).
+
+    SKIPS CLEANLY when the env cannot be stepped. MPPI rolls a candidate action sequence through the env,
+    so an env with no simulator cannot run control AT ALL -- and the env already says so: RecordedEnv marks
+    `reset`/`step` as `not_provided`, which log_env_capabilities prints as `reset x no-sim | step x no-sim`
+    at the start of every run. Nothing consulted that, so a recorded run instead dived into MPPI and died
+    somewhere inside on an unrelated symptom (a KeyError on the torus-only `fpv["coloring"]`, or before
+    that a TypeError from int() on a non-square img_size), which the callback counts toward its fatal
+    streak as a BUG. Ask the env first and raise NotImplementedError, the clean-skip the callback already
+    understands, so the log says the true reason instead of a misleading traceback."""
+    from ..environments.base import env_provides
+    from ..environments.registry import make_env
+    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, device)
+    missing = [h for h in ("reset", "step") if not env_provides(env, h)]
+    if missing:
+        raise NotImplementedError(
+            f"{type(env).__name__} provides no {'/'.join(missing)} -- MPPI has to roll candidate action "
+            f"sequences through a simulator, and a recorded dataset has none. This is the env contract "
+            f"working, not a failure; turn the routine off with eval.during_train.evals.control=false to "
+            f"stop it being requested at all.")
     return {"control": run_and_log_control(cfg, model, norm, ecfg, writer, device, step)}
 
 
@@ -451,6 +470,17 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
+    # CAP THE EPISODE LENGTH THAT GETS FORWARDED. manifold_predictions runs the model over each selected
+    # episode WHOLE, so cost scales with episode length, not with n_points. block-stack val holds 2 very
+    # long episodes (3,638 and 3,321 steps at stride 5), so every eval forwarded ~2 GB of resident frames
+    # across two image heads plus activations over the full T -- 6.5 GiB on top of a training process
+    # already holding 89 GiB, which OOMed and killed the routine every time. A projection needs a
+    # REPRESENTATIVE sample of latents, not every timestep: 2 x 1024 steps is ~2,000 points, comfortably
+    # more than UMAP/t-SNE need to show structure, and it is the same points these plots would have drawn
+    # from anyway (n_points=8000 exceeded the 6,941 available, so it was using all of them).
+    max_steps = int(cfg.eval.get("manifold_max_steps", 1024) or 0)
+    if max_steps:
+        mm_eps = [tuple(x[:max_steps] for x in ep) for ep in mm_eps]
     _, latents, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
                                                 stride=1, seed=0, device=device)
     sub = (f"each point = one committed 1-step next-state prediction from a real val context "
