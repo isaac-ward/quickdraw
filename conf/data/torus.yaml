@@ -16,6 +16,17 @@ F: 64          # future horizon rolled out during training (sets the BPTT length
 window_stride: 1   # LOCKED at 1 (user, 2026-07-20): NEVER use window_stride > 1. It skips training-window starts
                    # (e.g. 8 = only every 8th start -> 8x fewer batches/epoch); the user does not want this speed
                    # shortcut — always full dense coverage (stride 1). DO NOT CHANGE.
+# SUBSAMPLE IS A PREPROCESSING KNOB THAT SILENTLY RESCALES EVERY DOWNSTREAM ONE MEASURED IN STEPS.
+# It changes the physical timestep the model sees, so anything counted in STEPS now means a different
+# amount of REAL TIME. At 30 Hz source data, one step is 1000*s/30 ms. What moves with it:
+#   data.F / data.P      the window, in seconds:  F=64 spans 2.1 s at s=1 and 21.3 s at s=10
+#   derivative_strides   the loss differences k KEPT steps, so k=1 is 33 ms at s=1, 333 ms at s=10
+#                        -- and below the codec floor the term differences mostly noise (design/
+#                        derivative_loss.md), which is why the stride is a PRECONDITION for that
+#                        experiment rather than an independent knob
+#   eval.horizon         and every @+N eval label, likewise in steps not seconds
+#   action_aggregate     s raw actions are folded into one kept step -- see the block below
+# Compare ACROSS strides in seconds (steps * s / source_hz), never in steps.
 subsample: 1   # FRAME stride: keep every Nth frame and AGGREGATE the actions across the skipped ones. 1 = OFF
                # = bit-identical. NOT window_stride (above): that thins window STARTS and is locked; this thins
                # the frames INSIDE every window, i.e. it changes the physical timestep the dynamics models.
