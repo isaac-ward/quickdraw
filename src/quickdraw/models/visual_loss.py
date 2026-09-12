@@ -47,6 +47,99 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+# ---- TERMS ------------------------------------------------------------------------------------
+# ONE declaration per term, used by BOTH reductions. Before this, `forward()` and `temporal()` each
+# carried their own `if self.w_*:` chain, so a term added to one and not the other was silently
+# absent from half the objective and nothing failed.
+#
+# A term never sees HOW frames were chosen. `_subsample` (randperm over flattened rows) and `_pairs`
+# (contiguous pairs) are genuinely different and both load-bearing -- `_subsample` would hand back
+# (b=3,t=17), (b=0,t=52)..., useless for differencing -- so that choice stays in VisualLoss.
+#
+# `difference` returning None means "no temporal form", which is how w_l2's absence from the
+# derivative term became greppable instead of an undocumented divergence a reader had to notice.
+
+
+class _Term:
+    """One loss term. `pointwise` compares frames; `difference` compares temporal differences."""
+
+    name: str = ""
+
+    def weight(self, vl: "VisualLoss") -> float:
+        raise NotImplementedError
+
+    def pointwise(self, vl: "VisualLoss", p: Tensor, t: Tensor) -> Tensor | None:
+        raise NotImplementedError
+
+    def difference(self, vl: "VisualLoss", p0: Tensor, p1: Tensor, g0: Tensor, g1: Tensor) -> Tensor | None:
+        """Terms difference THEMSELVES, so a feature term can difference EMBEDDINGS rather than embed
+        a difference -- see LpipsTerm.difference. None = this term has no temporal form.
+
+        MAY RETURN A LIST, and LpipsTerm does. The caller then folds each element into the running
+        total separately, as `total = total + w * part`. That is not cosmetic: the pre-refactor code
+        multiplied w_lpips into the total ONCE PER VGG LAYER, and summing the five layers first and
+        multiplying once is mathematically identical but differs in fp32 by ~1e-7 -- which the parity
+        golden catches, correctly, because a 1e-7 drift in `visual_lpips` silently makes 25+ historical
+        runs incomparable."""
+        raise NotImplementedError
+
+
+class L2Term(_Term):
+    name = "l2"
+    full_sequence = True
+
+    def weight(self, vl): return vl.w_l2
+
+    def pointwise(self, vl, p, t): return F.mse_loss(p, t)
+
+    def difference(self, vl, p0, p1, g0, g1):
+        """NO temporal form, deliberately. A temporal difference image is SPARSE -- almost all zero
+        with a blob where something moved -- and L2 squares, so the single biggest change swamps the
+        rest. L1 does not let a few large values dominate and its constant gradient keeps small
+        motions visible. `temporal()` has always skipped L2; now it says so."""
+        return None
+
+
+class L1Term(_Term):
+    name = "l1"
+    full_sequence = True
+
+    def weight(self, vl): return vl.w_l1
+
+    def pointwise(self, vl, p, t): return F.l1_loss(p, t)
+
+    def difference(self, vl, p0, p1, g0, g1): return F.l1_loss(p1 - p0, g1 - g0)
+
+
+class LpipsTerm(_Term):
+    """The two reductions compute DIFFERENT functions of the same VGG features, deliberately.
+
+    `pointwise` calls the torchmetrics metric as a BLACK BOX, learned per-layer weights included --
+    that is the number the historical runs are ranked on, and reproducing its internals to "share
+    code" would change it. `difference` uses raw unit-normalised features and does NOT apply those
+    learned weights, which were fitted to human judgements of IMAGE similarity with nothing
+    calibrating them for the similarity of temporal DIFFERENCES.
+
+    They share the NETWORK (one process-level cache) and the `_sanitise` guard -- not the distance.
+    """
+
+    name = "lpips"
+    full_sequence = False            # sampled contiguous pairs -- the net is the cost
+
+    def weight(self, vl): return vl.w_lpips
+
+    def pointwise(self, vl, p, t): return vl._lpips_term(p, t)
+
+    def difference(self, vl, p0, p1, g0, g1):
+        fp0, fp1 = vl._layer_features(vl._sanitise(p0)), vl._layer_features(vl._sanitise(p1))
+        fg0, fg1 = vl._layer_features(g0.clamp(0, 1)), vl._layer_features(g1.clamp(0, 1))
+        if not fp0:                       # weights unavailable -> fail soft, as _lpips_term does
+            return None
+        # ONE ELEMENT PER LAYER, not a pre-summed scalar -- see _Term.difference on fp32 ordering.
+        return [((a1 - a0) - (b1 - b0)).pow(2).mean()
+                for a0, a1, b0, b1 in zip(fp0, fp1, fg0, fg1)]
+
+
 class VisualLoss(nn.Module):
     """w_l2*L2 + w_l1*L1 + w_lpips*LPIPS(net). Inputs (M,H,W,C) in [0,1].
 
@@ -63,6 +156,9 @@ class VisualLoss(nn.Module):
         self._net = None                      # built lazily on first use: it needs a device, and constructing
         #                                       it in __init__ would download weights during a --help.
         self._diag: dict = {}                 # per-site RAW output range, drained per epoch -- see range_stats
+        # ONE list, both reductions. Adding a term here makes it apply to the decode loss, the
+        # roundtrip anchor AND the derivative term, for every modality that owns a VisualLoss.
+        self._terms: list[_Term] = [L2Term(), L1Term(), LpipsTerm()]
 
     # ---- diagnostics ----
     # WHY THIS EXISTS (2026-09-03). The decoder head is an unbounded nn.Conv2d and NOTHING here reads its raw
@@ -230,17 +326,24 @@ class VisualLoss(nn.Module):
             return pred.reshape(-1, *pred.shape[-3:]), target.reshape(-1, *target.shape[-3:])
         return pred, target
 
+    def _assemble(self, zero: Tensor, mode: str, *args) -> Tensor:
+        """Sum w * term over the registry. `mode` picks which reduction each term contributes."""
+        total = zero
+        for term in self._terms:
+            w = float(term.weight(self) or 0.0)
+            if not w:
+                continue
+            part = term.pointwise(self, *args) if mode == "pointwise" else term.difference(self, *args)
+            if part is None:
+                continue
+            for sub in (part if isinstance(part, list) else [part]):
+                total = total + w * sub
+        return total
+
     def forward(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
         pred, target = self._flatten(pred, target)     # (B,F,H,W,C) from the anchor -> (B*F,H,W,C)
         self._record(site, pred)                       # RAW range, before any term clamps -- see pop_diagnostics
-        loss = pred.new_zeros(())
-        if self.w_l2:
-            loss = loss + self.w_l2 * F.mse_loss(pred, target)
-        if self.w_l1:
-            loss = loss + self.w_l1 * F.l1_loss(pred, target)
-        if self.w_lpips:
-            loss = loss + self.w_lpips * self._lpips_term(pred, target)
-        return loss
+        return self._assemble(pred.new_zeros(()), "pointwise", pred, target)
 
     # ---- the FIRST-ORDER term (design/derivative_loss.md) ------------------------------------------
     def _pairs(self, pred: Tensor, target: Tensor, stride: int):
@@ -295,20 +398,26 @@ class VisualLoss(nn.Module):
             k = int(k)
             if k < 1 or k >= pred.shape[1]:
                 continue
-            if self.w_l1:                                      # PIXEL part: all frames, a subtraction + L1
-                dp = pred[:, k:] - pred[:, :-k]
-                dg = target[:, k:] - target[:, :-k]
-                total = total + self.w_l1 * F.l1_loss(dp, dg)
-            if self.w_lpips:                                   # FEATURE part: sampled contiguous pairs
-                got = self._pairs(pred, target, k)
-                if got is None:
+            # TWO PAIRINGS, and the split is not arbitrary. The PIXEL terms are cheap, so they see
+            # ALL frames via a plain slice. The FEATURE terms are not, so they see `_pairs`' sampled
+            # contiguous pairs. Terms declare which they want with `full_sequence`.
+            for term in self._terms:
+                w = float(term.weight(self) or 0.0)
+                if not w:
                     continue
-                p0, p1, g0, g1 = got
-                fp0, fp1 = self._layer_features(self._sanitise(p0)), self._layer_features(self._sanitise(p1))
-                fg0 = self._layer_features(g0.clamp(0, 1))
-                fg1 = self._layer_features(g1.clamp(0, 1))
-                for a0, a1, b0, b1 in zip(fp0, fp1, fg0, fg1):
-                    total = total + self.w_lpips * ((a1 - a0) - (b1 - b0)).pow(2).mean()
+                if getattr(term, "full_sequence", False):
+                    args = (pred[:, :-k], pred[:, k:], target[:, :-k], target[:, k:])
+                else:
+                    got = self._pairs(pred, target, k)
+                    if got is None:
+                        continue
+                    p0, p1, g0, g1 = got
+                    args = (p0, p1, g0, g1)
+                part = term.difference(self, *args)
+                if part is None:
+                    continue
+                for sub in (part if isinstance(part, list) else [part]):
+                    total = total + w * sub
         return total
 
     @torch.no_grad()
