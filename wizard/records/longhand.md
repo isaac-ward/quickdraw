@@ -320,6 +320,72 @@ concat's advantage — concat winning would mean §12 does not hold here. A tie 
   (`"+run_summary.x='$VAL'"`) and fails with a bare grammar error naming one character. Guarded.
 - Editing a running bash script corrupts it — bash reads by byte offset as it executes.
 
+### 8.7 The derivative-loss arm (launched 2026-09-12 02:35)
+
+`bs_deriv_w10` on GPU 1. Term at weight 10 on all three heads, proprio moved `flow` -> `mse` to be
+eligible. Baseline is the retained `bs_stride10`.
+
+**The pre-flight the design doc asks for: PASSED.** `||dpred||/||dtrue||` vs `cos(dpred, dtrue)`,
+computed post-hoc from the retained runs' `raw_filmstrip` npz, no GPU:
+
+| run | ep1 -> last | ratio | cos |
+|---|---|---|---|
+| stride10 | 1 -> 9 | 0.253 -> **0.872** | +0.066 -> **+0.053** |
+| stride15 | 1 -> 17 | 0.197 -> **0.921** | +0.103 -> **+0.074** |
+
+Motion of roughly the right MAGNITUDE in essentially RANDOM DIRECTIONS = the doc's "incoherent, this
+IS flicker, the target case". The ep1 reading looks like the wrong row purely from undertraining, so
+do not diagnose off an early eval.
+
+**The weight is measured, and the doc's figure does not transfer.** Its 25%-of-decode guidance came
+from RANDOM 112x192 data (ratio 0.62). On real block-stack frames, three offsets, untrained:
+
+| head | decode | derivative | ratio | weight for 25% |
+|---|---|---|---|---|
+| proprio | 0.62–0.85 | 0.008–0.014 | 0.013–0.017 | 14.7–19.9 |
+| cam_scene | 2.31–2.37 | 0.048–0.072 | 0.021–0.031 | 8.0–12.1 |
+| cam_wrist | 2.79–2.81 | 0.084–0.124 | 0.030–0.044 | 5.6–8.3 |
+
+20–50x smaller than the doc's, because real consecutive frames barely differ — the low-motion
+problem itself. **Anyone copying 0.25 would run the term at ~2% of intended strength.** A flat 10
+(user's call, for simplicity) puts proprio at 13–17% of decode, cam_scene 21–31%, cam_wrist 30–44%.
+
+**KNOWN CONFOUND, accepted (user, 2026-09-12).** The arm differs from `bs_stride10` in TWO ways:
+`derivative_weight` 0 -> 10 AND proprio `decode_kind` flow -> mse. A win cannot be attributed to the
+term alone. Mitigating: both runs have IDENTICAL image heads (`mse`, same weights, same cameras), so
+proprio's objective reaches `cam_scene`/`cam_wrist` only through the shared trunk — the image
+comparison is far less contaminated than a proprio one, and `decode/proprio` is not comparable
+across the two at all. A matched `weight=0, proprio=mse` baseline was offered and declined; GPU 0
+stays on `bs_stride1`.
+
+**Reading it.** DECIDER: `eval_ood_horizon/open_loop/cam_scene/lpips` at `@+824` (275 s) / `@+1236`
+(412 s) plus `lpips_mean`, matched epochs vs `bs_stride10`. TRIPWIRE: `motion_ratio_mean` both heads
+vs baseline 0.858 (scene) / 0.810 (wrist) — the term is MEAN-SEEKING and the mean of "the block might
+go left or right" is NO MOTION, so an over-weighted term FREEZES the prediction; `cam_wrist` runs
+hottest so it shows there first, fallback 7. NEVER rank on `derivative/<head>`.
+
+**Per-head eval metrics ARE valid** — eval passes `image_head_cams(cfg)` to the loader, so each head
+is scored against its own camera. The `vl128_2cam` header's "read only the first head" warning is
+stale. Confirmed on `bs_stride10` ep9: `cam_wrist` OL l1 0.1041 vs `cam_scene` 0.0327, the same
+reconstructs-best / predicts-worst split robocasa §24.2 found.
+
+### 8.8 What the derivative term actually is
+
+`p` = predicted frames, `g` = ground truth, both (B,F,H,W,C) in [0,1]; `k` = 1 (locked).
+
+- vector head: `MSE(p[:,k:] - p[:,:-k], g[:,k:] - g[:,:-k])`
+- image head: `w_l1 * L1(dp, dg) + w_lpips * SUM_l ||(phi_l(p_t+k) - phi_l(p_t)) - (phi_l(g_t+k) - phi_l(g_t))||^2`
+
+`phi_l` = layer-`l` activations of a frozen VGG (LPIPS's own extractor); `w_l1=3.0, w_lpips=1.0`,
+the same mix the decode term uses. In one line: **does the frame-to-frame change in the prediction
+match the frame-to-frame change in the truth**, scored in pixels and in perceptual features.
+
+It is the **difference of embeddings**, not the embedding of the difference — the latter would feed
+VGG a signed near-zero tensor it never saw in training. For the pixel term the two coincide
+(subtraction commutes with identity), which is why the distinction is easy to miss. L1 rather than
+L2 on pixels because a temporal difference image is sparse and L2 would let the largest change swamp
+the rest.
+
 ## 9. Still open
 
 - [ ] Should `campaign4-rgb` / `campaign6-combos` / `campaign7-precision` be pooled (current
