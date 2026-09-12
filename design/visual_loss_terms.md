@@ -1,119 +1,80 @@
-# VisualLoss: one term registry, two reductions
+# VisualLoss: one term list instead of two
 
-**Status: PLAN. No code written. Do not start while `bs_deriv_w1` / `bs_deriv_w10` are in flight.**
+**Status: PLAN. Do not land while `bs_deriv_w1` / `bs_deriv_w10` are in flight** — not because an
+edit on disk touches them (Python does not reload), but because a crash-and-resume would pick up
+new code mid-experiment, and the sweep's value is that the arms differ in exactly one number.
 
-## 0. Why
+## The problem
 
-Adding a term to `VisualLoss` today means editing it in **two places** — `forward()` and
-`temporal()` each carry their own `if self.w_*:` chain. That is the footgun: a term added to one
-and not the other is silently absent from half the objective, and nothing fails.
+`forward()` and `temporal()` each carry their own `if self.w_*:` chain. A term added to one and not
+the other is silently absent from half the objective, and nothing fails.
 
-The goal is that **declaring a term once makes it apply everywhere** — the ordinary decode loss,
-the roundtrip anchor, the derivative term, and every modality that owns a `VisualLoss`. That
-property is already half-true: `self.visual` is ONE shared instance per modality
-(`modalities.py:381`), reached by both `recon_loss` (`:467`) and `derivative_loss` (`:459`). Only
-the term list is duplicated.
+Everything else is already shared: `self.visual` is ONE instance per modality
+(`modalities.py:381`), reached by both `recon_loss` (`:467`) and `derivative_loss` (`:459`).
 
-Immediate motivation: a **per-patch cosine critic** (P-DINO style, `design/` TBD) to target
-patch-level semantic persistence over long rollouts. Measured on `bs_stride10`, the predicted
-frame-to-frame change sits at `cos = 0.07` against truth — equivalent to a ~6-8 px displacement on
-a 128-wide frame, where a 1 px error would score 0.85. Objects are being repainted in the wrong
-places. LPIPS cannot see this well because it reduces with a spatial `.mean()` over a frame that is
-84.6% static, diluting the moving region 5x (measured, scene_right at stride 10).
+## The change
 
-## 1. What must NOT change
-
-Every number 25+ historical runs are ranked on. Concretely:
-
-* `forward()` must stay **bit-identical** for every existing weight combination.
-* `temporal()` must stay **bit-identical** at `derivative_strides=(1,)`.
-* The torchmetrics LPIPS call in `_lpips_term` stays a **black box**. See §5.
-
-## 2. The shape
-
-Each term becomes an object with two methods, and the class holds a list of them:
+Each term becomes an object with two methods; the class keeps one assembly loop.
 
 ```python
-class Term(Protocol):
+class Term:
     name: str
-    def weight(self, vl: "VisualLoss") -> float: ...
-    # POINTWISE: compare two frame batches directly.        (M,H,W,C) x2 -> scalar
-    def pointwise(self, p: Tensor, t: Tensor) -> Tensor: ...
-    # DIFFERENCE: compare two temporal DIFFERENCES, given contiguous pairs.
-    #   p0,p1 = predicted frames t and t+k; g0,g1 = the true ones.
-    #   Terms take the difference THEMSELVES so a feature term can difference EMBEDDINGS
-    #   rather than embed a difference -- the distinction visual_loss.temporal already makes
-    #   and which must survive the refactor.
-    def difference(self, p0, p1, g0, g1) -> Tensor | None: ...
+    def weight(self, vl) -> float: ...
+    def pointwise(self, p, t) -> Tensor: ...              # (M,H,W,C) x2
+    def difference(self, p0, p1, g0, g1) -> Tensor | None # contiguous pairs; None = no temporal form
 ```
 
-`difference` returning `None` means "this term has no temporal form" — which is how `w_l2`'s
-current silent absence from `temporal()` becomes **explicit and greppable** instead of an
-undocumented divergence a reader has to notice.
-
-`VisualLoss` then keeps ONE assembly method:
+Terms take the difference THEMSELVES, so a feature term can difference EMBEDDINGS rather than embed
+a difference — the distinction `temporal()` already makes, which must survive.
 
 ```python
-def _assemble(self, mode, *args) -> Tensor:
-    total = ...zeros
-    for term in self._terms:
-        w = term.weight(self)
+def _assemble(self, mode, *args):
+    total = zeros
+    for t in self._terms:
+        w = t.weight(self)
         if not w: continue
-        part = term.pointwise(*args) if mode == "pointwise" else term.difference(*args)
-        if part is not None:
-            total = total + w * part
+        part = t.pointwise(*args) if mode == "pointwise" else t.difference(*args)
+        if part is not None: total = total + w * part
     return total
 ```
 
-* `forward()`  = `_flatten` -> `_record` -> `_subsample` -> `_assemble("pointwise", p, t)`
-* `temporal()` = rank-5 assert -> per stride `_pairs` -> `_assemble("difference", p0,p1,g0,g1)`
+`forward()` = flatten -> record -> subsample -> `_assemble("pointwise", ...)`
+`temporal()` = rank-5 assert -> per stride `_pairs` -> `_assemble("difference", ...)`
 
-**Sampling stays where it is, outside the terms.** `_subsample` (randperm over flattened rows) and
-`_pairs` (contiguous pairs) are genuinely different and both are load-bearing — `_subsample` would
-give `(b=3,t=17), (b=0,t=52)...`, useless for differencing. The terms should never see that choice.
+**Sampling stays outside the terms.** `_subsample` (randperm over flattened rows) and `_pairs`
+(contiguous pairs) are genuinely different and both load-bearing — `_subsample` would give
+`(b=3,t=17), (b=0,t=52)...`, useless for differencing.
 
-## 3. Phases
+Side effect worth having: `w_l2`'s current SILENT absence from `temporal()` becomes an explicit
+`return None` with its reason attached (a temporal difference image is sparse; L2 lets the largest
+change swamp the rest).
 
-**Phase 0 — golden parity harness, BEFORE any refactor.** `smoke/visual_loss_parity.py`:
-capture `forward()` and `temporal()` outputs at fixed seed over a matrix of weight combinations
-(each of l2/l1/lpips alone, all pairs, all three; `frames` on and off; rank-4 and rank-5 input;
-`strides=(1,)`; bf16 autocast and fp32). Serialise to a golden `.pt` committed alongside. This is
-the contract §1 asks for, and it must exist and pass against UNCHANGED code first, or it proves
-nothing.
+## How to not break it
 
-**Phase 1 — extract the three existing terms**, no behaviour change. L2 and L1 are trivial. LPIPS
-wraps the existing `_lpips_term` for `pointwise` and the existing `_layer_features` path for
-`difference`, called verbatim. Assert `torch.equal` against the Phase 0 golden — not `allclose`.
+**Write `smoke/visual_loss_parity.py` first, against UNCHANGED code.** Fixed seed, every weight
+combination (each of l2/l1/lpips alone, the pairs, all three), `frames` on and off, rank-4 and
+rank-5 input, fp32 and bf16 autocast, `strides=(1,)`. Commit the golden. Then refactor and assert
+`torch.equal` — not `allclose`.
 
-**Phase 2 — make the divergences explicit.** `L2Term.difference` returns `None` with the reason in
-its docstring (a temporal difference image is sparse; L2 lets the largest change swamp the rest).
-Add `_record` to the temporal path so `pop_diagnostics` covers the derivative site, which it
-currently does not.
+That is the entire safety argument. If the harness does not exist and pass before the refactor, the
+refactor proves nothing.
 
-**Phase 3 — add the new critic, default weight 0.** One class, two methods. Prove
-`w_patchcos=0` is byte-identical to the Phase 0 golden. Only then wire a config knob.
+## What this is NOT
 
-Phases 0-2 are a pure refactor and land together or not at all. Phase 3 is a separate commit.
+Not a vehicle for adding a critic. That is an open question with its own investigation
+(`design/` TBD) and nothing about it is decided. This change is worth making on its own: it removes
+a footgun that exists today.
 
-## 4. Why not to start now
+## The seam that stays: two LPIPS distances
 
-Running processes do not reload code, so `bs_deriv_w1` and `bs_deriv_w10` are safe from an edit on
-disk. But a crash-and-resume would pick up new code MID-EXPERIMENT, and the whole point of the
-sweep is that the two arms differ in exactly one number. Land it after the sweep reports.
+`forward()` and `temporal()` compute different functions of the same VGG features, deliberately:
 
-## 5. The seam that stays: two LPIPS distances
+* `_lpips_term` calls **torchmetrics as a black box**, learned per-layer weights included.
+* `temporal()` uses `_layer_features` — raw unit-normalised features, squared difference of
+  differences — and deliberately does NOT apply those learned weights, which were fitted to human
+  judgements of IMAGE similarity with nothing calibrating them for temporal DIFFERENCES.
 
-`forward()` and `temporal()` compute genuinely different functions of the same VGG features, and
-this refactor deliberately does NOT unify them.
-
-* `_lpips_term` calls the **torchmetrics metric as a black box**, including its learned per-layer
-  weights.
-* `temporal()` uses `_layer_features` — raw unit-normalised features, then a squared difference of
-  differences — and deliberately does NOT apply LPIPS's learned weights, because those were fitted
-  to human judgements of IMAGE similarity and nothing calibrates them for the similarity of
-  temporal DIFFERENCES.
-
-They share the NETWORK (one process-level cache) and the `_sanitise` guard — not the distance.
-Unifying them would mean reimplementing torchmetrics' internals, which would change the
-`visual_lpips` number that every historical run is ranked on. The seam is a deliberate, documented
-trade. Keep it, and keep the two LPIPS terms as two separate `Term` objects if that reads clearer.
+They share the network and the `_sanitise` guard, not the distance. Unifying them means
+reimplementing torchmetrics' internals, which would change the `visual_lpips` number 25+ historical
+runs are ranked on — §24's whole comparison table is LPIPS values. Keep the seam; keep them as two
+`Term` objects if that reads clearer.
