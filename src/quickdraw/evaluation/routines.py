@@ -480,7 +480,12 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     # from anyway (n_points=8000 exceeded the 6,941 available, so it was using all of them).
     max_steps = int(cfg.eval.get("manifold_max_steps", 1024) or 0)
     if max_steps:
-        mm_eps = [tuple(x[:max_steps] for x in ep) for ep in mm_eps]
+        # An mm_eps entry is (obs (T,D), act (T,A), frames) where frames is ALWAYS A DICT
+        # {camera: (T,H,W,3)} -- see load_split_episodes_mm. Slicing the tuple elementwise treats
+        # that dict as sliceable and raises `KeyError: slice(None, 1024, None)`, which is exactly
+        # how this landed broken the first time.
+        mm_eps = [(o_[:max_steps], a_[:max_steps], {k: v[:max_steps] for k, v in fr_.items()})
+                  for o_, a_, fr_ in mm_eps]
     _, latents, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
                                                 stride=1, seed=0, device=device)
     sub = (f"each point = one committed 1-step next-state prediction from a real val context "
