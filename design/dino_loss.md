@@ -50,23 +50,64 @@ each patch `p`, and only then averaged over patches and frames. Two consequences
 NOT `cos` of the flattened frame (that is the diagnostic in §1, one number per frame). NOT a mean
 of features then a cosine. Per patch, then mean.
 
-## 3. THE PROBLEM THAT WILL BITE: near-zero temporal differences
+## 3. THE PROBLEM THAT WILL BITE, and the decided fix
 
-Most patches are static, so `Δf_p ≈ 0` for most `p`, and **the cosine of two near-zero vectors is
-numerically meaningless** — it will swing over [-1, 1] on floating-point noise. Averaged over 48
-patches of which ~40 are static, the temporal term would be mostly noise. This must be handled
-BEFORE the term is worth running; three options, to be decided by measurement in §6:
+Most patches are static, so `Δf_p ≈ 0`, and **the cosine of two near-zero vectors is numerically
+meaningless** — it swings over [-1, 1] on floating-point noise.
 
-| option | form | cost |
+MEASURED, on real (pred, gt) pairs from `bs_stride10` ep9, chopped into exactly the 6x8 grid of
+16x16 patches DINOv3 would see (79,200 patch-differences):
+
+| | |
+|---|---|
+| patches with `‖Δtrue‖` < 10% of the p90 | **72.2%** |
+| cosine on those STATIC patches | mean **+0.041**, std 0.155 -> centred on zero, i.e. noise |
+| cosine on the MOVING patches | mean **+0.161**, std 0.322 -> real signal |
+
+So a plain mean would be **72% composed of patches whose cosine is meaningless**.
+
+### The design space, stated algebraically
+
+`‖a − b‖² = ‖a‖² + ‖b‖² − 2‖a‖‖b‖·cos(a,b)`, so an L2 ALREADY contains the cosine, weighted by the
+product of the magnitudes. The question is therefore only HOW MUCH magnitude weighting:
+
+| reduction | magnitude weighting | outcome |
 |---|---|---|
-| **eps floor** | `cos = <a,b> / (‖a‖‖b‖ + eps)` | near-zero patches give `cos→0`, contributing a near-constant 1 with no direction. Safe, but they still dilute the mean. |
-| **hard mask** | drop patches with `‖Δf_true‖ < τ` | clean, but τ is a magic number and the count varies per frame |
-| **soft weight** | weight patch p by `‖Δf_true‖ / Σ‖Δf_true‖` | no threshold, degrades gracefully. Reintroduces magnitude weighting BUT per-patch and derived from GT only |
+| cosine, plain mean | none | 72% noise (measured above) |
+| plain L2 | quadratic | back to LPIPS-style dilution |
+| **weighted cosine** | **linear** | the middle ground — TAKE THIS |
 
-The soft weight is the same idea as motion-weighting (`MV2MAE`), arrived at independently and
-living in FEATURE space rather than pixel space. Note it carries the same risk: a patch the model
-should have left alone gets no gradient. The pointwise form has none of this problem — `f_p` is
-never near zero — so if only one form survives, it is the pointwise one.
+Measured on the same data: plain mean `0.9258`, weighted `0.8823`, moving-patches-only `0.8393`.
+
+### The rule
+
+```
+  w_p       =  stopgrad( max( ‖Δf_p(true)‖ , ‖Δf_p(pred)‖ ) )
+
+                 1    M     SUM_p  w_p · [ 1 - cos( Δf_p(pred), Δf_p(true) ) ]
+  L_temporal =  ---  SUM   ------------------------------------------------------
+                 M   m=1                    SUM_p  w_p
+```
+
+**`max`, not `‖Δf_true‖` alone.** Weighting by truth only means a patch where the model HALLUCINATES
+motion onto a static background gets ~0 weight, so the hallucination goes unpenalised — the
+background-neglect risk. `max` closes it: missed motion is weighted by the true magnitude, invented
+motion by the predicted one.
+
+**stopgrad on the weight.** Otherwise the model lowers the loss by shrinking `‖Δf_p(pred)‖` — i.e.
+FREEZING — to reduce its own weight. Detached, freezing gains nothing: a genuinely moving patch
+keeps weight `‖Δf_true‖`, and `cos(0, Δf_true) = 0` gives the full penalty. Direct precedent:
+Focal Frequency Loss locks the gradient through its spectrum weight matrix for the same reason.
+
+**NOT max or top-k OVER PATCHES.** With ~13 moving patches of 48, a max lets one patch drive the
+whole gradient — high variance, and it is the OHEM-ranked-by-current-loss failure that the
+segmentation literature reports degrading as training proceeds.
+
+`visual_dino_v3_weight` selects `max` (default) / `true` / `none`, so the choice stays measurable
+in section 6 rather than asserted.
+
+**The POINTWISE form has none of this problem** — `f_p` is never near zero, so it takes a plain
+mean over patches. Only the temporal form needs the weight.
 
 ## 4. Layer choice
 
@@ -89,13 +130,14 @@ DINOv2: **+6 mIoU** ADE20K, **+6.7 J&F** video tracking.
 more `Term` in the registry (`design/visual_loss_terms.md`), exactly as LPIPS is.
 
 ```
-visual_lpips: 1.0     # unchanged, still VGG
-visual_dino:  0.0     # new, default OFF -> byte-identical to not having it
-visual_dino_net:   vits16      # vits16 | vitsplus16 | vitb16
-visual_dino_layer: -1          # -1 = final block
+visual_lpips: 1.0           # unchanged, still VGG
+visual_dino_v3: 0.0         # new, default OFF -> byte-identical to not having it
+visual_dino_v3_net:   vits16    # vits16 | vitsplus16 | vitb16
+visual_dino_v3_layer: -1        # -1 = FINAL block (see section 4); configurable, settle it in section 6
+visual_dino_v3_weight: max      # patch reduction: max | true | none  (see section 3)
 ```
 
-**Two weights, not a mode switch.** Setting `visual_lpips=0 visual_dino=1` swaps them; leaving both
+**Two weights, not a mode switch.** Setting `visual_lpips=0 visual_dino_v3=1` swaps them; leaving both
 nonzero runs both, which is what PixelGen found best (LPIPS for local texture, DINO for semantics:
 FID 23.67 -> 10.00 with LPIPS -> 7.46 adding DINO). A `perceptual: lpips|dino` enum could not
 express that, and would need a new value for every future combination.
