@@ -386,6 +386,126 @@ VGG a signed near-zero tensor it never saw in training. For the pixel term the t
 L2 on pixels because a temporal difference image is sparse and L2 would let the largest change swamp
 the rest.
 
+### 8.9 Derivative arms: the result
+
+`bs_deriv_w10` (all heads, weight 10) LOST and was killed at ep4. `bs_deriv_w1` ran to ep3+.
+
+Open-loop LPIPS, cam_scene, matched epochs (all arms subsample 10, steps x 0.333 s):
+
+| ep 3 | 21 s | 137 s | 275 s | 412 s | 550 s | mean |
+|---|---|---|---|---|---|---|
+| baseline (LPIPS) | 0.1117 | **0.0844** | 0.1344 | 0.1071 | 0.1000 | 0.1078 |
+| **deriv w1** | **0.1058** | 0.1006 | **0.1099** | **0.0901** | **0.0959** | **0.1035** |
+| deriv w10 | 0.1279 | 0.1103 | 0.1377 | 0.1169 | 0.1376 | 0.1289 |
+
+`deriv w1` beats baseline on the mean at both ep1 (0.1143 vs 0.1191) and ep3, and wins 4 of 5
+horizons at ep3 including all three long ones — a ~4% effect, i.e. real but small.
+
+**`deriv w10` failed exactly as the design doc predicted.** The mechanism ENGAGED — directional
+coherence roughly doubled, `cos` 0.149 vs the baseline's 0.070 — but it was bought by moving 32%
+less (`ratio` 0.475 vs 0.696), the mean-seeking freeze. A frozen prediction compounds, so the damage
+grew with horizon: +37.5% on lpips at 550 s, and worsening with training (+7.9% at ep1 -> +19.6% at
+ep3). The `l1`-improves-while-`lpips`-degrades split was the giveaway.
+
+### 8.10 DINOv3 arms: the result so far
+
+`bs_dino_w25` (lpips 0, dino 25) **DIVERGED by epoch 1** and was killed. Decoder output on
+`cam_scene` reached max **308**, min **-98**, with **58% of pixels outside [0,1]**;
+`roundtrip_cam_scene_mse` 1326 against the healthy 0.0037; `dynamics/latent` 155 against 0.289.
+
+**The cause is the property the term was chosen for.** A cosine is EXACTLY scale-invariant
+(measured: scaling the true change by 0.3, 0.5 or 2.0 all score 1.000), so it exerts ZERO gradient
+pressure on output MAGNITUDE. With `visual_lpips=0` the only thing bounding an unbounded conv decoder
+is L1 at weight 3; at dino 2.5 L1 still wins, at dino 25 the cosine outvotes it 8:1 and the decoder
+runs away. **A purely scale-invariant perceptual term must not be the ONLY perceptual term.**
+
+| ep 1 | lpips_mean | psnr | ssim | l1 | motion | ae_floor |
+|---|---|---|---|---|---|---|
+| baseline | 0.1191 | 22.41 | 0.818 | 0.0353 | 0.259 | 0.0622 |
+| dino 2.5 (lpips 0) | 0.2050 | 22.18 | 0.793 | 0.0386 | 0.156 | 0.0678 |
+| **dino 2.5 + lpips 1** | **0.1175** | **22.47** | 0.814 | **0.0347** | 0.243 | **0.0608** |
+
+At ep3 `dino 2.5` had closed from +72% to +40% on lpips_mean and had OVERTAKEN baseline on psnr
+(23.04 vs 22.39) and l1 (0.0316 vs 0.0345) — the metrics neither arm optimises. Discount its lpips
+gap heavily: it is graded on the quantity it gave up while the baseline optimises it directly.
+
+**The weight is not 1.** With the shared l1 subtracted, LPIPS at w=1 contributes 0.8041 on cam_scene
+and DINO at w=1 contributes 0.3545, so **2.5 is the matched-contribution point**. Swapping at 1.0
+would have run the perceptual term at ~40% strength and measured a weakened version of it.
+
+### 8.11 THE ACTUAL DIAGNOSIS — and it is not a loss-weighting problem
+
+Operator observation, 2026-09-13, watching the rollouts: **the arm motion is good; the blocks pop in
+and out of existence when interacted with.**
+
+That asymmetry is the whole answer, and the literature names it. A deterministic MSE-trained decoder
+emits `E[obs | tokens]`, the AVERAGE OVER POSSIBLE FUTURES. So:
+
+* the **arm** is commanded directly — one possible future, and the average of one thing is that
+  thing. It renders sharply.
+* the **blocks** move only on contact, and contact outcomes are multimodal — tip left or right,
+  slide or stick. The MSE-optimal prediction is the average of those, and a block averaged across
+  two positions is a faint smear, i.e. IT VANISHES.
+
+Published verbatim: *"deterministic models using loss functions like MSE will average together
+possible futures, producing blurry predictions"*, and *"PredRNN produces blurry frames with objects
+disappearing while still achieving a low MSE"*.
+
+**So vanishing is the CORRECT answer to the objective we wrote** — the same structural trap as
+record §13 one level up, and the reason three loss-term experiments moved so little. LPIPS vs DINO,
+derivative terms and patch weighting are all ways of REWEIGHTING a loss whose optimum already puts a
+ghost there. You cannot reweight your way out of a conditional mean.
+
+Our **dynamics** is already stochastic (`mm_flow`, `stochastic_eval: true`, locked by the user
+2026-08-10). Our **decoder is not**: `decode_kind: mse` on both image heads. We sample the latent
+trajectory and then render it through a head trained to emit conditional means.
+
+### 8.12 The fork this creates
+
+`decode_kind=flow` and the derivative term are MUTUALLY EXCLUSIVE, verified in code
+(`modalities.py:270`): a noised decoder has no clean single-pass prediction, and
+`design/derivative_loss.md §5.1` measured that 62% of a temporal difference of its predictions is
+the tau draw rather than motion. The eligibility guard raises.
+
+Second cost: `decode_arch: up` is `decode_kind=mse` ONLY — it is a pure decoder with no analysis
+path, and the dispatch raises rather than silently falling back. Flow needs `unet` or `vit`. But
+`decode_arch: up` was itself an experimental win (robocasa §20), so switching moves TWO variables.
+
+**Prior evidence is thin and does not settle it.** `_oneoff_decode_kind.py` compared decode heads on
+FROZEN latents — flow beat mse by 16% on LPIPS at 6000 steps but `decode_stochastic` lost, with the
+reasoning *"a converged head on a good code is nearly a point mass"* and *"a drifted latent makes the
+mean WRONG, not UNCERTAIN"*. **That argument is about the DECODER's uncertainty given fixed tokens;
+the failure here is uncertainty in the DYNAMICS — where the block ends up.** Different distributions.
+The experiment also self-reports that both heads were MEMORISING. **No full training run has ever
+used `decode_kind=flow` on an image head.**
+
+### 8.13 The other two candidate fixes
+
+* **Object-centric / SlotDiffusion** (arXiv 2305.11281). Represent a frame as a few SLOTS, each
+  binding to one object, rather than a grid of patches. A block becomes a persistent ENTITY with
+  attributes, so when the gripper occludes it the slot survives even though the pixels do not —
+  object permanence becomes structural instead of something to be learned. A diffusion decoder
+  renders slots back to pixels. The principled fix; it would replace the token bag.
+* **Stochastic Adversarial Video Prediction** (arXiv 1804.01523). Keep the architecture, change the
+  objective: a latent variable for WHICH future plus an adversarial loss, so samples must look real
+  rather than average-real. A discriminator rejects a smeared block because no real frame contains
+  one. Cheaper than object-centric, but adds adversarial instability.
+* Worth knowing before promising a fix: **MemoBench (arXiv 2606.27537) reports that NO current video
+  generation model reliably maintains object memory across occlusion.** Our blocks are occluded by
+  the gripper at the moment of contact, so this may be partly unsolved rather than merely unsolved
+  by us.
+
+### 8.14 Tooling built along the way
+
+* `VisualLoss` term registry — one declaration reaches the decode loss, the roundtrip anchor AND the
+  derivative term. `smoke/visual_loss_parity.py` holds a 32-cell golden asserted with `torch.equal`;
+  it caught that the old code multiplied `w_lpips` into the running total ONCE PER VGG LAYER, a 1e-7
+  fp32 difference that showed up in exactly one cell.
+* `models/dino_loss.py` + `DinoV3Term`, default off and byte-identical. `smoke/dino_loss.py` 17/17.
+* `eval_control` now asks the env before running (clean `NotImplementedError` skip instead of dying
+  inside MPPI on a KeyError); `eval.manifold_max_steps` caps what manifold forwards.
+* Issue #19 (normalization diagnostic rollout) and #20 (the LPIPS dilution finding) on the repo.
+
 ## 9. Still open
 
 - [ ] Should `campaign4-rgb` / `campaign6-combos` / `campaign7-precision` be pooled (current
