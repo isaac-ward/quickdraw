@@ -1,4 +1,5 @@
-"""How much of the next K actions is LINEARLY readable from the context the prior is given?
+"""THE CEILING on the action prior: how much of the next K actions is LINEARLY readable from the
+context vector it is given? Anything the head scores below this, it is leaving behind.
 
 The action prior scores an energy skill of ~0.11 at lead 0 and ~0 at the far leads. Three explanations fit
 that: the signal is not in the data, the signal is in the data but the flow is not extracting it, or the
@@ -19,7 +20,7 @@ Episodes are split 4 fit / 1 select / 2 test, so the ridge penalty is never chos
 Reported alongside 1 - sqrt(1 - R^2), the energy skill an equally-informed sampler would score, so the
 number is directly comparable to eval_action_distribution/lead_XX/energy_skill.
 
-    CUDA_VISIBLE_DEVICES=0 python -m quickdraw.evaluation.probe <ckpt_or_run_dir> [K]
+    CUDA_VISIBLE_DEVICES=0 python -m quickdraw.evaluation.action_context_ceiling <ckpt_or_run_dir> [K]
 """
 from __future__ import annotations
 
@@ -174,5 +175,5 @@ def main(path, K) -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        raise SystemExit("usage: python -m quickdraw.evaluation.probe <ckpt_or_run_dir> [K]")
+        raise SystemExit("usage: python -m quickdraw.evaluation.action_context_ceiling <ckpt_or_run_dir> [K]")
     sys.exit(main(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 32))

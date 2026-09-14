@@ -265,7 +265,7 @@ action_head:
   #       pooled  + PIT     +0.115      grouped + PIT     +0.653
   #   4x either way, and the head's conditional mean R^2 rises 0.247 -> 0.872, ABOVE the 0.794 a ridge probe
   #   on the same grouped context reaches. A linear readout of the POOLED vector already beat the head that
-  #   read it, which is how the bottleneck was found (quickdraw.evaluation.probe).
+  #   read it, which is how the bottleneck was found (quickdraw.evaluation.action_context_ceiling).
   #   DEFAULT CHANGED 2026-09-14. `pooled` reproduces every action head trained before that date, and is
   #   REQUIRED to load one: the conditioning width changes, so a head trained under one setting cannot load
   #   under the other (load_checkpoint fails on the size mismatch rather than silently mis-reading).

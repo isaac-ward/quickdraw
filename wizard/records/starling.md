@@ -321,7 +321,7 @@ REPLACED BY, in `evaluation/conditional.py`, logged every eval under `eval_actio
 
 ### 2.6 THE BINDING CONSTRAINT WAS THE CONTEXT POOLING, NOT THE OBJECTIVE (09-13)
 
-`quickdraw.evaluation.probe`: ridge from the FROZEN `h_ctx` to the recorded chunk, fit on 20 TRAIN flights and
+`quickdraw.evaluation.action_context_ceiling`: ridge from the FROZEN `h_ctx` to the recorded chunk, fit on 20 TRAIN flights and
 tested on all 7 VAL flights (no flight in both; an episode-level split of val alone fails on the per-flight
 mean shift and reports -0.30 everywhere, which measures the shift and nothing else).
 
