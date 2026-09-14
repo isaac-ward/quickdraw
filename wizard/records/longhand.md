@@ -580,6 +580,44 @@ arm in the whole sequence ahead at a matched epoch, on a third fewer samples per
 **ep1 is too early to read the break point at all** — baseline and win64 are equally mushy there,
 neither renders crisp blocks, so there are no clean colours to watch swap. The test needs ~ep9.
 
+### 8.17b THE WINDOW HYPOTHESIS IS FALSIFIED (2026-09-14)
+
+Both arms rendered at the first epoch where they draw crisp blocks. **The break point did not move.**
+
+| | window | anchor leaves at | PREDICTED break | ACTUAL break | OL LPIPS, compute-matched |
+|---|---|---|---|---|---|
+| baseline | 32 | step 24 | 8 s | ~8 s | **0.0930 @10k steps** |
+| `bs_win64` | 64 | step 56 | **19 s** | **~3–5 s** | 0.0980 @10k |
+| `bs_win128` | 128 | never (in training) | **never** | **~1–3 s** | 0.1006 @21k |
+
+`win128` — where the true context is NEVER out of view during training — breaks EARLIEST of the
+three. A stronger manipulation producing a worse result is the signature of a hypothesis that is
+wrong, not one that is under-dosed. The 8 s timing coincidence that motivated this was exactly that.
+
+And they cost: wider windows cut the batch (13 → 8 → 4), raised epoch cost to 5,350 s and 7,750 s,
+and lost on OL LPIPS at every matched step count. Killed.
+
+**Nine hypotheses now measured and dead.** What is solid: the codec CAN hold identity; the flow HAS
+learned it; it COMPOUNDS away by ~8 s, sharply and confidently, into a different scene. It is not
+mode collapse, capacity, a scoring artefact, off-manifold decode, latent salience, teacher-forcing
+substitution, diffusion forcing, or the attention window.
+
+No lever survives. The remaining explanations are not knobs — **2.06 h of data and a 6.8M-parameter
+model** — so the next collection session is worth more than any config change available here, and it
+should target object interactions, where identity has to survive contact and occlusion.
+
+### 8.19 An operational lesson: eval products fill the disk
+
+`eval:ae_floor` died at `win64` ep5 with `OSError: No space left on device` — 287/290 GB. Eval
+products (rollout videos and images) run **~1.3 GB per eval epoch per run**; thirteen runs over three
+days filled it. Training survived only because the callback treats a failed routine as non-fatal; a
+checkpoint write would have been much worse.
+
+Recovered 50 GB by dropping `logs/epoch_*` and local `wandb/` from nine already-killed runs, keeping
+every `metrics.jsonl`, `progress.log` and checkpoint — so no quoted number was lost. Burn rate with
+two arms and evals every other epoch is ~1.3 GB/h, i.e. ~40 h of headroom. Budget for it, or prune
+products on a schedule.
+
 ### 8.18 Reading rules earned the hard way today
 
 - **OL LPIPS on cam_scene is the decider.** `latent_cos` is a diagnostic that explains *why* a
