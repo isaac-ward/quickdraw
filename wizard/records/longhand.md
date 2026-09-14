@@ -506,6 +506,98 @@ used `decode_kind=flow` on an image head.**
   inside MPPI on a KeyError); `eval.manifold_max_steps` caps what manifold forwards.
 * Issue #19 (normalization diagnostic rollout) and #20 (the LPIPS dilution finding) on the repo.
 
+### 8.15 THE REAL SYMPTOM: object IDENTITY, not permanence (2026-09-13)
+
+Operator, watching rollouts: *"the arm motion is really good, but the blocks kinda pop in and out of
+existence when interacted with"* — and later, decisively, that **untouched stationary objects** do it
+too.
+
+Rendering ground truth against prediction settled what "popping" means. **Blocks do not fade, blur
+or vanish. They CHANGE COLOUR and merge.** Truth holds a blue and a green block; the baseline turns
+green→red by 8 s and is down to a single red block by 21 s, with the arm tracking well and every
+frame sharp throughout. The model knows *a block is there* and not *which block*.
+
+This invalidated the framing we had both been using for two days, and it explains why a stationary-
+object metric said "objects persist, 1.2× error growth": **a patch where green becomes red still
+holds a block of similar size and brightness, so L1 barely moves.** I was measuring presence when
+the failure is identity.
+
+### 8.16 Seven hypotheses, measured and killed
+
+All on trained checkpoints, no training runs. Tooling: `_oneoff_rollout_diagnosis.py`.
+
+| # | hypothesis | verdict |
+|---|---|---|
+| 1 | loss reweighting (LPIPS / DINOv3 / derivative) | moved little; high doses actively hurt |
+| 2 | mode collapse in the flow | **no** — 8 draws spread to 2.8× their own step-motion |
+| 3 | we score away real diversity | **no** — best-of-8 gains 2.5% at 21 s, and the gain SHRINKS with horizon, the opposite of what multimodality predicts |
+| 4 | codec capacity | **no** — per-frame encode→decode of the TRUE frames keeps blue blue and green green for the whole clip. Recon error is 0.29× the patch's own variation on dynamic patches vs 2.48× on still ones |
+| 5 | off-manifold decode | **no** — rolled frames are 0.90–1.01× as sharp as real ones; encode→decode is 0.95× |
+| 6 | identity is a low-variance latent direction | **no** — a recolour moves the latent **2.3× MORE per pixel** than a reposition, so the L2 flow loss is not blind to it |
+| 7 | the flow never learned identity | **no** — at steps 0–12 (0–4 s) the rollout matches the codec ceiling with correct colours. **IT COMPOUNDS** |
+
+Plus two compounding knobs run as real arms to ep13: `p_tf_dynamics=0.8` and `df_scale=0.1`, both
+**6–8% worse** on OL LPIPS at every epoch, with no instability (`grad/norm/flow` 0.99 / 0.53).
+
+**Notably the robocasa gradient blow-ups did NOT reproduce** — 2.4 here against 3.33e13 there at the
+same dose. That vindicates the reading that §21.1's catastrophe was its `flow_hidden=512` base (§23),
+not substitution per se. Two separable claims the record had fused: substitution is *not unstable*
+here, it is simply *not helpful*.
+
+### 8.17 The window hypothesis (running)
+
+Temporal attention is a **sliding window** of `window` steps (`spacetime.py:6`, per token-slot,
+causal + RoPE). With P=8 context frames, at rollout step *t* the window holds 8 context + *t*
+predicted — so **the last TRUE frame scrolls out at t = window − P.**
+
+| window | anchor leaves at | |
+|---|---|---|
+| **32** (all runs to date) | step 24 | **8 s** |
+| 64 | step 56 | 19 s |
+| 128 | never, within P+F=72 | — |
+
+**Observed colour swaps begin at steps 24–32, i.e. 8–10 s.** That is exactly where the anchor leaves
+at window=32. From that point the model attends only to its own predictions with nothing real to
+anchor identity against — and **no reweighting of any objective can repair a model that has
+structurally forgotten what the scene contained**, which would explain why every loss-side
+intervention did nothing.
+
+FALSIFIABLE: if the break point MOVES with the window, confirmed; if it stays at ~8 s, the timing
+match was coincidence.
+
+**Arms:** `bs_win64` and `bs_win128`, otherwise identical to `bs_stride10` — proprio stays
+`decode_kind=flow` (proprio=mse existed ONLY in the derivative arms, forced by the eligibility
+guard), `p_tf_dynamics=1.0`, `df_scale=0.0`.
+
+**CONFOUND, stated not hidden: autobatch cut the batch 13 → 8 → 4** and epoch cost rose to 5,490 s
+and 7,901 s. Epochs are not compute-matched either (1,094 / 1,778 / 3,556 batches). So aggregate
+LPIPS from these arms is unreliable, especially at batch 4. The readable claim is narrow: **does the
+colour-swap onset move?** That is qualitative and a batch difference should not manufacture it.
+
+Early, and not the decider: `win64` ep3 `lpips_mean` **0.1008 vs the baseline's 0.1078** — the first
+arm in the whole sequence ahead at a matched epoch, on a third fewer samples per step. One point.
+
+**ep1 is too early to read the break point at all** — baseline and win64 are equally mushy there,
+neither renders crisp blocks, so there are no clean colours to watch swap. The test needs ~ep9.
+
+### 8.18 Reading rules earned the hard way today
+
+- **OL LPIPS on cam_scene is the decider.** `latent_cos` is a diagnostic that explains *why* a
+  number moved; it is never the number. (Told three times before it stuck.)
+- **Single-epoch per-horizon breakdowns are noise.** A "coherent" in-horizon win at ep9 had
+  REVERSED by ep11. Only `lpips_mean` across several epochs is stable enough to read.
+- **Do not transfer a robocasa finding without checking its base and its data.** Robocasa is a
+  simulator replaying scripted demos — deterministic by construction. Its "the flow learned a
+  near-deterministic map" result measured 2.8× sample spread when re-run here. Its `p_tf_dynamics`
+  dose curve ran on `flow_hidden=512`, which §23 later identified as the collapse cause, under pure
+  L2 rather than the L1+LPIPS where §23 says 512 is fatal.
+- **The configs and the records disagree, and the records are right.** `mm_flow.yaml` still said
+  "Try 0.9" for `p_tf_dynamics` long after §21.1 measured that wrong. Acted on it, had to kill the
+  arm at launch. Now corrected in the config with the dose table.
+- **Look at the pictures.** Five measurements agreed the model was fine on object permanence. One
+  filmstrip showed the actual failure was colour swapping. The metric was answering a question
+  nobody had asked.
+
 ## 9. Still open
 
 - [ ] Should `campaign4-rgb` / `campaign6-combos` / `campaign7-precision` be pooled (current
