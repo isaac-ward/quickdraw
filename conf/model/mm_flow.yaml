@@ -229,6 +229,85 @@ action_head:
   #                           co-shapes the trunk; detachF beat detachT on every axis, see detach_gradient below).
   #                           Set false for the leaner no-head baseline. (Post-hoc on a frozen ckpt still valid.)
   weight: 1.0               # weight of the action-flow loss in the total training loss
+  hidden: 0                 # THE PRIOR'S OWN WIDTH. 0 -> fall back to flow_hidden, then to d (the old
+  #   behaviour, bit-identical). Give it its own value when the prior's target is wide: the target is
+  #   action_dim * chunk, and under data.action_aggregate=concat action_dim is ALREADY subsample-times
+  #   wider than the raw command. On starling-2 at subsample=4 an action is 16 wide, so chunk=8 is a
+  #   128-number joint target and chunk=16 is 256 -- against an inherited d=128 that is a bottleneck, and
+  #   a chunk study run at the inherited width cannot separate "longer chunk" from "not enough width".
+  #   This is a SEPARATE knob from flow_hidden because flow_hidden is baked into the trained dynamics
+  #   FlowField: raising that to widen the prior changes the WM's architecture and a frozen checkpoint
+  #   stops loading. The prior is always fresh-initialised (post-hoc or joint), so its width is free.
+  sampling_steps: 16        # ODE steps for the PRIOR. 0 -> borrow diffusion.sampling_steps (the old behaviour).
+  #   MEASURED ON THE SETTLED RECIPE (grouped context + PIT target, chunk 8, ep29), and the two metrics
+  #   disagree in a way worth knowing: SAMPLING STEPS BUY MARGINAL FIDELITY, NOT CONDITIONAL SKILL.
+  #       steps      6      8     12     16     24     32     48     64     96    128
+  #       W1     .0921  .0843  .0787  .0774  .0764  .0761  .0758  .0757  .0756  .0756
+  #       skill  +.408         +.405  +.404         +.403         +.403
+  #       ms/1k    0.51   0.63   0.87   1.13   1.59   2.09   3.04   3.98   5.92   7.87
+  #   Energy skill against a context-blind null is FLAT from 6 to 64 (and fractionally better at 6): coarse
+  #   integration distorts the SHAPE of the distribution without moving where it is centred or how wide it is
+  #   per context. So the count is chosen on W1, and 16 sits within 2.4% of the asymptote at half the cost of
+  #   32. Calibration deviation also drifts slightly the right way with more steps (0.1205 -> 0.1167).
+  #   HISTORY: 6 was inherited from the dynamics flow, which is right for ITS near-deterministic field and
+  #   2.4x wrong for this one; 32 was measured on the pre-PIT field, whose W1 curve TURNED AROUND after 48
+  #   (the flow approximating an unreachable singularity). This field is monotone and has no such turn.
+  context: grouped          # LOCKED (user, 2026-09-14). grouped | pooled. WHAT THE PRIOR CONDITIONS ON, and
+  #   the single biggest lever
+  #   found on this head. The backbone emits one vector per token and "pooled" averaged ALL of them into one
+  #   d-vector: on starling-2 the bag is 32 image tokens + 1 proprio + 1 action, so the vehicle state was
+  #   2.9% of the prior's input AND SO WAS THE ACTION TOKEN -- the command currently being held, which is the
+  #   most informative single feature about the command coming next. "grouped" averages within each modality
+  #   and keeps the two single tokens whole: [mean(image), proprio, action] = (len(layout)+1)*d = 384 here.
+  #   MEASURED, 2x2 at matched epoch 29 on the frozen s2_sub4_concat WM, chunk 8, energy skill at lead 0
+  #   against a context-blind null (wizard/records/starling.md 2.6-2.7):
+  #       pooled  + no PIT  +0.168      grouped + no PIT  +0.654
+  #       pooled  + PIT     +0.115      grouped + PIT     +0.653
+  #   4x either way, and the head's conditional mean R^2 rises 0.247 -> 0.872, ABOVE the 0.794 a ridge probe
+  #   on the same grouped context reaches. A linear readout of the POOLED vector already beat the head that
+  #   read it, which is how the bottleneck was found (quickdraw.evaluation.probe).
+  #   DEFAULT CHANGED 2026-09-14. `pooled` reproduces every action head trained before that date, and is
+  #   REQUIRED to load one: the conditioning width changes, so a head trained under one setting cannot load
+  #   under the other (load_checkpoint fails on the size mismatch rather than silently mis-reading).
+  #   The world model is untouched either way -- this is the prior's input only.
+  target_transform: pit     # pit | none. THE SPACE THE PRIOR'S TARGET LIVES IN, and it should be `pit`
+  #   wherever the dataset supports it. z = Phi^-1(F(a)), with F the empirical CDF of the TRAIN actions.
+  #   WHY: a rectified flow integrates a finite-Lipschitz velocity field, so noise -> action is a
+  #   diffeomorphism and its terminal law is ABSOLUTELY CONTINUOUS -- it cannot place an atom. Measured on
+  #   starling-2, 23-58% of every recorded joystick axis is EXACTLY 0.0, the stick at rest, so without this
+  #   the prior cannot emit the single value the pilot holds a third to half of the time, on any axis, ever.
+  #   Under PIT an atom becomes a SLAB of z whose width is its probability -- something a smooth field CAN
+  #   hit -- and the inverse maps every point of the slab back to the atom's exact value. It is not a
+  #   zero-special-case: EVERY sharp marginal feature is flattened in proportion to its mass, so the stick
+  #   stops and any interior dwell get the same treatment without anyone having to notice them first.
+  #   MEASURED at matched epoch 29 on the grouped context: conditional skill UNCHANGED (+0.653 with, +0.654
+  #   without) while rest AUC goes 0.500 -> 0.87/0.82/0.95/1.00 across the four axes and Brier skill
+  #   -1.389 -> +0.935 on the longest-held one. Free, and nothing else buys it.
+  #   NOTE the two knobs INTERACT: on the old `pooled` context PIT cost skill (+0.115 vs +0.168), which is
+  #   why the 2x2 was run rather than one factor at a time. See wizard/records/starling.md 2.6-2.7.
+  #
+  #   WHAT A "KNOT" IS: the transform is stored in the dataset as `action_pit`, 1024 numbers per raw action
+  #   axis -- the action value at the 0th, 1/1023rd, ... 100th percentile of the training data. Those points
+  #   ARE the empirical CDF, held as a lookup table; between them the quantile function is read off
+  #   piecewise-linearly. An atom is simply a long RUN of identical knots, which is why interpolating inside
+  #   it returns the atom exactly. Fitted at dataset build time (`compute_norm_stats`); datasets built before
+  #   2026-09-13 need `python -m quickdraw.data.backfill_pit <root>` once, which is additive.
+  #
+  #   REQUIRES data.action_aggregate=concat, for TWO reasons:
+  #     1. SEMANTIC, and true regardless of PIT: starling actions are ABSOLUTE stick positions, and summing
+  #        `subsample` of them is meaningless -- it scales the std by ~s against stats computed on the raw
+  #        commands (measured 4.21 z-std at stride 4, see data/dataset.py). concat is the right aggregation
+  #        for this data on its own merits.
+  #     2. MECHANICAL: the knots are fitted ONCE at build time, but the aggregation happens at LOAD time and
+  #        depends on `data.subsample`, a training-time knob the dataset cannot know. Under concat every slot
+  #        holds the RAW action distribution whatever the stride, so tiled raw knots are exactly right; under
+  #        sum the stored action is a sum whose distribution changes with the stride, so no pre-fitted table
+  #        can describe it. Fitting knots post-aggregation would lift this, and nothing else would need to.
+  #   ALSO REQUIRES a FRESH head (weights live in the target space; load_checkpoint refuses a mismatch rather
+  #   than silently sampling from the wrong distribution) and forbids sample_action(deterministic=True),
+  #   which under PIT returns a median rather than a mean.
+  n_freq: 16                # tau Fourier features for the prior (FlowField's own default)
+  time_dim: 32              # tau embedding width for the prior (FlowField's own default)
   chunk: 1                  # how many consecutive POST-SUBSAMPLE actions the prior predicts JOINTLY.
   #   1 = the next action only, bit-identical to every run before 2026-09-10. K>1 widens the flow's TARGET
   #   to K*action_dim and predicts the whole chunk as ONE vector, so it is a genuine joint over lead times

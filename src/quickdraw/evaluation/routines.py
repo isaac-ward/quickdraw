@@ -17,9 +17,11 @@ import numpy as np
 from ..controller.run import _plog, run_and_log_control
 from ..environments.registry import make_env
 from ..logging import viz
-from ..training.setup import eval_episodes, image_head_cams, image_head_sizes, resolve_data_root, step_fps
+from ..training.setup import (effective_action_dim, eval_episodes, image_head_cams, image_head_sizes,
+                             resolve_data_root, step_fps)
 import torch
 
+from .conditional import blind_null, energy_score, energy_skill, rank_calibration, rest_skill
 from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_curves, proprio_curves
 from .products import emit_openloop
 
@@ -1142,6 +1144,19 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
         action_names = info.get("features", {}).get("action", {}).get("names") or None
     except Exception:
         pass
+    # UNDER data.action_aggregate=concat one stored action is `subsample` raw commands laid end to end,
+    # TIME-MAJOR (dataset.py: grp.reshape(n, -1) over (n, s, dim)), so dim i is raw axis i % dim at
+    # sub-step i // dim. info.json only names the `dim` RAW axes, so the length check in
+    # viz.fig_action_marginals rejects them and every panel falls back to a bare "a[i]" -- 16 anonymous
+    # panels that cannot be read. Expand the raw names across the sub-steps instead.
+    _adim = int(effective_action_dim(cfg))
+    _sub = int(cfg.data.get("subsample", 1) or 1)
+    if str(cfg.data.get("action_aggregate", "sum")) == "concat" and _sub > 1 and _adim % _sub == 0:
+        _raw = _adim // _sub
+        # names from the dataset when it has them, else a<axis> -- either way every panel says WHICH raw
+        # axis and WHICH sub-step it is, instead of 16 anonymous a[i] tiles.
+        base = list(action_names) if action_names and len(action_names) == _raw else [f"a{i}" for i in range(_raw)]
+        action_names = [f"{n}·t+{j}" for j in range(_sub) for n in base]
     a_max = getattr(ecfg, "a_max", None)   # torus-only histogram x-limit knob; None -> viz derives it from the data
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
                                  img_size=image_head_sizes(cfg) or img_size,
@@ -1174,64 +1189,121 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     # stack onto the same few spikes. n_ep is capped by the val split (here 64).
     K = int(getattr(m, "action_head_chunk", 1))
     true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()           # (E,L-1,a) recorded a[1..L-1]
-    # A CHUNKED head predicts [a[t], a[t+1], ... a[t+K-1]] per context. The products below are all about the
-    # NEXT action, so they use LEAD TIME 0 -- identical to the whole output when K=1. The other lead times are
-    # scored as w1/lead_<k> scalars further down rather than folded in here, because pooling them would mix K
-    # different prediction problems into one histogram and quietly flatter the head.
-    pred_chunk = pred_norm.reshape(*pred_norm.shape[:-1], K, -1) if K > 1 else None
-    pred_a = norm.denorm_act(pred_chunk[..., 0, :] if K > 1 else pred_norm).numpy()   # (E,L-1,a) lead time 0
-    prog(50, "head sampling" + (f" (chunk K={K}, products use lead time 0)" if K > 1 else ""))
+    # A CHUNKED head predicts [a[t], a[t+1], ... a[t+K-1]] per context. Every product below is produced ONCE
+    # PER LEAD TIME, into its own lead_<k>/ subfolder, because lead times are K DIFFERENT prediction problems
+    # and pooling them into one histogram would quietly flatter the head. K=1 keeps the flat, unprefixed
+    # layout every pre-chunk run wrote.
+    pred_chunk = pred_norm.reshape(*pred_norm.shape[:-1], K, -1)   # (E,L-1,K,a) -- K=1 is the degenerate case
+    leads = cfg.eval.get("action_dist_leads", "auto")
+    if isinstance(leads, str):                                   # "auto": the near, middle and far end of the chunk
+        leads = sorted({0, K // 2, K - 1})
+    leads = sorted({int(k) for k in leads if 0 <= int(k) < K})
+    win = int(cfg.eval.get("action_dist_window", 4) or 0)        # +/-w timesteps pooled per animation frame
+    mx = int(cfg.eval.get("action_dist_max_frames", 0) or 0) or None   # cap the animations (cost ~ frames x dims)
+    prog(50, f"head sampling (chunk K={K}, products at lead times {leads})")
 
-    # PRIMARY product: per-dim marginals (dataset/env-agnostic — no a_max/state-split/geometry needed).
-    fig = viz.fig_action_marginals(true_a, pred_a, names=action_names)
-    writer.figure("eval_action_distribution/marginals", fig, step); plt.close(fig)
-    prog(55, "marginals (primary product)")
+    def _dir(k):   # flat layout at K=1 so old runs' product names are untouched; subfoldered once chunked
+        return "eval_action_distribution/" + ("" if K == 1 else f"lead_{k:02d}/")
 
-    # window: pool +/-w timesteps per frame/tile -> ~(2w+1)x more samples (the dist changes slowly, so bias is
-    # tiny). This is the way to densify PAST the #episodes ceiling. w=4 -> ~9x for both true and pred.
-    win = int(cfg.eval.get("action_dist_window", 4) or 0)
-    if split_info is not None:                                   # by-state products: TORUS-ONLY (item 3)
-        labels, low_name, high_name = split_info
-        for name, arr in (("true", true_a), ("pred", pred_a)):   # by-state 2-row static: recorded vs head
-            fig = viz.fig_action_by_state(arr, labels, a_max, low_name=low_name, high_name=high_name,
-                                          sampler_name=f"{asamp} · {name}", window=win)
-            writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
-
-    tm, pm = np.linalg.norm(true_a, axis=-1).reshape(-1), np.linalg.norm(pred_a, axis=-1).reshape(-1)
     q = np.linspace(0.0, 1.0, 512)
-    w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a| (vs recorded)
-    writer.scalar("eval_action_distribution/true_pred_w1", w1, step)
+    fps = step_fps(cfg, ecfg)
+    head_w1 = None
+
+    # ---- THE CONDITIONAL SCORE ------------------------------------------------------------------------
+    # W1 above compares POOLED histograms, which a model that ignores its context matches perfectly. These
+    # need M draws per context instead of one; that costs ~2 ms per 1000 samples against an eval dominated
+    # by the animations, so it is effectively free. 0 draws disables the whole block.
+    COND = None
+    nd = int(cfg.eval.get("action_dist_energy_draws", 32) or 0)
+    if nd >= 4 and true_a.shape[1] > K:
+        with torch.no_grad():
+            dr = torch.stack([m.sample_action(h_ctx) for _ in range(nd)], dim=-2)   # (E,L-1,M,K*a)
+        T0 = true_a.shape[1] - K + 1                          # contexts with a full chunk of future
+        Y = np.stack([true_a[:, k0:k0 + T0] for k0 in range(K)], axis=2)            # (E,T0,K,a)
+        X = norm.denorm_act(dr[:, :T0].reshape(dr.shape[0], T0, nd, K, -1).cpu()).numpy()
+        Y = Y.reshape(-1, K, Y.shape[-1])
+        X = X.reshape(Y.shape[0], nd, K, Y.shape[-1])
+        COND = {"X": X, "Y": Y, "null": blind_null(Y, nd)}
+        prog(45, f"conditional score: {nd} draws x {Y.shape[0]} contexts")
+    for n_done, k in enumerate(leads):
+        # slot k is scored against the recorded action k steps LATER -- the same alignment w1/lead_<k> uses
+        T_ = true_a.shape[1] - k
+        t_k = true_a[:, k:]
+        p_k = norm.denorm_act(pred_chunk[:, :T_, k, :]).numpy()
+        d = _dir(k)
+        base = 50 + int(45 * n_done / max(1, len(leads)))        # progress budget shared across the lead times
+
+        fig = viz.fig_action_marginals(t_k, p_k, names=action_names)
+        writer.figure(f"{d}marginals", fig, step); plt.close(fig)
+        if split_info is not None:                               # by-state products: TORUS-ONLY
+            labels, low_name, high_name = split_info
+            for name, arr in (("true", t_k), ("pred", p_k)):
+                fig = viz.fig_action_by_state(arr, labels[:, :T_] if labels.ndim > 1 else labels, a_max,
+                                              low_name=low_name, high_name=high_name,
+                                              sampler_name=f"{asamp} · {name}", window=win)
+                writer.figure(f"{d}by_state_{name}", fig, step); plt.close(fig)
+
+        tm, pm = np.linalg.norm(t_k, axis=-1).reshape(-1), np.linalg.norm(p_k, axis=-1).reshape(-1)
+        w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))
+        writer.scalar(f"{d}true_pred_w1", w1, step)
+        w1_per_dim = [float(np.mean(np.abs(np.quantile(t_k[..., i], q) - np.quantile(p_k[..., i], q))))
+                      for i in range(t_k.shape[-1])]
+        live = [i for i in range(t_k.shape[-1]) if t_k[..., i].std() > 1e-6]
+        writer.scalars({f"{d}w1/dim_{i}": w for i, w in enumerate(w1_per_dim)}, step)
+        w1_mean = float(np.mean([w1_per_dim[i] for i in live])) if live else 0.0
+        writer.scalar(f"{d}w1_mean", w1_mean, step)
+        if COND is not None:                                     # this lead's slice of the conditional score
+            Xk, Yk = COND["X"][:, :, k, :], COND["Y"][:, k, :]
+            writer.scalar(f"{d}energy_skill", energy_skill(Xk, Yk, COND["null"][:, :, k, :], ), step)
+        if k == leads[0]:
+            head_w1 = w1
+        prog(base + 2, f"lead {k}: w1={w1:.3f} w1_mean={w1_mean:.3f}")
+
+        frames = viz.anim_action_distribution(t_k, p_k, a_max, window=win, max_frames=mx)
+        writer.video(f"{d}animation_pooled", frames, fps, step)
+        mframes = viz.anim_action_marginals(t_k, p_k, names=action_names, window=win, max_frames=mx)
+        writer.video(f"{d}animation_marginals", mframes, fps, step)
+        if split_info is not None:                               # by-state animation: TORUS-ONLY
+            frames_bx = viz.anim_action_by_state(t_k, p_k, labels, a_max, low_name=low_name,
+                                                 high_name=high_name, window=win)
+            writer.video(f"{d}animation_byx", frames_bx, fps, step)
+        prog(base + 12, f"lead {k}: animations")
+
+    # EVERY lead time still gets its scalar, even the ones with no figures -- the cost is a quantile, and the
+    # shape of w1-vs-lead is the thing that says how far ahead the prior stays faithful.
     if K > 1:
-        # Per-LEAD-TIME W1: does the chunk stay faithful as it reaches further ahead? Slot k is scored against
-        # the recorded action k steps later, so each is a like-for-like 1D-Wasserstein on pooled |a|.
         for k in range(K):
             pk = np.linalg.norm(norm.denorm_act(pred_chunk[:, :true_a.shape[1] - k, k, :]).numpy(), axis=-1)
             tk = np.linalg.norm(true_a[:, k:], axis=-1)
             wk = float(np.mean(np.abs(np.quantile(tk.reshape(-1), q) - np.quantile(pk.reshape(-1), q))))
             writer.scalar(f"eval_action_distribution/w1/lead_{k}", wk, step)
-    # per-dim W1 (item 4b): `live` skips constant dims (W1~=0) so w1_mean isn't flattered by dead dims.
-    w1_per_dim = [float(np.mean(np.abs(np.quantile(true_a[..., i], q) - np.quantile(pred_a[..., i], q))))
-                  for i in range(true_a.shape[-1])]
-    live = [i for i in range(true_a.shape[-1]) if true_a[..., i].std() > 1e-6]
-    writer.scalars({f"eval_action_distribution/w1/dim_{i}": w for i, w in enumerate(w1_per_dim)}, step)
-    w1_mean = float(np.mean([w1_per_dim[i] for i in live])) if live else 0.0
-    writer.scalar("eval_action_distribution/w1_mean", w1_mean, step)
-    prog(70, f"distance (w1={w1:.3f}, w1_mean={w1_mean:.3f})")
-
-    fps = step_fps(cfg, ecfg)
-    # POOLED over all episodes per frame (recorded green vs head red), ALL timesteps (no frame cap), +/-win pooled.
-    frames = viz.anim_action_distribution(true_a, pred_a, a_max, window=win)
-    writer.video("eval_action_distribution/animation_pooled", frames, fps, step)
-    prog(85, "animation (pooled)")
-    # per-dim marginals VIDEO: the animated companion to the static marginals PNG (same styling + same `win`).
-    mframes = viz.anim_action_marginals(true_a, pred_a, names=action_names, window=win)
-    writer.video("eval_action_distribution/animation_marginals", mframes, fps, step)
-    prog(88, "animation (marginals)")
-    if split_info is not None:                                   # by-state animation: TORUS-ONLY (item 3)
-        frames_bx = viz.anim_action_by_state(true_a, pred_a, labels, a_max, low_name=low_name,
-                                             high_name=high_name, window=win)
-        writer.video("eval_action_distribution/animation_byx", frames_bx, fps, step)
-    prog(95, "animation (by-state)")
+    w1 = head_w1 if head_w1 is not None else 0.0
+    writer.scalar("eval_action_distribution/true_pred_w1", w1, step)   # headline = the FIRST lead drawn
+    if COND is not None:
+        X, Y, nul = COND["X"], COND["Y"], COND["null"]
+        N = X.shape[0]
+        es = float(energy_score(X.reshape(N, X.shape[1], -1), Y.reshape(N, -1)).mean())
+        sk = energy_skill(X.reshape(N, X.shape[1], -1), Y.reshape(N, -1), nul.reshape(N, X.shape[1], -1))
+        writer.scalar("eval_action_distribution/energy_score", es, step)
+        writer.scalar("eval_action_distribution/energy_skill_vs_blind", sk, step)
+        # THE FLOOR OF THE OLD METRIC, logged on every chart: w1_mean below this line is not evidence of
+        # anything conditional, because a model that ignores its context reaches it.
+        nq = np.linalg.norm(nul[:, :, 0, :], axis=-1).reshape(-1)
+        tq = np.linalg.norm(Y[:, 0, :], axis=-1).reshape(-1)
+        writer.scalar("eval_action_distribution/w1_blind_null",
+                      float(np.mean(np.abs(np.quantile(tq, q) - np.quantile(nq, q)))), step)
+        hist, dev, verdict = rank_calibration(X[:, :, 0, :], Y[:, 0, :])
+        writer.scalar("eval_action_distribution/rank_calibration_dev", dev, step)
+        writer.scalars({f"eval_action_distribution/rank_decile/{i}": float(v) for i, v in enumerate(hist)},
+                       step)
+        rs = list(rest_skill(X[:, :, 0, :], Y[:, 0, :]))
+        writer.scalars({f"eval_action_distribution/rest_auc/dim_{r['dim']}": r["auc"] for r in rs}, step)
+        writer.scalars({f"eval_action_distribution/rest_brier_skill/dim_{r['dim']}": r["brier_skill"]
+                        for r in rs}, step)
+        _plog(writer, f"[eval_action_distribution @ep{step}] conditional: energy skill vs context-blind "
+                      f"{sk:+.3f} | calibration {verdict} | rest AUC "
+                      + " ".join(f"d{r['dim']}:{r['auc']:.3f}" for r in rs))
+    prog(95, "scalars")
 
     if was:
         m.train()

@@ -29,8 +29,24 @@ from .logging.callback import LoggingCallback, ProgressPrinter
 from .logging.writer import make_writer
 from .train_world_model import _assert_summary_unique, _run_summary_text, _startup_log
 from .training.lit import LitActionModel
-from .training.setup import build_model, data_exists, env_cfg, load_checkpoint, normalizer, window_loaders
+from .training.setup import (autobatch_find, build_model, data_exists, env_cfg, load_checkpoint, normalizer,
+                             window_loaders)
 from .utils.logging import make_run_dir
+
+
+def _action_step_probe(model, opt, obs, act):
+    """ONE LitActionModel._step for autobatch_find: the frozen-WM context pass under no_grad, then the head's
+    flow loss + backward + optimizer step. Mirrors lit.py::LitActionModel._step, SDPA backend restriction
+    included -- a probe that models a different step is how an autobatch picks a batch that OOMs."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.no_grad(), sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+            h_ctx = model.action_context(obs, act)
+        cond, a_target = model.action_pairs(h_ctx, act)
+        l_flow, l_cons = model.action_flow.loss(cond, a_target, time_sampling=model.time_sampling)
+        loss = l_flow if l_cons is None else l_flow + l_cons
+    loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
 
 
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
@@ -83,6 +99,20 @@ def main(cfg):
     set_subsample(int(cfg.data.get("subsample", 1) or 1))          # match the rate + obs layout the WM trained on
     set_action_aggregate(str(cfg.data.get("action_aggregate", "sum")))   # beside the stride: same one-shot rule
     set_obs_keep(cfg.data.get("obs_keep", None))                   # applied inside every loader + the normalizer
+    # Size the batch the SAME way train_world_model does -- same budget, same resident-frame-store estimate,
+    # same linear fit + bisect -- with only the STEP swapped for this entrypoint's. Without this the batch fell
+    # through to the inherited default of 1024, which OOMs on contact (1024 x (P+F) frames through the image
+    # encoder), so every launch had to pin data.batch by hand. Must run BEFORE window_loaders, exactly as in
+    # train_world_model: the probe budgets against a card the GPU-resident frame store has not been parked on
+    # yet, and set_subsample() above is what makes that estimate right.
+    _ab_on = bool(cfg.data.get("autobatch", True)) and torch.cuda.is_available()
+    if _ab_on:
+        cfg.data.batch = int(autobatch_find(cfg, torch.device("cuda"),
+                                            log=lambda m: _startup_log(run_dir, m),
+                                            step_probe=_action_step_probe))
+        OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))
+    _startup_log(run_dir, f"[batch] data.batch={int(cfg.data.batch)} "
+                          f"({'autobatch' if _ab_on else 'PINNED via data.autobatch=false'})")
     norm = normalizer(cfg)
     loaders = window_loaders(cfg, norm)
     _startup_log(run_dir, f"[startup] data ready in {time.perf_counter() - _t:.1f}s: "
@@ -93,7 +123,7 @@ def main(cfg):
     # the WM loads and action_flow stays fresh-initialized. Verify both (a wrong/mismatched checkpoint would
     # otherwise silently load nothing and the head would train on random features).
     before = {k: v.clone() for k, v in model.state_dict().items()}
-    load_checkpoint(model, cfg.checkpoint)
+    load_checkpoint(model, cfg.checkpoint, allow_missing=("action_flow", "action_pit_knots"))
     changed = {k for k, v in model.state_dict().items() if not torch.equal(v, before[k])}
     wm_keys = [k for k in before if not k.startswith("action_flow.")]
     n_wm = sum(k in changed for k in wm_keys)

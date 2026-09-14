@@ -14,50 +14,82 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from . import transforms as T
+
 
 class Normalizer:
-    """Train-only mean/std, applied to every split (so OOD shift stays real)."""
+    """Train-only mean/std, applied to every split (so OOD shift stays real).
+
+    The z-score is a `transforms.ZScore` rather than four inlined tensors: ONE implementation of the map,
+    shared with the action prior's PIT and with act_enc's symlog. The public API (`norm_act` and friends,
+    `o_mean` and friends) is unchanged and BITWISE identical -- smoke/transforms.py asserts the expressions
+    match, because 92 call sites and every trained checkpoint depend on it.
+
+    `act_pit` is the optional probability integral transform for the ACTION PRIOR'S TARGET, fitted at
+    dataset-build time and carried in normalization_stats.json under "action_pit". It is NOT part of the
+    z-score chain and is never applied by norm_act: the head's target and the world model's conditioning
+    are the same tensor, so folding it in here would silently move the conditioning too. The model asks for
+    it explicitly (`model.action_head.target_transform=pit`) and applies it to the target alone."""
 
     def __init__(self, stats: dict):
-        self.o_mean = torch.tensor(stats["observation_vector"]["mean"])
-        self.o_std = torch.tensor(stats["observation_vector"]["std"])
-        self.a_mean = torch.tensor(stats["action"]["mean"])
-        self.a_std = torch.tensor(stats["action"]["std"])
+        self.obs = T.ZScore(torch.tensor(stats["observation_vector"]["mean"]),
+                            torch.tensor(stats["observation_vector"]["std"]))
+        self.act = T.ZScore(torch.tensor(stats["action"]["mean"]),
+                            torch.tensor(stats["action"]["std"]))
+        self.act_pit = T.PIT.from_state(stats["action_pit"]) if stats.get("action_pit") else None
 
     @classmethod
     def from_file(cls, root: str) -> "Normalizer":
         with open(os.path.join(root, "normalization_stats.json")) as f:
             return cls(json.load(f))
 
+    # the four tensors, still readable as attributes: smoke/action_chunk.py and any downstream code that
+    # reaches for them keeps working, and there is still only one copy of each.
+    @property
+    def o_mean(self):
+        return self.obs.mean
+
+    @property
+    def o_std(self):
+        return self.obs.std
+
+    @property
+    def a_mean(self):
+        return self.act.mean
+
+    @property
+    def a_std(self):
+        return self.act.std
+
     def subset_obs(self):
         """Restrict the obs stats to the process-wide _OBS_KEEP subset (set_obs_keep), so norm/denorm match
         the subset the loaders apply. Single source of truth: no obs_keep is threaded. No-op if unset."""
         idx = get_obs_keep()
         if idx is not None:
-            t = torch.as_tensor(idx, dtype=torch.long)
-            self.o_mean, self.o_std = self.o_mean[t], self.o_std[t]
+            self.obs = self.obs.subset(torch.as_tensor(idx, dtype=torch.long))
         return self
 
     def tile_act(self, k: int):
         """Repeat the action stats k times, for `data.action_aggregate=concat` where one kept step carries k
         raw actions laid out time-major ([slot0 dims..., slot1 dims..., ...]). Each slot holds the RAW action
         distribution the stats were computed on, so tiling is exactly right -- and it is the reason concat has
-        no normalization mismatch, unlike sum. No-op for k<=1."""
-        if int(k) > 1:
-            self.a_mean, self.a_std = self.a_mean.repeat(int(k)), self.a_std.repeat(int(k))
+        no normalization mismatch, unlike sum. No-op for k<=1. The PIT knots tile for the same reason."""
+        self.act = self.act.tile(k)
+        if self.act_pit is not None:
+            self.act_pit = self.act_pit.tile(k)
         return self
 
     def norm_obs(self, o):
-        return (o - self.o_mean.to(o)) / self.o_std.to(o)
+        return self.obs.apply(o)
 
     def denorm_obs(self, o):
-        return o * self.o_std.to(o) + self.o_mean.to(o)
+        return self.obs.invert(o)
 
     def norm_act(self, a):
-        return (a - self.a_mean.to(a)) / self.a_std.to(a)
+        return self.act.apply(a)
 
     def denorm_act(self, a):
-        return a * self.a_std.to(a) + self.a_mean.to(a)
+        return self.act.invert(a)
 
 
 # ---- TEMPORAL SUBSAMPLING (data.subsample; 1 = OFF = bit-identical) -------------------------------

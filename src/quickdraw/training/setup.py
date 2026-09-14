@@ -364,6 +364,16 @@ def build_model(cfg):
                                        action_head_shortcut=bool(ahg("shortcut", True)),
                                        action_head_detach_gradient=bool(ahg("detach_gradient", False)),
                                        action_head_chunk=int(ahg("chunk", 1)),
+                                       # the prior's OWN hyperparameters -- defaults reproduce the old
+                                       # "borrow flow_hidden, take FlowField's tau defaults" behaviour
+                                       action_head_hidden=int(ahg("hidden", 0)),
+                                       action_head_n_freq=int(ahg("n_freq", 16)),
+                                       action_head_time_dim=int(ahg("time_dim", 32)),
+                                       action_head_sampling_steps=int(ahg("sampling_steps", 0)),
+                                       action_head_target_transform=str(ahg("target_transform", "none")),
+                                       action_head_context=str(ahg("context", "pooled")),
+                                       action_pit_knots=_action_pit_knots(cfg, str(ahg("target_transform",
+                                                                                       "none"))),
                                        dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)),
                                        # default 1.0 (always-clean) so an old config adopted by
                                        # run_standalone rebuilds the behaviour it TRAINED under.
@@ -374,7 +384,7 @@ def build_model(cfg):
 _hf_root_cache: dict = {}   # hf_repo -> snapshot path (avoid re-resolving/downloading per call)
 
 
-def autobatch_find(cfg, device, log=print) -> int:
+def autobatch_find(cfg, device, log=print, step_probe=None) -> int:
     """Size `data.batch` to the largest whose AR training step fits `VRAM - autobatch_reserve_gb`, capped at
     `autobatch_max`. Sizes by a LINEAR FIT of peak-vs-batch (2 probes + confirm), falling back to a
     bracket-and-bisect search; budgets on RESERVED memory (what OOMs), not allocated. The AR step is DISPATCH-bound (accelerations.md Exp 8), so bigger batch is nearly-free
@@ -390,6 +400,13 @@ def autobatch_find(cfg, device, log=print) -> int:
     depend on data.batch, the phases are sequential, and the freed training blocks are reused (2026-08-19: eval
     after an 87.5GB train peak added NO new reservation). The margin held back is `data.autobatch_reserve_gb`
     PLUS the GPU-resident dataset, which is subtracted explicitly below.
+    `step_probe(model, opt, obs, act)` REPLACES the world-model training step with the caller's own, so a
+    different entrypoint can reuse all of this -- the budget, the resident frame-store estimate, the linear
+    fit, the bisect fallback -- and only supply the step whose memory differs. train_action_model uses it:
+    its step is a no_grad frozen-WM context pass plus a tiny head loss, nothing like `rollout_train`, so
+    without an injection point that entrypoint could not autobatch at all and had to be pinned by hand
+    (and its inherited default is data.batch=1024, which OOMs on contact).
+
     Config: data.autobatch{,_reserve_gb,_max,_base}."""
     import gc
     # ONE ABSOLUTE MARGIN (2026-08-18), replacing `autobatch_headroom` (a fraction). The two reserves that used
@@ -523,9 +540,18 @@ def autobatch_find(cfg, device, log=print) -> int:
         #                         TRUE memory peak). feeds=None: no rollout ran, so there is nothing to condition on.
         return model({k: v[:, :-1] for k, v in obs.items()}, act[:, :-1])[:, P - 1:], None
 
-    def _probe_path(obs, act, preds_fn):   # 2 iters (so Adam states allocate) of fwd-loss + bwd + step -> peak bytes
+    def _measure(run_step, obs, act):   # 2 iters (so Adam states allocate) of ONE training step -> peak bytes
         torch.cuda.synchronize(device); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
         for _ in range(2):
+            run_step(model, opt, obs, act)
+        # RESERVED, not allocated (2026-08-18). The allocator's reserved pool is what actually OOMs -- the gap is
+        # fragmentation, and budgeting on `allocated` made that gap invisible and left it to be absorbed by a
+        # hand-tuned headroom fraction. On record: "batch 112 probed 81GB then OOM'd at 93GB". Both are returned
+        # so the ratio is logged rather than assumed.
+        return torch.cuda.max_memory_reserved(device), torch.cuda.max_memory_allocated(device)
+
+    def _wm_step(preds_fn):
+        def run(_model, _opt, obs, act):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 try:
                     loss = _loss_from_preds(preds_fn(obs, act), obs, act)   # faithful full loss graph
@@ -533,17 +559,16 @@ def autobatch_find(cfg, device, log=print) -> int:
                     if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower():
                         raise
                     loss = preds_fn(obs, act)[0].float().pow(2).mean()     # fall back to a pred-only estimate
-            loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
-        # RESERVED, not allocated (2026-08-18). The allocator's reserved pool is what actually OOMs -- the gap is
-        # fragmentation, and budgeting on `allocated` made that gap invisible and left it to be absorbed by a
-        # hand-tuned headroom fraction. On record: "batch 112 probed 81GB then OOM'd at 93GB". Both are returned
-        # so the ratio is logged rather than assumed.
-        return torch.cuda.max_memory_reserved(device), torch.cuda.max_memory_allocated(device)
+            loss.backward(); _opt.step(); _opt.zero_grad(set_to_none=True)
+        return run
 
     def probe(B):   # peak = MAX(p_tf=0 rollout, p_tf=1 parallel forward). The old probe measured ONLY the rollout,
         try:        #   missing the parallel-forward peak that epoch 0 hits -> under-sized -> OOM at epoch 0. None on OOM.
             obs, act = synth(B)
-            a, b_ = _probe_path(obs, act, _seq_preds), _probe_path(obs, act, _par_preds)
+            if step_probe is not None:                      # caller's own step: ONE path, nothing to max over
+                return _measure(step_probe, obs, act)
+            a = _measure(_wm_step(_seq_preds), obs, act)
+            b_ = _measure(_wm_step(_par_preds), obs, act)
             return max(a[0], b_[0]), max(a[1], b_[1])       # (reserved, allocated), each maxed over both paths
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if not (isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in str(e).lower()):
@@ -672,7 +697,9 @@ def autobatch_find(cfg, device, log=print) -> int:
         finally:
             gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
 
-    _ev = probe_eval()
+    # The eval probe models the WORLD MODEL's eval routines; a caller with its own training step has its own
+    # (or no) eval, so it is skipped rather than run against shapes it never uses.
+    _ev = None if step_probe is not None else probe_eval()
     if _ev == -1.0:
         log("[autobatch] WARNING: the eval phase OOM'd on its own, INDEPENDENT of data.batch. Training will "
             "still be sized (correctly -- eval cost does not depend on the batch), but expect eval routines to "
@@ -890,11 +917,51 @@ def data_exists(cfg) -> bool:
     return bool(root) and os.path.exists(os.path.join(root, "normalization_stats.json"))
 
 
-def load_checkpoint(model, path: str):
+def _action_pit_knots(cfg, mode: str):
+    """The PIT knots for the action prior's target, tiled to the aggregated action, or None when off.
+
+    Read through `normalizer(cfg)` rather than from the file directly, because that is the one place the
+    concat tiling rule lives -- and the knots have to be tiled exactly as mean/std are."""
+    if mode != "pit":
+        return None
+    agg = str(cfg.data.get("action_aggregate", "sum"))
+    if agg != "concat":
+        raise ValueError(
+            f"action_head.target_transform=pit requires data.action_aggregate=concat, got {agg!r}.\n"
+            f"  The knots are fitted ONCE at dataset build time, but the aggregation happens at LOAD time and "
+            f"depends on data.subsample -- a training-time knob the dataset cannot know. Under concat every "
+            f"slot holds the RAW action distribution whatever the stride, so tiled raw knots are exactly "
+            f"right; under 'sum' the stored action is a sum whose distribution changes with the stride, so no "
+            f"pre-fitted table describes it.\n"
+            f"  Either set data.action_aggregate=concat (which is also the semantically correct aggregation "
+            f"for absolute-position actions like starling's sticks), or set "
+            f"model.action_head.target_transform=none to train in raw action units -- at the cost that the "
+            f"prior then cannot emit any atom in the data, e.g. the stick at rest.")
+    n = normalizer(cfg)                                   # tiled to the aggregated action, as mean/std are
+    if n.act_pit is None:
+        raise ValueError(
+            f"action_head.target_transform=pit, but {resolve_data_root(cfg)}/normalization_stats.json has no "
+            f"'action_pit' knots -- this dataset was built before they were fitted. Run "
+            f"`python -m quickdraw.data.backfill_pit {resolve_data_root(cfg)}` once to add them (additive; every "
+            f"other consumer ignores the key).")
+    # THE KNOTS MUST LIVE IN THE SPACE THE TARGET LIVES IN. They are fitted on the RAW actions (that is the
+    # variable the dataset stores), but `action_pairs` transforms `act_seq`, which is NORMALIZED -- so raw
+    # knots would put 38.6% of the target on the clamp instead of spreading it (measured). z-scoring the
+    # knots by the same per-dim mean/std fixes it and changes nothing else: the map is monotone, so ranks,
+    # the atom's slab and the exact inverse are all preserved, and the atom's normalized value is computed
+    # by the SAME expression on both sides, so it still matches bit for bit.
+    return n.norm_act(n.act_pit.knots.T).T
+
+
+def load_checkpoint(model, path: str, allow_missing: tuple[str, ...] = ()):
     """Load a Lightning checkpoint into a bare BaseWorldModel, stripping wrapper prefixes.
 
     `path` may be a .ckpt file or a train run dir (resolved to <dir>/checkpoints/best.ckpt).
-    """
+
+    `allow_missing` names module prefixes that are SUPPOSED to be absent from the checkpoint and stay
+    fresh-initialised. The only caller is train_action_model, whose whole design is to build the WM with a
+    head the frozen checkpoint never had; without this the missing-parameter guard (correctly) refuses to
+    load a partly-random model and blocks the post-hoc path outright."""
     import torch
 
     if path and os.path.isdir(path):
@@ -917,11 +984,36 @@ def load_checkpoint(model, path: str):
     # discarding IncompatibleKeys is how a partly-RANDOM model gets evaluated as if it were trained. Missing
     # PARAMETERS are fatal; missing buffers that have a defined default are reported and tolerated.
     _param_names = {n for n, _ in model.named_parameters()}
-    _missing_params = [k for k in inc.missing_keys if k in _param_names]
+    _ok = tuple(allow_missing)
+    _missing_params = [k for k in inc.missing_keys
+                       if k in _param_names and not any(k == m or k.startswith(m + ".") for m in _ok)]
+    if _ok:
+        _fresh = [k for k in inc.missing_keys if any(k == m or k.startswith(m + ".") for m in _ok)]
+        if _fresh:
+            print(f"[load_checkpoint] {len(_fresh)} tensors left FRESH on purpose ({', '.join(_ok)})")
     if inc.missing_keys or inc.unexpected_keys:
         print(f"[load_checkpoint] missing={len(inc.missing_keys)} unexpected={len(inc.unexpected_keys)}"
               + (f"\n  missing: {inc.missing_keys[:8]}" if inc.missing_keys else "")
               + (f"\n  unexpected: {inc.unexpected_keys[:8]}" if inc.unexpected_keys else ""))
+    # THE TARGET SPACE MUST MATCH. A head trained under PIT has weights in z-space; loading it into a model
+    # configured without PIT (or the reverse) produces plausible actions from the wrong distribution rather
+    # than an error, because the knots are a buffer and strict=False forgives buffers.
+    # ...but ONLY when the checkpoint actually carries a trained head. The post-hoc path loads a WORLD MODEL
+    # that has no action head at all and builds a fresh one on top; there is no target space to disagree with.
+    _ck_head = any(k.startswith("action_flow.") for k in clean)
+    _ck_pit, _md_pit = "action_pit_knots" in clean, hasattr(model, "action_pit_knots")
+    if _ck_head and _ck_pit != _md_pit:
+        raise RuntimeError(
+            f"action_head.target_transform mismatch: the checkpoint {'HAS' if _ck_pit else 'does NOT have'} "
+            f"PIT knots but the model being built {'HAS' if _md_pit else 'does NOT have'} them. The head's "
+            f"weights live in whichever target space it trained in, so this would silently sample from the "
+            f"wrong distribution. Set model.action_head.target_transform to match the checkpoint "
+            f"({'pit' if _ck_pit else 'none'}), or train a fresh head.")
+    if _ck_head and _ck_pit and _md_pit and not torch.equal(clean["action_pit_knots"].cpu(),
+                                               model.action_pit_knots.cpu()):
+        raise RuntimeError(
+            "the checkpoint's PIT knots differ from the ones this dataset supplies: the head would invert its "
+            "own draws through a map it never trained under. Point at the dataset the head was trained on.")
     if _missing_params:
         raise RuntimeError(
             f"checkpoint is missing {len(_missing_params)} PARAMETER tensors, so those modules would stay at "

@@ -22,6 +22,7 @@ import torch
 from ..environments.examples.torus import TorusEnv
 from ..environments.policies import make_policy
 from ..environments.torus_utils import TorusConfig
+from .transforms import PIT
 
 
 def generate_episodes(env, n_traj: int, steps: int, seed: int, device="cpu",
@@ -97,6 +98,12 @@ def compute_norm_stats(obs: np.ndarray, act: np.ndarray,
     return {
         "observation_vector": {"mean": o_mean.tolist(), "std": o_std.tolist()},
         "action": {"mean": a_mean.tolist(), "std": a_std.tolist()},
+        # The ACTION PRIOR'S optional target transform, fitted here because this is the one place that sees
+        # the TRAIN actions and nothing else. Only read when model.action_head.target_transform=pit; storing
+        # it always costs ~30 KB per action dim and means the knob can be turned on without rebuilding a
+        # dataset. 1024 knots is the accuracy/size trade: measured 1e-3 max round-trip error on starling-2
+        # (0.05% of the action range), against 2e-4 at 4096 and four times the file.
+        "action_pit": PIT.fit(a, n_knots=1024).state_dict(),
         # Advisory only; no consumer reads it. Kept so a dataset records what its own build knew.
         "concentration_diagnostic": diag,
     }

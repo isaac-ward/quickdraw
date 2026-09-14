@@ -1,4 +1,17 @@
 action_dist_window: 4      # +/-N timesteps pooled per frame/tile across ALL action-dist products (pooled-magnitude
+action_dist_leads: auto    # which chunk LEAD TIMES get the full product set, each in its own lead_<k>/ subfolder.
+#   "auto" -> {0, K//2, K-1}: the next action, the middle of the chunk and its far end. A list picks explicitly.
+#   Lead times are K DIFFERENT prediction problems, so they are never pooled into one histogram; at K=1 the
+#   layout stays flat/unprefixed exactly as every pre-chunk run wrote it.
+action_dist_max_frames: 0  # 0/null -> every timestep. Caps the frames in EVERY action-dist animation. Cost is
+action_dist_energy_draws: 32   # draws per context for the CONDITIONAL scores (energy skill, rank
+#                          calibration, rest AUC). 0 = off. W1 compares POOLED histograms, which a model
+#                          that ignores its context matches perfectly on held-out data forever -- these
+#                          score every draw against WHAT ACTUALLY HAPPENED at that context, relative to a
+#                          context-blind null (the recorded chunks, shuffled). ~2 ms/1000 samples, against
+#                          an eval the animations dominate, so 32 is effectively free.
+#   ~frames x action_dim panels of single-core matplotlib: at 16 concat dims and 440 timesteps the marginals
+#   video alone took 10 of one eval's 12 minutes, and the per-lead subfolders multiply that by len(leads).
 #                            animation, by-state, AND the per-dim marginals video) -> ~(2N+1)x samples/frame past the
 #                            #episodes ceiling; the dist changes slowly so bias is tiny. ONE knob for all of them (the
 #                            viz styling is shared too). 0 = no pooling (per-timestep). Change here -> changes both.
