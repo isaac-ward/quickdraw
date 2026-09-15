@@ -439,7 +439,9 @@ def ood(paper, dev="cuda"):
     mark_context(AE)
     # OUT OF THE AXES, same reason as the visual panel: in here the legend sat squarely on the peak.
     _h, _l = AE.get_legend_handles_labels()
-    fig.legend(_h, _l, loc="lower center", bbox_to_anchor=(xp + wp / 2, 0.0), ncol=2,
+    # CENTRED IN THE FIGURE, not on the plot block: the images are part of the frame too, so anchoring
+    # the strip on the plots' midpoint left it visibly off to the left.
+    fig.legend(_h, _l, loc="lower center", bbox_to_anchor=(0.5, 0.0), ncol=2,
                fontsize=FS - 2.2, frameon=False, handlelength=1.4, columnspacing=1.2,
                borderaxespad=0.0)
     f = os.path.join(paper, "figures", "ood-dynamical.png")
