@@ -262,8 +262,9 @@ def ood(paper, dev="cuda"):
     # A SECOND ANOMALOUS FRAME, later than the first: the pair shows the noodle moving through the scene
     # and the map following it. PINNED by the author (t=27) rather than picked by contrast -- the
     # contrast rule kept landing on t=23, where the noodle reads less clearly to the eye.
-    T_LATE = 27
+    T_LATE = 26
     later = [t for t in inside if t > t_in and (T_LATE is None or t == T_LATE)]
+    assert later, f"pinned T_LATE={T_LATE} is not an anomaly-window step after t_in={t_in}"
     t_late, sur_late, q_late = t_in, best_sur, -1.0
     for t in later:
         ob = torch.from_numpy(fr[key][t]).float().div(255.0).to(dev)
@@ -305,7 +306,7 @@ def ood(paper, dev="cuda"):
     W = 1.0 - L - R
     cw_in = W * FIG_W / 4.0                           # one image column, in inches
     ch_in = cw_in * ih / iw
-    TOP_IN, PAD_IN, TR_IN, BOT_IN = 0.17, 0.22, 0.92, 0.42   # titles, gap, trace height, xlabel+ticks
+    TOP_IN, PAD_IN, TR_IN, BOT_IN = 0.17, 0.0, 0.92, 0.42    # titles, gap, trace height, xlabel+ticks
     FIG_H = TOP_IN + 2 * ch_in + PAD_IN + TR_IN + BOT_IN
     fig = plt.figure(figsize=(FIG_W, FIG_H))
     cw, ch = W / 4.0, ch_in / FIG_H
@@ -470,8 +471,11 @@ def curves(paper):
             # one caption group, identical captions tie in the softmax and the attainable floor is
             # 1.97 (simulated over the actual subset draw). Validation bottoms at 6.23: 1.39 nats
             # below chance, a quarter of the way to the floor. Weak, but not chance.
-            for yv, lab, va_ in ((7.625, "Chance ($\\ln 2048$)", "top"),
-                                 (1.969, "Caption-tie floor", "bottom")):
+            # PLAIN ENGLISH ON BOTH LINES. "Below chance" reads as a failure to anyone who has not just
+            # been told that this is a loss; naming the top line random guessing and the bottom one the
+            # best attainable value makes the direction unambiguous without a "lower is better" note.
+            for yv, lab, va_ in ((7.625, "Chance --- random guessing", "top"),
+                                 (1.969, "Best attainable (identical captions tie)", "bottom")):
                 A.axhline(yv, color="0.35", ls=":", lw=1.0)
                 A.annotate(lab, xy=(0.98, yv), xycoords=("axes fraction", "data"), ha="right",
                            va=va_, fontsize=5.2, color="0.25")

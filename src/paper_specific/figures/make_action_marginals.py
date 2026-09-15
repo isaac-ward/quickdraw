@@ -91,16 +91,16 @@ def main(run: str = RUN) -> int:
     print(f"  chunk {K} | recorded {real.shape} | sampled {pred.shape} "
           f"({len(h)} contexts x {N_DRAW} draws)")
 
-    fig = plt.figure(figsize=(3.4, 3.2))
-    # THE AXIS NAME GOES INSIDE THE PANEL. As a title it sat on top of the tick labels of the panel
-    # above it -- four stacked panels each need their own x labels, because fore/aft is on a different
-    # range, so there is nowhere for a title to go.
-    gh = fig.add_gridspec(NA, 1, hspace=0.30, left=0.030, right=0.985, top=0.995, bottom=0.075)
+    fig = plt.figure(figsize=(3.4, 2.9))
+    # ONE SHARED X AXIS. Every stick is now on -1..1, including fore/aft -- which never goes positive in
+    # this corpus, so half its panel is empty, but a shared axis is worth more than the space. The four
+    # panels are therefore JOINED, only the bottom one is labelled, and the axis name goes inside each
+    # panel because a title would land on the panel above it.
+    gh = fig.add_gridspec(NA, 1, hspace=0.0, left=0.055, right=0.99, top=0.995, bottom=0.135)
     k = LOOKAHEAD
     for r in range(NA):
         A_ = fig.add_subplot(gh[r, 0])
-        # fore/aft never goes positive in this corpus, so it gets its own range
-        x0, x1 = (-1.0, 0.0) if AXES[r].startswith("fore") else (-1.0, 1.0)
+        x0, x1 = -1.0, 1.0
         bins = np.linspace(x0, x1, BINS)
         last = (r == NA - 1)
         A_.hist(real[:, k, r], bins=bins, density=True, color="tab:green", alpha=0.45,
@@ -109,14 +109,19 @@ def main(run: str = RUN) -> int:
                 label="Prediction" if last else None)
         A_.set_yticks([])
         A_.set_xlim(x0, x1)
-        A_.tick_params(labelsize=FS - 2.5)
+        A_.tick_params(labelsize=FS - 2.5, labelbottom=last)
+        if last:
+            A_.set_xlabel("Normalised stick deflection", fontsize=FS)
         for sp in A_.spines.values():
             sp.set_visible(True); sp.set_linewidth(0.7); sp.set_color("black")
         A_.text(0.015, 0.90, AXES[r].capitalize() if not AXES[r].startswith("fore") else "Fore/aft",
                 transform=A_.transAxes, ha="left", va="top", fontsize=FS)
         if last:
-            # fore/aft piles up at both ends, so the legend goes in the empty middle
-            A_.legend(fontsize=FS - 2.0, frameon=False, loc="upper center")
+            # fore/aft never goes positive, so the right half of the bottom panel is free
+            A_.legend(fontsize=FS - 2.0, frameon=False, loc="upper right")
+    # density=True, so the bars ARE a probability density over stick deflection and the four panels are
+    # directly comparable now that they share one binning. Ticks stay off -- the shape is the message.
+    fig.supylabel("Probability density", fontsize=FS, x=0.014)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", OUT)
     return 0
