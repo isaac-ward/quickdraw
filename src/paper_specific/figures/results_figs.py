@@ -208,6 +208,40 @@ def curves(paper):
                 except Exception:
                     pass
         tags = {r["tag"] for r in rows if r.get("tag")}
+        # THE REWARD MODEL IS SCORED ON ITS PROBE, NOT ITS LOSS. train_reward_model.py calls
+        # probe/<factor>_acc "what steering actually queries, so it's the headline", and it is the only
+        # reward series that tells a story: the contrastive val loss bottoms at 6.22 against ln(512)=6.24,
+        # i.e. held-out retrieval is at chance, while the probe reaches 2.4-4.6x chance and train and val
+        # track each other. Chance differs per factor (6, 10 and 9 buckets), so the mean of the three is
+        # plotted against the mean of their chance levels, drawn.
+        if any(t.startswith("val/probe/") for t in tags):
+            facs = sorted({t.split("/")[-1][:-4] for t in tags if t.startswith("val/probe/")
+                           and t.endswith("_acc")})
+            NB = {"facing": 6, "object_in_view": 10, "motion_dominant": 9}
+            chance = float(np.mean([1.0 / NB[f] for f in facs]))
+            acc = {"train": {}, "val": {}}
+            for r in rows:
+                t = r.get("tag") or ""
+                for sp in ("train", "val"):
+                    if t.startswith(f"{sp}/probe/") and t.endswith("_acc"):
+                        acc[sp].setdefault(r.get("step", 0), []).append(r["value"])
+            A = ax[i]
+            for k, c in (("train", "tab:blue"), ("val", "tab:red")):
+                x = sorted(acc[k])
+                A.plot(x, [float(np.mean(acc[k][v])) for v in x], color=c, lw=1.3, label=k)
+            A.axhline(chance, color="k", ls=":", lw=0.9)
+            A.text(0.98, chance, "chance", ha="right", va="bottom", fontsize=6, color="k",
+                   transform=A.get_yaxis_transform())
+            A.set_title(f"{name}  (steering probe)", fontsize=8)
+            A.set_xlabel("epoch", fontsize=7); A.set_ylabel("probe accuracy", fontsize=7)
+            A.tick_params(labelsize=6); A.grid(alpha=0.25); A.legend(fontsize=6)
+            A.set_ylim(0.0, None)
+            if fallback_h:
+                span = fallback_h * max(max(acc["train"] or [0]), max(acc["val"] or [0]))
+                mul, unit = (60.0, "min") if span < 0.2 else (1.0, "h")
+                tw = A.twiny(); tw.set_xlim(*[x * fallback_h * mul for x in A.get_xlim()])
+                tw.set_xlabel(f"wall clock ({unit})", fontsize=7); tw.tick_params(labelsize=6)
+            continue
         pair = None
         for cand in ("loss/total", "loss/contrastive"):
             if f"train/{cand}" in tags and f"val/{cand}" in tags:
