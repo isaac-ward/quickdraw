@@ -219,7 +219,8 @@ STEER_RUNS = {
 # differs -- and the reference is labelled a CEILING, because it is not a method anyone can deploy: it
 # draws chunks that were actually flown.
 COLS = [("data", r"\makecell{Data Retrieval\\(ceiling)$^{\ddagger}$}"), ("gauss", "Gaussian"),
-        ("pitdelta", r"Learned $\Delta$"), ("prior", r"Learned (\textbf{ours})")]
+        ("pitdelta", r"\makecell{Learned\\$\Delta$}"),
+        ("prior", r"\makecell{Learned\\Raw (\textbf{ours})}")]
 # THE BASELINE IS NEVER BOLDED AS THE WINNER. Retrieval is a reference, not a competitor: it is bounded
 # by what the corpus happens to contain, so calling it "best" asserts a target none of the priors could
 # reach by construction. Bolding therefore runs over the generative columns only.
@@ -404,13 +405,13 @@ def wacc_locations(vl):
     return out
 
 
-def _avg_row(wa, denom):
+def _avg_row(wa, denom, what):
     best = max((v for m, v in wa.items() if v is not None and m in BOLD_COLS), default=None)
     cells = ["--" if wa[m] is None else
              ((r"\textbf{" + f"{100 * wa[m] / denom:.0f}" + r"}\%")
               if (m in BOLD_COLS and best and abs(wa[m] - best) < 1e-9)
               else f"{100 * wa[m] / denom:.0f}\%") for m, _ in COLS]
-    return r"    \midrule" + "\n" + r"    Mean over the block $\uparrow$ & " \
+    return r"    \midrule" + "\n" + f"    Mean over {what} " + r"$\uparrow$ & " \
         + " & ".join(cells) + r" \\"
 
 
@@ -470,7 +471,7 @@ def steer_table(paper: str) -> str:
     # THE AGGREGATE ROWS ARE GONE, at the author's ask: obeyed, motion against a pilot and the two
     # jerk multiples summarised the per-request cells above them and a continuity comparison this
     # table no longer makes. hits_all/frac_all stay accumulated -- the prose quotes them.
-    L += [_avg_row(avg_motion(ph), 15),
+    L += [_avg_row(avg_motion(ph), 15, "motion primitives"),
           r"    \midrule", r"    \multicolumn{" + str(1 + nc) +
           r"}{c}{Locations} \\", r"    \midrule"]
     for q in LOC_ROWS:
@@ -484,7 +485,7 @@ def steer_table(paper: str) -> str:
                   if (m in BOLD_COLS and best and abs(v[0] / v[1] - best) < 1e-9)
                   else f"{100 * v[0] / v[1]:.0f}\%") for (m, _), v in zip(COLS, vals)]
         L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
-    L += [_avg_row(avg_locations(vl), 4),
+    L += [_avg_row(avg_locations(vl), 4, "locations"),
           r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     # THE FALSE-POSITIVE-AWARE VERSION, printed rather than tabulated. The author wants the plain mean in
     # the table; this stays reproducible because the results prose quotes it, and it is the number that

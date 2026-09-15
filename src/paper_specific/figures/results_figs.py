@@ -2,7 +2,8 @@
 
     python -m paper_specific.figures.results_figs <paper_repo> [which ...]
 
-`which` selects figures by name (longhorizon, memory, ood, curves, data, overview); default is all.
+`which` selects figures by name (longhorizon, memory, ood, curves); default is all. The overview
+figure was removed from the paper, and with it the name.
 Everything lands in <paper_repo>/figures/ as PNG at print resolution.
 """
 from __future__ import annotations
