@@ -324,7 +324,7 @@ def ood(paper, dev="cuda"):
     # Row one: how it was applied, a clean frame, the anomalous frame, and a LATER anomalous frame.
     # Row two: the per-pixel surprise under each, with the first cell blank -- the map belongs under the
     # frame it explains, and the in-distribution map is the control that shows it stays dark.
-    panes = [(0, 0, photo, "Disturbance is applied"),
+    panes = [(0, 0, photo, "Disturbance\nis applied"),
              (0, 1, fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
              (0, 2, fr[key][t_in], f"Anomalous ($t{{=}}{t_in}$)"),
              (0, 3, fr[key][t_late], f"Anomalous ($t{{=}}{t_late}$)"),
@@ -342,7 +342,7 @@ def ood(paper, dev="cuda"):
             A.set_title(lab.replace(" ($t", "\n($t"), fontsize=FS - 2.2, pad=1.8, linespacing=1.15)
         A.set_xticks([]); A.set_yticks([])
         for sp_ in A.spines.values():
-            sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
+            sp_.set_visible(True); sp_.set_linewidth(0.6); sp_.set_color("black")
     A = fig.add_axes([L, (BOT_IN + LEG_IN) / FIG_H, W, TR_IN / FIG_H])   # the trace, on the images' span
     v = np.asarray(r[chan])
     A.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
@@ -381,7 +381,7 @@ def ood(paper, dev="cuda"):
     # are exactly as tall as the two images -- no frame is ever rescaled anisotropically.
     FIG_W, L, GAP, R = 3.4, 0.56, 0.0, 0.01            # inches: ylabel+ticks, plot-to-image gap, margin
     WI = 1.06                                          # image width; the plots take whatever is left
-    TOP_IN, BOT_IN, LEG_IN = 0.15, 0.34, 0.30          # image title, xlabel+ticks, legend strip
+    TOP_IN, BOT_IN, LEG_IN = 0.30, 0.34, 0.30          # 2-line image title, xlabel+ticks, legend strip
     hi = WI * ph / pw                                  # one image, and therefore one plot, in inches
     PW = FIG_W - L - GAP - WI - R
     FIG_H = TOP_IN + 2 * hi + BOT_IN + LEG_IN
@@ -394,12 +394,18 @@ def ood(paper, dev="cuda"):
     AI = fig.add_axes([xi, y_top - hr, wi_, hr]); AI.imshow(photo)
     AI.set_xticks([]); AI.set_yticks([])
     for sp_ in AI.spines.values():
-        sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    AI.set_title("Disturbance is applied", fontsize=FS - 2.2, pad=1.8)
+        sp_.set_visible(True); sp_.set_linewidth(0.6); sp_.set_color("black")
+    AI.set_title("Disturbance\nis applied", fontsize=FS - 2.2, pad=1.8, linespacing=1.15)
     A = fig.add_axes([xi, y_top - 2 * hr, wi_, hr]); A.imshow(pov)
+    # THE LABEL BELONGS UNDER THIS ONE: the frame is the whole argument for the dynamical case, and the
+    # argument is that there is nothing in it to see. It sits in the band the legend strip occupies on
+    # the plot side, which is free out here.
+    A.annotate("Disturbance is\nvisually\nundetectable", xy=(0.5, 0.0), xycoords="axes fraction",
+               ha="center", va="top", fontsize=FS - 2.2, linespacing=1.15,
+               xytext=(0, -3), textcoords="offset points")
     A.set_xticks([]); A.set_yticks([])
     for sp_ in A.spines.values():
-        sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
+        sp_.set_visible(True); sp_.set_linewidth(0.6); sp_.set_color("black")
     AV = fig.add_axes([xp, y_top - hr, wp, hr])
     for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
         AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
@@ -447,7 +453,8 @@ def curves(paper):
     # ONE ROW, NOT THREE. Stacked, three panels with their own x axis and a twin wall-clock axis
     # each cost 5.4 inches of page; side by side they cost 1.9, and nothing about the curves needs the
     # extra width -- they are each a single decaying line.
-    fig, ax = plt.subplots(1, 3, figsize=(7.1, 1.95))
+    CF = 1.5                                         # every font in this figure, at the author's ask
+    fig, ax = plt.subplots(1, 3, figsize=(7.1, 2.55))
     for i, (run, name, fallback_h) in enumerate(RUNS):
         p = os.path.join(run, "logs", "metrics.jsonl")
         rows = []
@@ -484,17 +491,17 @@ def curves(paper):
             if cur[k]:
                 x = sorted(cur[k])
                 A.plot(x, [cur[k][v] for v in x], color=c, lw=1.3, label=k)
-        A.set_title(name, fontsize=8)
-        A.set_xlabel("Epoch", fontsize=7); A.tick_params(labelsize=6); A.grid(alpha=0.25)
+        A.set_title(name, fontsize=8 * CF)
+        A.set_xlabel("Epoch", fontsize=7 * CF); A.tick_params(labelsize=6 * CF); A.grid(alpha=0.25)
         # ZOOMED PAST THE FLAT TAIL, per panel. Each model's curve is over well before its last epoch,
         # and the wall-clock axis follows because it is derived from this limit.
         XLIM = {"World Model": 30, "Action Model": 50, "Reward Model": 20}
         if name in XLIM:
             A.set_xlim(0, XLIM[name])
         if cur["train"] or cur["val"]:
-            A.legend(fontsize=6)
+            A.legend(fontsize=6 * CF, loc="lower left" if name == "Reward Model" else "best")
         if i == 0:
-            A.set_ylabel("Loss", fontsize=7)
+            A.set_ylabel("Loss", fontsize=7 * CF)
         h = float(np.mean(hrs)) if hrs else fallback_h
         if h:
             # UNIT PER PANEL. The world model took 45 h and the Reward Model 91 s; one axis in hours makes
@@ -502,7 +509,7 @@ def curves(paper):
             span = h * max(max(cur["train"] or [0]), max(cur["val"] or [0]))
             mul, unit = (3600.0, "s") if span < 0.05 else (60.0, "min") if span < 0.2 else (1.0, "h")
             tw = A.twiny(); tw.set_xlim(*[x * h * mul for x in A.get_xlim()])
-            tw.set_xlabel(f"Wall clock ({unit})", fontsize=7); tw.tick_params(labelsize=6)
+            tw.set_xlabel(f"Wall clock ({unit})", fontsize=7 * CF); tw.tick_params(labelsize=6 * CF)
     fig.tight_layout(w_pad=0.5, pad=0.4)
     f = os.path.join(paper, "figures", "training-curves.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)

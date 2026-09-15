@@ -91,18 +91,17 @@ def main(run: str = RUN) -> int:
     print(f"  chunk {K} | recorded {real.shape} | sampled {pred.shape} "
           f"({len(h)} contexts x {N_DRAW} draws)")
 
-    fig = plt.figure(figsize=(3.4, 3.5))
-    # 2x2 OF SQUARE PANELS. Every stick is on -1..1, including fore/aft -- which never goes positive in
-    # this corpus, so half its panel is empty, but a shared axis is worth more than the space. Only the
-    # bottom row carries tick labels, and the axis name goes inside each panel: as a title it landed on
-    # the tick labels of the panel above. set_box_aspect fixes the BOX, not the data, so a histogram can
-    # be square without touching its limits.
-    gh = fig.add_gridspec(2, 2, hspace=0.10, wspace=0.10,
-                          left=0.085, right=0.995, top=0.995, bottom=0.105)
+    fig = plt.figure(figsize=(3.4, 2.05))
+    # 2x2, FLUSH, HALF HEIGHT. Every stick is on -1..1, including fore/aft -- which never goes positive
+    # in this corpus, so half its panel is empty, but a shared axis is worth more than the space. The
+    # panels touch on all four sides, so only the bottom row carries tick labels and the ticks stop at
+    # +-0.5: at +-1.0 the left panel's last label and the right panel's first would have collided on the
+    # seam. The axis name goes inside each panel, because a title there would land on the panel above.
+    gh = fig.add_gridspec(2, 2, hspace=0.0, wspace=0.0,
+                          left=0.085, right=0.995, top=0.99, bottom=0.26)
     k = LOOKAHEAD
     for r in range(NA):
         A_ = fig.add_subplot(gh[r // 2, r % 2])
-        A_.set_box_aspect(1.0)
         x0, x1 = -1.0, 1.0
         bins = np.linspace(x0, x1, BINS)
         last, bottom_row = (r == NA - 1), (r >= NA - 2)
@@ -113,18 +112,24 @@ def main(run: str = RUN) -> int:
         A_.set_yticks([])
         A_.set_xlim(x0, x1)
         A_.tick_params(labelsize=FS - 2.5, labelbottom=bottom_row)
-        A_.set_xticks([-1.0, -0.5, 0.0, 0.5, 1.0])
+        A_.set_xticks([-0.5, 0.0, 0.5])
         for sp in A_.spines.values():
             sp.set_visible(True); sp.set_linewidth(0.7); sp.set_color("black")
         A_.text(0.015, 0.90, AXES[r].capitalize() if not AXES[r].startswith("fore") else "Fore/aft",
                 transform=A_.transAxes, ha="left", va="top", fontsize=FS)
         if last:
-            # fore/aft never goes positive, so the right half of the bottom panel is free
-            A_.legend(fontsize=FS - 2.0, frameon=False, loc="upper right")
+            # OUT OF THE PANELS, under the bottom-left one: with the panels flush there is no interior
+            # corner a legend can sit in without covering a distribution.
+            _h, _l = A_.get_legend_handles_labels()
+            fig.legend(_h, _l, loc="lower left", bbox_to_anchor=(0.085, 0.0), ncol=1,
+                       fontsize=FS - 2.0, frameon=False, handlelength=1.3, borderaxespad=0.0)
     # density=True, so the bars ARE a probability density over stick deflection and the four panels are
     # directly comparable now that they share one binning. Ticks stay off -- the shape is the message.
-    fig.supylabel("Probability density", fontsize=FS, x=0.016)
-    fig.supxlabel("Normalised stick deflection", fontsize=FS, y=0.012)
+    # THE LEGEND AND THE X LABEL SHARE ONE BAND. supxlabel centres the label under the axes, which put
+    # it straight on top of the tick labels; side by side with the legend the band does two jobs in the
+    # height of one, which is the point of halving the figure.
+    fig.supylabel("Probability density", fontsize=FS, x=0.016, y=0.625)
+    fig.text(0.66, 0.035, "Normalised stick deflection", ha="center", va="bottom", fontsize=FS)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", OUT)
     return 0

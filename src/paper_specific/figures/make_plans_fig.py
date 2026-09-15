@@ -107,7 +107,10 @@ def main() -> int:
             groups.append((req, [k]))
     # NO GAP INSIDE A SEQUENCE: the frames of one plan are one strip. Rows stay apart just enough for
     # the step numbers, and each request is braced across its own pair.
-    NR, HSP = len(rows), 0.26   # exactly the step-number title's own height, now that the letterbox is gone
+    # THE ROWS ARE AS CLOSE AS THE STEP NUMBERS ALLOW. Truly zero gap is not available while the "+N"
+    # sits ABOVE its image, as the author asked for earlier: the label would land on the image above it.
+    # So the gap is now exactly one label high and not a point more -- 0.26 -> 0.15 of a cell.
+    NR, HSP = len(rows), 0.15
     LEFT, RIGHT, TOP, BOT = 0.135, 0.999, 0.955, 0.004
     # SOLVE the height so each cell is EXACTLY the frame's aspect. A guessed multiplier left every row
     # letterboxed inside its own box -- with adjustable="box" imshow shrinks the axes to the data aspect
@@ -124,15 +127,18 @@ def main() -> int:
             A.imshow(imgs[c], interpolation="bilinear")
             A.set_xticks([]); A.set_yticks([])
             for sp in A.spines.values():
-                sp.set_linewidth(0.6); sp.set_color("black")
-            A.set_title(f"$+${steps[c]}", fontsize=FS - 1.0, pad=1.2)
+                sp.set_linewidth(0.3); sp.set_color("black")
+            A.set_title(f"$+${steps[c]}", fontsize=FS - 1.5, pad=0.8)
             row.append(A)
         axes.append(row)
     fig.canvas.draw()
     for req, idxs in groups:
         pos = [axes[i][0].get_position() for i in idxs]
         y0, y1 = pos[-1].y0, pos[0].y1
-        brace_left(fig, 0.115, y0, y1, 0.085, color="black", lw=0.9)
+        # HALF-HEIGHT BRACKET LINES, at the author's ask: the brace hugs the middle of the pair rather
+        # than spanning it corner to corner.
+        _c, _h = 0.5 * (y0 + y1), 0.5 * (y1 - y0)
+        brace_left(fig, 0.115, _c - _h / 2, _c + _h / 2, 0.085, color="black", lw=0.9)
         fig.text(0.030, 0.5 * (y0 + y1), "\u201c" + req + "\u201d", ha="center", va="center",
                  fontsize=FS * 1.5, style="italic", rotation=90)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)

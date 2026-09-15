@@ -142,9 +142,7 @@ OOD_ROWS = {
     # The proprioceptive channels ARE specific -- on the visual anomaly they sit at no-skill.
     "eval_ood_leafblower": [("pos_err", "Position error"), ("rot_err", "Orientation error"),
                             ("vel_err", "Velocity error"),
-                            ("angvel_err", r"Angular velocity error (\textbf{ours})"),
-                            ("latent_cos", "Latent surprise"), ("lpips", "Image LPIPS"),
-                            ("l2", "Image RMSE")],
+                            ("angvel_err", r"Angular velocity error (\textbf{ours})")],
 }
 OOD_NAME = {"eval_ood_noodle": "Visual anomaly: a pink pool noodle enters the frame", "eval_ood_leafblower": "Dynamical anomaly: an off-camera leaf blower pushes the drone"}
 
@@ -315,6 +313,58 @@ def _vlm(run):
     return out
 
 
+LOC_ROWS = ("center of room over mats", "floor to ceiling glass wall", "ladder", "mannequin", "table")
+
+# WEIGHTED STEERING ACCURACY, built exactly the way tab:ood's weighted accuracy is: the mean of the
+# true-positive and true-negative rates, so no-skill is 50% under any imbalance. It exists because a
+# hit rate alone rewards an arm that simply moves a lot, and a location hit rate alone rewards a
+# labeller that lists everything; folding in the false-positive rate is what removes both.
+MOTION_ROWS = ("rotate left", "rotate right", "climb", "descend",
+               "strafe left", "strafe right", "fly forward", "fly backward")
+
+
+def wacc_motion(ph):
+    """{arm: weighted accuracy} over MOTION_ROWS. The negative class is the OPPOSING request on the same
+    axis. _phys stores motion*sgn for the request it was asked under, so for the opposing request a
+    false positive -- motion in THIS request's direction past the threshold -- is a stored value below
+    -threshold."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
+    from steer_physical import WANTS
+    opp = {q: next(p for p in MOTION_ROWS if p != q and WANTS[p][0] == WANTS[q][0]) for q in MOTION_ROWS}
+    out = {}
+    for m, _ in COLS:
+        w = []
+        for q in MOTION_ROWS:
+            thr = 0.05 * PILOT[WANTS[q][0]]
+            pos, neg = ph[m].get(q), ph[m].get(opp[q])
+            if not pos or not neg:
+                continue
+            tpr = float(np.mean([v > thr for v in pos[2]]))
+            fpr = float(np.mean([v < -thr for v in neg[2]]))
+            w.append(0.5 * (tpr + 1.0 - fpr))
+        out[m] = 100.0 * float(np.mean(w)) if w else None
+    return out
+
+
+def wacc_locations(vl):
+    """{arm: weighted accuracy} over LOC_ROWS, from the VLM hit and base rates."""
+    out = {}
+    for m, _ in COLS:
+        w = [0.5 * (v[0] + 1.0 - v[1]) for v in (vl.get(m, {}).get(q) for q in LOC_ROWS)
+             if v and np.isfinite(v[1])]
+        out[m] = 100.0 * float(np.mean(w)) if w else None
+    return out
+
+
+def _wacc_row(wa):
+    best = max((v for v in wa.values() if v is not None), default=None)
+    cells = ["--" if wa[m] is None else
+             ((r"\textbf{" + f"{wa[m]:.1f}" + "}") if best and abs(wa[m] - best) < 1e-9
+              else f"{wa[m]:.1f}") for m, _ in COLS]
+    return r"    \midrule" + "\n" + r"    Weighted steering acc.\ (\%) $\uparrow$ & " \
+        + " & ".join(cells) + r" \\"
+
+
 def steer_table(paper: str) -> str:
     """Per-request steering as fractions of contexts, plus the aggregates the continuity table used to
     carry on its own -- the author asked for one table, since the second was mostly the same comparison
@@ -324,7 +374,6 @@ def steer_table(paper: str) -> str:
     ph = {k: _phys(v) for k, v in STEER_RUNS.items()}
     vl = {k: _vlm(v) for k, v in VLM_RUNS.items()}
     nc = len(COLS)
-    nb = nc + 1                                  # ...plus the base-rate column the locations carry
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
          r"  \caption{\textbf{Language steering.} The AM is the only thing that differs "
          r"between columns. Every cell is the fraction of starting contexts that met the request: for a "
@@ -332,20 +381,20 @@ def steer_table(paper: str) -> str:
          r"than $5\%$ of what a pilot covers in the same $34$\,s, read off the imagined proprioception "
          r"and independent of the reward the planner maximised; for a location, that a VLM asked to list "
          r"every object visible and every region faced \emph{at any point} in the imagined video named "
-         r"it. Best per row in bold. $^{\ddagger}$Data Retrieval is the \emph{baseline}: it "
-         r"draws real recorded chunks, so it is perfectly flyable and completely blind to the request, "
-         r"and beating it is the bar a learned prior has to clear. $^{\S}$The corpus contains no "
-         r"backward flight at all, and no arm gets more than one context out of fifteen -- a motion "
-         r"primitive absent from the data is not reachable by steering, however the candidates are "
-         r"drawn. The base rate is how often that same target is listed when a \emph{different} one was "
-         r"requested, averaged over the columns, and it is what the location block has to be read "
-         r"against: the room is one room, the labeller returns five to seven of the ten objects per "
-         r"clip, and a target whose base rate is near $0.9$ cannot distinguish anything. The two targets "
-         r"that are rare by chance --- ``white wall with table'' at $0.14$ and ``mannequin'' at $0.38$ "
-         r"--- are the only informative rows, and no arm wins both. Locations remain inconclusive.}",
-         r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nb + "}", r"    \toprule",
-         r"    Request & " + " & ".join(lab for _, lab in COLS) + r" & Base rate \\", r"    \midrule",
-         r"    \multicolumn{" + str(1 + nb) + r"}{c}{Motion primitives} \\", r"    \midrule"]
+         r"it. Best per row in bold. $^{\ddagger}$Data Retrieval draws real recorded chunks, so it is "
+         r"perfectly flyable and completely blind to the request; the reward still selects among them, "
+         r"so it steers. $^{\S}$The corpus contains no backward flight at all, and no arm gets more "
+         r"than one context out of fifteen -- a motion primitive absent from the data is not reachable "
+         r"by steering, however the candidates are drawn. Weighted steering accuracy is the mean of the "
+         r"true-positive and true-negative rates over the block, so its no-skill value is $50\%$ "
+         r"whatever the imbalance. The negative class is already in the run: for a motion primitive it "
+         r"is the \emph{opposing} request on the same axis, so a false positive is a context that flew "
+         r"left when right was asked for; for a location it is every context where a \emph{different} "
+         r"target was requested and this one was listed anyway. It is the only number here that cannot "
+         r"be inflated by an arm that simply moves a lot, or by a labeller that lists everything.}",
+         r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nc + "}", r"    \toprule",
+         r"    Request & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
+         r"    \multicolumn{" + str(1 + nc) + r"}{c}{Motion primitives} \\", r"    \midrule"]
     hits_all = {m: [] for m, _ in COLS}
     frac_all = {m: [] for m, _ in COLS}
     for q in ("rotate left", "rotate right", "climb", "descend", "strafe left", "strafe right",
@@ -365,14 +414,14 @@ def steer_table(paper: str) -> str:
                  ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if v[0] == best and best else
                   f"{v[0]}/{v[1]}") for v in vals]
         nm = q + (r"$^{\S}$" if q == "fly backward" else "")
-        L.append(f"    ``{nm}\'\' & " + " & ".join(cells) + r" & -- \\")
+        L.append(f"    ``{nm}\'\' & " + " & ".join(cells) + r" \\")
     # THE AGGREGATE ROWS ARE GONE, at the author's ask: obeyed, motion against a pilot and the two
     # jerk multiples summarised the per-request cells above them and a continuity comparison this
     # table no longer makes. hits_all/frac_all stay accumulated -- the prose quotes them.
-    L += [r"    \midrule", r"    \multicolumn{" + str(1 + nb) +
+    L += [_wacc_row(wacc_motion(ph)),
+          r"    \midrule", r"    \multicolumn{" + str(1 + nc) +
           r"}{c}{Locations} \\", r"    \midrule"]
-    for q in ("wall with black panels", "center of room over mats", "floor to ceiling glass wall",
-              "white wall with table", "ladder", "mannequin", "colored floor mat", "table"):
+    for q in LOC_ROWS:
         vals = []
         for m, _ in COLS:
             v = vl.get(m, {}).get(q)
@@ -381,10 +430,9 @@ def steer_table(paper: str) -> str:
         cells = ["--" if v is None else
                  ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if best and v[0] == best else
                   f"{v[0]}/{v[1]}") for v in vals]
-        bs = [v[1] for v in (vl.get(m, {}).get(q) for m, _ in COLS) if v and np.isfinite(v[1])]
-        L.append(f"    ``{q}\'\' & " + " & ".join(cells)
-                 + (f" & {np.mean(bs):.2f}" if bs else " & --") + r" \\")
-    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
+        L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
+    L += [_wacc_row(wacc_locations(vl)),
+          r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
 
 
