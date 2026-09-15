@@ -9,7 +9,7 @@ rm -rf /home/ubuntu/user_irw/quickdraw/scratch/paperbuild
 cp -r $P /home/ubuntu/user_irw/quickdraw/scratch/paperbuild
 cd /home/ubuntu/user_irw/quickdraw/scratch/paperbuild && rm -rf .git
 docker exec quickdraw-app-1 bash -lc '
-cd /app/scratch/paperbuild && cp root_code.tex root_build.tex   # a COPY, so root_code.tex stays the main file of the repo
+cd /app/scratch/paperbuild && cp root2.tex root_build.tex   # a COPY, so root2.tex stays the file Overleaf compiles
 pdflatex -interaction=nonstopmode root_build.tex >build1.log 2>&1
 bibtex root_build >/dev/null 2>&1 || true
 pdflatex -interaction=nonstopmode root_build.tex >build2.log 2>&1
