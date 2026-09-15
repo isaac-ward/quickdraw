@@ -38,7 +38,7 @@ AH_ROWS = [
 
 def wm_table() -> str:
     hs = [1, 8, 32, 128]
-    L = [r"\begin{table}[t]", r"  \centering",
+    L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
          r"  \caption{Open-loop prediction on held-out \texttt{starling-2} flight, by horizon. Rows change "
          r"one setting at a time; best per column in bold. The autoencoder floor re-encodes and decodes the "
          r"true frame, so it bounds what any dynamics model can reach.}",
@@ -66,12 +66,12 @@ def wm_table() -> str:
         L.append(f"    {name} & {cells} \\\\")
     L += [r"    \midrule",
           r"    Autoencoder floor & \multicolumn{4}{c}{" + fmt(sum(floors) / len(floors), 4) + r"} \\",
-          r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
+          r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
 
 
 def ah_table() -> str:
-    L = [r"\begin{table}[t]", r"  \centering",
+    L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
          r"  \caption{The play action prior. Energy skill is measured against a context-blind null, so $0$ is "
          r"a model that ignores its context. Rest AUC asks whether the prior identifies the stick being held "
          r"at rest, which a rectified flow cannot place mass on without the percentile transform. $W_1$ is "
@@ -101,7 +101,7 @@ def ah_table() -> str:
             cells.append(t)
         tail = f"  {note}" if note and "rejected" in note else ""
         L.append(f"    {nm} & " + " & ".join(cells) + (r" \\" if not tail else r" \\"))
-    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
+    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
 
 
@@ -125,7 +125,7 @@ def ood_table(paper: str) -> str:
     # walking up from the paper directory -- the paper repo lives outside quickdraw and its depth varies.
     j = json.load(open(os.path.join(LOGS, "paper_icra_2027", "wm_anomaly_classification.json")))
     cov = j.get("coverage", 0.9)
-    L = [r"\begin{table}[t]", r"  \centering",
+    L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
          r"  \caption{Out-of-distribution detection from one-step prediction error, scored per timestep "
          # ESCAPE THE PERCENT SIGN. `{cov:.0%}` emits a bare % and LaTeX comments out the rest of the
          # caption, which ends as "Runaway argument? ... File ended while scanning use of \caption".
@@ -147,24 +147,43 @@ def ood_table(paper: str) -> str:
             if r"\textbf" in label:
                 cells = [r"\textbf{" + c + "}" for c in cells]
             L.append(f"    & {label} & " + " & ".join(cells) + r" \\")
-    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
+    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
 
 
 
 
 # ---- steering: per-request, and then the proposal comparison ---------------------------------------
+# The direction block: one run per candidate source, all at the same 16 contexts x 8 requests, same
+# reward head, same objective, same commit -- the candidate source is the ONLY thing that differs.
+# `gauss` is the control: MPPI's historic white noise, which is what the planner drew from before the
+# prior was wired into it.
 STEER_RUNS = {
+    "gauss": "logs/eval_steer_2026_09_15_05_06_35_phys16_gauss",
+    "data": "logs/eval_steer_2026_09_14_22_08_48_phys16_data",
     "prior": "logs/eval_steer_2026_09_14_22_08_46_phys16_prior",
     "pitdelta": "logs/eval_steer_2026_09_15_01_12_15_phys16_pitdelta",
-    "data": "logs/eval_steer_2026_09_14_22_08_48_phys16_data",
 }
+COLS = [("gauss", "Gaussian"), ("data", "Data chunks"), ("prior", r"Prior (\textbf{ours})"),
+        ("pitdelta", r"Prior, PIT-$\Delta$")]
 VLM_RUNS = {
     "prior": "logs/eval_steer_2026_09_14_21_57_53_best_prior_guided",
     "pitdelta": "logs/eval_steer_2026_09_15_01_29_12_suite_pitdelta",
     "data": "logs/eval_steer_2026_09_15_01_28_55_suite_data_retrieved",
 }
 UNIT = {"yaw": r"$^\circ$", "altitude": "m", "forward": "m", "lateral": "m"}
+PILOT = {"yaw": 471.75, "altitude": 0.58, "forward": 23.63, "lateral": 19.92}   # analysis/steer_physical
+REC_DA = 0.0541          # recorded step-to-step |da| at this rate, same fold (check_action_continuity)
+# The continuity arms. Everything is held fixed except how a chunk is made to continue the one before it,
+# with the two candidate sources that are not the prior kept as references for the smoothness column.
+CONT_ROWS = [
+    ("logs/eval_steer_2026_09_15_05_06_35_phys16_gauss", "Gaussian noise"),
+    ("logs/eval_steer_2026_09_14_22_08_48_phys16_data", "Real data chunks"),
+    ("logs/eval_steer_2026_09_15_05_33_54_phys16_noguid", r"\quad prior, no continuity"),
+    ("logs/eval_steer_2026_09_15_05_58_34_phys16_xfade", r"\quad prior, crossfade"),
+    ("logs/eval_steer_2026_09_14_22_08_46_phys16_prior", r"\quad prior, prefix guidance (\textbf{ours})"),
+    ("logs/eval_steer_2026_09_15_01_12_15_phys16_pitdelta", r"\quad prior, PIT-$\Delta$"),
+]
 
 
 def _phys(run):
@@ -185,6 +204,39 @@ def _phys(run):
         v = physical(np.load(os.path.join(os.path.dirname(f), "proprio.npy")))[key] * sgn
         out.setdefault(d["request"], []).append(v)
     return {k: (sum(v) / len(v), len(v)) for k, v in out.items()}
+
+
+def _jerk(run):
+    """(inside a chunk, at the seam) mean |da|, as a multiple of the recorded step-to-step change.
+
+    The seam spacing is `commit`, not the chunk: a plan re-draws every `commit` steps, so at commit 16 of
+    a 32-step chunk the seams are at 16, 32, 48 ... Reading the chunk instead counts every other seam as
+    interior and dilutes both columns (see analysis/check_action_continuity.py, which this mirrors)."""
+    import glob
+    import json as _j
+
+    import numpy as np
+    fs = sorted(glob.glob(os.path.join(run, "logs", "epoch_*", "eval_steer", "plans", "*", "*",
+                                       "actions.npy")))
+    if not fs:
+        return None
+    d = _j.load(open(os.path.join(os.path.dirname(fs[0]), "plan.json")))
+    if d.get("commit"):
+        K = int(d["commit"])
+    else:                                          # runs from before plan.json recorded it: read the header
+        import re as _re
+        hdr = open(os.path.join(run, "progress.log")).readline()
+        mm = _re.search(r"commit (\d+)", hdr)
+        assert mm, f"no commit in plan.json or the header of {run}"
+        K = int(mm.group(1))
+    seam, inside = [], []
+    for f in fs:
+        a = np.load(f)
+        fold = a.reshape(len(a), -1, 4).mean(axis=1)
+        dd = np.abs(np.diff(fold, axis=0))
+        m = (np.arange(1, len(fold)) % K) == 0
+        seam.append(dd[m]); inside.append(dd[~m])
+    return float(np.concatenate(inside).mean()), float(np.concatenate(seam).mean())
 
 
 def _vlm(run):
@@ -213,44 +265,89 @@ def steer_table(paper: str) -> str:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
     from steer_physical import WANTS
     ph = {k: _phys(v) for k, v in STEER_RUNS.items()}
+    jk = {k: _jerk(v) for k, v in STEER_RUNS.items()}
     vl = {k: _vlm(v) for k, v in VLM_RUNS.items()}
-    L = [r"\begin{table}[t]", r"  \centering",
-         r"  \caption{Language steering, per request. For requests naming a \emph{direction} the readout is "
-         r"the imagined trajectory's net motion along the axis the words name, signed so positive means "
-         r"obeyed, measured in physical units and independent of the reward the planner maximised. For "
-         r"requests naming a \emph{place} the readout is a VLM's label of the imagined video; `null' is how "
-         r"often that place is reached when something \emph{else} was requested, which is a context-blind "
-         r"baseline computed inside the same run. Three candidate sources are compared: the trained prior, "
-         r"the same prior with the increment target, and real recorded action chunks.}",
-         r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{llccc}", r"    \toprule",
-         r"    Request & Asked for & Prior & PIT-$\Delta$ & Data \\", r"    \midrule",
-         r"    \multicolumn{5}{c}{Directions --- net motion achieved} \\", r"    \midrule"]
+    # what a pilot covers on each axis in the same 34 s, so "achieved" has a scale (analysis/steer_physical)
+    PILOT = {"yaw": 471.75, "altitude": 0.58, "forward": 23.63, "lateral": 19.92}
+    REC = 0.0541                                        # recorded step-to-step |da|, same fold
+    nc = len(COLS)
+    L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
+         r"  \caption{Language steering, per request, with the candidate source as the only difference "
+         r"between columns: gaussian noise (MPPI's historic candidates, the control), real recorded action "
+         r"chunks (state-blind but perfectly flyable), the trained prior, and the same prior trained on "
+         r"increments. For a request naming a \emph{direction} the readout is the imagined trajectory's net "
+         r"motion along the axis the words name, signed so positive means obeyed, in physical units and "
+         r"independent of the reward the planner maximised. For a request naming a \emph{place} it is a "
+         r"VLM's label of the imagined video, with `null' --- how often that place is reached when "
+         r"something \emph{else} was asked for --- as the context-blind baseline beside it.}",
+         r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{ll" + "c" * nc + "}", r"    \toprule",
+         r"    Request & Asked for & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
+         r"    \multicolumn{" + str(2 + nc) + r"}{c}{Directions --- net motion achieved, and $\%$ of what a "
+         r"pilot covers in the same $34$\,s} \\", r"    \midrule"]
+    hits = {m: [] for m, _ in COLS}
+    frac = {m: [] for m, _ in COLS}
     for q in ("rotate left", "rotate right", "climb", "descend", "strafe left", "strafe right",
               "fly forward", "fly backward"):
         key, sgn = WANTS[q]
-        asked = f"{key} {'+' if sgn > 0 else '$-$'}"
         cells = []
-        for m in ("prior", "pitdelta", "data"):
+        for m, _ in COLS:
             v = ph[m].get(q)
-            cells.append("--" if v is None else f"{v[0]:+.1f}{UNIT[key]}")
-        L.append(f"    {q} & {asked} & " + " & ".join(cells) + r" \\")
-    L += [r"    \midrule", r"    \multicolumn{5}{c}{Places --- VLM-confirmed, (null)} \\", r"    \midrule"]
+            if v is None:
+                cells.append("--")
+                continue
+            r = v[0] / PILOT[key]
+            hits[m].append(v[0] > 0.05 * PILOT[key]); frac[m].append(r)
+            cells.append(f"{v[0]:+.1f}{UNIT[key]} ({100 * r:+.0f}\\%)")
+        L.append(f"    {q} & {key} {'+' if sgn > 0 else '$-$'} & " + " & ".join(cells) + r" \\")
+    L += [r"    \midrule", r"    \multicolumn{" + str(2 + nc) +
+          r"}{c}{Places --- fraction of plans a VLM confirms reached it, (null)} \\", r"    \midrule"]
     for q in ("wall with black panels", "center of room over mats", "floor to ceiling glass wall",
               "white wall with table", "ladder", "mannequin", "colored floor mat", "table"):
         cells = []
-        for m in ("prior", "pitdelta", "data"):
-            v = vl[m].get(q)
+        for m, _ in COLS:
+            v = vl.get(m, {}).get(q)
             cells.append("--" if v is None else f"{v[0]:.2f}~({v[1]:.2f})")
         L.append(f"    {q} & place & " + " & ".join(cells) + r" \\")
-    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
+    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
+    return "\n".join(L) + "\n"
+
+
+def cont_table(paper: str) -> str:
+    """Obeyed / motion / smoothness per arm. The one table where the continuity mechanism varies."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
+    from steer_physical import WANTS
+    L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
+         r"  \caption{The candidate source and the continuity mechanism, over the same $8$ requests "
+         r"$\times$ $16$ contexts, same reward head, same objective, same commit. `Obeyed' counts requests "
+         r"whose imagined trajectory moved along the named axis by more than $5\%$ of a pilot's mean, and "
+         r"`motion' is the mean of that fraction. $|\Delta a|$ is the commanded step-to-step change as a "
+         r"multiple of the recorded one, inside a chunk and at the seam where a fresh chunk begins; the "
+         r"last column is the ratio, so $1.0$ means the join is indistinguishable from an ordinary step.}",
+         r"  \label{tab:continuity}", r"  \begin{tabular}{lccccc}", r"    \toprule",
+         r"    & Obeyed & Motion & \multicolumn{2}{c}{$|\Delta a| \times$ recorded $\downarrow$} & Seam / \\",
+         r"    \cmidrule(lr){4-5}",
+         r"    Candidates & of $8$ $\uparrow$ & of pilot & in chunk & at seam & inside \\", r"    \midrule"]
+    for run, lab in CONT_ROWS:
+        ph, jk = _phys(run), _jerk(run)
+        if not ph or jk is None:
+            L.append(f"    {lab} & -- & -- & -- & -- & -- \\\\")
+            continue
+        hits = sum(ph[q][0] > 0.05 * PILOT[WANTS[q][0]] for q in ph)
+        frac = sum(ph[q][0] / PILOT[WANTS[q][0]] for q in ph) / len(ph)
+        L.append(f"    {lab} & {hits}/8 & {100 * frac:+.0f}\\% & {jk[0] / REC_DA:.2f} & "
+                 f"{jk[1] / REC_DA:.2f} & {jk[1] / jk[0]:.2f} \\\\")
+    L += [r"    \midrule",
+          r"    Recorded flight & -- & $100\%$ & $1.00$ & $1.00$ & $1.00$ \\",
+          r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
 
 
 def main(paper: str) -> int:
     out = os.path.join(paper, "tables")
     os.makedirs(out, exist_ok=True)
-    for name, fn in (("longhorizon", wm_table), ("actionhead", ah_table), ("ood", ood_table), ("steering", steer_table)):
-        t = fn(paper) if fn in (ood_table, steer_table) else fn()
+    for name, fn in (("longhorizon", wm_table), ("actionhead", ah_table), ("ood", ood_table),
+                     ("steering", steer_table), ("continuity", cont_table)):
+        t = fn(paper) if fn in (ood_table, steer_table, cont_table) else fn()
         open(os.path.join(out, f"{name}.tex"), "w").write(t)
         print(f"  tables/{name}.tex  {len(t.splitlines())} lines")
     return 0
