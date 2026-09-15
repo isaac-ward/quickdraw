@@ -1,0 +1,107 @@
+# eval_steer: language-steered planning INSIDE the world model's imagination. Sample action chunks from the
+# trained prior, roll them through the world model, score the imagined latents with the language reward
+# head, commit the best, repeat -- no environment, no true dynamics.
+
+head: null            # REQUIRED: path to a train_reward_model run's reward_head.pt. null -> the routine skips.
+proposal: prior       # prior | data | gaussian. `prior` draws candidate chunks from the model's action head, which
+#                       is the point of having trained one; `gaussian` is MPPI's historic white noise, kept as
+#                       the control -- if steering works just as well with noise, the prior is not earning its
+#                       place. `data` draws REAL recorded chunks: state-blind but perfectly flyable, the
+#                       null that separates smoothness from conditioning (see steering.DataProposal).
+bank_split: train     # `data` proposal: which split the chunk bank is sliced from. train, not val -- a val
+#                       bank contains the literal continuation of the context being planned from.
+bank_stride: 1        # `data` proposal: window stride when slicing the bank. 1 = every chunk that exists
+#                       (24,737 on starling-2). The first version used stride 8 on val and got 365, which
+#                       starved both the proposal and the prefix-retrieval feasibility test.
+noise_sigma: 0.5      # gaussian proposal only
+harness: []           # post-hoc wrappers over the proposal, outermost last. Any proposal accepts either.
+#                       `held`      snaps a step to the previous one when the change is under `held_tol`,
+#                                   turning near-holds into exact holds. The probe for increment-PIT: the
+#                                   recorded fore/aft stick is held 13.4 steps running and the prior holds
+#                                   it 2.0, worse than a time-shuffled null.
+#                       `crossfade` blends the draw's opening onto the prefix (ACT temporal ensembling).
+#                                   Present as the BASELINE prefix guidance must beat -- RTC reports it
+#                                   failing on multimodal actions, and the average of "bank left" and
+#                                   "bank right" is "fly straight", which nothing ever flew.
+held_tol: 0.02        # `held`: below this raw change, the stick is treated as not having moved
+crossfade_decay: 0.5  # `crossfade`: weight exp(-decay * i) on position i of the overlap
+
+prefix_retrieval: true # DATA ONLY: draw bank chunks that already OPEN where the plan must continue
+#                       (softmax over -distance, so it stays stochastic) instead of uniformly. Needs a
+#                       real bank: at 365 chunks 0% of seams had a full 64-candidate pool within one
+#                       recorded step, at 24,737 it is 46%.
+retrieval_tau: 0.05   # softmax temperature on that distance; larger = closer to uniform
+prefix_guidance: true # PRIOR ONLY. Steer the flow while it integrates so the chunk CONTINUES the previous
+#                       one (RTC, arXiv 2506.07339) instead of starting wherever it likes. Needs no
+#                       retraining: conditioning a joint the head already learned is a legitimate query of
+#                       it. A no-op unless `commit` < the steps scored, since with no overlap there is no
+#                       prefix. No data/gaussian analogue -- a bank can only be searched (measured: its
+#                       64th-nearest opening is 6.3x the recorded step change away) and noise has no
+#                       structure to be continuous with.
+prefix_freeze: 1      # positions pinned at weight 1 before the exponential handoff begins
+prefix_decay: 0.5     # weight exp(-decay * (i - freeze + 1)) after that, 0 past the overlap
+horizon: 128          # planned steps. At subsample=4 on 15 Hz starling that is 34 s, and @+128 is the
+#                       horizon the world model is actually characterised at (the project objective).
+lookahead: 0          # steps scored before committing. 0 -> the prior's own chunk (8). CANNOT exceed it: one
+#                       context describes one chunk, so a longer lookahead would score actions drawn for a
+#                       state the plan has already left.
+commit: 16            # steps EXECUTED before re-planning. 16 = half the chunk-32 head's chunk, which is
+#                       what leaves an OVERLAP for prefix guidance to condition on. Measured at commit=16:
+#                       guidance takes the seam from 8.70x the recorded step change to 2.58x -- a join
+#                       indistinguishable from the chunk's interior (seam/inside 1.05) -- and yaw steering
+#                       IMPROVES with it (+0.208 7/8 -> +0.308 8/8), so continuity costs nothing here.
+#                       0 -> commit everything scored, no overlap, every continuity harness inert. 0 -> everything scored (`lookahead`), which is
+#                       what every run before 2026-09-14 did. Smaller decouples "propose a coherent
+#                       manoeuvre" from "commit to one": the steps a chunk scores highest on do carry the
+#                       requested stick, but the chunk's AVERAGE need not, and committing the whole chunk
+#                       commits its wandering too. Cost scales as lookahead/commit -- commit 4 of a 32-step
+#                       lookahead is 8x the decisions.
+beta_jerk: 0.0        # continuity penalty on the candidate chunk: reward - beta_jerk * mean|da|, with the
+#                       previously committed action prepended so the SEAM between chunks is inside the
+#                       penalty. 0 = off, which is what every run before 2026-09-14 did -- and measured,
+#                       those plans command stick changes 2.5-4x faster than a real flight inside a chunk
+#                       and 8-9x at the seam, because nothing in this planner ever asked for smoothness.
+#                       Normalized action units (the recorded raw step-to-step change is 0.055).
+n_samples: 64         # candidate chunks per block
+objective: level      # level | progress | terminal -- WHAT A CANDIDATE CHUNK IS JUDGED BY, and the one
+#                       knob that changes which candidate gets committed. `level` (mean R over the chunk) is
+#                       what every run before 2026-09-14 used; it SATURATES, measured: a plan hits its
+#                       reachable ceiling by step ~12 of 128 and then has no gradient left, which is why
+#                       reward_gain collapses at long horizon and why commanded motion comes out the same
+#                       for every request. `progress` (R_end - R_start) keeps asking for MORE of the
+#                       requested motion after the level has topped out -- use it when the request names a
+#                       manoeuvre rather than a place. See steering.chunk_return.
+lam: 0.3              # MPPI temperature. Diagnostic only here -- the best candidate is committed, not the
+#                       softmax-weighted mean, because averaging two plausible manoeuvres gives an
+#                       implausible one, which is exactly what a structured proposal must not have done to it.
+n_contexts: 4         # distinct starting contexts from val, per request
+seed: 0
+video: true           # decode each plan to an mp4
+plots: true           # write proprio_3d.png + proprio_axes.png per plan (same viz as the WM open-loop
+#                       rollouts). Turn both off for a many-context sweep: the .npy files and plan.json
+#                       always land, and they are what the analyses actually read.
+
+# REQUESTS, chosen by measurement rather than taste (scratch/probe_requests.py: held-out AUC and precision@20
+# against the labels of 153 unseen clips). P@20 matters more than AUC because MPPI consumes the TOP of the
+# ranking, and the two disagree: `fly upward` has AUC 0.874 but ZERO of its top-20 are climbs, while `climb`
+# -- the same physical request -- gets 22x lift. Use the phrasing closest to the caption vocabulary.
+requests:
+  # SANITY CHECKS: satisfiable by pushing one stick, so failure here is broken plumbing, not a weak model
+  - strafe right            # AUC 0.953  P@20 0.95
+  - strafe left             # AUC 0.956  P@20 0.90
+  - rotate left             # AUC 0.823  P@20 0.95
+  - climb                   # AUC 0.967  22x lift
+  - descend                 # AUC 0.975  35x lift
+  # THE REAL TESTS: require going somewhere, so the reward must shape a trajectory, not one command
+  - fly toward the ladder   # AUC 0.850  P@20 0.55
+  - the table               # AUC 0.853  22x lift
+  - fly forward toward the ladder   # AUC 0.962 -- the compound that beat both of its parts
+  # CONTROLS, so the eval shows its own floor. If these look like successes, the metric is broken.
+  - face the glass wall     # AUC 0.693, 1x lift at the top -- known weak
+  - do nothing              # a REQUEST FOR STILLNESS, and the only one whose success criterion is the
+#                             `still` column (mean |stick|), not the reward: the head ranks stillness at AUC
+#                             0.154, i.e. ANTI-correlated, so a planner maximising R cannot hold the sticks
+#                             centred and should come out with a HIGH still and a negative gain. That is a
+#                             fact about this reward head, not about the drone -- steering stillness with it
+#                             would mean MINIMISING R. If this row ever shows a low `still`, the head has
+#                             learned rest; if it shows a big positive gain, the metric is broken.

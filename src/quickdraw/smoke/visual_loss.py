@@ -35,7 +35,7 @@ Z = torch.randn(6, 32, 128)
 
 # ---- 1. the default mix is exactly MSE ----
 m0 = img()
-l0, _ = m0.decode_loss(Z, X)
+l0, _, _ = m0.decode_loss(Z, X)
 pred = m0.decode_head.velocity(cond=Z)
 check("default mix is l2-only", (m0.visual.w_l2, m0.visual.w_l1, m0.visual.w_lpips) == (1.0, 0.0, 0.0))
 check("default decode loss == F.mse_loss EXACTLY (plumbing is a no-op)",
@@ -43,17 +43,17 @@ check("default decode loss == F.mse_loss EXACTLY (plumbing is a no-op)",
 
 # ---- 2. each term is wired ----
 m1 = img(visual_l1=1.0)
-l1, _ = m1.decode_loss(Z, X)
+l1, _, _ = m1.decode_loss(Z, X)
 check("visual_l1 raises the loss", float(l1) > float(l0), f"{float(l0):.6f} -> {float(l1):.6f}")
 
 mp = img(visual_lpips=1.0, visual_frames=0)
-lp, _ = mp.decode_loss(Z, X)
+lp, _, _ = mp.decode_loss(Z, X)
 skipped = mp.visual._net is None            # LPIPS weights unavailable in this environment
 check("visual_lpips raises the loss", float(lp) > float(l0) or skipped,
       "LPIPS weights unavailable — term skipped" if skipped else f"{float(l0):.6f} -> {float(lp):.6f}")
 
 def dgrad(mod):
-    mod.zero_grad(); loss, _ = mod.decode_loss(Z, X); loss.backward()
+    mod.zero_grad(); loss, _, _ = mod.decode_loss(Z, X); loss.backward()
     p = mod.decode_head.out_conv.weight
     return p.grad.detach().clone()
 g0, g1 = dgrad(img()), dgrad(img(visual_l1=1.0))
@@ -87,7 +87,7 @@ check("FlowField.loss ignores recon_loss (param='v' has no clean prediction)",
 
 # ---- 6. subsampling ----
 ms = img(visual_lpips=1.0, visual_frames=2)
-ls, _ = ms.decode_loss(Z, X)
+ls, _, _ = ms.decode_loss(Z, X)
 ls.backward()
 check("frame subsampling still yields a finite loss and a gradient",
       torch.isfinite(ls) and ms.decode_head.out_conv.weight.grad is not None, f"frames=2, loss {float(ls):.6f}")

@@ -1,0 +1,73 @@
+# =============================================================================================
+# vl128_blockstack — the vl128 recipe carried to the recorded block-manipulation set.
+# Select with `model=vl128_blockstack`, paired with `data=block_stack`.
+# Read conf/model/vl128.yaml first: every loss/architecture rationale lives there and is unchanged.
+# This file changes only what the DATA forces, plus two deliberate additions.
+#
+# WHAT THE DATA FORCES
+#   * `modalities.0.dim: 17` and `action_dim: 5`. The obs layout is DOCUMENTED (the dataset's own
+#     PROCESSING.md §5, summarised in conf/data/block_stack.yaml) so unlike robocasa it needed no
+#     recovery: ee xyz in mm, a 6-D rotation, gripper, then 7 joint angles. The action is the RAW
+#     HUMAN JOYSTICK [move_x, move_y, height, yaw, gripper], deliberately not the commanded pose.
+#   * `img_size: [144, 192]` -- NON-SQUARE, 4:3. A bare int resizes to a square and silently distorts
+#     the frame. `vision.img_hw` takes the tuple form.
+#   * `ae_bottleneck: 9` PAIRED with it, because 9 divides BOTH axes exactly: 144/16 = 9 and
+#     192/16 = 12, so four levels give an exact 9x12 bottleneck grid. 108 readout cells x d128 =
+#     13,824 against a 32x128 = 4,096 latent, i.e. the readout does not choke.
+#
+# TWO DELIBERATE ADDITIONS
+#
+# 1. `decode_out_act: sigmoid`. Bounds the decoder output by construction. vl128 defaults it to `none`
+#    to stay bit-identical to the historical robocasa runs; there is no historical block-stack baseline
+#    to protect, so the safer setting is free. (On torus this was worth 3.4x because 66.9% of its target
+#    pixels are exactly white; real camera frames are not like that, so expect it to do nothing here --
+#    the range diagnostics will say either way.)
+#
+# 2. `decode_kind: mse` ON THE PROPRIO HEAD, not just the image head. This is the eligibility rule for
+#    the first-order derivative term (design/derivative_loss.md §5.1): a noised decoder has no clean
+#    single-pass prediction, and differencing its predictions measures the sampled tau rather than the
+#    motion -- measured at 62% tau noise. Every recipe before this one left proprio on `decode_kind: flow`,
+#    so proprio was ineligible. Setting it here makes BOTH heads eligible from the start.
+#    NOT a free change: it swaps that head's training objective from "denoise at random levels" to
+#    "predict directly", so this recipe is NOT comparable to a flow-proprio baseline on proprio metrics.
+#    The image objective (@+128) is what we rank on, and the step-9 baseline is run with THIS recipe, so
+#    the derivative arm and its control share it.
+#
+# THE DERIVATIVE TERM ITSELF IS OFF HERE (`derivative_weight: 0.0` by default). This recipe is the
+# BASELINE; the arm sets it on the CLI. Off is bit-identical to not having the feature.
+#
+# NOT COVERED HERE -- pass on the CLI:
+#   data=block_stack   data.subsample=8   environments=recorded
+#   (subsample 8 is MEASURED, not copied -- see conf/data/block_stack.yaml's header table)
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+action_dim: 5
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them, so inheriting vl128 and editing
+  # one entry is impossible -- and being explicit is what makes the recipe auditable.
+  - {name: proprio, kind: vector, dim: 17, weight: 1.0,
+     decode_kind: mse,        # <-- addition 2: makes proprio ELIGIBLE for the derivative term
+     decode_param: x0, decode_arch: mlp}
+  - {name: image, kind: image, weight: 1.0,
+     img_size: [144, 192],    # (H, W) -- NEVER an int here
+     ae_bottleneck: 9,        # PAIRED with img_size -> an exact 9x12 bottleneck grid
+     pretrained: false,
+     num_tokens: 32,
+     encode_arch: conv,
+     encode_base: 32,
+     decode_kind: mse,
+     decode_arch: up,
+     decode_base: 64,
+     decode_out_act: sigmoid, # <-- addition 1
+     decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64,
+     visual_l1: 3.0,
+     visual_l2: 0.0,
+     visual_lpips: 1.0,
+     visual_lpips_net: vgg,
+     visual_frames: 128,
+     latent_loss_weight: 10}

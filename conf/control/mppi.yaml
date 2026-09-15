@@ -33,3 +33,12 @@ reuse_render: true     # control video renderer reuse. true: FAST persistent plo
 reward_override: null  # optional dotted path to a callable reward_fn(obs, goal) that replaces env.reward
                        # as the scored per-step reward for BOTH controllers (e.g. mypkg.rewards.my_fn).
                        # null (default) = the env's own reward. language.head steering is separate/unaffected.
+proposal: gaussian     # gaussian | prior. WHERE MPPI'S CANDIDATES COME FROM. `gaussian` is mean + noise_sigma
+                       # * randn, what every run before 2026-09-14 did (and bit-identical to it -- the code
+                       # moved into evaluation/steering.GaussianProposal, the arithmetic did not).
+                       # `prior` draws from the trained action prior instead, conditioned on the pooled
+                       # backbone context, so candidates look like recorded pilot commands rather than white
+                       # noise -- which matters most where noise is worst: it never holds a stick still, and
+                       # the starling commands are at rest 23-58% of the time. Requires a checkpoint with an
+                       # action head, and PINS horizon <= the head's chunk (one context describes one chunk),
+                       # so set horizon: 8 / chunk: 8 alongside it. Same proposal object eval_steer uses.

@@ -27,6 +27,17 @@ EVAL_VIEW_PAD = _PAD  # eval plots use the same tight ~±1.3 framing as summarie
 N_SEG = 16          # discrete hue bands around the ring
 FPV_FOV = 103.5     # egocentric camera FOV (deg); VTK default is 30
 FPV_SIZE = 256      # egocentric video resolution (px, square)
+PREVIEW_FPS = 30    # Container rate for every human-viewing mp4 (eval rollouts, summary videos), in Hz.
+#                     ONE FRAME PER CONTAINER FRAME -- frames are never repeated, interpolated or dropped,
+#                     so 30 unique frames per second and a perfectly even cadence. A preview therefore plays
+#                     FASTER THAN REAL TIME whenever the true step rate is below 30: at 15 Hz data that is
+#                     2x at stride 1, 6x at stride 3, 8x at stride 4. The factor is printed to progress.log
+#                     once per run, never silently applied. Set null to encode at the true step rate instead
+#                     (real time), which for a strided run is a slideshow -- 3.75 Hz is 34 s of 128 steps.
+#                     Overridable per environment via `environments.preview_fps`.
+#                     Earlier versions repeated frames to reach the container rate. That preserved duration
+#                     but added no unique frames, and a non-integer repeat ratio (12 -> 30) made the cadence
+#                     UNEVEN, which reads as judder. Repetition is strictly worse than just encoding faster.
 SURFACE_EPS = 0.02  # absolute outward lift for trajectory lines/arrows (no z-fighting, any R,r)
 ACTION_SMOOTH_WINDOW = 18  # default boxcar window for action-arrow smoothing (config can override)
 TORUS_OPACITY = 0.6  # legacy default still passed by some callers; _build overrides it with the constants below
@@ -499,12 +510,16 @@ def fig_error_vs_step(errors: dict[str, np.ndarray], colors: dict[str, str] | No
 
 
 # ------------------------- public: videos -------------------------
-def save_mp4(path, frames, fps, quality=9):
+def save_mp4(path, frames, fps, quality=9, playback_fps=None):
+    """`fps` is the frames' TRUE sample rate; `playback_fps` is the rate to ENCODE at, one frame per
+    container frame (so the clip plays `playback_fps/fps` times real time). None -> encode at the true rate."""
     import imageio.v2 as imageio
 
+    rate = float(playback_fps or fps)
     # macro_block_size=2: pad odd dims up to even (libx264 requires divisible-by-2), no 16-px padding.
     # quality (0-10, higher = sharper/larger): default high so summary videos aren't mushy.
-    imageio.mimwrite(path, list(frames), fps=max(1, int(round(fps))), macro_block_size=2, quality=quality)
+    # rate stays FLOAT: rounding silently retimed strided rollouts (3.75 -> 4 is 6.7% too fast).
+    imageio.mimwrite(path, list(frames), fps=max(1e-3, rate), macro_block_size=2, quality=quality)
 
 
 def stitch_grid_video(paths, out_path, grid, fps):
@@ -839,11 +854,15 @@ def _pad3(P, frac=0.05):
 _GT_C, _PRED_C, _CTX_C = "black", "0.55", "black"
 
 
-def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0):
+def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0, curve_labels=("GT", "pred")):
     """Geometry-FREE 3D open-loop trajectory (the torus atlas' cross-env sibling): GT vs PRED world positions
     for a recorded env with no renderable geometry. `true_xyz`/`pred_xyz` START at the fork anchor (the last
     context point) so both branch from the same place; `ctx_xyz` is the pre-fork context. All inputs (·,3)
-    physical positions. Visual language: see _GT_C/_PRED_C above."""
+    physical positions. Visual language: see _GT_C/_PRED_C above.
+
+    `curve_labels` renames the two curves for callers where "GT" would be a LIE: eval_steer plans its own
+    actions, so the recorded future is not the ground truth of that rollout -- it is a different trajectory
+    entirely, shown only for scale. Default unchanged."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
     ctx = np.asarray(ctx_xyz, float).reshape(-1, 3)
     tru = np.asarray(true_xyz, float).reshape(-1, 3)
@@ -855,8 +874,8 @@ def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0):
     ax.set_box_aspect((xl[1] - xl[0], yl[1] - yl[0], zl[1] - zl[0]))
     if len(ctx) > 1:
         ax.plot(ctx[:, 0], ctx[:, 1], ctx[:, 2], color=_CTX_C, ls="--", lw=1.3, label="context")
-    ax.plot(tru[:, 0], tru[:, 1], tru[:, 2], color=_GT_C, lw=1.8, label="GT")
-    ax.plot(prd[:, 0], prd[:, 1], prd[:, 2], color=_PRED_C, lw=1.8, label="pred")
+    ax.plot(tru[:, 0], tru[:, 1], tru[:, 2], color=_GT_C, lw=1.8, label=curve_labels[0])
+    ax.plot(prd[:, 0], prd[:, 1], prd[:, 2], color=_PRED_C, lw=1.8, label=curve_labels[1])
     ax.scatter(*tru[-1], color=_GT_C, s=70, depthshade=False)          # GT end ball
     ax.scatter(*prd[-1], color=_PRED_C, s=70, depthshade=False)        # pred end ball
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
@@ -867,7 +886,8 @@ def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0):
     return fig
 
 
-def fig_pos_vs_time(ctx_xyz, true_xyz, pred_xyz, *, fork_step, labels=None, title=""):
+def fig_pos_vs_time(ctx_xyz, true_xyz, pred_xyz, *, fork_step, labels=None, title="",
+                    curve_labels=("GT", "pred")):
     """Per-axis position-vs-step panels (one row per position dim) — the readable companion to fig_paths_3d for
     a docking-style approach (you see each coordinate converge or diverge). Same visual language; a faint
     vertical dotted line marks the fork (a LINE, not a sphere). `true_xyz`/`pred_xyz` START at the fork anchor;
@@ -886,8 +906,8 @@ def fig_pos_vs_time(ctx_xyz, true_xyz, pred_xyz, *, fork_step, labels=None, titl
         ax = axes[d][0]
         if P > 1:
             ax.plot(tc, ctx[:, d], color=_CTX_C, ls="--", lw=1.2, label="context")
-        ax.plot(tf, tru[:, d], color=_GT_C, lw=1.6, label="GT")
-        ax.plot(tf, prd[:, d], color=_PRED_C, lw=1.6, label="pred")
+        ax.plot(tf, tru[:, d], color=_GT_C, lw=1.6, label=curve_labels[0])
+        ax.plot(tf, prd[:, d], color=_PRED_C, lw=1.6, label=curve_labels[1])
         ax.scatter(tf[-1], tru[-1, d], color=_GT_C, s=40, zorder=5)
         ax.scatter(tf[-1], prd[-1, d], color=_PRED_C, s=40, zorder=5)
         ax.axvline(fork_step - 1, color="0.8", lw=1.0, ls=":")     # fork marker (a line, not a sphere)

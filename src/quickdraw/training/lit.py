@@ -161,6 +161,21 @@ class LitWorldModel(L.LightningModule):
         # fixed stride) -> every frame gets recon gradient over an epoch (unbiased). The DYNAMICS loss (flow /
         # pred_latent, below) stays on all F frames regardless. frac=1.0 (default) = decode all frames.
         frac = self.recon_frac if tag == "train" else 1.0
+        # RECON_FRAC x DERIVATIVE: the first-order term differences ADJACENT decoded frames, and the subset
+        # below is a randperm -- so under frac<1 the "adjacent" rows are frames t=17 and t=52 of the rollout,
+        # and the term would silently compute a difference over a random time gap instead of one step. It
+        # would not error, log oddly, or look wrong; it would just optimise nonsense. design/derivative_loss.md
+        # asks for this assert and it was never added. Raise at the first step rather than train on garbage.
+        if frac < 1.0 and any(float(getattr(mod, "derivative_weight", 0.0) or 0.0) > 0.0
+                              for mod in getattr(m, "modalities", {}).values()):
+            hot = [n for n, mod in m.modalities.items()
+                   if float(getattr(mod, "derivative_weight", 0.0) or 0.0) > 0.0]
+            raise ValueError(
+                f"model.recon_frac={frac} < 1.0 with derivative_weight > 0 on {hot}. The first-order term "
+                f"differences ADJACENT decoded frames, but recon_frac<1 decodes a RANDOM subset of the "
+                f"rollout, so the 'adjacent' pairs would span arbitrary time gaps and the term would "
+                f"optimise noise silently. Set model.recon_frac=1.0 (vl128_starling does; bsp32mse.yaml "
+                f"sets 0.25 and is inherited by several recipes), or set derivative_weight=0.")
         if frac < 1.0:
             Tf = recon_src.shape[1]; k = max(1, int(round(frac * Tf)))
             idx = torch.randperm(Tf, device=recon_src.device)[:k]
@@ -474,8 +489,9 @@ class LitActionModel(L.LightningModule):
         from torch.nn.attention import SDPBackend, sdpa_kernel
         with torch.no_grad(), sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):  # frozen WM: contexts only
             h_ctx = m.action_context(obs, act)                # (B, L-1, d): h[k] predicts a[k+1] (leak-free)
-        cond = h_ctx[:, :-1]                                  # h[t-1], aligned to predict a[t] for t=1..L-2
-        a_target = act[:, 1:L_ - 1].detach()                  # a[1..L-2] — same alignment as loss_terms
+        cond, a_target = m.action_pairs(h_ctx, act)           # THE shared alignment (see MultiModalFlow)
+        assert cond is not None, (f"data.P+data.F={L_} is too short for action_head.chunk="
+                                  f"{m.action_head_chunk}; need L >= chunk+2")
         l_flow, l_cons = m.action_flow.loss(cond, a_target, time_sampling=m.time_sampling)
         loss = l_flow if l_cons is None else l_flow + l_cons
         self.log(f"{tag}/loss/action/flow", l_flow)

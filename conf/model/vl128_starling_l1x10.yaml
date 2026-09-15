@@ -1,0 +1,77 @@
+# =============================================================================================
+# vl128_starling_l1x10 — vl128_starling with the pixel term at 10.0. `model=vl128_starling_l1x10`.
+# The LOSS arm. Read conf/model/vl128_starling.yaml first; this changes ONE number, and it sits on the
+# DEPTH-2 base deliberately (see the last note).
+#
+# WHY, and it is not the codec. The failure on the flight sets is POSITIONAL, and the decomposition is
+# unambiguous (measured on `starling_vl128` at ep5, sharpness = fraction of pixels with |grad| > 0.08,
+# predicted over ground truth):
+#
+#                                   AE floor (codec only)     open-loop (codec + dynamics)
+#     starling  depth2 ep5                0.855                        0.174
+#     starling  depth4 ep5                0.882                        0.174
+#     robocasa  twocam  ep29              0.890                        0.856
+#
+# The codec renders sharp structure as well as robocasa's does. The ROLLOUT then throws 80% of it away,
+# where robocasa's keeps 96%. Ground-truth sharpness is the same in both (18.78% vs 20.29%), so it is not
+# the scene. The distinguishing fact is that robocasa's camera is FIXED -- most pixels are unchanged step
+# to step, so sharp structure survives by being carried forward -- while here the camera IS the drone and
+# every thin line must be re-localised at a new position every step.
+#
+# WHY THE LOSS MIX IS A LEVER ON THE DYNAMICS, which is the part that is easy to get wrong. `VisualLoss`
+# trains TWO sites: the roundtrip anchor (weight 10, real encoded frames -> the codec) and the AR decode
+# loss (weight 1.0, ROLLED latents). Per design/flow.md the AR decode loss is the ONLY autoregressive
+# gradient in the model and reaches the dynamics solely through the decoder's Jacobian -- so vl64.yaml's
+# header already names this exact failure: "a loss blind to spatial displacement tells the dynamics that
+# LANDING IN THE WRONG PLACE IS CHEAP. LPIPS scores VGG features after several POOLING stages, and is
+# exactly that blind." L1 is the only term in the mix that prices displacement.
+#
+# THE MIX HAS NEVER BEEN VARIED ON THIS DATASET. All four starling runs to date (starling_vl128,
+# starling2_vl128, starling_heavy, starling2_heavy) are l1=3.0 / lpips=1.0, inherited from vl128 where
+# 3.0 was solved for ROBOCASA's codec. Measured on the STARLING codec the natural ratio is 3.97:1, so:
+#     l1= 3.0  ->  43% pixel / 57% perceptual   <- every run so far
+#     l1= 3.97 ->  50 / 50   (parity on this codec)
+#     l1= 5.0  ->  56 / 44
+#     l1=10.0  ->  72 / 28   <- THIS RECIPE
+#
+# WHAT IT SPENDS AND WHY THAT IS AFFORDABLE. 72/28 is strongly pixel-dominant and the codec will very
+# likely get blurrier; §22 is unambiguous that pixel-only losses blur (though L1's minimiser is the
+# conditional MEDIAN, not L2's MEAN, so it blurs less). That is the trade being made ON PURPOSE: the codec
+# sits at 0.88 of the achievable sharpness with headroom to spare, while the dynamics sits at 0.174. We
+# are spending codec quality we are not using to buy positional accuracy we badly need. If the floor
+# degrades and @+128 does not improve, the trade is refuted and the mix is not the lever after all.
+#
+# ON THE DEPTH-2 BASE, NOT depth-4. `vl128_starling_heavy` (flow_arch_depth 4) is currently LOSING on the
+# only metric that counts -- better at 2/7 matched epochs at @+128 on starling, 2/6 on starling-2 -- so
+# stacking this on it would inherit a change that is not working and make a good result unattributable.
+# One variable against the baseline that is actually winning.
+#
+# NOT COVERED HERE -- pass on the CLI, same as vl128_starling:
+#   data=starling|starling2   data.subsample=5   environments=recorded
+# =============================================================================================
+defaults:
+  - vl128_starling
+  - _self_
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them.
+  - {name: proprio, kind: vector, dim: 16, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  - {name: image, kind: image, weight: 1.0,
+     img_size: [112, 192],
+     ae_bottleneck: 7,
+     pretrained: false,
+     num_tokens: 32,
+     encode_arch: conv,
+     encode_base: 32,
+     decode_kind: mse,
+     decode_arch: up,
+     decode_base: 64,
+     decode_out_act: sigmoid,
+     decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64,
+     visual_l1: 10.0,        # <-- THE change (was 3.0). 72% pixel / 28% perceptual on this codec.
+     visual_l2: 0.0,
+     visual_lpips: 1.0,
+     visual_lpips_net: vgg,
+     visual_frames: 128,
+     latent_loss_weight: 10}

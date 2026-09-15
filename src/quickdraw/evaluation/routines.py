@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 import matplotlib.pyplot as plt
@@ -17,9 +18,11 @@ import numpy as np
 from ..controller.run import _plog, run_and_log_control
 from ..environments.registry import make_env
 from ..logging import viz
-from ..training.setup import eval_episodes, image_head_cams, image_head_sizes, resolve_data_root
+from ..training.setup import (effective_action_dim, eval_episodes, image_head_cams, image_head_sizes,
+                             resolve_data_root, step_fps)
 import torch
 
+from .conditional import blind_null, energy_score, energy_skill, rank_calibration, rest_skill
 from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_curves, proprio_curves
 from .products import emit_openloop
 
@@ -101,7 +104,7 @@ def _openloop_split(cfg, model, norm, writer, device, split, R, r, v_scale, pref
 
 
 @torch.no_grad()
-def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
+def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int, n_ep_override=None):
     """THE single definition of eval_ood_horizon's shapes. `eval_ood_horizon` and autobatch's `probe_eval` both
     call this, so the memory probe CANNOT drift from the thing it is estimating.
 
@@ -115,7 +118,13 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
     Returns (n_ep, H, cl_h, modes, calls) where modes = [(name, every, horizon)] and calls =
     [(name, rows, horizon)] is the per-imagine_eval-call shape, i.e. the memory-relevant unit (see
     rollout_regrounded's `cap`)."""
-    n_ep = min(max(8, int(cfg.eval.get("n_plot", 2) or 2)) if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32), len(ep_lens))
+    # 8 with an image head is a DECODE-COST cap on val's ~1785-step episodes. The OOD/memory splits are
+    # ~31 model steps, so decoding all 10-12 of them costs less than 8 of val's -- and with only 10 episodes
+    # in a split, throwing 2 away for no reason weakens the only measurement they exist for. The override
+    # lets the split-driven routine ask for all of them; None keeps every existing run's shape untouched.
+    # (max(8, n_plot) preserved so a bigger n_plot -- e.g. 16 dock reconstructions -- actually evals that many.)
+    n_ep = min(int(n_ep_override) if n_ep_override else
+               (max(8, int(cfg.eval.get("n_plot", 2) or 2)) if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32)), len(ep_lens))
     H = min(int(cfg.eval.get("horizon", 2048)), min(ep_lens[:n_ep]) - P - 1)
     cl_steps = [int(x) for x in cfg.eval.get("closed_loop_steps", [1, 16])]
     cl_h = min(H, int(cfg.eval.get("closed_loop_horizon", 256) or H))
@@ -131,7 +140,7 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int):
 @torch.no_grad()          # every sibling eval routine has this; ood_horizon did not, so its latent pass was
 #                           building a full autograd tape over a 128-step rollout every eval epoch and
 #                           discarding it. imagine_eval was already guarded internally; latent_pass was not.
-def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
+def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None, tag=None):
     """The ONE long-horizon eval for every model (OOD: horizon >> trained). Held-out val episodes, decoding
     proprio (always) + any image head; the code generalizes over arbitrary trunks. Products are nested under
     a MODE sub-path, one full product set per mode:
@@ -145,27 +154,47 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     import numpy as _np
 
     from ..data.dataset import load_split_episodes_mm
+    # THE SPLIT AND THE PRODUCT PREFIX ARE THE ONLY THINGS THAT WERE EVER SPLIT-SPECIFIC HERE. Everything
+    # downstream -- the rollout, per-head psnr/ssim/lpips, the proprio obs/manifold/pointwise/tangent
+    # error, the filmstrips, the rollout mp4s, the error-vs-step curves -- reads the episodes it is handed.
+    # Parameterising these two makes the OOD and memory splits measurable with the IDENTICAL metric code
+    # that produced the @+128 numbers, so they are comparable by construction rather than by argument.
+    split = str(split or cfg.eval.get("horizon_split", "val"))
+    tag = str(tag or "eval_ood_horizon")
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
     heads = ["proprio"] + img_heads
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    P, fps = cfg.data.P, round(1.0 / ecfg.dt)
+    P, fps = cfg.data.P, step_fps(cfg, ecfg)
     dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None                  # chunk image decode over horizon (PR #8 bug 2)
 
     def prog(pct, what):
-        _plog(writer, f"[eval_ood_horizon @ep{step}] {pct:3d}% — {what}")
+        _plog(writer, f"[{tag} @ep{step}] {pct:3d}% — {what}")
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
+    eps = load_split_episodes_mm(resolve_data_root(cfg), split,
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
+    # DROP THE REVIEWED-OUT EPISODES before anything is measured. data/ood_windows.py records which OOD
+    # clips carry no usable anomaly -- the noodle never entered frame, or the blower produced no motion
+    # above the drone's own hover noise -- plus one memory clip whose turn returns too late to fall inside
+    # any rollout. Scoring them would average real events together with clips containing no event, which
+    # moves the number toward val for a reason that has nothing to do with the model. Splits with no
+    # annotation (train/val) are untouched.
+    from ..data.ood_windows import kept as _kept_eps
+    keep = [i for i in _kept_eps(split) if i < len(eps)]
+    if len(keep) < len(eps):
+        _plog(writer, f"[{tag} @ep{step}] reviewed exclusions: keeping {len(keep)}/{len(eps)} episodes "
+                      f"({[i for i in range(len(eps)) if i not in keep]} dropped, see data/ood_windows.py)")
+        eps = [eps[i] for i in keep]
     if cfg.eval.get("longest", False):
         eps = sorted(eps, key=lambda e: -len(e[0]))   # longest (full-dock) episodes first — presentation
     n_ep, H, cl_h, _modes, _calls = ood_horizon_shapes(cfg, bool(img_heads),
-                                                      [len(o) for o, _, _ in eps], P)
+                                                      [len(o) for o, _, _ in eps], P,
+                                                      n_ep_override=cfg.eval.get("horizon_n_episodes"))
     eps = eps[:n_ep]
     n_plot = min(int(cfg.eval.get("n_plot", 2) or 2), n_ep)   # per-episode visuals; SAME episode indices (0..n_plot-1) across all modes
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
@@ -240,7 +269,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         try:
             if bag is None:      # LOUD: latent_cos is the primary metric for the dfptf experiments, and a
                 #                  silent {} here would make it vanish from the panel with no explanation.
-                _plog(writer, f"[eval_ood_horizon @ep{step}] latent curves SKIPPED: imagine_eval returned no "
+                _plog(writer, f"[{tag} @ep{step}] latent curves SKIPPED: imagine_eval returned no "
                               f"`_bag` (return_bag path). The decoded-image products are unaffected.")
                 return {}
             gt = {"proprio": norm.norm_obs(p_true[:, :Hm])}
@@ -252,7 +281,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
                 z_gt = m.encode_state(gt, anc)
             return latent_curves(bag[:, :Hm].float(), z_gt.float())
         except Exception as e:                       # fail-soft but NOT silent (design/logging.md)
-            _plog(writer, f"[eval_ood_horizon @ep{step}] latent curves SKIPPED ({type(e).__name__}: {e}) — "
+            _plog(writer, f"[{tag} @ep{step}] latent curves SKIPPED ({type(e).__name__}: {e}) — "
                           f"the decoded-image products are unaffected")
             return {}
 
@@ -301,7 +330,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
                 f"Closed-loop rollout: the GROUND-TRUTH observation is re-injected as context every {every} steps "
                 f"(over a {Hm}-step horizon), so error resets each re-grounding instead of compounding.")
         lat = latent_pass(Hm, bag) if open_loop else None      # open-loop only (see latent_pass)
-        summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm, lat=lat))
+        summary.update(score_and_emit(out, f"{tag}/{name}", desc, Hm, lat=lat))
 
     if was:
         m.train()
@@ -328,7 +357,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    P, fps = cfg.data.P, round(1.0 / ecfg.dt)
+    P, fps = cfg.data.P, step_fps(cfg, ecfg)
     dev = device if isinstance(device, str) else device.type
 
     def prog(pct, what):
@@ -406,6 +435,50 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
     return summary
 
 
+@torch.no_grad()
+def eval_held_out_splits(cfg, model, norm, ecfg, writer, device, step=0):
+    """Open-loop prediction error on NAMED held-out splits -- the OOD and memory campaigns.
+
+    starling-2 ships four of them beside train/val (see conf/data/starling2.yaml for the manifest):
+
+        eval_ood_noodle        a novel object enters the frame          -> VISUAL ood, read the image error
+        eval_ood_leafblower    airflow pushes the drone                 -> DYNAMIC ood, read the proprio error
+        eval_memory_backwall1  turn away from a scene and back again    -> does the rolled state keep it
+        eval_memory_backwall2
+
+    THE METRICS ARE NOT NEW, deliberately. This calls `eval_ood_horizon` once per split with its `split`
+    and product `tag` swapped, so every number -- per-head psnr/ssim/lpips, proprio obs/manifold/pointwise/
+    tangent error, error-vs-step curves, filmstrips, rollout mp4s -- comes from the identical code that
+    produced the headline @+128 figures on val. Comparable by construction, not by argument. Run `val`
+    alongside in `eval.splits` to get the in-distribution baseline from the same invocation.
+
+    THE HORIZON IS BOUNDED BY THE CLIPS, and it is short: these episodes are ~125 frames at 15 Hz, so at
+    the trained stride of 4 they are ~31 model steps and `ood_horizon_shapes` clamps H to about 22 after
+    the P=8 context. That is ample for the OOD splits (the novelty arrives inside it) and TIGHT for memory
+    -- measured, the away-and-back spans 8-21 model steps against a 32-step attention window, so the
+    departed scene is still inside the window when the drone returns. The honest claim on this data is that
+    the SELF-ROLLED state preserves the scene through a turn (only P=8 frames are real; the rest of the
+    window is the model's own predictions), not that memory outlives the window.
+    """
+    splits = [str(x) for x in (cfg.eval.get("splits") or [])]
+    if not splits:
+        _plog(writer, f"[eval_held_out_splits @ep{step}] eval.splits is empty -- nothing to do. Set e.g. "
+                      f"eval.splits=[val,eval_ood_noodle,eval_ood_leafblower,eval_memory_backwall1,"
+                      f"eval_memory_backwall2]")
+        return {}
+    root = resolve_data_root(cfg)
+    summary = {}
+    for sp in splits:
+        if not os.path.isdir(os.path.join(root, sp)):
+            raise FileNotFoundError(
+                f"split {sp!r} is not in the dataset at {root}. Available: "
+                f"{sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d)))}")
+        _plog(writer, f"[eval_held_out_splits @ep{step}] === {sp}")
+        summary.update(eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step,
+                                        split=sp, tag=f"eval_split/{sp}"))
+    return summary
+
+
 def _ood_axis(cfg, model, norm, ecfg, writer, device, step, split):
     """Open-loop on one OOD split, scored on its own geometry + drawn with its coloring (from the
     dataset card). Shared by the visual/geometric/dynamics axes."""
@@ -415,7 +488,7 @@ def _ood_axis(cfg, model, norm, ecfg, writer, device, step, split):
     #                            a .get default is eval'd eagerly, so ecfg.R/.r must not be bare (crashes on non-torus envs)
     s = _openloop_split(cfg, model, norm, writer, device, split, se["R"], se["r"],
                         se.get("init_speed", getattr(ecfg, "init_speed", None)), split, step,
-                        coloring.get(split, "rainbow"), fps=round(1.0 / ecfg.dt))
+                        coloring.get(split, "rainbow"), fps=step_fps(cfg, ecfg))
     return {split: s}
 
 
@@ -433,7 +506,26 @@ def eval_ood_dynamics(cfg, model, norm, ecfg, writer, device, step=0):
 
 def eval_control(cfg, model, norm, ecfg, writer, device, step=0):
     """Dual MPPI control (oracle vs learned) through a random sequence of 8 goals. Multimodal models plan
-    with an FPV context rendered in the loop (run_and_log_control handles it)."""
+    with an FPV context rendered in the loop (run_and_log_control handles it).
+
+    SKIPS CLEANLY when the env cannot be stepped. MPPI rolls a candidate action sequence through the env,
+    so an env with no simulator cannot run control AT ALL -- and the env already says so: RecordedEnv marks
+    `reset`/`step` as `not_provided`, which log_env_capabilities prints as `reset x no-sim | step x no-sim`
+    at the start of every run. Nothing consulted that, so a recorded run instead dived into MPPI and died
+    somewhere inside on an unrelated symptom (a KeyError on the torus-only `fpv["coloring"]`, or before
+    that a TypeError from int() on a non-square img_size), which the callback counts toward its fatal
+    streak as a BUG. Ask the env first and raise NotImplementedError, the clean-skip the callback already
+    understands, so the log says the true reason instead of a misleading traceback."""
+    from ..environments.base import env_provides
+    from ..environments.registry import make_env
+    env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, device)
+    missing = [h for h in ("reset", "step") if not env_provides(env, h)]
+    if missing:
+        raise NotImplementedError(
+            f"{type(env).__name__} provides no {'/'.join(missing)} -- MPPI has to roll candidate action "
+            f"sequences through a simulator, and a recorded dataset has none. This is the env contract "
+            f"working, not a failure; turn the routine off with eval.during_train.evals.control=false to "
+            f"stop it being requested at all.")
     return {"control": run_and_log_control(cfg, model, norm, ecfg, writer, device, step)}
 
 
@@ -455,6 +547,22 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
+    # CAP THE EPISODE LENGTH THAT GETS FORWARDED. manifold_predictions runs the model over each selected
+    # episode WHOLE, so cost scales with episode length, not with n_points. block-stack val holds 2 very
+    # long episodes (3,638 and 3,321 steps at stride 5), so every eval forwarded ~2 GB of resident frames
+    # across two image heads plus activations over the full T -- 6.5 GiB on top of a training process
+    # already holding 89 GiB, which OOMed and killed the routine every time. A projection needs a
+    # REPRESENTATIVE sample of latents, not every timestep: 2 x 1024 steps is ~2,000 points, comfortably
+    # more than UMAP/t-SNE need to show structure, and it is the same points these plots would have drawn
+    # from anyway (n_points=8000 exceeded the 6,941 available, so it was using all of them).
+    max_steps = int(cfg.eval.get("manifold_max_steps", 1024) or 0)
+    if max_steps:
+        # An mm_eps entry is (obs (T,D), act (T,A), frames) where frames is ALWAYS A DICT
+        # {camera: (T,H,W,3)} -- see load_split_episodes_mm. Slicing the tuple elementwise treats
+        # that dict as sliceable and raises `KeyError: slice(None, 1024, None)`, which is exactly
+        # how this landed broken the first time.
+        mm_eps = [(o_[:max_steps], a_[:max_steps], {k: v[:max_steps] for k, v in fr_.items()})
+                  for o_, a_, fr_ in mm_eps]
     _, latents, n_avail = manifold_predictions(m, norm, mm_eps, P=cfg.data.P, n_points=8000,
                                                 stride=1, seed=0, device=device)
     sub = (f"each point = one committed 1-step next-state prediction from a real val context "
@@ -842,6 +950,31 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     return {}
 
 
+def _caption_lines(text: str, px: int, max_lines: int = 4):
+    """Wrap `text` to fit `px` wide, MEASURED with cv2.getTextSize rather than guessed from a characters-
+    per-line heuristic (which overflowed the bar). Shrinks the font until the whole caption fits in
+    max_lines, and returns (lines, scale, line_height) so the caller can size the bar to the text instead
+    of the other way round."""
+    import cv2
+    fnt, pad = cv2.FONT_HERSHEY_SIMPLEX, 6
+    for scale in (0.40, 0.36, 0.32, 0.28, 0.24, 0.20):
+        th = cv2.getTextSize("Ag", fnt, scale, 1)[0][1]
+        lines, cur = [], ""
+        for w in str(text).split():
+            trial = (cur + " " + w).strip()
+            if cv2.getTextSize(trial, fnt, scale, 1)[0][0] <= px - 2 * pad:
+                cur = trial
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        if len(lines) <= max_lines:
+            return lines, scale, th + 5
+    return lines[:max_lines], scale, th + 5
+
+
 @torch.no_grad()
 def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     """VLM-labeled latent interpretability (vision models ONLY; self-skips otherwise). Imagine N short clips
@@ -864,12 +997,21 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     if img_head is None:
         _plog(writer, f"[eval_interpret @ep{step}] no image head — eval_interpret is a vision probe, skipping")
         return {}
+    assert not cfg.interpret.get("_unset"), (
+        "no interpretability environment selected: pass `interpret=<env>` explicitly "
+        "(starling | torus | pendulum). The factor definitions are per-environment and the default is a "
+        "sentinel on purpose -- see conf/interpret/unset.yaml.")
     ic = OmegaConf.to_container(cfg.interpret, resolve=True)
     factors = ic["factors"]
+    # REQUIRED per environment: what each raw action axis MEANS. It is written into the VLM prompt, and a
+    # number whose meaning is not stated is worse than no number (see interpret.build_action_text).
+    _axes = ic.get("action_axes")
+    assert _axes, (f"conf/interpret/<env>.yaml must declare `action_axes` -- one {{name, positive, "
+                   f"negative}} per RAW action axis, in order. It names the sticks for the VLM prompt.")
     was = m.training
     m.eval()
     t0 = time.perf_counter()
-    P, H, fps = cfg.data.P, int(ic["clip_len"]), round(1.0 / ecfg.dt)
+    P, H, fps = cfg.data.P, int(ic["clip_len"]), step_fps(cfg, ecfg)
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
@@ -923,7 +1065,13 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     for f, fc in factors.items():
         if "analytic" in fc:
             kind = fc["analytic"]["kind"]
-            ana[f] = I.bucketize(kind, [I.analytic_scalar(kind, p, ecfg.R) for p in pro_all], fc, r=ecfg.r)
+            _dims = fc["analytic"].get("dims")
+            # `from: action` reads the COMMANDED action rather than the imagined proprio. For a world model
+            # that is the sharper question -- does the video it paints show the motion it was TOLD to make
+            # -- and the actions are exact inputs to the rollout, not predictions.
+            _src = clip_acts if fc["analytic"].get("from") == "action" else pro_all
+            ana[f] = I.bucketize(kind, [I.analytic_scalar(kind, p, getattr(ecfg, "R", 0.0), _dims, fc)
+                                        for p in _src], fc, r=getattr(ecfg, "r", None))
 
     # ---- VLM labels (source: vlm factors — reads the RENDERED image) + N free-form captions (CLIP-style reward
     #      training, same call). ok = clips the VLM successfully returned. ----
@@ -931,13 +1079,26 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     n_captions = int(ic.get("n_captions", 0))
     vlm = [None] * len(slices)
     ok = list(range(len(slices)))
+    segmented, per_frame, min_frames, seg_cfg = False, [], 3, {}
     if vlm_factors or n_captions:
-        key, schema = I.openai_api_key(), I.build_label_schema(vlm_factors, n_captions=n_captions)
+        key = I.openai_api_key()
+        # SEGMENTED MODE: factors marked `per_frame` are asked once per SEGMENT of the clip rather than once
+        # for the whole clip, so a label describes the steps it actually covers. Off unless the env config
+        # declares `segments:` and marks at least one factor per_frame -- torus/pendulum are unaffected.
+        seg_cfg.update(ic.get("segments") or {})
+        per_frame[:] = [f for f, fc in vlm_factors.items() if fc.get("per_frame")]
+        segmented = bool(seg_cfg) and bool(per_frame)
+        min_frames = int(seg_cfg.get("min_frames", 3))
+        schema = (I.build_segment_schema(vlm_factors, n_captions, H, int(seg_cfg.get("max", 4)))
+                  if segmented else I.build_label_schema(vlm_factors, n_captions=n_captions))
         fidx = _np.unique(_np.linspace(0, H - 1, int(ic["vlm_frames"])).round().astype(int))
         vmodel = ic["vlm"]["model"]
         prompt = ic["prompt"]
         if n_captions and ic.get("caption_prompt"):
             prompt = prompt + "\n\n" + ic["caption_prompt"].format(n=n_captions)   # append the caption instructions
+        if segmented:
+            prompt = prompt + "\n\n" + (seg_cfg.get("prompt") or "").format(
+                H=H, n_max=int(seg_cfg.get("max", 4)), k=min_frames, per_frame=", ".join(per_frame))
         # analytic-sourced factors (e.g. positioning) are EXACT from proprio and the VLM can't read them from the
         # FPV — pass them in as ground truth so captions don't assert the wrong position (color stays visual).
         known_factors = [f for f in ana if factors[f].get("source") == "analytic"]
@@ -955,7 +1116,7 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
         def _label(i):
             return I.label_clip(api_key=key, model=vmodel, prompt=prompt, schema=schema,
                                 frames_uint8=[frames[i][k] for k in fidx],
-                                action_text=I.build_action_text(clip_acts[i]) + _known(i))
+                                action_text=I.build_action_text(clip_acts[i], _axes) + _known(i))
 
         with ThreadPoolExecutor(max_workers=int(ic["vlm"]["max_workers"])) as ex:
             for i, res in enumerate(ex.map(_label, range(len(slices)))):
@@ -969,6 +1130,27 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
                 m.train()
             _plog(writer, f"[eval_interpret @ep{step}] no VLM labels returned — aborting (check OPENAI_API_KEY / network)")
             return {}
+
+    # ---- SEGMENTS -> per-step labels. Each factor also gets a clip-level MODAL label so the counts, the
+    #      cross-check and the manifest keep working exactly as before. ----
+    steps_lab, caps_step, n_merged = {}, {}, 0
+    if segmented:
+        for i in ok:
+            segs, mg = I.repair_segments(vlm[i].get("segments") or [], H, min_frames)
+            n_merged += mg
+            keys = list(per_frame) + (["captions"] if n_captions else [])
+            ex = I.expand_segments(segs, H, keys)
+            for f in per_frame:
+                steps_lab.setdefault(f, {})[i] = ex[f]
+                vlm[i][f] = max(set(ex[f]), key=ex[f].count)          # modal label stands in for the clip
+            if n_captions:
+                caps_step[i] = ex["captions"]
+                vlm[i]["captions"] = segs[0].get("captions") or []
+            vlm[i]["_segments"] = segs
+        _nseg = [len(vlm[i]["_segments"]) for i in ok]
+        _plog(writer, f"[eval_interpret @ep{step}] segments: {_np.mean(_nseg):.2f} per clip on average "
+                      f"(min {min(_nseg)}, max {max(_nseg)}) | {n_merged} short runs merged into neighbours "
+                      f"-- that merge count IS the flicker rate, i.e. how often a claimed change did not last")
 
     # ---- resolve each factor's plotted label from its configured source (aligned to `ok`) ----
     labels_ok = {f: ([vlm[i][f] for i in ok] if fc["source"] == "vlm" else [ana[f][i] for i in ok])
@@ -1007,14 +1189,24 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
 
     # ---- assemble the points to plot: one clip-mean latent, OR every per-step latent with its clip's label ----
     mode = str(ic.get("point", "mean"))
-    if mode == "per_step":                                  # dense, comparable to eval_manifold; clip label broadcast to its H steps
-        pts = _np.concatenate([bags[i] for i in ok], axis=0)         # (len(ok)*H, D)
-        clip_pos = _np.repeat(_np.arange(len(ok)), H)               # each point -> its clip's index within `ok`
+    # DROP THE FIRST STEP. Step 0's bag is built from the ENCODED REAL CONTEXT; steps 1+ are autoregressive.
+    # Measured on starling: the step0 -> step1 centroid jump is 42.3 in latent space against 12.0 for the next
+    # step and ~0.6 by step 10, and in UMAP every clip's step 0 lands in one tight blob 15 units from the
+    # rollout. It is a different KIND of state, it is 1/H of every bucket, and it drags every projection.
+    s0 = 1 if bool(ic.get("drop_first_step", False)) else 0
+    Hs = H - s0
+    if mode == "per_step":                                  # dense, comparable to eval_manifold
+        pts = _np.concatenate([bags[i][s0:] for i in ok], axis=0)    # (len(ok)*Hs, D)
+        clip_pos = _np.repeat(_np.arange(len(ok)), Hs)              # each point -> its clip's index within `ok`
+        step_pos = _np.tile(_np.arange(s0, H), len(ok))              # each point -> its step within the clip
         psize = 2.5
-        sub = f"each point = one latent of an imagined rollout, all {H}-steps kept ({len(ok)} clips x {H} = {len(pts):,} points; label broadcast from its clip)"
+        sub = (f"each point = one latent of an imagined rollout, steps {s0}..{H - 1} kept ({len(ok)} clips x "
+               f"{Hs} = {len(pts):,} points" + (f"; {len(steps_lab)} factor(s) labelled PER STEP"
+               if steps_lab else "; label broadcast from its clip") + ")")
     else:                                                    # one mean latent per clip (clean)
-        pts = _np.stack([bags[i].mean(0) for i in ok])              # (len(ok), D)
+        pts = _np.stack([bags[i][s0:].mean(0) for i in ok])         # (len(ok), D)
         clip_pos = _np.arange(len(ok))
+        step_pos = _np.zeros(len(ok), dtype=int)
         psize = 6.0
         sub = f"each point = the mean over {H}-steps of an imagined rollout ({len(ok)} clips = {len(pts):,} points)"
 
@@ -1024,9 +1216,19 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     pdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret", "saved_projections")
     os.makedirs(pdir, exist_ok=True)
     _np.save(os.path.join(pdir, "clip_index.npy"), clip_pos)                  # each point -> its clip's index within `ok`
-    labels_pp = {f: [labels_ok[f][c] for c in clip_pos] for f in factors}     # per-POINT labels (broadcast from clips)
+    _np.save(os.path.join(pdir, "step_index.npy"), step_pos)                  # each point -> its STEP within the clip,
+    #   which a consumer needs to find the SEGMENT a point belongs to (and hence that segment's captions).
+    #   Without it the only recourse is assuming the clip-major ordering and dividing, which breaks silently
+    #   the moment clips differ in length.
+    # PER-POINT labels: a per-step factor gives each point the label of ITS OWN step; everything else is
+    # still broadcast from the clip. This is the whole point of segmenting -- under per_step with a clip
+    # label, a clip that changed view mislabels most of its own points.
+    labels_pp = {f: ([steps_lab[f][ok[c]][t] for c, t in zip(clip_pos, step_pos)]
+                     if (f in steps_lab and mode == "per_step")
+                     else [labels_ok[f][c] for c in clip_pos]) for f in factors}
     transform_ok = project_and_plot(writer, "eval_interpret", pts, labels_pp, factors, step=step,
-                                    point_size=psize, subtitle=sub, methods=("pca", "tsne", "umap"),
+                                    point_size=psize, subtitle=sub,
+                                    methods=tuple(ic.get("projection_methods", ("pca", "tsne", "umap"))),
                                     umap_sup_weights=[float(w) for w in ic.get("umap_sup_weights", [0.5, 1.0])],
                                     save_dir=pdir, plots_name="world_model_latent_space_plots",
                                     log=lambda m: _plog(writer, f"[eval_interpret @ep{step}] {m} ({time.perf_counter() - t0:.0f}s)"))
@@ -1042,11 +1244,34 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     by_bucket = defaultdict(list)
     for f in factors:
         for j, i in enumerate(ok):
-            b = labels_ok[f][j]
-            if b in factors[f]["buckets"] and len(by_bucket[(f, b)]) < grid * grid:
-                by_bucket[(f, b)].append(frames[i])
+            if f in steps_lab:
+                # PER-STEP FACTOR: the unit of an example is a SEGMENT -- the contiguous run of steps that
+                # actually carries the label -- not the clip. One clip that faces two walls contributes a
+                # segment to EACH bucket, which is both correct and more informative than forcing it into one.
+                lab = steps_lab[f][i]
+                t = 0
+                while t < len(lab):
+                    u = t
+                    while u + 1 < len(lab) and lab[u + 1] == lab[t]:
+                        u += 1
+                    if lab[t] in factors[f]["buckets"] and len(by_bucket[(f, lab[t])]) < grid * grid:
+                        by_bucket[(f, lab[t])].append(frames[i][t:u + 1])
+                    t = u + 1
+            else:
+                b = labels_ok[f][j]
+                if b in factors[f]["buckets"] and len(by_bucket[(f, b)]) < grid * grid:
+                    by_bucket[(f, b)].append(frames[i])
     for (f, b), clips in by_bucket.items():
+        # Segments have different lengths, so pad each to the longest with BLACK rather than trimming or
+        # looping: a tile that goes dark has simply ended, which reads correctly and loses no frames.
+        n = max(len(c) for c in clips)
+        clips = [c if len(c) == n else _np.concatenate([c, _np.zeros((n - len(c),) + c.shape[1:], c.dtype)])
+                 for c in clips]
         writer.video(f"eval_interpret/examples/{f}/{b}", viz.tile_clips(clips, grid), fps_ex, step)
+        if f in steps_lab:
+            _lens = [int((c.sum(axis=(1, 2, 3)) > 0).sum()) for c in clips]
+            _plog(writer, f"[eval_interpret @ep{step}] examples/{f}/{b}: {len(clips)} segments, "
+                          f"median run {int(_np.median(_lens))}/{H} steps")
 
     # ---- per-clip imaginations, one dir per clip id, one file per TRUNK (keyed by trunk id, so multi-trunk
     #      models generalize). manifest.json indexes it for a web explorer: click a point -> pop its imagination.
@@ -1062,6 +1287,16 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
                 else:
                     _np.save(os.path.join(cd, f"{n}.npy"), decoded[n][i])               # (H,dim) physical/raw
             _np.save(os.path.join(cd, "actions.npy"), _np.asarray(clip_acts[i], dtype=_np.float32))
+            # SELF-CONTAINED: video + actions + proprio + this clip's own labels/captions/segments, so an
+            # imagination directory can be read without joining against labels.json or the manifest.
+            json.dump({"id": int(i), "episode": int(slices[i][0]), "start": int(slices[i][1]),
+                       "clip_len": H, "fps": fps,
+                       "labels": {f: labels_ok[f][j] for f in factors},
+                       "labels_per_step": {f: steps_lab[f][i] for f in steps_lab},
+                       "segments": (vlm[i] or {}).get("_segments", []),
+                       "captions": (vlm[i] or {}).get("captions", []),
+                       "reasoning": (vlm[i] or {}).get("reasoning", "")},
+                      open(os.path.join(cd, "labels.json"), "w"), indent=2)
         json.dump({"clip_len": H, "fps": fps, "point_mode": mode,
                    "trunks": [{"id": n, "kind": trunk_kind[n],
                                "file": f"{n}.{'mp4' if trunk_kind[n] == 'image' else 'npy'}"} for n in heads],
@@ -1069,6 +1304,41 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
                               "labels": {f: labels_ok[f][j] for f in factors}} for j, i in enumerate(ok)]},
                   open(os.path.join(imdir, "manifest.json"), "w"), indent=2)
         _plog(writer, f"[eval_interpret @ep{step}] saved {len(ok)} per-clip imaginations ({len(heads)} trunks) -> imaginations/")
+
+    # ---- examples_captions/: a SAMPLE of clips with their caption written under the frame. The captions are
+    #      the only product the reward head actually trains on, and until now they existed solely inside
+    #      labels.json -- unreadable alongside the video they describe, which is the one way to judge whether
+    #      a caption matches what you see. A sample, not all of them: burning text into video is slow and you
+    #      only need to browse. Under segmentation each segment shows its own caption, so the text changes
+    #      with the content. ----
+    n_cap_ex = int(ic.get("n_caption_examples", 0))
+    if n_cap_ex and n_captions:
+        import cv2
+        cdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_interpret", "examples_captions")
+        os.makedirs(cdir, exist_ok=True)
+        for i in ok[:n_cap_ex]:
+            clip = frames[i]
+            hh, ww = clip.shape[1:3]
+            # Lay every frame's caption out FIRST, so the bar is sized to the text that actually has to fit
+            # (and one height is used for the whole clip, or the video would change shape mid-play).
+            def _txt(t):
+                cap = (caps_step.get(i, [None] * len(clip))[t] or (vlm[i] or {}).get("captions") or [""])
+                return (cap[0] if isinstance(cap, (list, tuple)) and cap else
+                        (cap if isinstance(cap, str) else ""))
+            laid = [_caption_lines(_txt(t), ww) for t in range(len(clip))]
+            lh = max(l[2] for l in laid)
+            bar = max(l[2] * len(l[0]) for l in laid) + 12
+            out = _np.zeros((len(clip), hh + bar, ww, 3), dtype=_np.uint8)
+            out[:, :hh] = clip
+            for t, (lines, scale, _) in enumerate(laid):
+                y = hh + lh
+                for line in lines:
+                    cv2.putText(out[t], line, (6, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (240, 240, 240), 1,
+                                cv2.LINE_AA)
+                    y += lh
+            viz.save_mp4(os.path.join(cdir, f"{i}.mp4"), out, max(1, fps // 2))
+        _plog(writer, f"[eval_interpret @ep{step}] wrote {min(n_cap_ex, len(ok))} caption-annotated clips "
+                      f"-> examples_captions/")
 
     if was:
         m.train()
@@ -1111,6 +1381,19 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
         action_names = info.get("features", {}).get("action", {}).get("names") or None
     except Exception:
         pass
+    # UNDER data.action_aggregate=concat one stored action is `subsample` raw commands laid end to end,
+    # TIME-MAJOR (dataset.py: grp.reshape(n, -1) over (n, s, dim)), so dim i is raw axis i % dim at
+    # sub-step i // dim. info.json only names the `dim` RAW axes, so the length check in
+    # viz.fig_action_marginals rejects them and every panel falls back to a bare "a[i]" -- 16 anonymous
+    # panels that cannot be read. Expand the raw names across the sub-steps instead.
+    _adim = int(effective_action_dim(cfg))
+    _sub = int(cfg.data.get("subsample", 1) or 1)
+    if str(cfg.data.get("action_aggregate", "sum")) == "concat" and _sub > 1 and _adim % _sub == 0:
+        _raw = _adim // _sub
+        # names from the dataset when it has them, else a<axis> -- either way every panel says WHICH raw
+        # axis and WHICH sub-step it is, instead of 16 anonymous a[i] tiles.
+        base = list(action_names) if action_names and len(action_names) == _raw else [f"a{i}" for i in range(_raw)]
+        action_names = [f"{n}·t+{j}" for j in range(_sub) for n in base]
     a_max = getattr(ecfg, "a_max", None)   # torus-only histogram x-limit knob; None -> viz derives it from the data
     eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
                                  img_size=image_head_sizes(cfg) or img_size,
@@ -1128,7 +1411,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
 
     with torch.no_grad():                                        # no grad: this eval also runs on the TRAINING GPU
         h_ctx = m.action_context(ctx, act)                       # (E,L-1,d): h[k] predicts a[k+1] (leak-free)
-        pred_norm = m.sample_action(h_ctx).cpu()                 # (E,L-1,2) head, 1/context
+        pred_norm = m.sample_action(h_ctx).cpu()                 # (E,L-1,K*a) head, 1 chunk/context
     # obs at each action's state (E,L-1,obs_dim), for the env's OPTIONAL by-state split hook (item 3).
     obs_stack = np.stack([o[1:L] for o, _, _ in eps]).astype(np.float32)
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
@@ -1141,52 +1424,123 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     # marginals are estimated the same way and are directly comparable. Smoothness comes from #EPISODES (more
     # distinct contexts), NOT more samples/context: the head is sharp per context, so extra draws per context just
     # stack onto the same few spikes. n_ep is capped by the val split (here 64).
-    true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()           # (E,L-1,2) recorded a[1..L-1]
-    pred_a = norm.denorm_act(pred_norm).numpy()                  # (E,L-1,2) head, 1/context (sampled under no_grad)
-    prog(50, "head sampling")
+    K = int(getattr(m, "action_head_chunk", 1))
+    true_a = norm.denorm_act(act[:, 1:].cpu()).numpy()           # (E,L-1,a) recorded a[1..L-1]
+    # A CHUNKED head predicts [a[t], a[t+1], ... a[t+K-1]] per context. Every product below is produced ONCE
+    # PER LEAD TIME, into its own lead_<k>/ subfolder, because lead times are K DIFFERENT prediction problems
+    # and pooling them into one histogram would quietly flatter the head. K=1 keeps the flat, unprefixed
+    # layout every pre-chunk run wrote.
+    pred_chunk = pred_norm.reshape(*pred_norm.shape[:-1], K, -1)   # (E,L-1,K,a) -- K=1 is the degenerate case
+    leads = cfg.eval.get("action_dist_leads", "auto")
+    if isinstance(leads, str):                                   # "auto": the near, middle and far end of the chunk
+        leads = sorted({0, K // 2, K - 1})
+    leads = sorted({int(k) for k in leads if 0 <= int(k) < K})
+    win = int(cfg.eval.get("action_dist_window", 4) or 0)        # +/-w timesteps pooled per animation frame
+    mx = int(cfg.eval.get("action_dist_max_frames", 0) or 0) or None   # cap the animations (cost ~ frames x dims)
+    prog(50, f"head sampling (chunk K={K}, products at lead times {leads})")
 
-    # PRIMARY product: per-dim marginals (dataset/env-agnostic — no a_max/state-split/geometry needed).
-    fig = viz.fig_action_marginals(true_a, pred_a, names=action_names)
-    writer.figure("eval_action_distribution/marginals", fig, step); plt.close(fig)
-    prog(55, "marginals (primary product)")
+    def _dir(k):   # flat layout at K=1 so old runs' product names are untouched; subfoldered once chunked
+        return "eval_action_distribution/" + ("" if K == 1 else f"lead_{k:02d}/")
 
-    # window: pool +/-w timesteps per frame/tile -> ~(2w+1)x more samples (the dist changes slowly, so bias is
-    # tiny). This is the way to densify PAST the #episodes ceiling. w=4 -> ~9x for both true and pred.
-    win = int(cfg.eval.get("action_dist_window", 4) or 0)
-    if split_info is not None:                                   # by-state products: TORUS-ONLY (item 3)
-        labels, low_name, high_name = split_info
-        for name, arr in (("true", true_a), ("pred", pred_a)):   # by-state 2-row static: recorded vs head
-            fig = viz.fig_action_by_state(arr, labels, a_max, low_name=low_name, high_name=high_name,
-                                          sampler_name=f"{asamp} · {name}", window=win)
-            writer.figure(f"eval_action_distribution/by_state_{name}", fig, step); plt.close(fig)
-
-    tm, pm = np.linalg.norm(true_a, axis=-1).reshape(-1), np.linalg.norm(pred_a, axis=-1).reshape(-1)
     q = np.linspace(0.0, 1.0, 512)
-    w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))   # 1D-Wasserstein on pooled |a| (vs recorded)
-    writer.scalar("eval_action_distribution/true_pred_w1", w1, step)
-    # per-dim W1 (item 4b): `live` skips constant dims (W1~=0) so w1_mean isn't flattered by dead dims.
-    w1_per_dim = [float(np.mean(np.abs(np.quantile(true_a[..., i], q) - np.quantile(pred_a[..., i], q))))
-                  for i in range(true_a.shape[-1])]
-    live = [i for i in range(true_a.shape[-1]) if true_a[..., i].std() > 1e-6]
-    writer.scalars({f"eval_action_distribution/w1/dim_{i}": w for i, w in enumerate(w1_per_dim)}, step)
-    w1_mean = float(np.mean([w1_per_dim[i] for i in live])) if live else 0.0
-    writer.scalar("eval_action_distribution/w1_mean", w1_mean, step)
-    prog(70, f"distance (w1={w1:.3f}, w1_mean={w1_mean:.3f})")
+    fps = step_fps(cfg, ecfg)
+    head_w1 = None
 
-    fps = round(1.0 / ecfg.dt)
-    # POOLED over all episodes per frame (recorded green vs head red), ALL timesteps (no frame cap), +/-win pooled.
-    frames = viz.anim_action_distribution(true_a, pred_a, a_max, window=win)
-    writer.video("eval_action_distribution/animation_pooled", frames, fps, step)
-    prog(85, "animation (pooled)")
-    # per-dim marginals VIDEO: the animated companion to the static marginals PNG (same styling + same `win`).
-    mframes = viz.anim_action_marginals(true_a, pred_a, names=action_names, window=win)
-    writer.video("eval_action_distribution/animation_marginals", mframes, fps, step)
-    prog(88, "animation (marginals)")
-    if split_info is not None:                                   # by-state animation: TORUS-ONLY (item 3)
-        frames_bx = viz.anim_action_by_state(true_a, pred_a, labels, a_max, low_name=low_name,
-                                             high_name=high_name, window=win)
-        writer.video("eval_action_distribution/animation_byx", frames_bx, fps, step)
-    prog(95, "animation (by-state)")
+    # ---- THE CONDITIONAL SCORE ------------------------------------------------------------------------
+    # W1 above compares POOLED histograms, which a model that ignores its context matches perfectly. These
+    # need M draws per context instead of one; that costs ~2 ms per 1000 samples against an eval dominated
+    # by the animations, so it is effectively free. 0 draws disables the whole block.
+    COND = None
+    nd = int(cfg.eval.get("action_dist_energy_draws", 32) or 0)
+    if nd >= 4 and true_a.shape[1] > K:
+        with torch.no_grad():
+            dr = torch.stack([m.sample_action(h_ctx) for _ in range(nd)], dim=-2)   # (E,L-1,M,K*a)
+        T0 = true_a.shape[1] - K + 1                          # contexts with a full chunk of future
+        Y = np.stack([true_a[:, k0:k0 + T0] for k0 in range(K)], axis=2)            # (E,T0,K,a)
+        X = norm.denorm_act(dr[:, :T0].reshape(dr.shape[0], T0, nd, K, -1).cpu()).numpy()
+        Y = Y.reshape(-1, K, Y.shape[-1])
+        X = X.reshape(Y.shape[0], nd, K, Y.shape[-1])
+        COND = {"X": X, "Y": Y, "null": blind_null(Y, nd)}
+        prog(45, f"conditional score: {nd} draws x {Y.shape[0]} contexts")
+    for n_done, k in enumerate(leads):
+        # slot k is scored against the recorded action k steps LATER -- the same alignment w1/lead_<k> uses
+        T_ = true_a.shape[1] - k
+        t_k = true_a[:, k:]
+        p_k = norm.denorm_act(pred_chunk[:, :T_, k, :]).numpy()
+        d = _dir(k)
+        base = 50 + int(45 * n_done / max(1, len(leads)))        # progress budget shared across the lead times
+
+        fig = viz.fig_action_marginals(t_k, p_k, names=action_names)
+        writer.figure(f"{d}marginals", fig, step); plt.close(fig)
+        if split_info is not None:                               # by-state products: TORUS-ONLY
+            labels, low_name, high_name = split_info
+            for name, arr in (("true", t_k), ("pred", p_k)):
+                fig = viz.fig_action_by_state(arr, labels[:, :T_] if labels.ndim > 1 else labels, a_max,
+                                              low_name=low_name, high_name=high_name,
+                                              sampler_name=f"{asamp} · {name}", window=win)
+                writer.figure(f"{d}by_state_{name}", fig, step); plt.close(fig)
+
+        tm, pm = np.linalg.norm(t_k, axis=-1).reshape(-1), np.linalg.norm(p_k, axis=-1).reshape(-1)
+        w1 = float(np.mean(np.abs(np.quantile(tm, q) - np.quantile(pm, q))))
+        writer.scalar(f"{d}true_pred_w1", w1, step)
+        w1_per_dim = [float(np.mean(np.abs(np.quantile(t_k[..., i], q) - np.quantile(p_k[..., i], q))))
+                      for i in range(t_k.shape[-1])]
+        live = [i for i in range(t_k.shape[-1]) if t_k[..., i].std() > 1e-6]
+        writer.scalars({f"{d}w1/dim_{i}": w for i, w in enumerate(w1_per_dim)}, step)
+        w1_mean = float(np.mean([w1_per_dim[i] for i in live])) if live else 0.0
+        writer.scalar(f"{d}w1_mean", w1_mean, step)
+        if COND is not None:                                     # this lead's slice of the conditional score
+            Xk, Yk = COND["X"][:, :, k, :], COND["Y"][:, k, :]
+            writer.scalar(f"{d}energy_skill", energy_skill(Xk, Yk, COND["null"][:, :, k, :], ), step)
+        if k == leads[0]:
+            head_w1 = w1
+        prog(base + 2, f"lead {k}: w1={w1:.3f} w1_mean={w1_mean:.3f}")
+
+        frames = viz.anim_action_distribution(t_k, p_k, a_max, window=win, max_frames=mx)
+        writer.video(f"{d}animation_pooled", frames, fps, step)
+        mframes = viz.anim_action_marginals(t_k, p_k, names=action_names, window=win, max_frames=mx)
+        writer.video(f"{d}animation_marginals", mframes, fps, step)
+        if split_info is not None:                               # by-state animation: TORUS-ONLY
+            frames_bx = viz.anim_action_by_state(t_k, p_k, labels, a_max, low_name=low_name,
+                                                 high_name=high_name, window=win)
+            writer.video(f"{d}animation_byx", frames_bx, fps, step)
+        prog(base + 12, f"lead {k}: animations")
+
+    # EVERY lead time still gets its scalar, even the ones with no figures -- the cost is a quantile, and the
+    # shape of w1-vs-lead is the thing that says how far ahead the prior stays faithful.
+    if K > 1:
+        for k in range(K):
+            pk = np.linalg.norm(norm.denorm_act(pred_chunk[:, :true_a.shape[1] - k, k, :]).numpy(), axis=-1)
+            tk = np.linalg.norm(true_a[:, k:], axis=-1)
+            wk = float(np.mean(np.abs(np.quantile(tk.reshape(-1), q) - np.quantile(pk.reshape(-1), q))))
+            writer.scalar(f"eval_action_distribution/w1/lead_{k}", wk, step)
+    w1 = head_w1 if head_w1 is not None else 0.0
+    writer.scalar("eval_action_distribution/true_pred_w1", w1, step)   # headline = the FIRST lead drawn
+    if COND is not None:
+        X, Y, nul = COND["X"], COND["Y"], COND["null"]
+        N = X.shape[0]
+        es = float(energy_score(X.reshape(N, X.shape[1], -1), Y.reshape(N, -1)).mean())
+        sk = energy_skill(X.reshape(N, X.shape[1], -1), Y.reshape(N, -1), nul.reshape(N, X.shape[1], -1))
+        writer.scalar("eval_action_distribution/energy_score", es, step)
+        writer.scalar("eval_action_distribution/energy_skill_vs_blind", sk, step)
+        # THE FLOOR OF THE OLD METRIC, logged on every chart: w1_mean below this line is not evidence of
+        # anything conditional, because a model that ignores its context reaches it.
+        nq = np.linalg.norm(nul[:, :, 0, :], axis=-1).reshape(-1)
+        tq = np.linalg.norm(Y[:, 0, :], axis=-1).reshape(-1)
+        writer.scalar("eval_action_distribution/w1_blind_null",
+                      float(np.mean(np.abs(np.quantile(tq, q) - np.quantile(nq, q)))), step)
+        hist, dev, verdict = rank_calibration(X[:, :, 0, :], Y[:, 0, :])
+        writer.scalar("eval_action_distribution/rank_calibration_dev", dev, step)
+        writer.scalars({f"eval_action_distribution/rank_decile/{i}": float(v) for i, v in enumerate(hist)},
+                       step)
+        rs = list(rest_skill(X[:, :, 0, :], Y[:, 0, :]))
+        writer.scalars({f"eval_action_distribution/rest_auc/dim_{r['dim']}": r["auc"] for r in rs}, step)
+        writer.scalars({f"eval_action_distribution/rest_brier_skill/dim_{r['dim']}": r["brier_skill"]
+                        for r in rs}, step)
+        _plog(writer, f"[eval_action_distribution @ep{step}] conditional: energy skill vs context-blind "
+                      f"{sk:+.3f} | calibration {verdict} | rest AUC "
+                      + " ".join(f"d{r['dim']}:{r['auc']:.3f}" for r in rs))
+    prog(95, "scalars")
 
     if was:
         m.train()
@@ -1194,7 +1548,227 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     return {"action_true_pred_w1": w1}
 
 
-REGISTRY = {"ood_horizon": eval_ood_horizon, "ood_visual": eval_ood_visual,
+@torch.no_grad()
+def eval_steer(cfg, model, norm, ecfg, writer, device, step=0):
+    """LANGUAGE-STEERED PLANNING INSIDE THE IMAGINATION. Self-skips unless `steer.head` names a reward head.
+
+    For each request phrase and each starting context from val: draw candidate action chunks from the model's
+    own action prior, roll them through the world model, score every imagined latent with the language reward
+    head, commit the best chunk, re-plan -- out to `steer.horizon` steps with no environment anywhere.
+
+    TWO NUMBERS PER REQUEST, and the second is the one to trust. `reward_gain` is how much the reward the
+    planner was maximising went up, which is nearly circular -- a planner that maximises a number will
+    generally raise it. `motion` is derived from the COMMITTED ACTIONS alone, so "the plan scores well" and
+    "the plan actually climbs" are separate claims. A request whose reward climbs while its commanded motion
+    is unrelated has steered the reward, not the drone."""
+    if not (cfg.get("steer", {}) or {}).get("head"):
+        return {}
+    from omegaconf import OmegaConf as _OC
+    sc = _OC.to_container(cfg.steer, resolve=True)
+    head = sc["head"]
+    m = getattr(model, "_orig_mod", model)
+    if not getattr(m, "action_head_enabled", False) and str(sc.get("proposal", "prior")) == "prior":
+        _plog(writer, f"[eval_steer @ep{step}] proposal=prior but this checkpoint has NO action head -- "
+                      f"load a train_action_model run, or set steer.proposal=gaussian")
+        return {}
+    from omegaconf import OmegaConf
+    from ..data.dataset import load_split_episodes_mm
+    from ..language.reward import LanguageReward
+    from . import steering as S
+    was = m.training
+    m.eval()
+    t0 = time.perf_counter()
+
+    ic = OmegaConf.to_container(cfg.get("interpret", {}) or {}, resolve=True)
+    axes = ic.get("action_axes")
+    assert axes, "eval_steer needs `interpret=<env>` for action_axes (what each stick MEANS), see conf/interpret"
+    lang = LanguageReward(str(head), device=(device if isinstance(device, str) else device.type))
+    P, H = int(cfg.data.P), int(sc.get("horizon", 128))
+    look = int(sc.get("lookahead", 0)) or int(getattr(m, "action_head_chunk", 1))
+    img_heads = [n for n, _ in m.layout if n != "proprio"]
+    img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+                                 img_size=image_head_sizes(cfg) or img_size,
+                                 cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
+                                 repo_id=cfg.data.get("repo_id", "torus"))
+    _pk = str(sc.get("proposal", "prior"))
+    if _pk == "prior":
+        prop = S.PriorProposal(m, prefix_guidance=bool(sc.get("prefix_guidance", True)),
+                               prefix_freeze=int(sc.get("prefix_freeze", 1)),
+                               prefix_decay=float(sc.get("prefix_decay", 0.5)))
+    elif _pk == "data":
+        # THE BANK: real chunks, from `bank_split` at `bank_stride`. Defaults are train at stride 1, which
+        # is 24,737 chunks on starling-2 -- the first version used val at stride 8 and got 365, i.e. 1.5%
+        # of what exists, which both under-powered the proposal and made a prefix-retrieval feasibility
+        # test look hopeless when it had only been starved. Train also removes an unearned advantage: a
+        # val bank contains the literal continuation of the context being planned from.
+        from ..data.dataset import load_split_episodes
+        _K = int(getattr(m, "action_head_chunk", 1))
+        _bs = int(sc.get("bank_stride", 1) or 1)
+        _be = load_split_episodes(resolve_data_root(cfg), str(sc.get("bank_split", "train")),
+                                  repo_id=cfg.data.get("repo_id", "torus"))
+        _ch = [torch.from_numpy(a[i:i + _K]).float()
+               for _, a in _be for i in range(0, len(a) - _K, _bs)]
+        assert _ch, f"no chunks of {_K} in the bank split -- episodes too short?"
+        prop = S.DataProposal(norm.norm_act(torch.stack(_ch)).to(device),
+                              prefix_retrieval=bool(sc.get("prefix_retrieval", True)),
+                              retrieval_tau=float(sc.get("retrieval_tau", 0.05)))
+    else:
+        prop = S.GaussianProposal(float(sc.get("noise_sigma", 0.5)))
+    prop = S.wrap(prop, sc.get("harness") or [], held_tol=float(sc.get("held_tol", 0.02)),
+                  crossfade_decay=float(sc.get("crossfade_decay", 0.5)))
+    g = torch.Generator(device=(device if isinstance(device, str) else device.type))
+    g.manual_seed(int(sc.get("seed", 0)))
+    # SEEDING THE IMAGINATION, not just the proposal. Under model.diffusion.stochastic_eval the dynamics
+    # flow SAMPLES at every rolled step, from the GLOBAL rng -- so `g` (which now covers the candidate draw)
+    # left the rollouts free, two runs of one config disagreed, and a prior-vs-gaussian comparison could not
+    # be paired. Seed the global stream too, and RESTORE it afterwards: this routine also runs as a training
+    # callback, where silently reseeding the process would perturb the run it is evaluating.
+    _rng_state = (torch.get_rng_state(), torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
+    torch.manual_seed(int(sc.get("seed", 0)))
+    rng = np.random.RandomState(int(sc.get("seed", 0)))
+    starts = [(int(rng.randint(len(eps))), int(rng.randint(P, min(len(eps[0][0]) - 1, 400))))
+              for _ in range(int(sc.get("n_contexts", 4)))]
+    _plog(writer, f"[eval_steer @ep{step}] {len(sc['requests'])} requests x {len(starts)} contexts | "
+                  f"horizon {H} ({H * float(cfg.data.get('subsample', 1)) / max(1e-9, step_fps(cfg, ecfg)):.1f}s) "
+                  f"| lookahead {look} | {sc['n_samples']} candidates/block | proposal {prop.name} "
+                  f"| objective {sc.get('objective', 'level')} "
+                  f"| commit {sc.get('commit', 0) or look} | beta_jerk {sc.get('beta_jerk', 0.0)}"
+                  f"{'' if (sc.get('commit', 0) or look) >= look else ' | OVERLAP -> continuity harnesses live'}")
+
+    out, rows = {}, []
+    for req in sc["requests"]:
+        t_e = lang.text_embedding(req)[0] if lang.text_embedding(req).dim() > 1 else lang.text_embedding(req)
+        gains, motions, curves, stills = [], [], [], []
+        for ei, t in starts:
+            o, a, fr = eps[ei]
+            ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[t - P:t])).float().unsqueeze(0).to(device)}
+            for hh in img_heads:
+                ctx[hh] = torch.from_numpy(fr[hh][t - P:t]).float().div(255.0).unsqueeze(0).to(device)
+            ca = norm.norm_act(torch.from_numpy(a[t - P:t])).float().unsqueeze(0).to(device)
+            bags, acts, sco = S.plan(m, lang, t_e, ctx, ca, prop, horizon=H, lookahead=look,
+                                     n_samples=int(sc["n_samples"]), lam=float(sc.get("lam", 0.3)),
+                                     objective=str(sc.get("objective", "level")),
+                                     commit=int(sc.get("commit", 0) or 0),
+                                     beta_jerk=float(sc.get("beta_jerk", 0.0)), generator=g)
+            gains.append(float(sco[-max(1, len(sco) // 8):].mean() - sco[:max(1, len(sco) // 8)].mean()))
+            # DENORMALIZE FIRST. The planner works in normalized actions, and normalizing is (a-mean)/std --
+            # the fore/aft stick has a raw mean near -0.46, so normalized zero is NOT stick-centre and the
+            # SIGN of a normalized mean does not say which way the stick went. Read the direction off raw
+            # stick units or the whole readout is measured about the wrong origin.
+            rw = norm.denorm_act(acts.cpu()).numpy()
+            motions.append(S.motion_readout(rw, axes, len(axes)))
+            # STILLNESS: mean |stick| over axes and steps, in raw units. The per-axis means CANCEL -- a plan
+            # that slams left then right averages to zero and reads as motionless -- so a request whose only
+            # correct behaviour is a centred stick (`do nothing`) cannot be checked by them, and it must not
+            # be checked by the reward either (the head anti-ranks stillness, so maximising R moves). This
+            # number is small only if the plan really held still. Read it against the other requests' rows.
+            stills.append(float(np.abs(rw.reshape(len(rw), -1, len(axes)).mean(axis=1)).mean()))
+            curves.append(sco)
+            # ---- ONE FOLDER PER (request, context): the imagined video with the request written under it,
+            #      the imagined proprio, the committed actions in RAW stick units, and the numbers. Same
+            #      shape as eval_interpret's imaginations/, so the same habits work -- and the request is
+            #      IN the frame, which is the only way to check a plan by eye without cross-referencing. ----
+            slug = re.sub(r"[^a-z0-9]+", "_", req.lower()).strip("_")
+            pdir = os.path.join(writer.dir, f"epoch_{step:04d}", "eval_steer", "plans", slug,
+                                f"ep{ei:03d}_t{t:04d}")
+            os.makedirs(pdir, exist_ok=True)
+            dec = m.to_obs(bags.unsqueeze(0), heads=img_heads + ["proprio"])
+            pro = norm.denorm_obs(dec["proprio"][0].cpu()).numpy()
+            # THE LATENTS THE REWARD ACTUALLY SAW, in the flattened-bag space lang.score consumes -- the
+            # same space eval_interpret fit its reducers and the reward head on. Dumped in STEP ORDER so a
+            # diagnostic can bin by horizon: the head was fit on 15-step imaginations and the planner scores
+            # out to `horizon`, and whether f_z still discriminates that far out is checkable, not a guess.
+            np.save(os.path.join(pdir, "latents.npy"), bags.reshape(len(bags), -1).cpu().numpy().astype(np.float32))
+            np.save(os.path.join(pdir, "proprio.npy"), pro.astype(np.float32))
+            np.save(os.path.join(pdir, "actions.npy"), rw.astype(np.float32))   # RAW stick units
+            # ---- THE PROPRIO PRODUCTS, same machinery as the world model's open-loop long-horizon
+            #      rollouts (products.emit_openloop -> viz.fig_paths_3d + viz.fig_pos_vs_time), so a plan
+            #      reads like every other rollout in the project. The recorded future is drawn for SCALE
+            #      ONLY and labelled as such: the plan chose its own actions, so that curve is not the
+            #      ground truth of this rollout and calling it GT would be a lie. ----
+            pos = list((cfg.environments.get("position_idx") or [0, 1, 2]))
+            # `plots` gates the two figures the same way `video` gates the mp4: a many-context sweep writes
+            # n_requests x n_contexts of each, and at 26 x 16 that is 832 pngs nobody opens. The .npy and
+            # plan.json always land -- they are what the analyses read.
+            if len(pos) == 3 and bool(sc.get("plots", True)):
+                ctx_xyz = o[t - P:t][:, pos]                       # `o` is RAW (the ctx dict norms it itself)
+                rec_xyz = o[t:t + H][:, pos]                       # what the drone ACTUALLY did from here
+                pln_xyz = pro[:, pos]
+                anch = ctx_xyz[-1:]
+                cl = ("recorded (other actions)", "plan")
+                rec3 = np.concatenate([anch, rec_xyz])
+                pln3 = np.concatenate([anch, pln_xyz])
+                f3 = viz.fig_paths_3d(ctx_xyz, rec3, pln3, curve_labels=cl,
+                                      title=f"{req} | ep{ei} t{t} | {prop.name}")
+                f3.savefig(os.path.join(pdir, "proprio_3d.png"), dpi=110, bbox_inches="tight")
+                # The per-axis panels share ONE step axis, so both curves must be the same length -- and the
+                # recorded future is SHORTER whenever the start sits within `horizon` of the episode end
+                # (t can reach 400 of ~445). Pad it with NaN, which matplotlib simply stops drawing, rather
+                # than trimming the plan: the plan out to 128 is the thing being looked at.
+                recT = np.full_like(pln3, np.nan)
+                recT[:len(rec3)] = rec3[:len(recT)]
+                fa = viz.fig_pos_vs_time(ctx_xyz, recT, pln3, fork_step=P, curve_labels=cl,
+                                         title=f"{req} | ep{ei} t{t} | {prop.name}")
+                fa.savefig(os.path.join(pdir, "proprio_axes.png"), dpi=110, bbox_inches="tight")
+                plt.close(f3); plt.close(fa)
+            json.dump({"request": req, "episode": int(ei), "start": int(t), "horizon": int(H),
+                       "proposal": prop.name, "objective": str(sc.get("objective", "level")),
+                       "commit": int(sc.get("commit", 0) or look), "lookahead": int(look),
+                       "reward_gain": gains[-1],
+                       "reward_curve": [float(x) for x in sco],
+                       "commanded_motion": motions[-1], "stillness": stills[-1],
+                       "obs_columns": "see data/rosbag.py STATE_COLUMNS (position/velocity/quat/ang-vel/acc)",
+                       "alignment": ("actions[i] is applied AT proprio[i] and produces proprio[i+1]; the "
+                                     "first imagined frame is driven by the last recorded context action, "
+                                     "which the planner did not choose"),
+                       "note": ("reward_curve is the objective the planner MAXIMISED, so its rise is near "
+                                "circular; commanded_motion is derived from the chosen actions alone and is "
+                                "the independent check on whether the plan obeyed the request.")},
+                      open(os.path.join(pdir, "plan.json"), "w"), indent=2)
+            if bool(sc.get("video", True)):
+                import cv2
+                fr = (dec[img_heads[0]][0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+                hh, ww = fr.shape[1:3]
+                laid = [_caption_lines(f"{req}  |  step {i}/{H}  reward {sco[i]:+.3f}", ww)
+                        for i in range(len(fr))]
+                lh = max(l[2] for l in laid)
+                bar = max(l[2] * len(l[0]) for l in laid) + 12
+                out_v = np.zeros((len(fr), hh + bar, ww, 3), dtype=np.uint8)
+                out_v[:, :hh] = fr
+                for i, (lines, scale, _) in enumerate(laid):
+                    y = hh + lh
+                    for line in lines:
+                        cv2.putText(out_v[i], line, (6, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                                    (240, 240, 240), 1, cv2.LINE_AA)
+                        y += lh
+                viz.save_mp4(os.path.join(pdir, "image.mp4"), out_v, step_fps(cfg, ecfg))
+        dom = max(motions[0], key=lambda k: abs(motions[0][k]["mean"]))
+        mv = {k: float(np.mean([mo[k]["mean"] for mo in motions])) for k in motions[0]}
+        rows.append((req, float(np.mean(gains)), float(np.mean(stills)), dom, mv))
+        out[f"eval_steer/reward_gain/{req.replace(' ', '_')}"] = float(np.mean(gains))
+        out[f"eval_steer/stillness/{req.replace(' ', '_')}"] = float(np.mean(stills))
+        _plog(writer, f"[eval_steer @ep{step}] {req!r}: reward_gain {np.mean(gains):+.4f} | "
+                      f"stillness {np.mean(stills):.3f} | commanded "
+                      + ", ".join(f"{k} {v:+.2f}" for k, v in mv.items()))
+    writer.scalars(out, step)
+    print(f"\n  {'request':34s} {'reward gain':>12s} {'still':>7s}   commanded motion (mean stick per axis)")
+    print("  " + "-" * 104)
+    for req, gain, still, dom, mv in rows:
+        print(f"  {req:34s} {gain:>+12.4f} {still:>7.3f}   " + "  ".join(f"{k} {v:+.2f}" for k, v in mv.items()))
+    print("  reward gain is near circular (the planner maximised it); the stick columns are not. `still` is"
+          "\n  mean |stick| and is the ONLY column that can show a request for stillness.")
+    if was:
+        m.train()
+    torch.set_rng_state(_rng_state[0])
+    if _rng_state[1] is not None:
+        torch.cuda.set_rng_state_all(_rng_state[1])
+    _plog(writer, f"[eval_steer @ep{step}] done in {time.perf_counter() - t0:.1f}s -> eval_steer/")
+    return {"eval_steer_requests": float(len(rows))}
+
+
+REGISTRY = {"steer": eval_steer, "ood_horizon": eval_ood_horizon,
+            "held_out_splits": eval_held_out_splits, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
             "control": eval_control, "denoising_multistep": eval_denoising_multistep,
             "denoising_aggregate": eval_denoising_aggregate, "denoising_filmstrip": eval_denoising_filmstrip,

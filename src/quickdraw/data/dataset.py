@@ -14,41 +14,82 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from . import transforms as T
+
 
 class Normalizer:
-    """Train-only mean/std, applied to every split (so OOD shift stays real)."""
+    """Train-only mean/std, applied to every split (so OOD shift stays real).
+
+    The z-score is a `transforms.ZScore` rather than four inlined tensors: ONE implementation of the map,
+    shared with the action prior's PIT and with act_enc's symlog. The public API (`norm_act` and friends,
+    `o_mean` and friends) is unchanged and BITWISE identical -- smoke/transforms.py asserts the expressions
+    match, because 92 call sites and every trained checkpoint depend on it.
+
+    `act_pit` is the optional probability integral transform for the ACTION PRIOR'S TARGET, fitted at
+    dataset-build time and carried in normalization_stats.json under "action_pit". It is NOT part of the
+    z-score chain and is never applied by norm_act: the head's target and the world model's conditioning
+    are the same tensor, so folding it in here would silently move the conditioning too. The model asks for
+    it explicitly (`model.action_head.target_transform=pit`) and applies it to the target alone."""
 
     def __init__(self, stats: dict):
-        self.o_mean = torch.tensor(stats["observation_vector"]["mean"])
-        self.o_std = torch.tensor(stats["observation_vector"]["std"])
-        self.a_mean = torch.tensor(stats["action"]["mean"])
-        self.a_std = torch.tensor(stats["action"]["std"])
+        self.obs = T.ZScore(torch.tensor(stats["observation_vector"]["mean"]),
+                            torch.tensor(stats["observation_vector"]["std"]))
+        self.act = T.ZScore(torch.tensor(stats["action"]["mean"]),
+                            torch.tensor(stats["action"]["std"]))
+        self.act_pit = T.PIT.from_state(stats["action_pit"]) if stats.get("action_pit") else None
 
     @classmethod
     def from_file(cls, root: str) -> "Normalizer":
         with open(os.path.join(root, "normalization_stats.json")) as f:
             return cls(json.load(f))
 
+    # the four tensors, still readable as attributes: smoke/action_chunk.py and any downstream code that
+    # reaches for them keeps working, and there is still only one copy of each.
+    @property
+    def o_mean(self):
+        return self.obs.mean
+
+    @property
+    def o_std(self):
+        return self.obs.std
+
+    @property
+    def a_mean(self):
+        return self.act.mean
+
+    @property
+    def a_std(self):
+        return self.act.std
+
     def subset_obs(self):
         """Restrict the obs stats to the process-wide _OBS_KEEP subset (set_obs_keep), so norm/denorm match
         the subset the loaders apply. Single source of truth: no obs_keep is threaded. No-op if unset."""
         idx = get_obs_keep()
         if idx is not None:
-            t = torch.as_tensor(idx, dtype=torch.long)
-            self.o_mean, self.o_std = self.o_mean[t], self.o_std[t]
+            self.obs = self.obs.subset(torch.as_tensor(idx, dtype=torch.long))
+        return self
+
+    def tile_act(self, k: int):
+        """Repeat the action stats k times, for `data.action_aggregate=concat` where one kept step carries k
+        raw actions laid out time-major ([slot0 dims..., slot1 dims..., ...]). Each slot holds the RAW action
+        distribution the stats were computed on, so tiling is exactly right -- and it is the reason concat has
+        no normalization mismatch, unlike sum. No-op for k<=1. The PIT knots tile for the same reason."""
+        self.act = self.act.tile(k)
+        if self.act_pit is not None:
+            self.act_pit = self.act_pit.tile(k)
         return self
 
     def norm_obs(self, o):
-        return (o - self.o_mean.to(o)) / self.o_std.to(o)
+        return self.obs.apply(o)
 
     def denorm_obs(self, o):
-        return o * self.o_std.to(o) + self.o_mean.to(o)
+        return self.obs.invert(o)
 
     def norm_act(self, a):
-        return (a - self.a_mean.to(a)) / self.a_std.to(a)
+        return self.act.apply(a)
 
     def denorm_act(self, a):
-        return a * self.a_std.to(a) + self.a_mean.to(a)
+        return self.act.invert(a)
 
 
 # ---- TEMPORAL SUBSAMPLING (data.subsample; 1 = OFF = bit-identical) -------------------------------
@@ -87,6 +128,43 @@ def set_subsample(n: int) -> None:
 
 def get_subsample() -> int:
     return _SUBSAMPLE
+
+
+# HOW the actions of the skipped frames are folded into the kept step's action. `sum` is the historical
+# behaviour and the ONLY correct rule for DELTA actions (robocasa's EEF/rotation deltas compose additively
+# over the skipped frames, so the sum IS the net displacement). It is WRONG for ABSOLUTE commands: starling's
+# `joy_axis_*` are stick POSITIONS, and a pilot's stick is so autocorrelated that summing s of them scales the
+# std by essentially exactly s -- measured on starling-2, normalized |z| std 1.00 / 2.05 / 3.13 / 4.21 at
+# stride 1/2/3/4, with excursions to 12.2 sigma, because normalization_stats.json is computed on the RAW
+# actions at dataset-generation time and never sees the aggregation.
+#   sum     net effect over the window. Delta/velocity actions.                          (historical default)
+#   mean    average command over the window. Absolute commands; = sum/s, so it restores z std ~= 1.
+#   last    the command in effect at the kept frame. Absolute commands, causal reading.
+#   first   the command in effect when the kept transition STARTS.
+#   concat  all s raw actions, kept as an s*action_dim vector. LOSSLESS -- no aggregation assumption at
+#           all -- and it makes one strided step carry a genuine s-action chunk. Widens the action vector,
+#           so training.setup.effective_action_dim derives model action_dim and Normalizer.tile_act tiles
+#           the stats to match.
+_ACTION_AGGREGATE = "sum"
+_AGGREGATES = ("sum", "mean", "last", "first", "concat")
+
+
+def set_action_aggregate(mode: str) -> None:
+    """Set the process-wide action-aggregation rule (data.action_aggregate). Set ONCE at startup, beside
+    set_subsample, and for the same reason: a mid-process change would mix rules between the training
+    windows and the eval episodes, and the metrics would silently measure a different problem."""
+    global _ACTION_AGGREGATE
+    mode = str(mode)
+    if mode not in _AGGREGATES:
+        raise ValueError(f"data.action_aggregate must be one of {_AGGREGATES}, got {mode!r}")
+    if _SUBSAMPLE_USED and mode != _ACTION_AGGREGATE:
+        raise RuntimeError(f"data.action_aggregate changed {_ACTION_AGGREGATE!r} -> {mode!r} AFTER episodes "
+                           "were already loaded; train and eval would use different rules. Set it at startup.")
+    _ACTION_AGGREGATE = mode
+
+
+def get_action_aggregate() -> str:
+    return _ACTION_AGGREGATE
 
 
 _SUBSAMPLE_ALL_PHASES = False
@@ -150,7 +228,7 @@ def _subsample_episodes(eps, tag: str):
     logged -- on this dataset that is the flag at dim 4 and the gripper at dim 11."""
     global _SUBSAMPLE_USED
     _SUBSAMPLE_USED = True
-    s = _SUBSAMPLE
+    s, mode = _SUBSAMPLE, _ACTION_AGGREGATE
     if s <= 1:
         return eps
     acts = np.concatenate([e[1] for e in eps], 0)
@@ -169,17 +247,29 @@ def _subsample_episodes(eps, tag: str):
                 dropped += 1
                 continue
             grp = a[:n * s].reshape(n, s, -1)
-            aa = grp.sum(axis=1)
-            if hold:
-                aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the sum
+            if mode == "sum":
+                aa = grp.sum(axis=1)
+            elif mode == "mean":
+                aa = grp.mean(axis=1)
+            elif mode == "last":
+                aa = grp[:, -1].copy()                # .copy(): grp[:, -1] is a VIEW into the episode's array
+            elif mode == "first":
+                aa = grp[:, 0].copy()
+            else:                                     # concat: (n, s, dim) -> (n, s*dim), time-major
+                aa = grp.reshape(n, -1).copy()
+            if hold and mode in ("sum", "mean"):
+                aa[:, hold] = grp[:, -1, hold]        # last raw action in the group, not the aggregate.
+                #   Unnecessary for last/first (already one raw action) and wrong for concat (nothing to fix).
             # extra streams (ep[2:]) are sliced identically. A DICT of streams (the multi-camera frame
             # bundle) is sliced VALUE-WISE -- without this branch `x[ph:]` on a dict raises TypeError.
             extra = tuple({k: v[ph:][:n * s:s] for k, v in x.items()} if isinstance(x, dict)
                           else x[ph:][:n * s:s] for x in ep[2:])
             out.append((o[:n * s:s], aa) + extra)
     print(f"[subsample] {tag}: stride {s}{f' x {s} PHASES' if all_phases else ''} | {len(eps)} eps "
-          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions SUMMED except "
-          f"take-last on dims {hold} | {dropped} eps dropped as too short", flush=True)
+          f"{len(acts)} frames -> {len(out)} eps {sum(len(e[0]) for e in out)} frames | actions {mode.upper()}"
+          + (f" except take-last on dims {hold}" if hold and mode in ("sum", "mean") else "")
+          + (f" -> action_dim x{s}" if mode == "concat" else "")
+          + f" | {dropped} eps dropped as too short", flush=True)
     return out
 
 
@@ -196,6 +286,27 @@ def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
     act_all = np.stack(hf["action"]).astype(np.float32)
     return _subsample_episodes([(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)],
                                f"{repo_id}/{split}")
+
+
+def resize_frames_area(x, hw: tuple[int, int]):
+    """(N,H,W,3) uint8 -> (N,h,w,3) uint8 by AREA (anti-aliased) downsample. numpy or torch in, same out.
+
+    WHY THIS IS SHARED (2026-09-07). Two places must resize camera frames identically: this module, when it
+    builds the `<cam>_<size>.npy` training cache from a dataset's video, and a LIVE environment's
+    `render_obs`, which renders at the simulator's native size and must hand the model frames drawn from the
+    same distribution. If the two use different filters (area vs bilinear vs nearest) nothing raises -- the
+    model simply receives subtly out-of-distribution input and every rollout is quietly worse. So the op
+    lives in ONE function that both call, rather than being written twice and allowed to drift.
+
+    AREA specifically, not bilinear: it averages over the full source footprint of each output pixel, which
+    is the correct antialiasing filter for a large downsample (256 -> 96 here). Bilinear samples 4 taps and
+    aliases thin high-contrast structure -- exactly the ceiling strips and window mullions these datasets
+    are full of."""
+    was_np = not isinstance(x, torch.Tensor)
+    t = torch.from_numpy(np.ascontiguousarray(x)) if was_np else x
+    y = torch.nn.functional.interpolate(t.permute(0, 3, 1, 2).float(), size=tuple(hw), mode="area")
+    y = y.permute(0, 2, 3, 1).round().clamp(0, 255).to(torch.uint8)
+    return y.numpy() if was_np else y
 
 
 def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 128,
@@ -224,9 +335,7 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
             out.append(np.stack(buf))
             buf.clear()
             return
-        x = torch.from_numpy(np.stack(buf)).permute(0, 3, 1, 2).float()       # (b,3,H,W)
-        x = torch.nn.functional.interpolate(x, size=hw, mode="area")           # anti-aliased downsample
-        out.append(x.permute(0, 2, 3, 1).round().clamp(0, 255).to(torch.uint8).numpy())
+        out.append(resize_frames_area(np.stack(buf), hw))    # THE shared op -- see resize_frames_area
         buf.clear()
 
     def _have():

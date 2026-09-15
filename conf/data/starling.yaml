@@ -24,12 +24,29 @@
 #   model.modalities.1.img_size=[112,192]  +model.modalities.1.ae_bottleneck=7   <- PAIR THESE
 #   environments=recorded    <- there is no simulator for these flights; control/manifold evals are OFF
 #
-# SUBSAMPLE. Left at 1 and NOT copied from robocasa's 5. Record §13 chose 5 because robocasa is 20 Hz and
-# its true per-step image change was 0.61x the codec's own noise floor -- predicting zero motion was the
-# correct answer to the objective. This is 30 Hz EGOCENTRIC flight, where the whole frame moves with the
-# camera, so that measurement does not transfer and the per-step delta has to be measured here before a
-# stride is chosen. `python -m quickdraw.check_dataset` reports it.
-# =============================================================================================
+# SUBSAMPLE. Ships at 1, and on the CURRENT datasets that is the right answer -- pass a different value
+# only with a measurement in hand. THE STRIDE CURVE, measured on the 15 Hz rebuild (2026-09-08):
+#
+#     stride 1  15.0 Hz   67 ms/step   RMSE 0.1039   dup 1.9%   F=64 spans  4.3 s   @+128  8.5 s
+#     stride 2   7.5 Hz  133 ms/step   RMSE 0.1383   dup 0.0%   F=64 spans  8.5 s   @+128 17.1 s
+#     stride 3   5.0 Hz  200 ms/step   RMSE 0.1592                                  @+128 25.6 s
+#     stride 5   3.0 Hz  333 ms/step   RMSE 0.1850                                  @+128 42.7 s
+#
+#     robocasa's PROVEN regime (record 13)          RMSE 0.0997
+#     the OLD 30 Hz starling-2 at stride 5          RMSE 0.1502              @+128 21.3 s
+#
+# STRIDE 1 LANDS WITHIN 4% OF ROBOCASA'S PROVEN PER-STEP DIFFICULTY. That is the whole reason the old
+# runs strided at all: the 30 Hz build DUPLICATED 44% of consecutive frames (the camera is ~17 Hz), so
+# its stride-1 delta was diluted to 0.0751 and striding was compensating for a processing artifact
+# rather than for the physics. Rebuilt at 15 Hz -- below the camera -- no compensation is needed.
+#
+# THE TRADE AT STRIDE 1 IS HORIZON COVERAGE, and it is easy to miss: @+128 spans only 8.5 s, where every
+# number quoted before this rebuild was measured over 21.3 s. So a stride-1 score is NOT comparable to
+# the historical 0.2754 / 0.3505. Stride 2 (@+128 = 17.1 s, delta 0.1383 against the old 0.1502) is the
+# closest analogue to those, at half the epoch cost of stride 1.
+#
+# ONE EPOCH: 102,448 windows at stride 1 (~4 h), 51k at stride 2 (~2 h).
+
 defaults:
   - torus
   - _self_

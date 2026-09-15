@@ -167,7 +167,17 @@ def default_rollout_metrics(pred_obs: Tensor, true_obs: Tensor) -> dict[str, Ten
 def wants_diagnostics(env: object) -> bool:
     """True if `env` provides a real `render_diagnostics` (not the missing/degenerate default) -> eval-viz can
     request the rich multi-view; otherwise it falls back to the `render_obs` pred-vs-true filmstrip."""
-    fn = getattr(type(env), "render_diagnostics", None)
+    return env_provides(env, "render_diagnostics")
+
+
+def env_provides(env: object, member: str) -> bool:
+    """True if `env` really implements `member`, rather than inheriting the `not_provided` stub/default.
+
+    The same test `log_env_capabilities` uses for its per-hook checkmarks, exposed so a caller can ASK
+    before committing to work the env cannot support. `wants_diagnostics` is the render_diagnostics
+    special case of this; this is the general form.
+    """
+    fn = getattr(type(env), member, None)
     return callable(fn) and getattr(fn, "_is_default", False) is False
 
 
@@ -198,8 +208,7 @@ def log_env_capabilities(env, log_fn=print, name: str | None = None) -> str:
     stub/default), else ✗ + the fallback. Emitted at the START of training, data generation and the
     standalone evals — purely informational, never changes behavior."""
     def _has(member: str) -> bool:
-        fn = getattr(type(env), member, None)
-        return callable(fn) and not getattr(fn, "_is_default", False)
+        return env_provides(env, member)
     parts = [f"{m} {'✓ ' + ok if _has(m) else '✗ ' + miss}" for m, ok, miss in _CONTRACT_HOOKS]
     parts.append(f"checkpoint_metric={getattr(env, 'checkpoint_metric', 'pointwise_error')}")
     pol = list(getattr(env, "POLICIES", {}) or {})

@@ -7,8 +7,10 @@ defaults:
   - logging: wandb
   - eval: default
   - control: mppi
-  - interpret: torus
+  - interpret: unset   # MUST be set explicitly (interpret=starling|torus|pendulum) by anything that reads
+  #                      it; see conf/interpret/unset.yaml for why the default is a sentinel, not an env.
   - reward: default
+  - steer: default
   - _self_
 
 # language-steered control: set head (+ request) to make `eval_control` steer MPPI toward the request instead

@@ -5,7 +5,12 @@ description = "Who's the fastest gun in the west? A world models shoot out."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "numpy",
+  # numpy and mujoco are PINNED EXACTLY because robocasa asserts on them at import:
+  #   robocasa/__init__.py: assert numpy.__version__ in ["2.2.5"]   and   mujoco.__version__ == "3.3.1"
+  # Not upper bounds, not ranges -- exact allow-lists upstream. Loosening either breaks `import robocasa`
+  # with a bare AssertionError. torch/scipy/umap/sklearn are all fine on 2.2.5 (verified).
+  "numpy==2.2.5",
+  "mujoco==3.3.1",
   "scipy",
   "matplotlib",
   "tqdm",
@@ -20,6 +25,16 @@ dependencies = [
   "umap-learn",
   "scikit-learn",
   "transformers",
+  # --- rosbag2 flight recordings (data/rosbag.py). Pure Python, no ROS install needed.
+  "rosbags",
+  # --- robosuite/robocasa runtime needs. The two PACKAGES themselves are editable installs of the
+  #     checkouts under /caches/sim (a runtime volume, so they cannot live in the image) -- see
+  #     utils/setup_sim.sh, which relinks them after any rebuild. These are their importable deps:
+  "h5py",
+  "lxml",
+  # opencv-python-HEADLESS, never plain opencv-python: the latter links libgthread/GTK, which this
+  # container does not ship, so `import cv2` dies with ImportError: libgthread-2.0.so.0.
+  "opencv-python-headless",
 ]
 
 [build-system]

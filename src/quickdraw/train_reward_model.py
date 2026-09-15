@@ -68,8 +68,40 @@ def _load_interpret(run: str, factors):
     recs = json.load(open(os.path.join(d, "labels.json")))                        # per-clip, `ok` order
     labels_by = {f: [recs[int(c)]["label"][f] for c in clip_idx] for f in factors}
     labels_by_clip = {f: [r["label"][f] for r in recs] for f in factors}          # per-CLIP (for the caption plots)
-    caps_by_clip = [list(r.get("captions", [])) for r in recs]
-    return latents.astype(np.float32), clip_idx.astype(int), labels_by, labels_by_clip, caps_by_clip
+
+    # ---- CAPTION GROUPS: one group per SEGMENT when the interpret run segmented its clips, else one per
+    # clip (the old behaviour). This is the pairing the contrastive loss trains on, and getting it wrong is
+    # not merely wasteful: a clip whose view changes mid-way has most of its latents paired with text about
+    # a DIFFERENT part of the room, so the true caption for those latents sits in the batch as a NEGATIVE.
+    # Per-clip captions on a segmented run would also silently throw away every segment after the first.
+    # labels.json nests the VLM's own reply under "vlm", so the repaired segments live at r["vlm"]["_segments"]
+    # -- looking only at the top level silently fell through to the per-clip branch, which is exactly the
+    # failure this function exists to prevent, so both places are checked.
+    segs_by_clip = [(r.get("_segments") or (r.get("vlm") or {}).get("_segments") or []) for r in recs]
+    if any(len(sg) > 1 for sg in segs_by_clip):
+        sp = os.path.join(d, "saved_projections", "step_index.npy")
+        if os.path.exists(sp):
+            step_idx = np.load(sp).astype(int)
+        else:                                                   # pre-2026-09-14 runs saved no step index
+            _, cnt = np.unique(clip_idx, return_counts=True)
+            assert len(set(cnt.tolist())) == 1, "cannot infer step index: clips have different point counts"
+            step_idx = np.tile(np.arange(cnt[0]), len(cnt))     # points are clip-major, Hs per clip
+            step_idx += int(recs[0].get("clip_len", cnt[0])) - cnt[0]      # re-add a dropped first step
+        groups, of_point = [], {}
+        for ci, sg in enumerate(segs_by_clip):
+            for sd in (sg or [{"start_frame": 0, "end_frame": 10 ** 6}]):
+                g = len(groups)
+                groups.append(list(sd.get("captions") or recs[ci].get("captions") or []))
+                for t in range(int(sd["start_frame"]), int(sd["end_frame"]) + 1):
+                    of_point[(ci, t)] = g
+        group_of = np.array([of_point.get((int(c), int(t)), -1) for c, t in zip(clip_idx, step_idx)])
+        assert (group_of >= 0).all(), f"{(group_of < 0).sum()} points fall outside every segment"
+        caps_by_group = groups
+    else:                                                       # unsegmented: one group per clip, as before
+        caps_by_group = [list(r.get("captions", [])) for r in recs]
+        group_of = clip_idx.astype(int)
+    return (latents.astype(np.float32), clip_idx.astype(int), labels_by, labels_by_clip,
+            caps_by_group, group_of.astype(int))
 
 
 def _soft_ce(logits, target_dist):
@@ -103,6 +135,10 @@ def main(cfg):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     # factors are for EVAL ONLY (coloring + the bucket-word probe). The training loss is caption-contrastive.
     factors = list(rc.get("factors", None) or [rc.factor])
+    assert not cfg.interpret.get("_unset"), (
+        "no interpretability environment selected: pass `interpret=<env>` explicitly "
+        "(starling | torus | pendulum). The factor definitions are per-environment and the default is a "
+        "sentinel on purpose -- see conf/interpret/unset.yaml.")
     fac_cfgs = {f: OmegaConf.to_container(cfg.interpret.factors[f], resolve=True) for f in factors}
     buckets_by = {f: list(fac_cfgs[f]["buckets"]) for f in factors}
     flat = [(f, b) for f in factors for b in buckets_by[f]]       # every (factor, bucket), in probe-prototype order
@@ -112,14 +148,19 @@ def main(cfg):
     bmap = {f: {b: k for k, b in enumerate(buckets_by[f])} for f in factors}
 
     # ---- data: per-point latents + per-factor labels + per-clip captions; split BY CLIP ----
-    latents, clip_idx, labels_by, labels_by_clip, caps_by_clip = _load_interpret(rc.interpret_run, factors)
+    latents, clip_idx, labels_by, labels_by_clip, caps_by_clip, group_of = _load_interpret(
+        rc.interpret_run, factors)
     ncap = len(caps_by_clip[0]) if caps_by_clip else 0
     assert ncap and all(len(c) == ncap for c in caps_by_clip), (
-        f"caption-contrastive training needs a fixed #captions per clip; got {ncap} "
+        f"caption-contrastive training needs a fixed #captions per caption group; got {ncap} "
         f"(re-run eval_interpret with interpret.n_captions>0 so labels.json carries captions)")
+    _ng = len(caps_by_clip)
+    print(f"[reward] {len(latents)} points | {len(np.unique(clip_idx))} clips | {_ng} caption groups x {ncap} "
+          f"captions = {_ng * ncap} texts | {len(latents) / max(1, _ng):.1f} latents per caption group")
     X = torch.from_numpy(latents)
     y_by = {f: torch.tensor([bmap[f][l] for l in labels_by[f]]).to(dev) for f in factors}   # per-factor int labels (eval)
     clip_t = torch.from_numpy(clip_idx).to(dev)
+    group_t = torch.from_numpy(group_of).to(dev)              # point -> its caption group (segment, or clip)
     rng = np.random.RandomState(int(rc.seed))
     clips = np.unique(clip_idx); rng.shuffle(clips)
     n_val = max(1, int(len(clips) * float(rc.val_frac)))
@@ -204,7 +245,7 @@ def main(cfg):
                               pred=pred.cpu(), y=yy.cpu())
             sub = idxs[torch.randperm(len(idxs), device=dev)[:min(len(idxs), 2048)]]   # contrastive loss/retrieval subset
             zc2 = F.normalize(f_z(Xd[sub]), dim=-1)
-            craw = cap_emb[clip_t[sub] * ncap]                    # deterministic: caption 0 per clip
+            craw = cap_emb[group_t[sub] * ncap]                  # deterministic: caption 0 of the point's group
             contrastive.craw = craw
             closs = contrastive(zc2, F.normalize(f_t(craw), dim=-1)).item()
             logits = (zc2 @ F.normalize(f_t(craw), dim=-1).T) / temp
@@ -221,7 +262,8 @@ def main(cfg):
             xb = Xd[b]
             if lnoise > 0:
                 xb = xb + lnoise * x_std * torch.randn_like(xb)   # augment: f_z invariant to latent jitter
-            rows = clip_t[b] * ncap + torch.randint(ncap, (len(b),), device=dev)   # one random caption per point
+            rows = group_t[b] * ncap + torch.randint(ncap, (len(b),), device=dev)  # a random caption of the
+            #                                                   point's OWN segment, not of its whole clip
             craw = cap_emb[rows]
             contrastive.craw = craw
             loss = contrastive(F.normalize(f_z(xb), dim=-1), F.normalize(f_t(craw), dim=-1))
@@ -287,7 +329,13 @@ def main(cfg):
 
     # ---- language-model latent space: project the RAW MiniLM caption embeddings, colored by concept. This is
     #      the language space BEFORE f_t (model-independent, frozen MiniLM). Subsample for a legible/fast plot. ----
-    cap_lab = {f: [labels_by_clip[f][c] for c in range(len(caps_by_clip)) for _ in range(ncap)] for f in factors}
+    # One label per caption for the caption-space plots. Indexed by GROUP now, not by clip -- with segments
+    # there are more groups than clips, so the old `labels_by_clip[group]` would read past the end.
+    _g_any = {}
+    for _i, _g in enumerate(group_of):
+        _g_any.setdefault(int(_g), _i)
+    cap_lab = {f: [labels_by[f][_g_any[g]] for g in range(len(caps_by_clip)) for _ in range(ncap)]
+               for f in factors}
     n_cap = cap_emb.shape[0]
     keep = np.arange(n_cap)
     if n_cap > 4000:                                             # cap points: t-SNE/UMAP cost + plot legibility

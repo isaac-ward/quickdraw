@@ -78,8 +78,8 @@ class FourierMLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if self.input_squash == "symlog":
-            from .features import symlog
-            x = symlog(x)                    # BEFORE both paths: the raw copy AND the fourier expansion see it,
+            from ..data.transforms import Symlog
+            x = Symlog().apply(x)            # BEFORE both paths: the raw copy AND the fourier expansion see it,
             #                                  so the fourier clamp below becomes nearly inert rather than doing
             #                                  the bounding by itself (and losing everything past the threshold).
         if self.n_freq > 0:
@@ -263,7 +263,9 @@ class MultiModalSequenceModel(nn.Module):
         # proposal (never fed back into the WM). Only present when action_head.enabled -> show it so the head is visible.
         if getattr(self, "action_head_enabled", False) and getattr(self, "action_flow", None) is not None:
             rows.append(("action_flow (learned action prior)",
-                         f"context h -> (B,T,{self.act_enc.in_raw}) action dist", npar(self.action_flow)))
+                         f"context h -> (B,T,{self.act_enc.in_raw}"
+                         + (f"x{self.action_head_chunk} chunk" if self.action_head_chunk > 1 else "")
+                         + ") action dist", npar(self.action_flow)))
         if getattr(self, "predictor_q", None) is not None:
             rows.append(("predictor_q (BYOL online)", f"(B,T,{self.n_state},{self.d}) -> same", npar(self.predictor_q)))
         # decode heads (predicted tokens -> obs)
@@ -364,10 +366,13 @@ class MultiModalSequenceModel(nn.Module):
                 wts["decode/proprio"] = float(mod.weight)
                 off += n
                 continue
-            main, sc = mod.decode_loss(bag[..., off:off + n, :], dtgt[name])
+            main, sc, deriv = mod.decode_loss(bag[..., off:off + n, :], dtgt[name])
             out[f"decode/{name}"], wts[f"decode/{name}"] = main, float(mod.weight)
             if sc is not None:                                  # flow decoders only
                 out[f"decode/{name}_shortcut"], wts[f"decode/{name}_shortcut"] = sc, float(mod.weight)
+            if deriv is not None:                               # first-order term, off unless weighted
+                out[f"derivative/{name}"] = deriv
+                wts[f"derivative/{name}"] = float(getattr(mod, "derivative_weight", 0.0))
             off += n
         rt, rtw = self.roundtrip_losses(targets, pre_z=pre_z_targets, anchor=anchor)   # codec/roundtrip_<name>
         out.update(rt); wts.update(rtw)
@@ -921,6 +926,23 @@ class MultiModalFlow(MultiModalSequenceModel):
                  df_scale: float = 0.0, df_granularity: str = "timestep",
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
+                 action_head_chunk: int = 1,
+                 # THE ACTION PRIOR'S OWN CAPACITY. It used to borrow `flow_hidden` from the dynamics flow,
+                 # which made it unwidenable in practice: flow_hidden is baked into the trained dynamics
+                 # FlowField, so raising it to give the prior room changes the WM's architecture and the
+                 # frozen checkpoint no longer loads. The prior is always fresh-initialised, so its shape is
+                 # free -- it just needed a knob of its own. 0 keeps the old behaviour exactly.
+                 action_head_hidden: int = 0, action_head_n_freq: int = 16, action_head_time_dim: int = 32,
+                 # ...and its own INTEGRATOR. It used to borrow the dynamics flow's `sampling_steps`, which is
+                 # tuned for a near-deterministic next-state field; the prior's field is multimodal and has to
+                 # CURVE, so it needs far more steps. MEASURED 2026-09-13 on s2_ah_chunk8 (frozen head, same
+                 # noise draw): mean W1 0.2132 at 6 steps -> 0.0755 at 64, a 2.8x error the SAMPLER was adding.
+                 action_head_sampling_steps: int = 0,
+                 # ...and the SPACE its target lives in. "none" is the z-scored action (bit-identical to every
+                 # run before 2026-09-13); "pit" is Phi^-1(F(a)), whose knots arrive here from the dataset.
+                 action_head_target_transform: str = "none", action_pit_knots=None,
+                 action_delta_pit_knots=None,
+                 action_head_context: str = "pooled",
                  dynamics_detach_encoder: bool = False, p_tf_dynamics: float | None = 1.0, **kw):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
@@ -986,9 +1008,71 @@ class MultiModalFlow(MultiModalSequenceModel):
         #          in the model). Replaces the old `dynamics_follows_p_tf` bool: false == 1.0, true == None.
         # design/flow.md, record section 18.
         self.p_tf_dynamics = None if p_tf_dynamics is None else float(p_tf_dynamics)
+        # ACTION CHUNK: how many consecutive POST-SUBSAMPLE actions the prior predicts JOINTLY. 1 reproduces
+        # every run before 2026-09-10 bit-for-bit. K>1 widens the flow's TARGET to K*action_dim -- one flow over
+        # the concatenated chunk, which is a genuine joint (the MLP velocity of each component sees all
+        # K*action_dim components). NOT FlowField(chunk=), which is a gradient-checkpoint batch split.
+        self.action_head_chunk = max(1, int(action_head_chunk))
+        if str(action_head_context) not in ("pooled", "grouped"):
+            raise ValueError(f"action_head.context must be 'pooled' or 'grouped', got {action_head_context!r}")
+        self.action_head_context = str(action_head_context)
+        self.action_head_sampling_steps = int(action_head_sampling_steps) or int(sampling_steps)
         if self.action_head_enabled:
-            self.action_flow = FlowField(action_dim, h_dim=d, hidden=(flow_hidden or d), cond="concat",
-                                         shortcut=action_head_shortcut)
+            # WIDTH MATTERS HERE more than it does for the dynamics flow: under action_aggregate=concat one
+            # stored action is already action_dim wide, so the prior's target is action_dim * chunk -- at
+            # chunk=8 on starling-2 that is 128, which EQUALS the inherited d=128 hidden, and chunk=16 is
+            # double it. A chunk study run at the inherited width confounds chunk length with capacity.
+            self.action_flow = FlowField(action_dim * self.action_head_chunk, h_dim=self.context_dim(),
+                                         hidden=(int(action_head_hidden) or flow_hidden or d),
+                                         cond="concat", shortcut=action_head_shortcut,
+                                         n_freq=int(action_head_n_freq), time_dim=int(action_head_time_dim))
+            # THE PRIOR'S TARGET SPACE. "none" is the z-scored action, bit-identical to every run before
+            # 2026-09-13. "pit" trains the flow on Phi^-1(F(a)) instead: a rectified flow integrates a
+            # finite-Lipschitz field, so its terminal law is absolutely continuous and CANNOT place an atom
+            # -- and 38-58% of every recorded joystick axis is exactly at rest. Under PIT that atom is a
+            # SLAB, which a smooth field can hit, and the inverse returns the atom's exact value. The knots
+            # are a persistent BUFFER so they travel inside the checkpoint: a head reloaded without the
+            # exact map it trained under would be silently wrong, not obviously broken.
+            if str(action_head_target_transform) not in ("none", "pit", "pit_delta"):
+                raise ValueError(f"action_head.target_transform must be 'none', 'pit' or 'pit_delta', got "
+                                 f"{action_head_target_transform!r}")
+            self.action_head_target_transform = str(action_head_target_transform)
+            if self.action_head_target_transform == "pit_delta":
+                # THE ATOM MOVES FROM THE VALUE TO THE CHANGE. Under `pit` the slab a smooth flow can land
+                # in sits where the stick is at REST, which fixes the marginal -- measured, the prior gets
+                # 91% of the rest-rate on the axis whose atom is biggest. It does not fix HOLDS: a run of
+                # held steps needs several chunk slots to independently agree on the same LEVEL, and
+                # measured the head does not (P(rest | prev rest) 0.88 -> 0.09 on the vertical axis, so
+                # holds collapse to 2.0 steps against a pilot's 13.4). Predicting [a_0, da_1 .. da_K-1]
+                # puts the slab on "did not move" instead, which is a far LARGER atom (0.67-0.996 of the
+                # data) and needs no coordination at all: one draw in one slab is one held step. That also
+                # moves every axis into the big-atom regime the head already handles best.
+                if action_delta_pit_knots is None:
+                    raise ValueError(
+                        "action_head.target_transform=pit_delta needs the INCREMENT knots; they are fitted "
+                        "at build time from the strided train split (training/setup._action_delta_pit_knots) "
+                        "because an increment's distribution depends on data.subsample.")
+                if int(self.action_head_chunk) < 2:
+                    raise ValueError("action_head.target_transform=pit_delta needs chunk >= 2: with one "
+                                     "action per chunk there are no increments, so it would be `pit` under "
+                                     "another name.")
+                dk = torch.as_tensor(action_delta_pit_knots, dtype=torch.float32)
+                if dk.shape[0] != action_dim:
+                    raise ValueError(f"increment knots are fitted for {dk.shape[0]} dims but action_dim is "
+                                     f"{action_dim}")
+                self.register_buffer("action_delta_pit_knots", dk, persistent=True)
+            if self.action_head_target_transform in ("pit", "pit_delta"):
+                if action_pit_knots is None:
+                    raise ValueError(
+                        "action_head.target_transform=pit needs the PIT knots, which come from the dataset's "
+                        "normalization_stats.json ('action_pit'). This dataset was built before they were "
+                        "fitted -- run `python -m quickdraw.data.backfill_pit <dataset_root>` once to add them.")
+                kn = torch.as_tensor(action_pit_knots, dtype=torch.float32)
+                if kn.shape[0] != action_dim:
+                    raise ValueError(f"PIT knots are fitted for {kn.shape[0]} dims but action_dim is "
+                                     f"{action_dim}; the knots must be tiled to the aggregated action "
+                                     f"(Normalizer.tile_act does this for concat)")
+                self.register_buffer("action_pit_knots", kn, persistent=True)
 
     def _add_level_emb(self, bag: Tensor, levels) -> Tensor:
         """Add a per-timestep noise-level embedding to the state tokens (DF). levels: (...,1) in [0,1] over the
@@ -1057,20 +1141,86 @@ class MultiModalFlow(MultiModalSequenceModel):
         raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function
         if l_cons is not None:
             raw["dynamics/latent_shortcut"], w["dynamics/latent_shortcut"] = l_cons, self.lambda_consistency
-        if self.action_head_enabled and L >= 3:
-            # action-flow PRIOR: predict a[t] from the PREVIOUS-step pooled context h[t-1] (leak-free — h[t-1]
-            # never attended to a[t]). Pool the backbone context over the bag's tokens -> one vector per step.
+        if self.action_head_enabled:
+            # action-flow PRIOR: predict the next action (or the next `action_head_chunk` actions, jointly)
+            # from the PREVIOUS-step pooled context h[t-1] -- leak-free, h[t-1] never attended to what it
+            # predicts. Pool the backbone context over the bag's tokens -> one vector per step.
             # detach_gradient=True -> detach so the action task does NOT reshape the WM trunk.
-            h_ctx = h.mean(dim=-2)                              # (B, L-1, d): per-step context (all input tokens)
-            cond = h_ctx[:, :-1]                                # h[t-1], aligned to predict a[t] for t=1..L-2
-            if self.action_head_detach_gradient:
-                cond = cond.detach()
-            a_target = act_seq[:, 1:L - 1].detach()             # normalized a[1..L-2] (never the a[t] in cond)
-            l_aflow, l_acons = self.action_flow.loss(cond, a_target, time_sampling=self.time_sampling)
-            raw["action/flow"], w["action/flow"] = l_aflow, self.action_head_weight
-            if l_acons is not None:
-                raw["action/shortcut"], w["action/shortcut"] = l_acons, self.action_head_weight
+            h_ctx = self.pool_context(h)                        # (B, L-1, context_dim): ONE pooling rule
+            cond, a_target = self.action_pairs(h_ctx, act_seq)   # the ONE alignment (guards short windows)
+            if cond is not None:
+                if self.action_head_detach_gradient:
+                    cond = cond.detach()
+                l_aflow, l_acons = self.action_flow.loss(cond, a_target, time_sampling=self.time_sampling)
+                raw["action/flow"], w["action/flow"] = l_aflow, self.action_head_weight
+                if l_acons is not None:
+                    raw["action/shortcut"], w["action/shortcut"] = l_acons, self.action_head_weight
         return raw, w
+
+    def action_pairs(self, h_ctx: Tensor, act_seq: Tensor):
+        """THE one place the action prior's `h[t-1] -> a[t .. t+K-1]` alignment lives. Returns
+        `(cond, target)`, or `(None, None)` when the window is too short to form one chunk.
+
+        `h_ctx` (B, L-1, d) is the pooled per-step backbone context; `act_seq` (B, >=L, action_dim) the
+        NORMALIZED actions. L is taken from `h_ctx` (not from act_seq, which callers may hand in longer).
+        Row t of the result pairs context h[t] -- which saw states <= t and actions < t+1, so it never saw
+        anything it predicts -- with `[a[t+1], a[t+2], ... a[t+K]]` flattened to K*action_dim, time-major.
+        N = L-1-K rows. At K=1 this is exactly `cond = h_ctx[:, :-1]`, `target = act_seq[:, 1:L-1]`.
+
+        It exists because that alignment used to be written out three times -- the joint loss here, the
+        frozen-WM loss in training/lit.py, and the eval in evaluation/routines.py. They agree by luck at
+        K=1 and would silently diverge at K>1, and two of the three are training losses."""
+        K, L = self.action_head_chunk, h_ctx.shape[1] + 1
+        if L < K + 2:                                            # not even one chunk fits in the window
+            return None, None
+        A = act_seq[:, 1:L - 1]                                  # (B, L-2, a): a[1..L-2]
+        if getattr(self, "action_head_target_transform", "none") == "pit_delta":
+            # SEPARATE BRANCH so `none` and `pit` stay byte-for-byte the code they were. The differencing
+            # has to happen AFTER the unfold, inside each chunk -- differencing the sequence first would
+            # take deltas across chunk boundaries, which is a different quantity.
+            from ..data.transforms import PIT
+            W = A.unfold(1, K, 1)                                # (B, N, a, K)
+            C = W.permute(0, 1, 3, 2)                            # (B, N, K, a) chunk, time-major
+            head = PIT(self.action_pit_knots).apply(C[:, :, :1])         # the chunk's first ACTION
+            dlt = PIT(self.action_delta_pit_knots).apply(C[:, :, 1:] - C[:, :, :-1])   # its INCREMENTS
+            T = torch.cat([head, dlt], dim=2).reshape(C.shape[0], C.shape[1], K * C.shape[-1])
+            return h_ctx[:, :T.shape[1]], T.detach()
+        # THE TARGET SPACE, applied per STEP (width action_dim) before the chunk is flattened, so one map
+        # covers every lead time. getattr, not an attribute read: smoke stand-ins bind this method to a
+        # bare object, and "none" must be untouched code for them and for every pre-2026-09-13 run.
+        if getattr(self, "action_head_target_transform", "none") == "pit":
+            from ..data.transforms import PIT
+            A = PIT(self.action_pit_knots).apply(A)
+        if K > 1:
+            W = A.unfold(1, K, 1)                                # (B, L-1-K, a, K) sliding windows
+            A = W.permute(0, 1, 3, 2).reshape(A.shape[0], W.shape[1], K * A.shape[-1])
+        return h_ctx[:, :A.shape[1]], A.detach()
+
+    def pool_context(self, h: Tensor) -> Tensor:
+        """THE one place the backbone's token bag becomes the action prior's conditioning vector.
+
+        "pooled" (default, bit-identical to every run before 2026-09-13) averages ALL n_state+1 tokens into
+        one d-vector. On starling-2 that bag is 32 image tokens + 1 proprio + 1 action, so the proprio state
+        is 1/34 = 2.9% of what the prior sees -- and so is the ACTION TOKEN, i.e. what the stick is doing
+        right now, which is the most obviously predictive feature of what it does next.
+
+        "grouped" averages WITHIN each modality and concatenates, plus the action token whole:
+        [mean(image tokens), proprio token, action token] -> (len(layout) + 1) * d. Spatial averaging is
+        kept where it is defensible (a summary of the scene) and the two single tokens stop being diluted.
+
+        `h` is (B, T, n_state + 1, d) in layout order, action token last (see _to_input)."""
+        if getattr(self, "action_head_context", "pooled") != "grouped":
+            return h.mean(dim=-2)
+        out, i = [], 0
+        for _name, n in self.layout:
+            out.append(h[..., i:i + n, :].mean(dim=-2))
+            i += n
+        out.append(h[..., i, :])                             # the action token, whole
+        return torch.cat(out, dim=-1)
+
+    def context_dim(self) -> int:
+        """Width of what pool_context returns -- what the prior's FlowField must be built for."""
+        return self.d if getattr(self, "action_head_context", "pooled") != "grouped" else (len(self.layout) + 1) * self.d
 
     def action_context(self, obs, act_seq) -> Tensor:
         """Per-step pooled backbone context for the action prior. Returns (B, L-1, d): entry k is h[k], the
@@ -1079,13 +1229,46 @@ class MultiModalFlow(MultiModalSequenceModel):
         z = self.encode_state(obs)                               # (B, L, n_state, d)
         L = z.shape[1]
         h = self.backbone(self._to_input(z[:, :-1], act_seq[:, :L - 1]))   # (B, L-1, n_input, d)
-        return h.mean(dim=-2)                                    # (B, L-1, d) pooled per step
+        return self.pool_context(h)                              # (B, L-1, context_dim) per step
 
-    def sample_action(self, h_ctx: Tensor, *, deterministic: bool = False, eps: Tensor | None = None) -> Tensor:
+    def sample_action(self, h_ctx: Tensor, *, deterministic: bool = False, eps: Tensor | None = None,
+                      hook=None) -> Tensor:
         """Sample from the learned action PRIOR given a per-step context vector `h_ctx` (..., d) — the pooled
-        backbone context h[t-1]. Returns NORMALIZED actions (..., action_dim); the caller denorms. For the
-        eval_action_distribution routine + the MPPI proposal. Requires action_head_enabled."""
-        return self.action_flow.sample(h_ctx, steps=self.sampling_steps, deterministic=deterministic, eps=eps)
+        backbone context h[t-1]. Returns NORMALIZED actions (..., action_dim * action_head_chunk), i.e. the
+        chunk flattened time-major; reshape to (..., K, action_dim) for per-lead-time use. The caller denorms.
+        For the eval_action_distribution routine + the MPPI proposal. Requires action_head_enabled.
+
+        Under target_transform=pit the flow lives in z-space and its draw is inverted HERE, so the boundary
+        of this method is unchanged: callers still get a normalized action and never learn the difference."""
+        out = self.action_flow.sample(h_ctx, steps=self.action_head_sampling_steps,
+                                      deterministic=deterministic, eps=eps, hook=hook)
+        if getattr(self, "action_head_target_transform", "none") == "pit":
+            if deterministic:
+                # F^-1(Phi(E[z])) is the MEDIAN action, not the mean: the inverse is nonlinear, so a
+                # deterministic draw in z-space is not the deterministic draw the caller asked for. Refuse
+                # rather than return a different quantity under the same name.
+                raise ValueError(
+                    "sample_action(deterministic=True) is not defined under action_head.target_transform=pit: "
+                    "inverting the mean of z gives the MEDIAN action, not the mean action. Sample "
+                    "stochastically and reduce in action space if you need a point estimate.")
+            from ..data.transforms import PIT
+            K, a = self.action_head_chunk, self.action_pit_knots.shape[0]
+            out = PIT(self.action_pit_knots).invert(out.reshape(*out.shape[:-1], K, a)).reshape(out.shape)
+        elif getattr(self, "action_head_target_transform", "none") == "pit_delta":
+            if deterministic:
+                raise ValueError(
+                    "sample_action(deterministic=True) is not defined under target_transform=pit_delta, for "
+                    "the same reason as pit: inverting the mean of z gives a median, not a mean.")
+            from ..data.transforms import PIT
+            K, a = self.action_head_chunk, self.action_pit_knots.shape[0]
+            z = out.reshape(*out.shape[:-1], K, a)
+            # invert each slot in ITS OWN space, then cumulative-sum: [a_0, da_1, ...] -> [a_0, a_1, ...].
+            # The atom guarantee survives the sum -- an increment that inverts to exactly 0 leaves the
+            # running value bit-identical, which is what makes a HOLD exactly held rather than nearly so.
+            act = torch.cat([PIT(self.action_pit_knots).invert(z[..., :1, :]),
+                             PIT(self.action_delta_pit_knots).invert(z[..., 1:, :])], dim=-2)
+            out = act.cumsum(dim=-2).reshape(out.shape)
+        return out
 
 
 class MultiModalDistribution(MultiModalSequenceModel):

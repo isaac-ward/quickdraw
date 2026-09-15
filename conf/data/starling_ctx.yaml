@@ -1,0 +1,29 @@
+# =============================================================================================
+# starling_ctx — `data=starling` with 3x the context window. The "more context" arm.
+# Pair with `model=vl128_starling` (NOT the _heavy recipe -- see that file: the two arms are kept
+# separate so an improvement is attributable). For the sibling set: `data=starling2 data.P=24`.
+#
+# P IS THE NUMBER OF PAST TIMESTEPS FED BEFORE PREDICTION STARTS -- the model encodes P observations
+# (proprio vector + camera frame each) into the token bag, then rolls F steps forward from it. At
+# subsample=5 on 30 Hz footage, P=8 is 8 frames spanning 1.33 s of flight; P=24 spans 4.0 s.
+#
+# WHY MORE CONTEXT IS A REAL CANDIDATE HERE, when torus.yaml argues the opposite ("obs already carries
+# velocity, so the state is near-Markov -> little history needed"). That argument is about the PROPRIO
+# state, and it holds: 16 dims of pose and rate are near-Markov. It does not hold for the VISUAL state.
+# In egocentric flight what appears next depends on scene geometry that is currently OUT OF FRAME and can
+# only be inferred from where the camera has already been. A manipulator moving inside a fixed view has no
+# such problem, which is why P=8 was never the limit on robocasa.
+#
+# THE EVIDENCE IT TARGETS is the hedging signature measured on `starling_vl128` at ep10:
+# `latent_motion_ratio@+8` = 0.50 with `latent_cos@+8` = 0.265, i.e. the head predicts half the true
+# motion in a barely-correlated direction. Hedging is the CORRECT response to an under-determined state,
+# so if the state is the problem this fixes it and no amount of head capacity will.
+#
+# COST: P is context, not rollout, so it does not lengthen BPTT (F=64 is unchanged) -- but it does add
+# 16 more frames to encode per window, so expect autobatch to pick a smaller batch and epochs to slow.
+# =============================================================================================
+defaults:
+  - starling
+  - _self_
+
+P: 24

@@ -26,7 +26,16 @@ def _sample_contexts(ds, *, P, n_points, stride, seed):
 def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
     """Multimodal analogue of manifold_predictions. Committed next-state token bag over many contexts via
     the shared forward(); returns (data_phys (N, obs_dim) decoded PROPRIO physical, latents (N, n_state*d) =
-    the flattened carried token bag, n_avail). mm_eps: list of (obs (T, obs_dim), act (T, action_dim), img (T,H,W,3))."""
+    the flattened carried token bag, n_avail).
+
+    `mm_eps`: list of (obs (T, obs_dim), act (T, action_dim), frames) as load_split_episodes_mm returns
+    them -- and `frames` is a DICT {camera: (T,H,W,3) uint8}, ALWAYS, even for a single camera. It is not
+    an array. This docstring used to say `img (T,H,W,3)`, and a caller that believed it and sliced the
+    tuple elementwise got `KeyError: slice(None, 1024, None)` (see eval_manifold's manifold_max_steps).
+
+    NOTE THE COST MODEL: this runs the model over each selected episode WHOLE, so cost scales with
+    EPISODE LENGTH, not with `n_points`. `n_points` only decides how many of the resulting latents are
+    kept. Cap the episode length upstream if memory is the constraint."""
     n_ep = len(mm_eps)
     rng = np.random.RandomState(seed)
     slices = [(ei, t) for ei in range(n_ep) for t in range(P, len(mm_eps[ei][0]) - 1, stride)]

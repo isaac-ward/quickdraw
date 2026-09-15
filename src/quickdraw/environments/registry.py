@@ -2,8 +2,9 @@
 `make_env` so a run selects its environment purely by config (`environments.name`), never by import.
 
 Registered: `torus_world` (the reference env — batched TorusEnv, environments/examples/torus.py).
-`pendulum` (the single-file full-contract example — environments/examples/pendulum.py). `gym:<EnvId>`
-(Phase 6) wraps an arbitrary gymnasium.Env via GymBatchAdapter."""
+`pendulum` (the single-file full-contract example — environments/examples/pendulum.py). `robocasa` (the
+HEAVY THIRD-PARTY SIMULATOR example — environments/examples/robocasa.py). `gym:<EnvId>` (Phase 6) wraps
+an arbitrary gymnasium.Env via GymBatchAdapter."""
 
 from __future__ import annotations
 
@@ -27,6 +28,11 @@ def make_env(name: str, cfg, batch: int, device="cpu") -> WorldEnv:
         pc = PendulumConfig(dt=float(cfg.dt), max_torque=float(cfg.max_torque),
                             g=float(cfg.g), m=float(cfg.m), l=float(cfg.l))
         return PendulumEnv(pc, batch, device=device)
+    if n in ("robocasa", "robocasa_kitchen"):
+        # LIVE robocasa kitchen (examples/robocasa.py). Needs the SOURCE robosuite checkout, not the PyPI
+        # wheel, and robocasa hard-asserts numpy==2.2.5 / mujoco==3.3.1 -- see that module's docstring.
+        from .examples.robocasa import RoboCasaEnv
+        return RoboCasaEnv(cfg, batch, device=device)
     if n == "recorded":
         from .recorded import RecordedEnv
         return RecordedEnv(cfg, batch, device=device)
@@ -34,4 +40,5 @@ def make_env(name: str, cfg, batch: int, device="cpu") -> WorldEnv:
         from .gym_adapter import GymBatchAdapter          # Phase 6
         env_id = str(name).split(":", 1)[1]               # from the ORIGINAL name — gym ids are case-sensitive
         return GymBatchAdapter(env_id, cfg, batch, device=device)
-    raise ValueError(f"unknown environment name: {name!r} (known: torus_world, pendulum, recorded, gym:<EnvId>)")
+    raise ValueError(f"unknown environment name: {name!r} "
+                     f"(known: torus_world, pendulum, robocasa, recorded, gym:<EnvId>)")

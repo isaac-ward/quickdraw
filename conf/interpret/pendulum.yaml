@@ -22,6 +22,11 @@ vlm:
 # evaluation/interpret.py (hue_at_position / z_band / speed_quantile) are torus-shaped today (they read
 # ecfg.R / ecfg.r), so pendulum `analytic` cross-check blocks (theta quadrant, theta_dot sign — both exact
 # from the imagined proprio) need kinds added there before they can be declared here.
+# Required per environment (see interpret.build_action_text). The pendulum's action is a single torque in
+# [-max_torque, max_torque] (environments/examples/pendulum.py).
+action_axes:
+  - {name: torque, positive: counter-clockwise, negative: clockwise}
+
 factors:
   region:                      # which quadrant the rod TIP points to (theta = 0 is straight UP)
     source: vlm

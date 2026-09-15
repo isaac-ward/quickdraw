@@ -18,7 +18,9 @@ import numpy as np
 
 from ..environments.base import SceneOverlay, wants_diagnostics
 from ..environments.registry import make_env
+from ..environments.torus_utils import TorusConfig
 from ..logging import viz
+from ..training.setup import step_fps
 from .mppi import MPPIConfig, run_control
 
 
@@ -45,15 +47,28 @@ def _agent(res, i, color, R, r):
 
 
 def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) -> dict:
+    # LANGUAGE STEERING reads the per-environment factor definitions (bucket names, and for torus the
+    # ground-truth reward hooks), so the `interpret` group must be the right environment rather than the
+    # default sentinel -- see conf/interpret/unset.yaml.
+    if cfg.get("language", {}).get("head") and cfg.interpret.get("_unset"):
+        raise AssertionError("language-steered control needs `interpret=<env>` set explicitly "
+                             "(starling | torus | pendulum): it reads that environment's factor buckets.")
     # reuse_render / reward_override are control-config knobs that aren't MPPIConfig fields; strip them
     # before building MPPIConfig so MPPIConfig(**...) doesn't choke on the extra keys.
-    mppi_kwargs = {k: v for k, v in cfg.control.items() if k not in ("reuse_render", "reward_override")}
+    mppi_kwargs = {k: v for k, v in cfg.control.items()
+                   if k not in ("reuse_render", "reward_override", "proposal")}
     fpv = None                                    # image models: render FPV context in the MPPI loop
     core = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
     if img_head is not None:                       # only render FPV when there's a real image head
         img_size = next((mod.ae.cfg.img_size for mod in core.modalities.values() if hasattr(mod, "ae")), 128)
-        if hasattr(ecfg, "R"):                     # torus: the FPVRenderer fast path (parity-critical, unchanged)
+        # TORUS TEST BY TYPE, not by attribute. `hasattr(ecfg, "R")` was not a torus test: RecordedConfig
+        # carries R/r/init_speed as INERT PLACEHOLDERS (environments/recorded.py, "train_world_model reads
+        # e.R / e.r / e.init_speed unconditionally"), so it was True for every recorded env and sent drone
+        # runs down the torus FPVRenderer path. There they hit int(img_size) on a (112,192) tuple and raised
+        # a TypeError, which the callback treats as a BUG (counted toward the fatal streak) instead of the
+        # NotImplementedError clean-skip it has for "this env has no simulator" -- the actual reason.
+        if isinstance(ecfg, TorusConfig):          # torus: the FPVRenderer fast path (parity-critical, unchanged)
             try:
                 from ..training.setup import resolve_data_root
                 coloring = json.load(open(os.path.join(resolve_data_root(cfg), "dataset_card.json"))).get("coloring", {}).get("train", "rainbow")
@@ -62,7 +77,12 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
             fpv = {"coloring": coloring, "fov": float(cfg.data.fpv_fov), "size": int(img_size)}
             _plog(writer, f"[eval_control @ep{step}] multimodal: FPV render in the MPPI loop (coloring={coloring}, size={img_size})")
         else:                                      # generic env: mppi falls back to env.render_obs in the loop
-            fpv = {"size": int(img_size)}
+            # NOT int(): a non-square image head carries img_size as an (H, W) TUPLE (starling is (112,192)),
+            # and coercing it raised `int() argument must be ... not 'tuple'` BEFORE control ever reached the
+            # env -- so every starling run logged a misleading TypeError instead of the real reason (a
+            # recorded env has no simulator to step). Only the torus branch above consumes `size`, as a
+            # square int for FPVRenderer; the generic path renders through env.render_obs and never reads it.
+            fpv = {"size": img_size}
             _plog(writer, f"[eval_control @ep{step}] multimodal: in-loop image context via env.render_obs (size={img_size})")
 
     # language steering: request + reward head -> the LEARNED controller maximizes R(latent, request) with the
@@ -100,6 +120,20 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     env_factory = lambda: make_env(cfg.environments.get("name", "torus_world"), cfg.environments,
                                    mppi_cfg.n_episodes, device)
     env = env_factory()
+    # WHERE CANDIDATES COME FROM (control.proposal, default gaussian == every run before 2026-09-14).
+    # `prior` swaps MPPI's white noise for draws from the trained action prior, conditioned on the imagined
+    # context -- the same proposal object eval_steer uses, so the two routines cannot drift apart. The prior
+    # describes ONE chunk from one context, so it pins horizon/chunk (asserted in mppi.run_control).
+    proposal = None
+    if str(cfg.control.get("proposal", "gaussian")) == "prior":
+        from ..evaluation.steering import PriorProposal
+        assert getattr(core, "action_head_enabled", False), (
+            "control.proposal=prior needs a checkpoint with a trained action head (train_action_model)")
+        # RAW action space: MPPI candidates are env actions clamped to a_max and normalized on their way
+        # into the model, while the prior emits normalized actions -- so it must denormalize on the way out.
+        proposal = PriorProposal(core, a_max=float(getattr(env, "a_max", None) or ecfg.a_max), norm=normalizer)
+        _plog(writer, f"[eval_control @ep{step}] proposal {proposal.name} (MPPI candidates from the action "
+                      f"prior, not gaussian noise); commit={proposal.commit}")
     knobs = {k: getattr(mppi_cfg, k) for k in ("beta_vel", "r_settle")
              if k in inspect.signature(env.reward).parameters}
     reward_fn = functools.partial(env.reward, **knobs)
@@ -119,12 +153,12 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     if reward is None and (goals_fn is None
                            or goals_fn(mppi_cfg.n_episodes, mppi_cfg.n_goals, None, device) is None):
         return _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, device, step,
-                                                env, mppi_cfg, n_plot, reward_fn)
+                                                env, mppi_cfg, n_plot, reward_fn, proposal)
     t = time.perf_counter()
     res, _ = run_control(model, normalizer, ecfg, mppi_cfg, device=device,
                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv,
                          reward=reward, request=request, requests=requests, oracle=(reward is None), n_plot=n_plot,
-                         reward_fn=reward_fn, env=env, env_factory=env_factory)
+                         reward_fn=reward_fn, env=env, env_factory=env_factory, proposal=proposal)
     t_ctrl = time.perf_counter() - t
     # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers the controller(s) + chunk
     # execution over n_chunks replans, so per-chunk wall time = t_ctrl / n_chunks.
@@ -133,7 +167,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     _plog(writer, f"[eval_control @ep{step}] MPPI done: {res['n_chunks']} replans over {res['n_steps']} steps "
                   f"-> {mppi_chunk_s * 1000:.0f} ms/chunk ({mppi_chunk_hz:.1f} hz)")
     R, r = getattr(ecfg, "R", None), getattr(ecfg, "r", None)   # torus geometry; None for a generic env
-    fps = round(1.0 / ecfg.dt)
+    fps = step_fps(cfg, ecfg)
     from ..evaluation.products import log_image_head, product_tag
 
     # controllers present: 'pred' (learned) always; 'true' (oracle) only in the goal race (oracle on).
@@ -382,7 +416,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
 
 
 def _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, device, step,
-                                     env, mppi_cfg, n_plot, reward_fn) -> dict:
+                                     env, mppi_cfg, n_plot, reward_fn, proposal=None) -> dict:
     """REWARD-ONLY control eval for an env with NO goal source (WorldEnv.control_goals -> None): the env's
     OWN reward is the objective (mppi.run_control_reward_only), so there are no goals/success metrics —
     logs eval_control/{true,pred,diff}/{mean_reward,final_reward} instead, per-episode reward curves, and a
@@ -397,13 +431,13 @@ def _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, devic
     t = time.perf_counter()
     res = run_control_reward_only(model, normalizer, env_factory, mppi_cfg, device=device,
                                   log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"),
-                                  oracle=True, n_plot=n_plot, reward_fn=reward_fn)
+                                  oracle=True, n_plot=n_plot, reward_fn=reward_fn, proposal=proposal)
     t_ctrl = time.perf_counter() - t
     mppi_chunk_s = t_ctrl / max(1, res["n_chunks"])
     mppi_chunk_hz = 1.0 / mppi_chunk_s if mppi_chunk_s > 0 else 0.0
     _plog(writer, f"[eval_control @ep{step}] MPPI done: {res['n_chunks']} replans over {res['n_steps']} steps "
                   f"-> {mppi_chunk_s * 1000:.0f} ms/chunk ({mppi_chunk_hz:.1f} hz)")
-    fps = round(1.0 / ecfg.dt)
+    fps = step_fps(cfg, ecfg)
     kinds = [k for k in ("true", "pred") if k in res]
     labels = {"true": "oracle", "pred": "learned"}
     NP = res["n_plot"]
