@@ -232,11 +232,11 @@ def ood(paper, dev="cuda"):
         # A DASHED LINE plus the hatched span it bounds, both named in the legend rather than written on
         # the plot. Everything left of the line is context, so there is no prediction there at all --
         # hatching it says that, where an unmarked white gap read as a flat score.
-        A.axvline(P, color="black", ls="--", lw=1.2, label="Prediction starts")
+        A.axvline(P, color="black", ls="--", lw=1.2, label="Prediction begins")
         # SPARSE AND PALE. At "///" in mid grey the hatch was the loudest thing in the panel; it is
         # background, so it reads as background. hatch.linewidth is an rcParam, not a patch property.
         plt.rcParams["hatch.linewidth"] = 0.6
-        A.axvspan(0, P, facecolor="none", edgecolor="0.72", hatch="//", lw=0.0,
+        A.axvspan(0, P, facecolor="none", edgecolor="0.72", hatch="////", lw=0.0,
                   label="Context frames")
 
     # ================= (a) VISUAL =====================================================================
@@ -341,7 +341,7 @@ def ood(paper, dev="cuda"):
     A = fig.add_axes([L, BOT_IN / FIG_H, W, TR_IN / FIG_H])       # the trace, on the images' own span
     v = np.asarray(r[chan])
     A.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
-    A.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
+    A.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly frames")
     A.set_xlim(0, len(o) - 1)
     A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("Prediction step", fontsize=FS)
     A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25)
@@ -371,7 +371,7 @@ def ood(paper, dev="cuda"):
     # leaving a gap between the plots and the images that no wspace can close. Here the image block is
     # butted straight against the plot block, and the figure height is SOLVED so the two plots together
     # are exactly as tall as the two images -- no frame is ever rescaled anisotropically.
-    FIG_W, L, GAP, R = 7.2, 0.64, 0.10, 0.02           # inches: ylabel+ticks, plot-to-image gap, margin
+    FIG_W, L, GAP, R = 7.2, 0.64, 0.0, 0.02            # inches: ylabel+ticks, plot-to-image gap, margin
     WI = 2.02                                          # image width; the plots take whatever is left
     TOP_IN, BOT_IN = 0.17, 0.42                        # the image title, and the xlabel + tick labels
     hi = WI * ph / pw                                  # one image, and therefore one plot, in inches
@@ -403,7 +403,7 @@ def ood(paper, dev="cuda"):
     AV.set_xlim(0, len(o) - 1)
     AE = fig.add_axes([xp, y_top - 2 * hr, wp, hr], sharex=AV)
     AE.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
-    AE.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
+    AE.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly frames")
     AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)
     AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25)
     mark_context(AE)

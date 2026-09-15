@@ -136,8 +136,13 @@ OOD_ROWS = {
     "eval_ood_noodle": [("latent_cos", r"Latent surprise (\textbf{ours})"), ("lpips", "Image LPIPS"),
                         ("l2", "Image RMSE"), ("angvel_err", "Angular velocity error"),
                         ("pos_err", "Position error")],
+    # LATENT SURPRISE APPEARS IN BOTH BLOCKS, because the obvious question about a two-anomaly claim is
+    # whether each channel is specific or just sensitive. It is not specific: on the dynamical anomaly it
+    # still reads 72.4, well clear of no-skill, because a pushed drone eventually sees a different room.
+    # The proprioceptive channels ARE specific -- on the visual anomaly they sit at no-skill.
     "eval_ood_leafblower": [("angvel_err", r"Angular velocity error (\textbf{ours})"),
                             ("vel_err", "Velocity error"), ("lpips", "Image LPIPS"),
+                            ("latent_cos", "Latent surprise"),
                             ("rot_err", "Orientation error"), ("pos_err", "Position error")],
 }
 OOD_NAME = {"eval_ood_noodle": "Visual anomaly: a pink pool noodle enters the frame", "eval_ood_leafblower": "Dynamical anomaly: an off-camera leaf blower pushes the drone"}

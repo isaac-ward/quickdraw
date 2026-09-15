@@ -123,7 +123,7 @@ RM_COS_GAP   = 110.0     # branch boxes -> the cosine: the two feed arrows have 
 #                          tall and the figure has no room under the token column for that
 RM_PAD       = 26.0
 RM_GAP_BR    = BRACE_M   # column bottom -> brace line: THE SAME LIFT the summariser's input brace uses
-RM_GAP_BOX   = 102.0     # brace line -> box top (lowered three times now, at the author's ask)
+RM_GAP_BOX   = 134.0     # brace line -> box top (lowered four times now, at the author's ask)
 RM_GAP_TXT   = 70.0      # box -> the sentence, which sits to its LEFT
 # ---- Z ORDER (one place, because the stacking rules are not obvious) --------------------------------
 # RULE: A FEED ARROW MUST NEVER CROSS A TOKENIZER OUTLINE. The tokenizers therefore sit ABOVE every
@@ -223,6 +223,12 @@ BOX_FS       = ENC_FS    # the box titles are set at the TOKENIZER LABEL SIZE, a
 #   contours  nested level sets: the observation head samples a whole 33-token BAG, a vector, not a scalar
 #   bimodal   a 1-D density with two modes: the action head samples a stick, and the prior over one really
 #             is multimodal (a bell would quietly deny that)
+HEAD_IN_DX   = -32.0     # the flow heads' MECHANISM shifts left inside its own box, at the author's ask:
+#                          the sublayer stack, the trunk and its residual arcs, the bars and tail, the
+#                          repeat brace and both x N labels, the sampling loop and the `denoising` caption.
+#                          NOT the box outline, NOT the centred title or its badge, and NOT the
+#                          probability glyph -- the glyph is pinned to the right margin and the space this
+#                          opens in front of it is the point.
 GLYPH_W      = 52.0
 GLYPH_H      = 36.0
 # (centre, width, weight) per mode. Two peaks each, but not the SAME two: a reader who sees one mark
@@ -1416,9 +1422,11 @@ def draw_box(ax, D, sx):
       +1  enters at the BOTTOM, stacks UP,   leaves to the RIGHT   (the space-time backbone)
       -1  enters at the LEFT,   stacks DOWN, leaves out the BOTTOM  (the rectified-flow head)"""
     f = D["flow"]
+    # THE MECHANISM'S OWN OFFSET, flow heads only (the summariser keeps its internals centred).
+    idx = HEAD_IN_DX if f < 0 else 0.0
     x0, x1, y0, y1 = D["x0"] + sx, D["x1"] + sx, D["y0"], D["y1"]
-    cx, arc_x = D["cx"] + sx, D["arc_x"] + sx
-    bx0, bx1 = D["sub_x0"] + sx, D["sub_x1"] + sx
+    cx, arc_x = D["cx"] + sx + idx, D["arc_x"] + sx + idx
+    bx0, bx1 = D["sub_x0"] + sx + idx, D["sub_x1"] + sx + idx
     ax.add_patch(PathPatch(rounded_polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], CORNER_R),
                            fc=ENC_FC, ec=BOX_EC, lw=ENC_LW, zorder=Z_TOKENIZER))
     # THE HEADS ARE BOLD, the summariser is not: bold marks the three things the paper trains, and the
@@ -1481,7 +1489,7 @@ def draw_box(ax, D, sx):
             inner.append(dict(pts=leg + [(t[0] - ARROW_L, t[1])], tip=t))
         kind = f"bus + {len(tips)} branch" + ("es" if len(tips) > 1 else "")
     else:                                                # in at the LEFT, down, out the BOTTOM
-        bars = [(b[0] + sx, b[1], b[2] + sx, b[3]) for b in D["bars"]]
+        bars = [(b[0] + sx + idx, b[1], b[2] + sx + idx, b[3]) for b in D["bars"]]
         for (bx0, by0, bx1, by1), txt in zip(bars, D["bars_txt"]):
             ax.add_patch(PathPatch(rounded_polygon([(bx0, by0), (bx1, by0), (bx1, by1), (bx0, by1)],
                                                    CORNER_R),
@@ -1492,7 +1500,8 @@ def draw_box(ax, D, sx):
         for lo, hi in zip(bars, bars[1:]):               # concat -> project, with the SHORT head
             inner.append(dict(pts=[(cx, lo[1]), (cx, hi[3] + edge + ARROW_L * 0.5)],
                               tip=(cx, hi[3] + edge), head_dir=(0.0, -1.0), head_len=ARROW_L * 0.5))
-        for (tx0, ty0, tx1, ty1), txt in zip([(b[0] + sx, b[1], b[2] + sx, b[3]) for b in D["tail"]],
+        for (tx0, ty0, tx1, ty1), txt in zip([(b[0] + sx + idx, b[1], b[2] + sx + idx, b[3])
+                                              for b in D["tail"]],
                                              D["tail_txt"]):
             ax.add_patch(PathPatch(rounded_polygon([(tx0, ty0), (tx1, ty0), (tx1, ty1), (tx0, ty1)],
                                                    CORNER_R),
@@ -1503,7 +1512,7 @@ def draw_box(ax, D, sx):
         inner.append(dict(pts=[(x0, D["out_y"]), (cat[0], D["out_y"])]))
         # THE SAMPLING LOOP, kept INSIDE the box, in its own channel right of the "x N" brace.
         tap = D["loop_y"]                        # the loop CLOSES below everything the box stacks
-        lx = D["loop_x"] + sx
+        lx = D["loop_x"] + sx + idx
         inner.append(dict(pts=[(cx, tap), (lx, tap), (lx, D["out_y"]),
                                (cat[2] + edge + ARROW_L * 0.5, D["out_y"])],
                           tip=(cat[2] + edge, D["out_y"]), head_dir=(-1.0, 0.0),
@@ -1561,7 +1570,7 @@ def draw_box(ax, D, sx):
             # CENTRED ON ITS OWN BOX, offset clear of the shaft. rotation_mode="anchor" put the
             # baseline on the line itself, so the word straddled it whatever the offset.
             # rotation 270, NOT 90: turned end over end so it reads down the shaft.
-            ax.text(cx + 2.2 * MIN_SEG + text_extent(SAMPLE_LAB, BOX_FS * 0.78)[1] - 4.0,
+            ax.text(cx + 2.2 * MIN_SEG + text_extent(SAMPLE_LAB, BOX_FS * 0.78)[1] - 20.0,
                     0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="center", va="center", rotation=270,
                     fontsize=BOX_FS * 0.78, color=EDGE, zorder=Z_TOKENIZER + 5)
             ROUTES.append((D["title"].splitlines()[0], "x_0", f"45 arrival x {len(legs)}"))
@@ -1830,7 +1839,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                 # the arrow carries the word instead: this is A DRAW, not the distribution
                 # over the SHAFT: the arrow now runs flush into the first tile, so there is no gap
                 # at its head to put a word in
-                ax.text(0.5 * (AH["x1"] + AH["exit_tip"][0]) + sx, AH["exit_tip"][1] - MIN_SEG,
+                ax.text(0.5 * (AH["x1"] + AH["exit_tip"][0]) + sx - 24.0, AH["exit_tip"][1] - MIN_SEG,
                         SAMPLE_LAB, ha="center", va="bottom", fontsize=BOX_FS * 0.78, color=EDGE,
                         zorder=Z_ARROW + 2)
     if reward and RM_ON:
