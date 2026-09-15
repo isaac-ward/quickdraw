@@ -1966,11 +1966,18 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
     fig.savefig(path, transparent=True, dpi=DPI, pad_inches=0)
     plt.close(fig)
     if crop_bottom:
+        # ...AND THE RIGHT. solve_layout reserves room for the widest thing it can predict, which left
+        # dead columns past the last drawn pixel; at width=\textwidth those columns are inside the float,
+        # so \centering was centring a box that was part air and the figure read as left-justified.
         im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        pad = MARGIN * DPI / 100
         rows = np.where(im[:, :, 3].max(axis=1) > 0)[0]
-        keep = min(im.shape[0], int(rows[-1] + 1 + MARGIN * DPI / 100))
-        cv2.imwrite(path, im[:keep])
-        print(f"  wrote {path.split('/')[-1]}  (bottom trimmed {im.shape[0] - keep} px)")
+        cols = np.where(im[:, :, 3].max(axis=0) > 0)[0]
+        keep_r = min(im.shape[0], int(rows[-1] + 1 + pad))
+        keep_c = min(im.shape[1], int(cols[-1] + 1 + pad))
+        cv2.imwrite(path, im[:keep_r, :keep_c])
+        print(f"  wrote {path.split('/')[-1]}  (trimmed {im.shape[0] - keep_r} px bottom, "
+              f"{im.shape[1] - keep_c} px right)")
         return
     print(f"  wrote {path.split('/')[-1]}")
 

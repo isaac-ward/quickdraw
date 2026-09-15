@@ -308,12 +308,15 @@ def ood(paper, dev="cuda"):
     # in figure coordinates: the 2x4 block of images is CONTIGUOUS (no gaps, as in the dynamical figure)
     # and spans exactly [L, 1-R], and the trace below spans the same. The figure height is then SOLVED
     # from the image width so that equal aspect fills each box exactly -- never aspect="auto".
-    FIG_W, L, R = 7.2, 0.086, 0.004      # L must clear the trace's ylabel AND its tick labels
+    FIG_W, L, R = 3.4, 0.175, 0.008      # L must clear the trace's ylabel AND its tick labels
     W = 1.0 - L - R
     cw_in = W * FIG_W / 4.0                           # one image column, in inches
     ch_in = cw_in * ih / iw
-    TOP_IN, PAD_IN, TR_IN, BOT_IN = 0.17, 0.0, 0.92, 0.42    # titles, gap, trace height, xlabel+ticks
-    FIG_H = TOP_IN + 2 * ch_in + PAD_IN + TR_IN + BOT_IN
+    # THE LEGEND COMES OUT OF THE AXES. Four entries will not fit beside the data at 3.4in -- inside
+    # the panel it covered the rise that is the whole point of the figure -- so it sits under the trace
+    # as a two-column strip and the plot area is left clear.
+    TOP_IN, PAD_IN, TR_IN, BOT_IN, LEG_IN = 0.34, 0.0, 0.78, 0.34, 0.30
+    FIG_H = TOP_IN + 2 * ch_in + PAD_IN + TR_IN + BOT_IN + LEG_IN
     fig = plt.figure(figsize=(FIG_W, FIG_H))
     cw, ch = W / 4.0, ch_in / FIG_H
     y0 = 1.0 - (TOP_IN + ch_in) / FIG_H               # top image row
@@ -334,11 +337,13 @@ def ood(paper, dev="cuda"):
         else:
             A.imshow(img)
         if lab:
-            A.set_title(lab, fontsize=FS, pad=2.5)
+            # TWO LINES AT SINGLE-COLUMN WIDTH: "In distribution ($t{=}8$)" is wider than 0.78in of
+            # column, so the parenthetical drops under the name rather than colliding with its neighbour.
+            A.set_title(lab.replace(" ($t", "\n($t"), fontsize=FS - 2.2, pad=1.8, linespacing=1.15)
         A.set_xticks([]); A.set_yticks([])
         for sp_ in A.spines.values():
             sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    A = fig.add_axes([L, BOT_IN / FIG_H, W, TR_IN / FIG_H])       # the trace, on the images' own span
+    A = fig.add_axes([L, (BOT_IN + LEG_IN) / FIG_H, W, TR_IN / FIG_H])   # the trace, on the images' span
     v = np.asarray(r[chan])
     A.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
     A.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly frames")
@@ -346,7 +351,10 @@ def ood(paper, dev="cuda"):
     A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("Prediction step", fontsize=FS)
     A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25)
     mark_context(A)
-    A.legend(fontsize=FS - 1.5, loc="upper center")
+    _h, _l = A.get_legend_handles_labels()
+    fig.legend(_h, _l, loc="lower center", bbox_to_anchor=(L + W / 2, 0.0), ncol=2,
+               fontsize=FS - 2.2, frameon=False, handlelength=1.4, columnspacing=1.2,
+               borderaxespad=0.0)
     f = os.path.join(paper, "figures", "ood-visual.png")
     fig.savefig(f, dpi=DPI); plt.close(fig)            # NO bbox_inches: tight would re-trim the margins
     print("  figures/ood-visual.png")
@@ -371,14 +379,14 @@ def ood(paper, dev="cuda"):
     # leaving a gap between the plots and the images that no wspace can close. Here the image block is
     # butted straight against the plot block, and the figure height is SOLVED so the two plots together
     # are exactly as tall as the two images -- no frame is ever rescaled anisotropically.
-    FIG_W, L, GAP, R = 7.2, 0.64, 0.0, 0.02            # inches: ylabel+ticks, plot-to-image gap, margin
-    WI = 2.02                                          # image width; the plots take whatever is left
-    TOP_IN, BOT_IN = 0.17, 0.42                        # the image title, and the xlabel + tick labels
+    FIG_W, L, GAP, R = 3.4, 0.56, 0.0, 0.01            # inches: ylabel+ticks, plot-to-image gap, margin
+    WI = 1.06                                          # image width; the plots take whatever is left
+    TOP_IN, BOT_IN, LEG_IN = 0.15, 0.34, 0.30          # image title, xlabel+ticks, legend strip
     hi = WI * ph / pw                                  # one image, and therefore one plot, in inches
     PW = FIG_W - L - GAP - WI - R
-    FIG_H = TOP_IN + 2 * hi + BOT_IN
+    FIG_H = TOP_IN + 2 * hi + BOT_IN + LEG_IN
     fig = plt.figure(figsize=(FIG_W, FIG_H))
-    hr, y_top = hi / FIG_H, 1.0 - TOP_IN / FIG_H
+    hr, y_top = hi / FIG_H, 1.0 - TOP_IN / FIG_H       # ...so the block's bottom clears the strip
     xp, wp = L / FIG_W, PW / FIG_W
     xi, wi_ = (L + PW + GAP) / FIG_W, WI / FIG_W
     # THE TWO PLOTS SHARE AN X AXIS, so they are joined with no gap and only the lower one is labelled;
@@ -387,7 +395,7 @@ def ood(paper, dev="cuda"):
     AI.set_xticks([]); AI.set_yticks([])
     for sp_ in AI.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    AI.set_title("Disturbance is applied", fontsize=FS, pad=2.5)
+    AI.set_title("Disturbance is applied", fontsize=FS - 2.2, pad=1.8)
     A = fig.add_axes([xi, y_top - 2 * hr, wi_, hr]); A.imshow(pov)
     A.set_xticks([]); A.set_yticks([])
     for sp_ in A.spines.values():
@@ -407,7 +415,11 @@ def ood(paper, dev="cuda"):
     AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)
     AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25)
     mark_context(AE)
-    AE.legend(fontsize=FS - 1.5, loc="upper right", ncol=1)
+    # OUT OF THE AXES, same reason as the visual panel: in here the legend sat squarely on the peak.
+    _h, _l = AE.get_legend_handles_labels()
+    fig.legend(_h, _l, loc="lower center", bbox_to_anchor=(xp + wp / 2, 0.0), ncol=2,
+               fontsize=FS - 2.2, frameon=False, handlelength=1.4, columnspacing=1.2,
+               borderaxespad=0.0)
     f = os.path.join(paper, "figures", "ood-dynamical.png")
     fig.savefig(f, dpi=DPI); plt.close(fig)             # NO bbox_inches: tight would re-trim the margins
     print("  figures/ood-dynamical.png")

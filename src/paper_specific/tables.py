@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import numpy as np
 
 from .harvest import config, fmt, metrics, suffix, contains
 
@@ -51,13 +52,13 @@ def wm_table() -> str:
     hs = [1, 8, 32, 128]
     L = [r"\begin{table}[t]", r"  \centering", r"  \footnotesize",
          r"  \setlength{\tabcolsep}{3pt}",
-         r"  \caption{\textbf{World Model.} Open-loop prediction on held-out \texttt{starling-2} flight, by "
+         r"  \caption{\textbf{World Model.} Open-loop prediction on held-out \dataname flight, by "
          r"horizon: how far the action-conditioned observation prediction holds up. The first row is the "
          r"recipe as inherited from a manipulation dataset; every row below it changes one setting, and the "
          r"best per column is bold. The autoencoder floor re-encodes and decodes the true frame, so it "
          r"bounds what any dynamics model on this tokenizer can reach. The inherited recipe kept every "
          r"fifth frame and summed the commands it skipped; each row below changes one thing. "
-         r"$^{\dagger}$The autoencoder floor is not a model: it encodes and decodes the TRUE frame, so "
+         r"$^{\dagger}$The autoencoder floor is not a model: it encodes and decodes the true frame, so "
          r"it is the same at every horizon and no dynamics model on this tokenizer can beat it. "
          r"$^{*}$The configuration \modelname{} uses.}",
          r"  \label{tab:longhorizon}", r"  \begin{tabular}{lcccc}", r"    \toprule",
@@ -100,10 +101,10 @@ def ah_table() -> str:
          r"column that measures \emph{conditioning}, against a context-blind null, so $0$ is a model that "
          r"ignores its context; it is given at the first lead time and at the worst. $W_1$ is the distance "
          r"to the recorded action marginal, i.e.\ whether it flies like the data. Rest AUC asks whether "
-         r"the model can place mass on a stick being HELD still, which is what the percentile transform "
+         r"the model can place mass on a stick being held still, which is what the percentile transform "
          r"buys and what a flow cannot do without it. Pooled context with a raw target is the one cell of "
          r"the $2\times2$ that was never trained: nothing recommends it. No row wins every column, because "
-         r"the trade is real --- Fig.~\ref{fig:marginals} is the same question answered by eye. "
+         r"the trade is real --- Figure~\ref{fig:marginals} is the same question answered by eye. "
          r"$^{*}$The configuration \modelname{} uses, at the chunk length the planner wants.}",
          r"  \label{tab:actionhead}", r"  \begin{tabular}{lcccc}", r"    \toprule",
          r"    & Skill$_{+1}$ & Skill$_{\max}$ & $W_1$ & Rest AUC \\",
@@ -134,16 +135,16 @@ def ah_table() -> str:
 
 OOD_ROWS = {
     "eval_ood_noodle": [("latent_cos", r"Latent surprise (\textbf{ours})"), ("lpips", "Image LPIPS"),
-                        ("l2", "Image RMSE"), ("angvel_err", "Angular velocity error"),
-                        ("pos_err", "Position error")],
+                        ("l2", "Image RMSE")],
     # LATENT SURPRISE APPEARS IN BOTH BLOCKS, because the obvious question about a two-anomaly claim is
     # whether each channel is specific or just sensitive. It is not specific: on the dynamical anomaly it
     # still reads 72.4, well clear of no-skill, because a pushed drone eventually sees a different room.
     # The proprioceptive channels ARE specific -- on the visual anomaly they sit at no-skill.
-    "eval_ood_leafblower": [("angvel_err", r"Angular velocity error (\textbf{ours})"),
-                            ("vel_err", "Velocity error"), ("lpips", "Image LPIPS"),
-                            ("latent_cos", "Latent surprise"),
-                            ("rot_err", "Orientation error"), ("pos_err", "Position error")],
+    "eval_ood_leafblower": [("pos_err", "Position error"), ("rot_err", "Orientation error"),
+                            ("vel_err", "Velocity error"),
+                            ("angvel_err", r"Angular velocity error (\textbf{ours})"),
+                            ("latent_cos", "Latent surprise"), ("lpips", "Image LPIPS"),
+                            ("l2", "Image RMSE")],
 }
 OOD_NAME = {"eval_ood_noodle": "Visual anomaly: a pink pool noodle enters the frame", "eval_ood_leafblower": "Dynamical anomaly: an off-camera leaf blower pushes the drone"}
 
@@ -275,24 +276,42 @@ def _jerk(run):
 
 
 def _vlm(run):
-    """{request: (hit, base)} for the object/region requests, from the VLM labels."""
+    """{request: (hit, base, n)} for the object/region requests, from the VLM labels.
+
+    DOES THE TARGET APPEAR IN THE IMAGINED SEQUENCE, which is the question the author asked for and not
+    the one the training labels answer. `vlm_object_check.json` reuses the reward head's own schema: the
+    ONE most prominent object, and the one region in front of the drone at the END of the clip. Scored
+    that way a plan that flies to the table with the ladder also in frame counts as a miss, and the
+    learned prior read 0 of 4 on requests its own video satisfies. `vlm_object_appears.json`
+    (analysis/steer_vlm_appears.py) asks the same model for EVERY listed object visible at any point and
+    every region faced at any point, and is preferred where it exists.
+
+    The base rate is what makes either version readable, and it is why this is reported next to the hit:
+    under the permissive question the labeller returns 5-7 of the 10 objects per clip, so a target turns
+    up ~0.6 of the time when something else was asked for."""
     import json as _j
-    p = os.path.join(run, "vlm_object_check.json")
-    if not os.path.exists(p):
-        return {}
+    p = os.path.join(run, "vlm_object_appears.json")
+    multi = os.path.exists(p)
+    if not multi:
+        p = os.path.join(run, "vlm_object_check.json")
+        if not os.path.exists(p):
+            return {}
     rows = [(r["request"], r["label"]) for r in _j.load(open(p)) if r.get("label")]
     import yaml
     ic = yaml.safe_load(open("conf/interpret/starling.yaml"))
     OBJ, REG = list(ic["factors"]["object_in_view"]["buckets"]), list(ic["factors"]["facing"]["buckets"])
+    fields = (("objects_seen", "regions_faced") if multi else ("object_in_view", "facing"))
+    hit = (lambda o, b: b in o) if multi else (lambda o, b: o == b)
     out = {}
-    for buckets, field in ((OBJ, "object_in_view"), (REG, "facing")):
+    for buckets, field in zip((OBJ, REG), fields):
         sub = [(q, l[field]) for q, l in rows if q in buckets]
         for b in buckets:
             mine = [o for q, o in sub if q == b]
             other = [o for q, o in sub if q != b]
             if mine:
-                out[b] = (sum(o == b for o in mine) / len(mine),
-                          (sum(o == b for o in other) / len(other)) if other else float("nan"), len(mine))
+                out[b] = (sum(hit(o, b) for o in mine) / len(mine),
+                          (sum(hit(o, b) for o in other) / len(other)) if other else float("nan"),
+                          len(mine))
     return out
 
 
@@ -303,26 +322,30 @@ def steer_table(paper: str) -> str:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
     from steer_physical import WANTS
     ph = {k: _phys(v) for k, v in STEER_RUNS.items()}
-    jk = {k: _jerk(v) for k, v in STEER_RUNS.items()}
     vl = {k: _vlm(v) for k, v in VLM_RUNS.items()}
     nc = len(COLS)
+    nb = nc + 1                                  # ...plus the base-rate column the locations carry
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
-         r"  \caption{\textbf{Language steering.} The Action Model (AM) is the only thing that differs "
+         r"  \caption{\textbf{Language steering.} The AM is the only thing that differs "
          r"between columns. Every cell is the fraction of starting contexts that met the request: for a "
          r"motion primitive, that the imagined trajectory moved along the axis the words name by more "
          r"than $5\%$ of what a pilot covers in the same $34$\,s, read off the imagined proprioception "
-         r"and independent of the reward the planner maximised; for a location, that a VLM labelling the "
-         r"imagined video named it. Best per row in bold. $^{\ddagger}$Data Retrieval is the BASELINE: it "
+         r"and independent of the reward the planner maximised; for a location, that a VLM asked to list "
+         r"every object visible and every region faced \emph{at any point} in the imagined video named "
+         r"it. Best per row in bold. $^{\ddagger}$Data Retrieval is the \emph{baseline}: it "
          r"draws real recorded chunks, so it is perfectly flyable and completely blind to the request, "
          r"and beating it is the bar a learned prior has to clear. $^{\S}$The corpus contains no "
          r"backward flight at all, and no arm gets more than one context out of fifteen -- a motion "
          r"primitive absent from the data is not reachable by steering, however the candidates are "
-         r"drawn. The location block does "
-         r"not separate the columns and is scored strictly: the VLM names ONE object and ONE region per "
-         r"clip, so a plan that reaches the table while the ladder is also in view scores nothing here.}",
-         r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nc + "}", r"    \toprule",
-         r"    Request & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
-         r"    \multicolumn{" + str(1 + nc) + r"}{c}{Motion primitives} \\", r"    \midrule"]
+         r"drawn. The base rate is how often that same target is listed when a \emph{different} one was "
+         r"requested, averaged over the columns, and it is what the location block has to be read "
+         r"against: the room is one room, the labeller returns five to seven of the ten objects per "
+         r"clip, and a target whose base rate is near $0.9$ cannot distinguish anything. The two targets "
+         r"that are rare by chance --- ``white wall with table'' at $0.14$ and ``mannequin'' at $0.38$ "
+         r"--- are the only informative rows, and no arm wins both. Locations remain inconclusive.}",
+         r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nb + "}", r"    \toprule",
+         r"    Request & " + " & ".join(lab for _, lab in COLS) + r" & Base rate \\", r"    \midrule",
+         r"    \multicolumn{" + str(1 + nb) + r"}{c}{Motion primitives} \\", r"    \midrule"]
     hits_all = {m: [] for m, _ in COLS}
     frac_all = {m: [] for m, _ in COLS}
     for q in ("rotate left", "rotate right", "climb", "descend", "strafe left", "strafe right",
@@ -342,21 +365,11 @@ def steer_table(paper: str) -> str:
                  ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if v[0] == best and best else
                   f"{v[0]}/{v[1]}") for v in vals]
         nm = q + (r"$^{\S}$" if q == "fly backward" else "")
-        L.append(f"    ``{nm}\'\' & " + " & ".join(cells) + r" \\")
-    # THE AGGREGATES the continuity table used to hold: obeyed, motion against a pilot, and the two jerk
-    # columns, which is what makes the comparison between candidate sources legible in one place.
-    L += [r"    \midrule",
-          r"    Primitives obeyed (of $8$) & " + " & ".join(
-              (r"\textbf{" + f"{sum(hits_all[m])}" + "}/8")
-              if sum(hits_all[m]) == max(sum(h) for h in hits_all.values()) else f"{sum(hits_all[m])}/8"
-              for m, _ in COLS) + r" \\",
-          r"    Motion, fraction of a pilot & " + " & ".join(
-              f"{sum(frac_all[m]) / max(1, len(frac_all[m])):+.2f}" for m, _ in COLS) + r" \\",
-          r"    $|\Delta a|$ in a chunk ($\times$ recorded) & " + " & ".join(
-              "--" if jk[m] is None else f"{jk[m][0] / REC_DA:.2f}" for m, _ in COLS) + r" \\",
-          r"    $|\Delta a|$ at the seam ($\times$ recorded) & " + " & ".join(
-              "--" if jk[m] is None else f"{jk[m][1] / REC_DA:.2f}" for m, _ in COLS) + r" \\"]
-    L += [r"    \midrule", r"    \multicolumn{" + str(1 + nc) +
+        L.append(f"    ``{nm}\'\' & " + " & ".join(cells) + r" & -- \\")
+    # THE AGGREGATE ROWS ARE GONE, at the author's ask: obeyed, motion against a pilot and the two
+    # jerk multiples summarised the per-request cells above them and a continuity comparison this
+    # table no longer makes. hits_all/frac_all stay accumulated -- the prose quotes them.
+    L += [r"    \midrule", r"    \multicolumn{" + str(1 + nb) +
           r"}{c}{Locations} \\", r"    \midrule"]
     for q in ("wall with black panels", "center of room over mats", "floor to ceiling glass wall",
               "white wall with table", "ladder", "mannequin", "colored floor mat", "table"):
@@ -368,7 +381,9 @@ def steer_table(paper: str) -> str:
         cells = ["--" if v is None else
                  ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if best and v[0] == best else
                   f"{v[0]}/{v[1]}") for v in vals]
-        L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
+        bs = [v[1] for v in (vl.get(m, {}).get(q) for m, _ in COLS) if v and np.isfinite(v[1])]
+        L.append(f"    ``{q}\'\' & " + " & ".join(cells)
+                 + (f" & {np.mean(bs):.2f}" if bs else " & --") + r" \\")
     L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
 
