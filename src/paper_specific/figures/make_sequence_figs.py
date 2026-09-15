@@ -72,8 +72,15 @@ CORNER_R     = 8.0       # ONE corner radius: braces and tokenizers alike
 
 BRACE_M      = 30.0      # clearance above the items
 BRACE_T      = 8.0       # gap between a brace nib and the corner it marks
+STREAM_FRAC  = 1.0      # vertical spacing between the three cascades, as a fraction of the riser gap.
+#                         MEASURED 2026-09-15 and left at 1.0: the arrow of time sits 601 units (33% of
+#                         the height) below the bottom of the blue action block, but compressing this
+#                         moves the canvas height NOT AT ALL -- 1814.9 units at 1.0, 0.5 and 0.25 alike,
+#                         because the height is pinned by the RIGHT-HAND column (summariser, the two
+#                         heads, the token blocks, the decoders), not by the streams. Lifting the streams
+#                         only moves whitespace around inside the same box.
 TIME_M       = 40.0      # clearance between the last cascade and the arrow of time
-TIME_LAB     = "time"
+TIME_LAB     = "Time"   # capitalised, like every arrow-of-time label in the paper
 BRACE_HALO   = 6.0       # white halo width, as a multiple of LW
 
 ENC_GAP      = 170.0     # gap between the cascade and its tokenizer (holds the stem risers)
@@ -117,7 +124,10 @@ BLK_EC       = "#5b82ab"
 # and what marks it as PREDICTED is diagonal hatching, not hue. That separates the two questions a reader
 # asks of a block ("which modality" and "observed or predicted") onto two channels instead of making one
 # hue answer both, which is what forced the slice to orange and made it look like a third stream.
-PRED_HATCH   = "///"    # ...and EVERY predicted thing carries it: the slice in the token column, both
+PRED_HATCH   = "//"     # THICKER AND SPARSER than the default: "///" at the block line weight read as a
+#                         grey wash at print size rather than as a texture, so the stripe count is halved
+#                         and hatch.linewidth is tripled below. Every predicted thing carries it: the
+#                         slice in the token column, both
 #                         decoded outputs, the sampled chunk. The hatch always takes the object's OWN
 #                         outline colour, so it never introduces a hue -- it only adds a texture.
 LEG_S        = 58.0     # legend swatch
@@ -135,7 +145,7 @@ PRED_STEPS   = 1       # ONE predicted slice in this variant. Everything downstr
 #                        needed no separate switch: x_0's fan collapses to a single 45 (one target), the
 #                        decoder feeds leave that one slice's face, and each decoder emits one item.
 BLK_LW       = 1.1
-plt.rcParams["hatch.linewidth"] = BLK_LW * 0.9   # the hatch rides the block's own line weight
+plt.rcParams["hatch.linewidth"] = BLK_LW * 2.7   # 3x the old 0.9x: a hatch that reads AS a hatch
 # ---- decoders: mirrored trapezia off the RED blocks, producing the predicted frame and vector --------
 DEC_GAP      = 170.0     # red column's right face -> decoder input edge
 OUT_GAP      = 150.0     # decoder output edge -> the predicted item
@@ -743,7 +753,11 @@ def tokenizer_pts(cy, x0, flip=False):
 # ----------------------------------------------------------------------------------------------------
 # LAYOUT — solved ONCE, shared by every component render
 # ----------------------------------------------------------------------------------------------------
-_arrows = np.random.default_rng(7).choice(np.arange(8) * (np.pi / 4), size=ACT.shape)
+# THE ARROWS ARE THE DATA. These were random angles (rng(7).choice of the eight compass directions),
+# which is indefensible in a figure whose point is what the data looks like -- a reader takes a glyph to
+# mean something. Up is a positive stick, down negative, which is the same convention the dataset figure
+# uses, so the two figures agree.
+_arrows = np.where(ACT >= 0.0, 0.0, np.pi)
 _p_prop, _vw, _vh_p, _p_prop_vec = vector_item_factory(OBS, cmap=MOD_CMAP["proprio"])
 _p_act, _, _vh_a, _p_act_vec = vector_item_factory(ACT, arrows=_arrows, cmap=MOD_CMAP["action"],
                                                   cmap_vec=ACT_OUT_CMAP)
@@ -838,7 +852,11 @@ def solve_layout():
     # point of each stream and the horizontal stem line of the stream below it, so the figure breathes at
     # one rate in both axes and cannot drift if the riser stagger changes.
     GAP = LAYERS[1]["riser_x"][0] - ((LAYERS[0]["n"] - 1) * OFFSET_X + LAYERS[0]["pw"])
-    STREAM_GAP = GAP
+    # STREAM_GAP was tied to the horizontal riser gap, on the principle that one gap should appear
+    # everywhere. That principle costs a third of the figure's height: the three cascades descend
+    # diagonally and stack, so the action stream ends up 600 units below the bottom of the action token
+    # block, and the arrow of time below that again. STREAM_FRAC compresses the VERTICAL spacing only.
+    STREAM_GAP = GAP * STREAM_FRAC
     item_bottom = [L["ph"] + OFFSET_Y * (L["n"] - 1) for L in LAYERS]
     brace_top = [min(q[1] for i0, i1 in L["braces"] for q in brace_segs(L["pw"], i0, i1)[0]) for L in LAYERS]
     # STREAM SPACING IS THE ORIGINAL RULE -- one measured gap from the lowest point of each stream to the
@@ -1493,7 +1511,9 @@ def _draw_action_fan(ax, x0, y0, x1, y1):
 # compass per cell, not the command's direction), so the output tiles carry the same kind of glyph from
 # their own seed: what makes a tile read as an ACTION here is the glyph, and dropping it would make the
 # action output look like the proprio output.
-_smp_arrows = np.random.default_rng(11).choice(np.arange(8) * (np.pi / 4), size=(AS_TILES, ACT.shape[1]))
+# Same rule as the input stream: the glyph is the SIGN of the value in the tile it sits in, here the
+# action chunk the head actually sampled -- not a random direction.
+_smp_arrows = np.where(ACT_SMP[0, :AS_TILES] >= 0.0, 0.0, np.pi)
 
 
 def _draw_action_tiles(ax, x0, y0, x1, y1):

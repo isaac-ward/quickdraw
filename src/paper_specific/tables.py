@@ -16,15 +16,17 @@ from .harvest import config, fmt, metrics, suffix, contains
 
 LOGS = "logs"
 
-# ---- the world-model ablation: same data, same codec, one setting changed per row -----------------
+# ---- the world-model ablation: same data, same autoencoder, one setting changed per row ----------
+# Row labels say what the setting IS, not what the run was called: `vl128 base` named a file, not a
+# configuration, and stride 5 with summed actions is the thing a reader needs to know.
 WM_ROWS = [
-    ("train_world_model_2026_09_05_20_21_02_starling2_vl128", r"\texttt{vl128} base", ""),
+    ("train_world_model_2026_09_05_20_21_02_starling2_vl128", r"Stride $5$, summed actions", ""),
     ("train_world_model_2026_09_07_03_45_54_starling2_heavy", r"\quad + denoiser depth 4", "rejected"),
     ("train_world_model_2026_09_12_08_06_49_s2_sub4_concat_deriv", r"\quad + derivative actions", "rejected"),
-    ("train_world_model_2026_09_11_03_17_22_s2_sub3_concat", r"\quad frame stride 3", ""),
-    ("train_world_model_2026_09_08_21_46_53_s2_sub1", r"\quad frame stride 1", ""),
-    ("train_world_model_2026_09_08_22_04_09_s2_sub4", r"\quad frame stride 4, summed actions", ""),
-    ("train_world_model_2026_09_11_03_17_47_s2_sub4_concat", r"\quad frame stride 4, concatenated (\textbf{ours})", "kept"),
+    ("train_world_model_2026_09_11_03_17_22_s2_sub3_concat", r"\quad stride $3$, concatenated", ""),
+    ("train_world_model_2026_09_08_21_46_53_s2_sub1", r"\quad stride $1$, concatenated", ""),
+    ("train_world_model_2026_09_08_22_04_09_s2_sub4", r"\quad stride $4$, summed", ""),
+    ("train_world_model_2026_09_11_03_17_47_s2_sub4_concat", r"\quad stride $4$, concatenated (\textbf{ours})", "kept"),
 ]
 # ---- the Action Model: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
 AH_ROWS = [
@@ -39,9 +41,11 @@ AH_ROWS = [
 def wm_table() -> str:
     hs = [1, 8, 32, 128]
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
-         r"  \caption{Open-loop prediction on held-out \texttt{starling-2} flight, by horizon. Rows change "
-         r"one setting at a time; best per column in bold. The autoencoder floor re-encodes and decodes the "
-         r"true frame, so it bounds what any dynamics model can reach.}",
+         r"  \caption{\textbf{World Model.} Open-loop prediction on held-out \texttt{starling-2} flight, by "
+         r"horizon: how far the action-conditioned observation prediction holds up. The first row is the "
+         r"recipe as inherited from a manipulation dataset; every row below it changes one setting, and the "
+         r"best per column is bold. The autoencoder floor re-encodes and decodes the true frame, so it "
+         r"bounds what any dynamics model on this tokenizer can reach.}",
          r"  \label{tab:longhorizon}", r"  \begin{tabular}{lcccc}", r"    \toprule",
          r"    & \multicolumn{4}{c}{LPIPS $\downarrow$ at open-loop horizon} \\",
          r"    \cmidrule(lr){2-5}",
@@ -72,10 +76,13 @@ def wm_table() -> str:
 
 def ah_table() -> str:
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
-         r"  \caption{The Action Model. Energy skill is measured against a context-blind null, so $0$ is "
-         r"a model that ignores its context. Rest AUC asks whether the prior identifies the stick being held "
-         r"at rest, which a rectified flow cannot place mass on without the percentile transform. $W_1$ is "
-         r"against the recorded action marginal. Best per column in bold.}",
+         r"  \caption{\textbf{Action Model.} The counterpart of Table~\ref{tab:longhorizon} for the other "
+         r"half of what \modelname{} predicts: not what follows from an action, but what action follows from "
+         r"a context. Rows change one setting at a time, best per column in bold. Energy skill is measured "
+         r"against a context-blind null, so $0$ is a model that ignores its context, reported at the first "
+         r"lead time and at the worst. Rest AUC asks whether the model identifies the stick being HELD at "
+         r"rest, mass a rectified flow cannot place without the percentile transform. $W_1$ is to the "
+         r"recorded action marginal. $\uparrow$ higher is better, $\downarrow$ lower.}",
          r"  \label{tab:actionhead}", r"  \begin{tabular}{lllcccc}", r"    \toprule",
          r"    Chunk & Context & Target & Skill$_{+1}$ $\uparrow$ & Skill$_{\max}$ $\uparrow$ "
          r"& $W_1$ $\downarrow$ & Rest AUC $\uparrow$ \\", r"    \midrule"]
@@ -116,7 +123,7 @@ OOD_ROWS = {
                             ("vel_err", "velocity error"), ("lpips", "image LPIPS"),
                             ("rot_err", "orientation error"), ("pos_err", "position error")],
 }
-OOD_NAME = {"eval_ood_noodle": "Visual (pool noodle)", "eval_ood_leafblower": "Dynamical (leaf blower)"}
+OOD_NAME = {"eval_ood_noodle": "Visual anomaly: a pool noodle enters frame", "eval_ood_leafblower": "Dynamical anomaly: an off-camera leaf blower pushes the drone"}
 
 
 def ood_table(paper: str) -> str:
@@ -126,29 +133,31 @@ def ood_table(paper: str) -> str:
     j = json.load(open(os.path.join(LOGS, "paper_icra_2027", "wm_anomaly_classification.json")))
     cov = j.get("coverage", 0.9)
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
-         r"  \caption{Out-of-distribution detection from one-step prediction error, scored per timestep "
+         r"  \caption{\textbf{Out-of-distribution detection}, from one-step prediction error, scored per "
          # ESCAPE THE PERCENT SIGN. `{cov:.0%}` emits a bare % and LaTeX comments out the rest of the
          # caption, which ends as "Runaway argument? ... File ended while scanning use of \caption".
-         rf"against the reviewed anomaly windows. The threshold is the {100 * cov:.0f}\% quantile of the "
-         r"non-conformity scores of the \emph{other} episodes' in-distribution steps, so nominal accuracy "
-         r"is calibrated to $\approx$" + rf"{100 * cov:.0f}\%" + r" by construction and failure accuracy is what the "
-         r"detector buys. Weighted accuracy is the mean of the two, whose no-skill value is $0.500$ under "
-         r"any class imbalance. Rows below the first in each block are the same pipeline read through a "
-         r"different error channel.}",
-         r"  \label{tab:ood}", r"  \begin{tabular}{llccc}", r"    \toprule",
-         r"    & & Nominal & Failure & Weighted \\",
-         r"    Anomaly & Score & acc.\ $\uparrow$ & acc.\ $\uparrow$ & acc.\ $\uparrow$ \\"]
+         rf"timestep against the reviewed anomaly windows. The threshold is the {100 * cov:.0f}\% quantile "
+         r"of the non-conformity scores of the \emph{other} episodes' in-distribution steps, so nominal "
+         r"accuracy is calibrated to $\approx$" + rf"{100 * cov:.0f}\%" + r" by construction and failure "
+         r"accuracy is what the detector buys. Weighted accuracy is the mean of the two, whose no-skill "
+         r"value is $50\%$ under any class imbalance. Within each block the first row is the channel we "
+         r"use and the rest are the same pipeline read through a different error channel, which is what "
+         r"makes them controls. $\uparrow$ higher is better.}",
+         r"  \label{tab:ood}", r"  \begin{tabular}{lccc}", r"    \toprule",
+         r"    & Nominal & Failure & Weighted \\",
+         r"    Score & acc.\ (\%) $\uparrow$ & acc.\ (\%) $\uparrow$ & acc.\ (\%) $\uparrow$ \\"]
     for split, rows in OOD_ROWS.items():
-        L += [r"    \midrule", r"    \multicolumn{5}{c}{" + OOD_NAME[split] + r"} \\", r"    \midrule"]
+        L += [r"    \midrule", r"    \multicolumn{4}{c}{" + OOD_NAME[split] + r"} \\", r"    \midrule"]
         m = j[split]["metrics"]
         for key, label in rows:
             r = m[key]
-            cells = [fmt(r["specificity"]), fmt(r["recall"]), fmt(r["balanced_accuracy"])]
+            cells = [f"{100 * r[k]:.1f}" for k in ("specificity", "recall", "balanced_accuracy")]
             if r"\textbf" in label:
                 cells = [r"\textbf{" + c + "}" for c in cells]
-            L.append(f"    & {label} & " + " & ".join(cells) + r" \\")
+            L.append(f"    {label} & " + " & ".join(cells) + r" \\")
     L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
+
 
 
 
@@ -164,8 +173,8 @@ STEER_RUNS = {
     "prior": "logs/eval_steer_2026_09_14_22_08_46_phys16_prior",
     "pitdelta": "logs/eval_steer_2026_09_15_01_12_15_phys16_pitdelta",
 }
-COLS = [("gauss", "Gaussian"), ("data", "Data chunks"), ("prior", r"Prior (\textbf{ours})"),
-        ("pitdelta", r"Prior, PIT-$\Delta$")]
+COLS = [("gauss", "Gaussian prior"), ("data", "Data prior"),
+        ("prior", r"Learned PIT prior (\textbf{ours})"), ("pitdelta", r"Learned PIT-$\Delta$ prior")]
 # The place block needs DECODED VIDEO for the labeller, so these are the video-on 26-request suites
 # rather than the 16-context physical runs above.
 VLM_RUNS = {
@@ -180,12 +189,12 @@ REC_DA = 0.0541          # recorded step-to-step |da| at this rate, same fold (c
 # The continuity arms. Everything is held fixed except how a chunk is made to continue the one before it,
 # with the two candidate sources that are not the prior kept as references for the smoothness column.
 CONT_ROWS = [
-    ("logs/eval_steer_2026_09_15_05_06_35_phys16_gauss", "Gaussian noise"),
-    ("logs/eval_steer_2026_09_14_22_08_48_phys16_data", "Real data chunks"),
-    ("logs/eval_steer_2026_09_15_05_33_54_phys16_noguid", r"\quad prior, no continuity"),
-    ("logs/eval_steer_2026_09_15_05_58_34_phys16_xfade", r"\quad prior, crossfade"),
-    ("logs/eval_steer_2026_09_14_22_08_46_phys16_prior", r"\quad prior, prefix guidance (\textbf{ours})"),
-    ("logs/eval_steer_2026_09_15_01_12_15_phys16_pitdelta", r"\quad prior, PIT-$\Delta$"),
+    ("logs/eval_steer_2026_09_15_05_06_35_phys16_gauss", "Gaussian prior"),
+    ("logs/eval_steer_2026_09_14_22_08_48_phys16_data", "Data prior"),
+    ("logs/eval_steer_2026_09_15_05_33_54_phys16_noguid", r"\quad learned prior, no continuity"),
+    ("logs/eval_steer_2026_09_15_05_58_34_phys16_xfade", r"\quad learned prior, crossfade"),
+    ("logs/eval_steer_2026_09_14_22_08_46_phys16_prior", r"\quad learned prior, prefix guidance (\textbf{ours})"),
+    ("logs/eval_steer_2026_09_15_01_12_15_phys16_pitdelta", r"\quad learned PIT-$\Delta$ prior"),
 ]
 
 
@@ -206,7 +215,7 @@ def _phys(run):
         key, sgn = WANTS[d["request"]]
         v = physical(np.load(os.path.join(os.path.dirname(f), "proprio.npy")))[key] * sgn
         out.setdefault(d["request"], []).append(v)
-    return {k: (sum(v) / len(v), len(v)) for k, v in out.items()}
+    return {k: (sum(v) / len(v), len(v), v) for k, v in out.items()}   # (mean, n, per-context values)
 
 
 def _jerk(run):
@@ -265,54 +274,54 @@ def _vlm(run):
 
 
 def steer_table(paper: str) -> str:
+    """Per-request steering, as FRACTIONS OF CONTEXTS THAT MET THE REQUIREMENT.
+
+    The earlier version printed net motion in metres and degrees, which needs the pilot scale beside it to
+    mean anything and cannot be compared across axes. A request either moved the drone the way it named or
+    it did not, per starting context, so x/16 (directions) and x/4 (places, as judged by the VLM) says the
+    same thing without the units -- and the aggregate motion, which is the part a fraction loses, is in
+    Table~\ref{tab:continuity}."""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
     from steer_physical import WANTS
     ph = {k: _phys(v) for k, v in STEER_RUNS.items()}
-    jk = {k: _jerk(v) for k, v in STEER_RUNS.items()}
     vl = {k: _vlm(v) for k, v in VLM_RUNS.items()}
-    # what a pilot covers on each axis in the same 34 s, so "achieved" has a scale (analysis/steer_physical)
-    PILOT = {"yaw": 471.75, "altitude": 0.58, "forward": 23.63, "lateral": 19.92}
-    REC = 0.0541                                        # recorded step-to-step |da|, same fold
     nc = len(COLS)
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
-         r"  \caption{Language steering, per request, with the candidate source as the only difference "
-         r"between columns: gaussian noise (MPPI's historic candidates, the control), real recorded action "
-         r"chunks (state-blind but perfectly flyable), the trained prior, and the same prior trained on "
-         r"increments. For a request naming a \emph{direction} the readout is the imagined trajectory's net "
-         r"motion along the axis the words name, signed so positive means obeyed, in physical units and "
-         r"independent of the reward the planner maximised. For a request naming a \emph{place} it is a "
-         r"VLM's label of the imagined video, with `null' --- how often that place is reached when "
-         r"something \emph{else} was asked for --- as the context-blind baseline beside it. The place block "
-         r"is inconclusive and we report it as such: every arm beats its own null, but so does the gaussian "
-         r"control, and at four contexts per request the differences between columns are noise.}",
-         r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{ll" + "c" * nc + "}", r"    \toprule",
-         r"    Request & Asked for & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
-         r"    \multicolumn{" + str(2 + nc) + r"}{c}{Directions --- net motion achieved, and $\%$ of what a "
-         r"pilot covers in the same $34$\,s} \\", r"    \midrule"]
-    hits = {m: [] for m, _ in COLS}
-    frac = {m: [] for m, _ in COLS}
+         r"  \caption{\textbf{Language steering}, per request, with the candidate source as the only "
+         r"difference between columns. Every cell is the fraction of starting contexts that met the "
+         r"request: for a motion primitive, that the imagined trajectory moved along the axis the words "
+         r"name by more than $5\%$ of what a pilot covers in the same $34$\,s, read off the imagined "
+         r"proprioception and independent of the reward the planner maximised; for a location, that a VLM "
+         r"labelling the imagined video reports the drone reached it. `null\' beside a location is how "
+         r"often it is reached when something \emph{else} was requested, the context-blind baseline from "
+         r"inside the same run. The location block does not separate the columns -- every arm beats its "
+         r"own null and so does the gaussian control -- and at four contexts per request it has no power "
+         r"to.}",
+         r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nc + "}", r"    \toprule",
+         r"    Request & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
+         r"    \multicolumn{" + str(1 + nc) + r"}{c}{Motion primitives} \\", r"    \midrule"]
     for q in ("rotate left", "rotate right", "climb", "descend", "strafe left", "strafe right",
               "fly forward", "fly backward"):
-        key, sgn = WANTS[q]
+        key = WANTS[q][0]
         cells = []
         for m, _ in COLS:
             v = ph[m].get(q)
             if v is None:
-                cells.append("--")
-                continue
-            r = v[0] / PILOT[key]
-            hits[m].append(v[0] > 0.05 * PILOT[key]); frac[m].append(r)
-            cells.append(f"{v[0]:+.1f}{UNIT[key]} ({100 * r:+.0f}\\%)")
-        L.append(f"    {q} & {key} {'+' if sgn > 0 else '$-$'} & " + " & ".join(cells) + r" \\")
-    L += [r"    \midrule", r"    \multicolumn{" + str(2 + nc) +
-          r"}{c}{Places --- fraction of plans a VLM confirms reached it, (null)} \\", r"    \midrule"]
+                cells.append("--"); continue
+            hits = sum(x > 0.05 * PILOT[key] for x in v[2])
+            cells.append(f"{hits}/{len(v[2])}")
+        L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
+    L += [r"    \midrule", r"    \multicolumn{" + str(1 + nc) + r"}{c}{Locations} \\", r"    \midrule"]
     for q in ("wall with black panels", "center of room over mats", "floor to ceiling glass wall",
               "white wall with table", "ladder", "mannequin", "colored floor mat", "table"):
         cells = []
         for m, _ in COLS:
             v = vl.get(m, {}).get(q)
-            cells.append("--" if v is None else f"{v[0]:.2f}~({v[1]:.2f})")
-        L.append(f"    {q} & place & " + " & ".join(cells) + r" \\")
+            if v is None:
+                cells.append("--"); continue
+            n = int(v[2])
+            cells.append(f"{round(v[0] * n)}/{n}~({v[1]:.2f})")
+        L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
     L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
 

@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import FancyArrowPatch
 import torch
 
 DPI = 450          # figures whose content is text and line art: export high so print stays crisp
@@ -45,18 +46,27 @@ def _model(dev="cuda"):
 
 
 @torch.no_grad()
-def longhorizon(paper, dev="cuda", n_traj=4, H=128, n_show=8):
-    """Open-loop rollout on RECORDED actions: prediction above, ground truth below, time left to right.
+def longhorizon(paper, dev="cuda", n_show=8):
+    """Open-loop rollout on RECORDED actions: Predicted above, Truth directly below, Time left to right.
 
-    Recorded actions, not planned ones: this figure is about the dynamics, so the action sequence must be
-    one the drone actually flew. Four different val episodes, each a row-pair."""
+    Recorded actions, not planned ones: this figure is about the dynamics, so the action sequence has to
+    be one the drone actually flew.
+
+    HOW LONG CAN WE GO? The horizon is capped by the shortest val episode, not by the model: 7 episodes of
+    1763-1796 frames, which at stride 4 and P=8 context leaves 432 steps = 115 s. The first pair is shown
+    at +128 (34 s, the horizon the project is characterised at) and the other two at the full 432, which
+    is what the cap allows."""
+    # THE CAP IS THE EPISODE, AND THE START MATTERS. At t0=0 the context is the first 8 frames, which is
+    # takeoff -- a near-static view of the floor -- and even the +1 prediction came out wrong from it.
+    # Skipping 24 steps costs 32 of the available horizon and buys a context the model has seen.
+    H_SHORT, H_LONG, T0_LONG = 128, 400, 24
+    PLAN = [(0, H_SHORT, 40), (1, H_LONG, T0_LONG), (2, H_LONG, T0_LONG)]
     cfg, core, norm, P, key = _model(dev)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
                                  cam=image_head_cams(cfg), repo_id="starling-2")
     rows = []
-    for ei in range(min(n_traj, len(eps))):
+    for ei, H, t0 in PLAN:
         o, a, fr = eps[ei]
-        t0 = 40 + ei * 60
         h = min(H, len(o) - t0 - P - 1)
         ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[t0:t0 + P])).float()[None].to(dev),
                key: torch.from_numpy(fr[key][t0:t0 + P]).float().div(255.0)[None].to(dev)}
@@ -64,22 +74,39 @@ def longhorizon(paper, dev="cuda", n_traj=4, H=128, n_show=8):
         pr = core.imagine_eval(ctx, acts, h, heads=[key], norm=norm)[key][0].clamp(0, 1)
         gt = fr[key][t0 + P:t0 + P + h]
         ks = np.unique(np.linspace(0, h - 1, n_show).round().astype(int))
-        pred = np.concatenate([(pr[k].cpu().numpy() * 255).astype(np.uint8) for k in ks], axis=1)
-        true = np.concatenate([gt[k] for k in ks], axis=1)
-        rows.append((pred, true, ks, h))
-    fig, ax = plt.subplots(2 * len(rows), 1, figsize=(14, 1.35 * 2 * len(rows)))
-    for i, (pred, true, ks, h) in enumerate(rows):
-        for j, (img, lab) in enumerate(((pred, "predicted"), (true, "ground truth"))):
-            A = ax[2 * i + j]
-            A.imshow(img); A.axis("off")
-            A.text(-0.008, 0.5, lab, transform=A.transAxes, ha="right", va="center", fontsize=7,
-                   rotation=90)
-        ax[2 * i].set_title(f"episode {i}   open-loop steps " + ", ".join(f"$+${k + 1}" for k in ks),
-                            fontsize=7, loc="left")
-    fig.tight_layout(h_pad=0.15)
+        rows.append(([(pr[k].cpu().numpy() * 255).astype(np.uint8) for k in ks], [gt[k] for k in ks],
+                     ks, h))
+        print(f"    episode {ei}: {h} steps ({h * 4 / 15.0:.0f} s), columns "
+              + ", ".join(f"+{k + 1}" for k in ks))
+
+    ih, iw = rows[0][0][0].shape[:2]
+    NC = len(rows[0][2])
+    # ONE GRID, BUILT BY HAND. gridspec with wspace=hspace=0 is the only way the Truth row touches the
+    # Predicted row with no white gap; a per-axes imshow with tight_layout always leaves one.
+    fig = plt.figure(figsize=(14, 14 * (2 * len(rows) * ih + 0.34 * len(rows) * ih) / (NC * iw)))
+    gs = fig.add_gridspec(3 * len(rows), NC, hspace=0.0, wspace=0.0,
+                          height_ratios=[0.34, 1.0, 1.0] * len(rows))
+    for r, (pred, true, ks, h) in enumerate(rows):
+        for c in range(NC):
+            lab = fig.add_subplot(gs[3 * r, c]); lab.axis("off")
+            lab.text(0.5, 0.12, f"$+${ks[c] + 1}", ha="center", va="bottom", fontsize=11)
+            for k, img in ((1, pred[c]), (2, true[c])):
+                A = fig.add_subplot(gs[3 * r + k, c])
+                A.imshow(img, interpolation="bilinear")
+                A.set_xticks([]); A.set_yticks([])
+                for sp in A.spines.values():                 # the frame outline: black, and the same
+                    sp.set_linewidth(2.0); sp.set_color("black")   # weight as the green one in Fig. 4
+                if c == 0:
+                    A.set_ylabel("Predicted" if k == 1 else "Truth", fontsize=11)
+    # THE ARROW OF TIME, along the bottom of the whole figure
+    fig.subplots_adjust(bottom=0.045)
+    fig.patches.append(FancyArrowPatch((0.045, 0.021), (0.995, 0.021), transform=fig.transFigure,
+                                       arrowstyle="-|>", mutation_scale=22, lw=1.6, color="#333333"))
+    fig.text(0.52, 0.030, "Time", ha="center", va="bottom", fontsize=13, color="#333333")
     f = os.path.join(paper, "figures", "longhorizon.png")
     fig.savefig(f, dpi=DPI_IMG, bbox_inches="tight"); plt.close(fig)
-    print(f"  figures/longhorizon.png  {len(rows)} episodes x {H} steps")
+    print(f"  figures/longhorizon.png  {len(rows)} pairs, horizons "
+          + ", ".join(str(r[3]) for r in rows))
 
 
 def memory(paper):
