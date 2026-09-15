@@ -465,22 +465,12 @@ def curves(paper):
         A.set_title(name, fontsize=8)
         A.set_xlabel("Epoch", fontsize=7); A.tick_params(labelsize=6); A.grid(alpha=0.25)
         if name == "Reward Model":
-            # THE TWO REFERENCE LINES, BOTH MEASURED. Without them the reward panel reads as a flat
-            # failure. The logged loss is evaluated on a 2048-point subset of the held-out points --
-            # NOT on the training batch -- so chance is ln(2048)=7.63; and because 6.7 latents share
-            # one caption group, identical captions tie in the softmax and the attainable floor is
-            # 1.97 (simulated over the actual subset draw). Validation bottoms at 6.23: 1.39 nats
-            # below chance, a quarter of the way to the floor. Weak, but not chance.
-            # PLAIN ENGLISH ON BOTH LINES. "Below chance" reads as a failure to anyone who has not just
-            # been told that this is a loss; naming the top line random guessing and the bottom one the
-            # best attainable value makes the direction unambiguous without a "lower is better" note.
-            for yv, lab, va_ in ((7.625, "Chance --- random guessing", "top"),
-                                 (1.969, "Best attainable (identical captions tie)", "bottom")):
-                A.axhline(yv, color="0.35", ls=":", lw=1.0)
-                A.annotate(lab, xy=(0.98, yv), xycoords=("axes fraction", "data"), ha="right",
-                           va=va_, fontsize=5.2, color="0.25")
+            # ZOOMED TO THE FIRST 20 EPOCHS. Everything happens there -- val bottoms at epoch 10 and the
+            # remaining 70 are flat -- and the wall-clock axis follows, because it is derived from this
+            # limit. The chance and best-attainable lines are gone; the numbers live in the caption.
+            A.set_xlim(0, 20)
         if cur["train"] or cur["val"]:
-            A.legend(fontsize=6, loc="lower left" if name == "Reward Model" else "best")
+            A.legend(fontsize=6)
         if i == 0:
             A.set_ylabel("Loss", fontsize=7)
         h = float(np.mean(hrs)) if hrs else fallback_h
