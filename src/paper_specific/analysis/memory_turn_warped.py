@@ -293,6 +293,11 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
                 im_axes.append(A)
             else:
                 top_axes.append(A)
+                # THE STEP TAG GOES INSIDE, on a translucent plate: the design the author prefers. Only
+                # the period's name is left above, which is what the brace has to point at.
+                A.text(0.035, 0.94, f"$+${int(k) + 1}", transform=A.transAxes, ha="left", va="top",
+                       fontsize=FS - 1.0, color="black",
+                       bbox=dict(boxstyle="square,pad=0.14", fc="white", ec="none", alpha=0.74))
     AC = fig.add_subplot(gcur[0])
     for (kk, name), col in zip(METRICS, ("tab:blue", "tab:green", "tab:red")):
         S = d[kk]
@@ -326,9 +331,9 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     steps = [int(np.clip(k, 0, len(pred_fr) - 1)) + 1 for _, k in EV]
     for i, ((xa, xb), A, txt) in enumerate(zip(((0.0, t_away), (t_away, t_back), (t_back, t_end)),
                                                im_axes,
-                                               (f"Looking at\nOOD region ($+${steps[0]})",
-                                                f"Looking away from\nOOD region ($+${steps[1]})",
-                                                f"Looking back at\nOOD region ($+${steps[2]})"))):
+                                               ("Looking at\nOOD region",
+                                                "Looking away from\nOOD region",
+                                                "Looking back at\nOOD region"))):
         fa = inv.transform(AC.transData.transform((xa, 0)))[0]
         fb = inv.transform(AC.transData.transform((xb, 0)))[0]
         col = A.get_position()

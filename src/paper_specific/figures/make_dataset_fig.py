@@ -110,6 +110,11 @@ def main() -> int:
         for i, x in enumerate(xs):
             ax.imshow(frames[i], extent=(x, x + IMG_W, y0 + img_h, y0), interpolation="bilinear")
             ax.add_patch(Rectangle((x, y0), IMG_W, img_h, fill=False, ec=vis, lw=IMG_LW / 2))
+            # THE STEP TAG, INSIDE the frame on a translucent plate -- the same design as every other
+            # figure in the paper. The y axis is inverted here, so the frame's TOP is the smaller y.
+            ax.text(x + 0.030 * IMG_W, y0 + 0.055 * img_h, f"$+${i + 1}", ha="left", va="top",
+                    fontsize=7.5, color="black",
+                    bbox=dict(boxstyle="square,pad=0.14", fc="white", ec="none", alpha=0.74))
         y_s = y0 + img_h + gap
         cells(ax, o, xs, y_s, CMAP["proprio"], rows=2, lw=LW / 2)
         cells(ax, a, xs, y_s + 2 * CELL + gap, CMAP["action"], rows=1, needles=True, lw=LW / 2)

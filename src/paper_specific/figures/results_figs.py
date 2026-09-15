@@ -86,25 +86,28 @@ def longhorizon(paper, dev="cuda", n_show=8):
     NC = len(rows[0][2])
     # ONE GRID, BY HAND: gridspec with hspace=0 is the only way the Truth row touches the Predicted row.
     # Per pair: a label strip, the two image rows, then a full-width curve panel.
-    fig = plt.figure(figsize=(14, 14 * (2 * len(rows) * ih * 1.62) / (NC * iw)))
-    # FIVE rows per pair: label strip, the two images, the curve panel, and a SPACER -- with hspace=0
-    # (which the flush image pair needs) the next pair's step labels otherwise land on this pair's ticks.
-    gs = fig.add_gridspec(5 * len(rows), NC, hspace=0.0, wspace=0.0,
-                          height_ratios=[0.34, 1.0, 1.0, 0.95, 0.30] * len(rows))
+    fig = plt.figure(figsize=(14, 14 * (2 * len(rows) * ih * 1.50) / (NC * iw)))
+    # FOUR rows per pair: the two images, the curve panel, and a SPACER. The step-label strip is GONE --
+    # the tag sits INSIDE its own frame now, which is the design the author prefers and which buys the
+    # strip's height back.
+    gs = fig.add_gridspec(4 * len(rows), NC, hspace=0.0, wspace=0.0,
+                          height_ratios=[1.0, 1.0, 0.95, 0.34] * len(rows))
     for r, (pred, true, ks, h, cur) in enumerate(rows):
         for c in range(NC):
-            lab = fig.add_subplot(gs[5 * r, c]); lab.axis("off")
-            lab.text(0.5, 0.12, f"$+${ks[c] + 1}", ha="center", va="bottom", fontsize=13)
-            for k, img in ((1, pred[c]), (2, true[c])):
-                A = fig.add_subplot(gs[5 * r + k, c])
+            for k, img in ((0, pred[c]), (1, true[c])):
+                A = fig.add_subplot(gs[4 * r + k, c])
                 A.imshow(img, interpolation="bilinear", aspect="auto")
                 A.set_xticks([]); A.set_yticks([])
                 for sp in A.spines.values():                 # the frame outline: black, and the same
                     sp.set_linewidth(1.0); sp.set_color("black")   # half weight, at the author's ask
                 if c == 0:                                   # 13pt made the two labels touch
-                    A.set_ylabel("Predicted" if k == 1 else "Truth", fontsize=10.5, labelpad=2)
+                    A.set_ylabel("Predicted" if k == 0 else "Truth", fontsize=10.5, labelpad=2)
+                if k == 0:
+                    A.text(0.022, 0.96, f"$+${ks[c] + 1}", transform=A.transAxes, ha="left", va="top",
+                           fontsize=11, color="black",
+                           bbox=dict(boxstyle="square,pad=0.14", fc="white", ec="none", alpha=0.72))
         # THE ERRORS OVER THE WHOLE ROLLOUT, under the pair they belong to and on the same x
-        AC = fig.add_subplot(gs[5 * r + 3, :])
+        AC = fig.add_subplot(gs[4 * r + 2, :])
         x = np.arange(1, h + 1)
         for (nm, v), col in zip(cur.items(), ("tab:blue", "tab:green", "tab:red")):
             AC.plot(x, v, lw=1.3, color=col, label=nm)
@@ -315,7 +318,7 @@ def ood(paper, dev="cuda"):
     # THE LEGEND COMES OUT OF THE AXES. Four entries will not fit beside the data at 3.4in -- inside
     # the panel it covered the rise that is the whole point of the figure -- so it sits under the trace
     # as a two-column strip and the plot area is left clear.
-    TOP_IN, PAD_IN, TR_IN, BOT_IN, LEG_IN = 0.34, 0.0, 0.78, 0.34, 0.30
+    TOP_IN, PAD_IN, TR_IN, BOT_IN, LEG_IN = 0.02, 0.0, 0.78, 0.34, 0.30
     FIG_H = TOP_IN + 2 * ch_in + PAD_IN + TR_IN + BOT_IN + LEG_IN
     fig = plt.figure(figsize=(FIG_W, FIG_H))
     cw, ch = W / 4.0, ch_in / FIG_H
@@ -337,9 +340,11 @@ def ood(paper, dev="cuda"):
         else:
             A.imshow(img)
         if lab:
-            # TWO LINES AT SINGLE-COLUMN WIDTH: "In distribution ($t{=}8$)" is wider than 0.78in of
-            # column, so the parenthetical drops under the name rather than colliding with its neighbour.
-            A.set_title(lab.replace(" ($t", "\n($t"), fontsize=FS - 2.2, pad=1.8, linespacing=1.15)
+            # INSIDE THE FRAME, top left, on a translucent plate -- the design the author prefers, and it
+            # returns the entire title band to the figure.
+            A.text(0.03, 0.95, lab.replace(" ($t", "\n($t"), transform=A.transAxes, ha="left",
+                   va="top", fontsize=FS - 2.4, color="black", linespacing=1.1,
+                   bbox=dict(boxstyle="square,pad=0.16", fc="white", ec="none", alpha=0.74))
         A.set_xticks([]); A.set_yticks([])
         for sp_ in A.spines.values():
             sp_.set_visible(True); sp_.set_linewidth(0.6); sp_.set_color("black")
@@ -381,7 +386,9 @@ def ood(paper, dev="cuda"):
     # are exactly as tall as the two images -- no frame is ever rescaled anisotropically.
     FIG_W, L, GAP, R = 3.4, 0.56, 0.0, 0.01            # inches: ylabel+ticks, plot-to-image gap, margin
     WI = 1.06                                          # image width; the plots take whatever is left
-    TOP_IN, BOT_IN, LEG_IN = 0.30, 0.34, 0.30          # 2-line image title, xlabel+ticks, legend strip
+    # TOP_IN is not zero even with the captions inside: the rotated two-line "Observed omega (rad/s)" is
+    # taller than its own panel, so it overflows both ends of it and the top end needs somewhere to go.
+    TOP_IN, BOT_IN, LEG_IN = 0.10, 0.34, 0.30          # ylabel slack, xlabel+ticks, legend strip
     hi = WI * ph / pw                                  # one image, and therefore one plot, in inches
     PW = FIG_W - L - GAP - WI - R
     FIG_H = TOP_IN + 2 * hi + BOT_IN + LEG_IN
@@ -395,14 +402,16 @@ def ood(paper, dev="cuda"):
     AI.set_xticks([]); AI.set_yticks([])
     for sp_ in AI.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(0.6); sp_.set_color("black")
-    AI.set_title("Disturbance\nis applied", fontsize=FS - 2.2, pad=1.8, linespacing=1.15)
+    AI.text(0.03, 0.95, "Disturbance\nis applied", transform=AI.transAxes, ha="left", va="top",
+            fontsize=FS - 2.4, color="black", linespacing=1.1,
+            bbox=dict(boxstyle="square,pad=0.16", fc="white", ec="none", alpha=0.74))
     A = fig.add_axes([xi, y_top - 2 * hr, wi_, hr]); A.imshow(pov)
     # THE LABEL BELONGS UNDER THIS ONE: the frame is the whole argument for the dynamical case, and the
     # argument is that there is nothing in it to see. It sits in the band the legend strip occupies on
     # the plot side, which is free out here.
-    A.annotate("Disturbance is\nvisually\nundetectable", xy=(0.5, 0.0), xycoords="axes fraction",
-               ha="center", va="top", fontsize=FS - 2.2, linespacing=1.15,
-               xytext=(0, -3), textcoords="offset points")
+    A.text(0.03, 0.95, "Disturbance is\nvisually\nundetectable", transform=A.transAxes, ha="left",
+           va="top", fontsize=FS - 2.4, color="black", linespacing=1.1,
+           bbox=dict(boxstyle="square,pad=0.16", fc="white", ec="none", alpha=0.74))
     A.set_xticks([]); A.set_yticks([])
     for sp_ in A.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(0.6); sp_.set_color("black")
