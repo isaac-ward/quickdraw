@@ -262,7 +262,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     t_away, t_back, t_end = -x0, D - x0, float(gx[have][-1])
     fig = plt.figure(figsize=(7.1, 5.6))
     # the images take the larger share, and the gap holds the braces and their labels
-    outer = fig.add_gridspec(2, 1, height_ratios=(1.42, 1.30), hspace=0.10)
+    outer = fig.add_gridspec(2, 1, height_ratios=(1.42, 1.30), hspace=0.24)
     gim = outer[0].subgridspec(2, 3, hspace=0.0, wspace=0.16)
     gcur = outer[1].subgridspec(2, 1, hspace=0.0, height_ratios=(1.15, 1.0))
     im_axes, top_axes = [], []
@@ -309,7 +309,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     # the brace sits high enough that its two-line label clears the axes below it
-    y_br = AC.get_position().y1 + 0.040
+    y_br = AC.get_position().y1 + 0.018
     for i, ((xa, xb), A, txt) in enumerate(zip(((0.0, t_away), (t_away, t_back), (t_back, t_end)),
                                                im_axes,
                                                ("Looking at\naltered region",

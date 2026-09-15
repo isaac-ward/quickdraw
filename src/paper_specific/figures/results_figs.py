@@ -90,7 +90,7 @@ def longhorizon(paper, dev="cuda", n_show=8):
     # FIVE rows per pair: label strip, the two images, the curve panel, and a SPACER -- with hspace=0
     # (which the flush image pair needs) the next pair's step labels otherwise land on this pair's ticks.
     gs = fig.add_gridspec(5 * len(rows), NC, hspace=0.0, wspace=0.0,
-                          height_ratios=[0.34, 1.0, 1.0, 0.95, 0.62] * len(rows))
+                          height_ratios=[0.34, 1.0, 1.0, 0.95, 0.30] * len(rows))
     for r, (pred, true, ks, h, cur) in enumerate(rows):
         for c in range(NC):
             lab = fig.add_subplot(gs[5 * r, c]); lab.axis("off")
@@ -113,7 +113,7 @@ def longhorizon(paper, dev="cuda", n_show=8):
         AC.set_xlim(1, h); AC.set_ylim(0, 1.0)
         AC.set_ylabel("error", fontsize=12); AC.tick_params(labelsize=10)
         AC.grid(alpha=0.25)
-        AC.legend(fontsize=10, ncol=3, loc="lower left", framealpha=0.85)
+        AC.legend(fontsize=10, ncol=3, loc="upper left", framealpha=0.85)
         # EACH PAIR HAS ITS OWN X AXIS -- the rollouts are different lengths, so they never shared one --
         # but the NAME of that axis is written once, under the arrow of time, because a label per panel
         # lands on the next pair's step numbers.
@@ -125,12 +125,12 @@ def longhorizon(paper, dev="cuda", n_show=8):
         pos = A.get_position()
         if abs(pos.y0 - first.y0) < 1e-6:
             last = pos
-    fig.subplots_adjust(bottom=0.075)
+    fig.subplots_adjust(bottom=0.052)
     x0, x1 = first.x0, (last or first).x1
-    fig.patches.append(FancyArrowPatch((x0, 0.022), (x1, 0.022), transform=fig.transFigure,
+    fig.patches.append(FancyArrowPatch((x0, 0.018), (x1, 0.018), transform=fig.transFigure,
                                        arrowstyle="-|>", mutation_scale=22, lw=1.6, color="#333333"))
-    fig.text(x1 + 0.006, 0.022, "$t$", ha="left", va="center", fontsize=15, color="#333333")
-    fig.text(0.5 * (x0 + x1), 0.016, "Open-loop prediction step", ha="center", va="top", fontsize=12,
+    fig.text(x1 + 0.006, 0.018, "$t$", ha="left", va="center", fontsize=15, color="#333333")
+    fig.text(0.5 * (x0 + x1), 0.012, "Open-loop prediction step", ha="center", va="top", fontsize=12,
              color="#333333")
     f = os.path.join(paper, "figures", "longhorizon.png")
     fig.savefig(f, dpi=DPI_IMG, bbox_inches="tight"); plt.close(fig)
@@ -154,7 +154,7 @@ def memory(paper):
 
 
 @torch.no_grad()
-def _scene_photo(paper, name):
+def _scene_photo(paper, name, shape=None):
     """The third-person shot out of the author's own composite figure (figures/leaf-blower.png etc).
 
     Only the TOP panel is wanted -- the scene with the disturbance in it -- and the panels in those files
@@ -168,7 +168,15 @@ def _scene_photo(paper, name):
     dark = (im.max(axis=(1, 2)) < 40)
     rows = [r for r in range(int(h * 0.20), int(h * 0.60)) if dark[r]]
     cut = rows[0] if rows else int(h * 0.42)
-    return im[2:cut - 2, 2:-2]
+    im = im[2:cut - 2, 2:-2]
+    if shape is not None:
+        # MATCH THE CAMERA FRAMES' ASPECT by cropping off the TOP, so the photo sits in the row at the
+        # same size as the frames beside it instead of being taller than all of them.
+        want = shape[0] / shape[1]
+        hh, ww = im.shape[:2]
+        keep = int(min(hh, ww * want))
+        im = im[hh - keep:, :]
+    return im
 
 
 def ood(paper, dev="cuda"):
@@ -222,85 +230,106 @@ def ood(paper, dev="cuda"):
         return eps, c
 
     def mark_context(A):
-        A.axvline(P, color="tab:blue", ls="-.", lw=1.0)
-        A.text(P, A.get_ylim()[1], " prediction starts", color="tab:blue", fontsize=FS - 2.0,
-               ha="left", va="top")
+        # a SOLID line named in the legend, not text on the plot: the first P frames are context, so
+        # there is no prediction to the left of it
+        A.axvline(P, color="tab:blue", ls="-", lw=1.2, label="Prediction starts")
 
     # ================= (a) VISUAL =====================================================================
-    split, chan, chan_lab = "eval_ood_noodle", "latent_cos", "latent surprise"
+    split, chan, chan_lab = "eval_ood_noodle", "latent_cos", "Latent surprise"
     eps, c = pick(split, prefer="end")
     ep, w0, w1 = c["ep"], c["w0"], c["w1"]
     o, a, fr = eps[ep]
     r = one_step(core, norm, o, a, fr[key], key, P, dev)
     inside = [t for t in range(max(P, w0), min(w1, len(o)))]
-    t_in = max(((pink_mask(fr[key][t]).mean(), t) for t in inside))[1]
+    # SEVERAL CANDIDATES, and the one whose surprise map is sharpest wins. Pink fraction alone picks the
+    # frame with the MOST noodle in it, which is often the one where it fills the frame and the map has
+    # nothing to contrast against; the ratio of the map's 99th percentile to its median says how much the
+    # object stands out from the rest of the scene, which is what makes the panel legible.
+    top_pink = [t for _, t in sorted(((pink_mask(fr[key][t]).mean(), t) for t in inside),
+                                     reverse=True)[:5]]
+    best_t, best_sur, best_q = None, None, -1.0
+    for t in top_pink:
+        ob = torch.from_numpy(fr[key][t]).float().div(255.0).to(dev)
+        mm, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t, dev, n=32), ob)
+        sm = mm["surprise_patch"].cpu().numpy()
+        q = float(np.percentile(sm, 99) / max(1e-6, np.median(sm)))
+        print(f"      candidate t={t}: surprise contrast {q:.2f}")
+        if q > best_q:
+            best_t, best_sur, best_q = t, sm, q
+    t_in = best_t
     cand = [t for t in range(P, len(o)) if not (w0 <= t < w1)]
     t_out = max(cand, key=lambda t: abs(t - t_in)) if cand else P
-    obs = torch.from_numpy(fr[key][t_in]).float().div(255.0).to(dev)
-    mp, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t_in, dev, n=32), obs)
-    sur = mp["surprise_patch"].cpu().numpy()
-    photo = _scene_photo(paper, "pool-noodle.png")
+    sur = best_sur
+    photo = _scene_photo(paper, "pool-noodle.png", shape=fr[key][0].shape)
     fig = plt.figure(figsize=(7.2, 3.6))
     outer = fig.add_gridspec(2, 1, height_ratios=(1.05, 1.0), hspace=0.24)
     top = outer[0].subgridspec(1, 4 if photo is not None else 3, wspace=0.06)
-    panes = [(photo, "how it was applied")] if photo is not None else []
-    panes += [(fr[key][t_out], f"in distribution ($t{{=}}{t_out}$)"),
-              (fr[key][t_in], f"anomalous ($t{{=}}{t_in}$)"), (None, "per-pixel surprise")]
+    panes = [(photo, "How it was applied")] if photo is not None else []
+    panes += [(fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
+              (fr[key][t_in], f"Anomalous ($t{{=}}{t_in}$)"), (None, "Per-pixel surprise")]
     for jx, (img, lab) in enumerate(panes):
         A = fig.add_subplot(top[0, jx])
         if img is None:
-            A.imshow(sur, cmap="inferno", vmin=np.percentile(sur, 50), vmax=np.percentile(sur, 99))
+            A.imshow(sur, cmap="inferno", vmin=np.percentile(sur, 50), vmax=np.percentile(sur, 99),
+                     aspect="auto")
         else:
-            A.imshow(img)
-        A.set_title(lab, fontsize=FS); A.axis("off")
+            A.imshow(img, aspect="auto")
+        A.set_title(lab, fontsize=FS)
+        A.set_xticks([]); A.set_yticks([])
+        for sp_ in A.spines.values():                    # every image in the paper carries this border
+            sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
     A = fig.add_subplot(outer[1])
     v = np.asarray(r[chan])
     A.plot(r["steps"], v, color="crimson", lw=1.4)
-    A.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0, label="reviewed anomaly window")
+    A.axvspan(w0, w1, color="tab:purple", alpha=0.16, lw=0, label="Anomaly window")
     out = (r["steps"] < w0) | (r["steps"] >= w1)
     if out.any():
         A.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
-                  label="90% conformal threshold")
+                  label="90% threshold")
     A.set_xlim(0, len(o) - 1)
-    A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("Model step", fontsize=FS)
-    A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25); A.legend(fontsize=FS - 1.5, loc="lower left")
+    A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("Prediction step", fontsize=FS)
+    A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25)
     mark_context(A)
+    A.legend(fontsize=FS - 1.5, loc="upper right")
     f = os.path.join(paper, "figures", "ood-visual.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print("  figures/ood-visual.png")
 
     # ================= (b) DYNAMICAL ==================================================================
-    split, chan, chan_lab = "eval_ood_leafblower", "angvel_err", "angular velocity error"
+    split, chan, chan_lab = "eval_ood_leafblower", "angvel_err", "$\\omega$ error"
     eps, c = pick(split, prefer="central")
     ep, w0, w1 = c["ep"], c["w0"], c["w1"]
     o, a, fr = eps[ep]
     r = one_step(core, norm, o, a, fr[key], key, P, dev)
-    photo = _scene_photo(paper, "leaf-blower.png")
+    photo = _scene_photo(paper, "leaf-blower.png", shape=fr[key][0].shape)
     fig = plt.figure(figsize=(7.2, 3.3))
     gb = fig.add_gridspec(2, 2, width_ratios=(1.0, 1.7), wspace=0.20, hspace=0.14)
     if photo is not None:
-        A = fig.add_subplot(gb[:, 0]); A.imshow(photo); A.axis("off")
-        A.set_title("how it was applied", fontsize=FS)
+        A = fig.add_subplot(gb[:, 0]); A.imshow(photo, aspect="auto")
+        A.set_xticks([]); A.set_yticks([])
+        for sp_ in A.spines.values():
+            sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
+        A.set_title("How it was applied", fontsize=FS)
     AV = fig.add_subplot(gb[0, 1])
     for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
         AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
-    AV.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0)
-    AV.set_ylabel("recorded\n$\\omega$ (rad/s)", fontsize=FS)
+    AV.axvspan(w0, w1, color="tab:purple", alpha=0.16, lw=0)
+    AV.set_ylabel("Observed $\\omega$\n(rad/s)", fontsize=FS, labelpad=2)
     AV.legend(fontsize=FS - 2, ncol=3, loc="upper left", frameon=False)
     AV.tick_params(labelsize=FS - 1.5, labelbottom=False); AV.grid(alpha=0.25)
     AV.set_xlim(0, len(o) - 1)
     AE = fig.add_subplot(gb[1, 1], sharex=AV)
     v = np.asarray(r[chan])
     AE.plot(r["steps"], v, color="crimson", lw=1.4)
-    AE.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0, label="reviewed anomaly window")
+    AE.axvspan(w0, w1, color="tab:purple", alpha=0.16, lw=0, label="Anomaly window")
     out = (r["steps"] < w0) | (r["steps"] >= w1)
     if out.any():
         AE.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
-                   label="90% conformal threshold")
-    AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Model step", fontsize=FS)
+                   label="90% threshold")
+    AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)
     AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25)
-    AE.legend(fontsize=FS - 1.5, loc="upper right")      # upper-left is where the context mark labels
     mark_context(AE)
+    AE.legend(fontsize=FS - 1.5, loc="upper right", ncol=1)
     f = os.path.join(paper, "figures", "ood-dynamical.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print("  figures/ood-dynamical.png")

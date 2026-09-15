@@ -38,7 +38,7 @@ OUT = "/app/logs/paper_icra_2027/marginals.png"
 AXES = [a["name"] for a in yaml.safe_load(open("conf/interpret/starling.yaml"))["action_axes"]]
 NA = len(AXES)
 LOOKAHEADS = (0, 7, 15, 31)    # slots into the 32-step chunk: +1, +8, +16, +32
-N_CTX, N_DRAW, BINS = 48, 64, 61
+N_CTX, N_DRAW, BINS = 48, 64, 41   # coarser bins: on a log axis 61 bins read as noise
 FS = 9.0
 
 
@@ -78,32 +78,62 @@ def main(run: str = RUN) -> int:
         pr = PriorProposal(core, a_max=1e9, norm=norm, prefix_guidance=False)     # raw stick units
         g = torch.Generator(device="cuda"); g.manual_seed(0)
         d = pr.sample(torch.zeros(len(h), K, A, device="cuda"), N_DRAW, ctx=h, g=g)
-        pred = d.reshape(-1, K, A).cpu().numpy().reshape(-1, K, A // NA, NA).mean(axis=2)
+        # KEEP THE CONTEXT GROUPING: (contexts, draws, K, axes). The marginals pool it away, but the
+        # conditioning panel needs to compare spread WITHIN a context against spread ACROSS contexts.
+        pred_g = d.cpu().numpy().reshape(len(h), N_DRAW, K, A // NA, NA).mean(axis=3)
+        pred = pred_g.reshape(-1, K, NA)
     print(f"  chunk {K} | recorded {real.shape} | sampled {pred.shape} "
           f"({len(h)} contexts x {N_DRAW} draws)")
 
-    fig, ax = plt.subplots(len(LOOKAHEADS), NA, figsize=(7.1, 2.8), sharex=True)
+    # CONDITIONING, computed from the same draws: spread within a context against spread across all of
+    # them. If the model is using its context, its samples for one context are tighter than the pooled
+    # population; if it has stopped using it, the two coincide and this goes to zero. That is the thing
+    # that decays with lookahead, and the marginals above cannot show it -- they are pooled.
+    within = pred_g.std(axis=1).mean(axis=0)                     # (K, NA)
+    pooled = pred_g.reshape(-1, K, NA).std(axis=0)               # (K, NA)
+    cond = 1.0 - within / np.maximum(pooled, 1e-9)               # (K, NA)
+
+    fig = plt.figure(figsize=(7.1, 3.9))
+    outer = fig.add_gridspec(2, 1, height_ratios=(2.5, 1.0), hspace=0.42)
+    gh = outer[0].subgridspec(len(LOOKAHEADS), NA, hspace=0.0, wspace=0.30)
     for r, k in enumerate(LOOKAHEADS):
         for c in range(NA):
-            A_ = ax[r, c]
-            # ONE x range for every panel: the stick is bounded at +-1 by construction, so a per-panel
-            # range made panels with a narrow distribution look like panels with a wide one.
-            bins = np.linspace(-1.0, 1.0, BINS)
+            A_ = fig.add_subplot(gh[r, c])
+            # fore/aft never goes positive in this corpus, so its own range is -1..0 and the shared
+            # -1..1 spent half the panel on empty space
+            x0, x1 = (-1.0, 0.0) if AXES[c].startswith("fore") else (-1.0, 1.0)
+            bins = np.linspace(x0, x1, BINS)
             A_.hist(real[:, k, c], bins=bins, density=True, color="tab:green", alpha=0.45,
                     label="Truth" if (r == 0 and c == 0) else None)
             A_.hist(pred[:, k, c], bins=bins, density=True, color="tab:red", alpha=0.45,
                     label="Prediction" if (r == 0 and c == 0) else None)
-            A_.set_yticks([]); A_.tick_params(labelsize=FS - 2.5)
-            A_.set_xlim(-1.0, 1.0)
-            for sp in A_.spines.values():                    # every panel in its own box
+            # LOG COUNTS: the atom at rest is one or two orders of magnitude above the body, so on a
+            # linear axis the body is a flat smear under a spike.
+            A_.set_yscale("log"); A_.set_yticks([])
+            A_.set_xlim(x0, x1)
+            A_.tick_params(labelsize=FS - 2.5, labelbottom=(r == len(LOOKAHEADS) - 1))
+            for sp in A_.spines.values():
                 sp.set_visible(True); sp.set_linewidth(0.7); sp.set_color("black")
             if r == 0:
-                A_.set_title(AXES[c], fontsize=FS)
+                A_.set_title(AXES[c].capitalize() if not AXES[c].startswith("fore") else "Fore/aft",
+                             fontsize=FS)
             if c == 0:
                 A_.set_ylabel(f"$+${k + 1}", fontsize=FS)
-    ax[0, 0].legend(fontsize=FS - 2.0, frameon=False, loc="upper left")
-    fig.supylabel("lookahead", fontsize=FS)
-    fig.tight_layout(h_pad=0.25, w_pad=0.35)
+            if r == 0 and c == 0:
+                A_.legend(fontsize=FS - 2.0, frameon=False, loc="upper left")
+    AC = fig.add_subplot(outer[1])
+    for c in range(NA):
+        AC.plot(np.arange(1, K + 1), cond[:, c], lw=0.9, alpha=0.55,
+                label=AXES[c].capitalize() if not AXES[c].startswith("fore") else "Fore/aft")
+    AC.plot(np.arange(1, K + 1), cond.mean(axis=1), lw=2.0, color="k", label="Mean")
+    AC.axhline(0.0, color="k", ls=":", lw=0.8)
+    AC.set_xlim(1, K); AC.set_xlabel("Lookahead (steps into the chunk)", fontsize=FS)
+    AC.set_ylabel("Conditioning", fontsize=FS)
+    AC.tick_params(labelsize=FS - 2.0); AC.grid(alpha=0.25)
+    AC.legend(fontsize=FS - 2.5, ncol=5, loc="upper right", frameon=False)
+    fig.supylabel("Lookahead", fontsize=FS)
+    print("  conditioning: mean {:.3f} at +1 -> {:.3f} at +{}".format(
+        cond.mean(axis=1)[0], cond.mean(axis=1)[-1], K))
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", OUT)
     return 0

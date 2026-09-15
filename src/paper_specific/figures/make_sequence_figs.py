@@ -111,15 +111,16 @@ RM_TITLE     = "Reward model\n(contrastive)"
 RM_LAT       = "MLP $f_z$"            # the latent branch, fed by the brace, drawn ON TOP
 RM_TXT       = "MiniLM + MLP $f_t$"   # the text branch, fed by the request, drawn BELOW it
 RM_COS       = "cosine"
-RM_REQ       = "\u201cgo forward to the ladder\nin the middle of the room\u201d"   # no box, two lines
+RM_REQ       = "\u201cGo forward to the ladder\nin the middle of the room\u201d"   # no box, two lines
+RM_REQ_PAD   = 90.0      # clear space between the request and the box it feeds
 RM_OUT       = "Similarity score"
 RM_ROW_H     = 58.0      # internal row height
 RM_ROW_SEP   = 16.0      # between the two stacked branches
 RM_COS_GAP   = 110.0     # branch boxes -> the cosine: the two feed arrows have to be visible in it
 #                          tall and the figure has no room under the token column for that
 RM_PAD       = 26.0
-RM_GAP_BR    = 70.0      # column bottom -> brace line
-RM_GAP_BOX   = 95.0      # brace line -> box top
+RM_GAP_BR    = BRACE_M   # column bottom -> brace line: THE SAME LIFT the summariser's input brace uses
+RM_GAP_BOX   = 62.0      # brace line -> box top
 RM_GAP_TXT   = 70.0      # box -> the sentence, which sits to its LEFT
 # ---- Z ORDER (one place, because the stacking rules are not obvious) --------------------------------
 # RULE: A FEED ARROW MUST NEVER CROSS A TOKENIZER OUTLINE. The tokenizers therefore sit ABOVE every
@@ -1340,7 +1341,10 @@ def solve_layout():
     for D in DEC:
         D["cy"] += dy; D["out_cy"] += dy
         D["src"] = (D["src"][0], D["src"][1] + dy)
-    return max([blk_x + blk_w, DEC_BOX[2] + MARGIN, AH["x1"] + MARGIN]
+    # THE REWARD MODEL'S OUTPUT LABEL IS THE RIGHTMOST INK, now that the block's right edge is aligned
+    # with the decoders': its arrow and "Similarity score" run past that edge and were clipped.
+    _rm_x = (DEC_BOX[2] + 2.6 * ARROW_L + text_extent(RM_OUT, BOX_FS * 0.8)[0] + MARGIN) if RM_ON else 0.0
+    return max([blk_x + blk_w, DEC_BOX[2] + MARGIN, AH["x1"] + MARGIN, _rm_x]
                + ([LD["x1"] + MARGIN] if LD_ON else [])
                + ([AS_BOX[2] + MIN_SEG + max(text_extent(nm, BB_FS * 0.85)[0] for nm in AS_AXES)
                    + MARGIN] if AS_BOX else [])) - x_min + 2 * MARGIN, (bot - top) + 2 * MARGIN, enc_x, blk_x
@@ -1579,10 +1583,10 @@ def draw_legend(ax):
     about TEXTURE: colour already means modality everywhere in this figure, and a coloured swatch here
     would read as a fifth stream."""
     w_lab = max(text_extent(t, ENC_FS)[0] for t in (LEG_TRUE, LEG_PRED))
-    # TOP LEFT. It used to sit bottom-right; the streams now occupy less of the lower band and the
-    # top-left corner above the first cascade is the emptiest part of the figure.
+    # BOTTOM LEFT: the reward model now fills the lower right, and the streams having lifted leaves the
+    # bottom-left corner empty.
     lx = MARGIN
-    ly = MARGIN
+    ly = CANVAS_H - MARGIN - 2 * LEG_S - LEG_SEP
     for k, (lab, hatch) in enumerate(((LEG_TRUE, None), (LEG_PRED, PRED_HATCH))):
         y = ly + k * (LEG_S + LEG_SEP)
         ax.add_patch(Rectangle((lx, y), LEG_S, LEG_S, fc="white", ec=EDGE, lw=LW * 1.6, hatch=hatch,
@@ -1781,12 +1785,19 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
     if reward and RM_ON:
         sx = LAYERS[0]["sx"]
         dy_ = LAYERS[0]["tip"][0][1] - LAYERS[0]["tip_abs"][0][1]      # solve_layout's own y offset
-        # THE BRACE SPANS THE TOKEN BAG ITSELF: the left edge of the ACTION (blue) block to the right
-        # edge of the PROPRIOCEPTION (orange) one, which is the width of the bag the reward reads.
+        # THE BRACE, AND WHY IT WAS SHORT. brace_between PROJECTS its two corners onto a line through
+        # the lifted start point in direction `u`, and `u` defaults to the CASCADE ANGLE -- which is
+        # right for the summariser's brace, because that one sits on an isometric edge of the block and
+        # runs parallel to it. The bottom span here is horizontal, so projecting it onto a sloped line
+        # shortened it by cos(angle) and slid the left end inward: the ends no longer matched the corners
+        # they were meant to mark. Passing u=(1,0) makes the projection the identity in x, so the brace
+        # runs from the ACTION (blue) block's left edge to the PROPRIOCEPTION (orange) block's right
+        # edge exactly, which is the width of the token bag the reward reads. The lift is BRACE_M, the
+        # same depth as the summariser's input brace.
         bl = min(b[0] for b in LAYERS[-1]["blk_box"]) + sx
         br = max(b[2] for b in LAYERS[1]["blk_box"]) + sx
         by = max([b[3] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[3]]) + dy_
-        poly, mid = brace_between((bl, by), (br, by), RM_GAP_BR, off=(0.0, 1.0))
+        poly, mid = brace_between((bl, by), (br, by), RM_GAP_BR, u=(1.0, 0.0), off=(0.0, 1.0))
         draw_arrow(ax, poly, Z_ARROW)
         # SAME RENDERING AS THE HEADS: outer box at ENC_LW with a BOX_FS title, internals at ENC_LW*0.6
         # with BB_FS text, which is what draw_box uses -- the reward model was drawn at its own weights
@@ -1799,12 +1810,13 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         ttl_h = text_extent(RM_TITLE, BOX_FS)[1]
         rw = 2 * RM_PAD + w_br + RM_COS_GAP + w_cos
         rh = 2 * RM_PAD + ttl_h + 2 * sub_h + RM_ROW_SEP
-        # LEFT EDGE PAST THE BLUE CUBOID'S RIGHT EDGE, which is what keeps this band shallow and stops
-        # the block sitting under the column it hangs off.
+        # RIGHT EDGE IN LINE WITH THE DECODERS', and never further left than the blue cuboid's right
+        # edge, so the block does not sit under the column it hangs off.
         blue_r = max(b[2] for b in LAYERS[-1]["blk_box"]) + sx
-        rx0 = max(mid[0] + 0.30 * rw, blue_r + 2 * MIN_SEG)
-        ry0 = mid[1] + RM_GAP_BOX
+        rx1 = DEC_BOX[2] + sx
+        rx0 = max(rx1 - rw, blue_r + 2 * MIN_SEG)
         rx1 = rx0 + rw
+        ry0 = mid[1] + RM_GAP_BOX
         ax.add_patch(PathPatch(rounded_polygon([(rx0, ry0), (rx1, ry0), (rx1, ry0 + rh), (rx0, ry0 + rh)],
                                                CORNER_R), fc=ENC_FC, ec=BOX_EC, lw=ENC_LW,
                                zorder=Z_TOKENIZER))
@@ -1841,7 +1853,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         tw = max(text_extent(l, BB_FS * 1.5)[0] for l in lines)
         draw_arrow(ax, [(mid[0], y_txt), (bx0 - ARROW_L, y_txt)], Z_ARROW, tip=(bx0, y_txt),
                    head_dir=(1.0, 0.0))
-        ax.text(mid[0] - MIN_SEG, y_txt, RM_REQ, ha="right", va="center", fontsize=BB_FS * 1.5,
+        ax.text(mid[0] - RM_REQ_PAD, y_txt, RM_REQ, ha="right", va="center", fontsize=BB_FS * 2.0,
                 style="italic", color=EDGE, linespacing=1.25, zorder=Z_TOKENIZER + 1)
         draw_arrow(ax, [(cx0 + w_cos, y_cos), (rx1 + 1.2 * ARROW_L, y_cos)], _z_in,
                    tip=(rx1 + 2.2 * ARROW_L, y_cos), head_dir=(1.0, 0.0))
