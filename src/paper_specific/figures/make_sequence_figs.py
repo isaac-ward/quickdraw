@@ -122,7 +122,7 @@ RM_COS_GAP   = 110.0     # branch boxes -> the cosine: the two feed arrows have 
 #                          tall and the figure has no room under the token column for that
 RM_PAD       = 26.0
 RM_GAP_BR    = BRACE_M   # column bottom -> brace line: THE SAME LIFT the summariser's input brace uses
-RM_GAP_BOX   = 78.0      # brace line -> box top (16 units lower than it was, at the author's ask)
+RM_GAP_BOX   = 94.0      # brace line -> box top (lowered twice now, at the author's ask)
 RM_GAP_TXT   = 70.0      # box -> the sentence, which sits to its LEFT
 # ---- Z ORDER (one place, because the stacking rules are not obvious) --------------------------------
 # RULE: A FEED ARROW MUST NEVER CROSS A TOKENIZER OUTLINE. The tokenizers therefore sit ABOVE every
@@ -309,8 +309,8 @@ BB_SUBSEP    = 22.0      # gap between sublayer boxes -- where the residual arcs
 BB_ARC       = 26.0      # width of the channel the residual bypass arcs run down, left of the boxes
 BB_BRACE     = 16.0      # how far right of the sublayer boxes the "x 4" brace line sits
 BB_FS        = 14.0
-BADGE_R      = 26.0      # the circled number in each head's top-left corner: 1 observation, 2 action,
-BADGE_FS     = 20.0      #   3 reward -- the order the paper introduces them in
+BADGE_R      = 20.0      # the circled number in each head's top-left corner: 1 observation, 2 action,
+BADGE_FS     = 16.0      #   3 reward -- the order the paper introduces them in
 # The flow head's ENTRY BAR. flow.py refuses cond="adaln": every input is CONCATENATED once, here, and
 # after that it is a plain transformer. Linear(544 -> 128) over [x_tau 128 | tau_emb 32 | cond 384].
 # TWO bars, because they are two different operations: the concatenation (whose arguments are the whole
@@ -1422,9 +1422,15 @@ def draw_box(ax, D, sx):
                            fc=ENC_FC, ec=BOX_EC, lw=ENC_LW, zorder=Z_TOKENIZER))
     # THE HEADS ARE BOLD, the summariser is not: bold marks the three things the paper trains, and the
     # summariser is a component inside the first of them.
-    ax.text(0.5 * (x0 + x1), D["title_cy"], D["title"], ha="center", va="center",
-            fontsize=BOX_FS, color="black", linespacing=1.3, zorder=Z_TOKENIZER + 4,
-            fontweight="bold" if "head" in D["title"] else "normal")
+    # THE NAME IS BOLD, THE PARENTHETICAL IS NOT: "(rectified flow)" is a qualifier, not the name, so
+    # the two lines are drawn separately rather than as one bold block.
+    _tl = D["title"].split("\n")
+    _bold = "head" in _tl[0]
+    _lh = text_extent("Ay", BOX_FS)[1] * 1.3
+    for _i, _ln in enumerate(_tl):
+        ax.text(0.5 * (x0 + x1), D["title_cy"] + (_i - (len(_tl) - 1) / 2.0) * _lh, _ln,
+                ha="center", va="center", fontsize=BOX_FS, color="black", zorder=Z_TOKENIZER + 4,
+                fontweight="bold" if (_bold and _i == 0) else "normal")
     if D.get("badge"):
         badge(ax, x0 + BB_PAD + BADGE_R, y0 + BB_PAD + BADGE_R, D["badge"])
     if D.get("glyph"):
@@ -1628,10 +1634,10 @@ def draw_legend(ax):
     about TEXTURE: colour already means modality everywhere in this figure, and a coloured swatch here
     would read as a fifth stream."""
     w_lab = max(text_extent(t, ENC_FS)[0] for t in (LEG_TRUE, LEG_PRED))
-    # BOTTOM LEFT: the reward model now fills the lower right, and the streams having lifted leaves the
-    # bottom-left corner empty.
+    # BOTTOM LEFT, and its BOTTOM is level with the reward head's bottom, so the figure ends where the
+    # ink does rather than leaving a band under both.
     lx = MARGIN
-    ly = CANVAS_H - MARGIN - 2 * LEG_S - LEG_SEP
+    ly = globals().get("RM_BOT", CANVAS_H - MARGIN) - 2 * LEG_S - LEG_SEP
     for k, (lab, hatch) in enumerate(((LEG_TRUE, None), (LEG_PRED, PRED_HATCH))):
         y = ly + k * (LEG_S + LEG_SEP)
         ax.add_patch(Rectangle((lx, y), LEG_S, LEG_S, fc="white", ec=EDGE, lw=LW * 1.6, hatch=hatch,
@@ -1860,8 +1866,13 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         ax.add_patch(PathPatch(rounded_polygon([(rx0, ry0), (rx1, ry0), (rx1, ry0 + rh), (rx0, ry0 + rh)],
                                                CORNER_R), fc=ENC_FC, ec=BOX_EC, lw=ENC_LW,
                                zorder=Z_TOKENIZER))
-        ax.text(0.5 * (rx0 + rx1), ry0 + RM_PAD * 0.45 + ttl_h / 2, RM_TITLE, ha="center", va="center",
-                fontsize=BOX_FS, linespacing=1.3, zorder=Z_TOKENIZER + 4, fontweight="bold")
+        _rl = RM_TITLE.split("\n")
+        _rlh = text_extent("Ay", BOX_FS)[1] * 1.3
+        for _i, _ln in enumerate(_rl):
+            ax.text(0.5 * (rx0 + rx1), ry0 + RM_PAD * 0.45 + ttl_h / 2
+                    + (_i - (len(_rl) - 1) / 2.0) * _rlh, _ln, ha="center", va="center",
+                    fontsize=BOX_FS, zorder=Z_TOKENIZER + 4,
+                    fontweight="bold" if _i == 0 else "normal")
         badge(ax, rx0 + BB_PAD + BADGE_R, ry0 + BB_PAD + BADGE_R, 3)
         w_cos = text_extent(RM_COS, BB_FS)[0] + 1.7 * RM_PAD
         # THE BRANCH CELLS MUST FIT THEIR OWN TEXT. The box width is fixed (it matches the two heads), so
@@ -1902,14 +1913,17 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         ax.text(cx0 + w_cos / 2, y_cos, RM_COS, ha="center", va="center", fontsize=BB_FS,
                 zorder=Z_TOKENIZER + 3)
         for yy in (y_lat, y_txt):
-            draw_arrow(ax, [(px0 + w_prj, yy), (0.5 * (px0 + w_prj + cx0), yy),
-                            (0.5 * (px0 + w_prj + cx0), y_cos), (cx0 - ARROW_L, y_cos)], _z_in,
-                       tip=(cx0, y_cos), head_dir=(1.0, 0.0))
+            _turn = px0 + w_prj + 0.25 * (cx0 - (px0 + w_prj))
+            draw_arrow(ax, [(px0 + w_prj, yy), (_turn, yy), (_turn, y_cos), (cx0 - ARROW_L, y_cos)],
+                       _z_in, tip=(cx0, y_cos), head_dir=(1.0, 0.0))
         # the brace stem comes down and turns into the latent branch
         # AT _z_in, NOT Z_ARROW: the last leg runs INSIDE the box, and the box fill sits far above
         # arrow depth, so at Z_ARROW the line vanished the moment it crossed the wall.
-        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], y_lat), (px0 - ARROW_L, y_lat)], _z_in,
-                   tip=(px0, y_lat), head_dir=(1.0, 0.0))
+        # THE HEAD LANDS ON THE BOX, and a plain line carries on inside it to the block -- an arrowhead
+        # at the block would say the box wall is not a boundary.
+        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], y_lat), (rx0 - ARROW_L, y_lat)], _z_in,
+                   tip=(rx0, y_lat), head_dir=(1.0, 0.0))
+        draw_arrow(ax, [(rx0, y_lat), (px0, y_lat)], _z_in)
         # ...and the request runs in from the SAME x the brace stem turns at, so the two inputs align
         lines = RM_REQ.split(chr(10))
         tw = max(text_extent(l, BB_FS * 1.5)[0] for l in lines)
@@ -1923,11 +1937,13 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                                     (_tx1 + MIN_SEG, y_txt + _th / 2 + BRACE_T),
                                     BRACE_M * 0.7, u=(0.0, 1.0), off=(1.0, 0.0))
         draw_arrow(ax, rpoly, Z_ARROW)
-        draw_arrow(ax, [rmid, (bx0 - ARROW_L, y_txt)], _z_in, tip=(bx0, y_txt), head_dir=(1.0, 0.0))
+        draw_arrow(ax, [rmid, (rx0 - ARROW_L, y_txt)], _z_in, tip=(rx0, y_txt), head_dir=(1.0, 0.0))
+        draw_arrow(ax, [(rx0, y_txt), (bx0, y_txt)], _z_in)
         draw_arrow(ax, [(cx0 + w_cos, y_cos), (rx1 + 1.2 * ARROW_L, y_cos)], _z_in,
                    tip=(rx1 + 2.2 * ARROW_L, y_cos), head_dir=(1.0, 0.0))
         ax.text(rx1 + 2.6 * ARROW_L, y_cos, RM_OUT, ha="left", va="center", fontsize=BOX_FS * 0.8,
                 zorder=Z_ARROW + 1)
+        globals()["RM_BOT"] = ry0 + rh
         ROUTES.append(("Reward model", "brace", "action block left -> proprio block right"))
     if legend:
         draw_legend(ax)

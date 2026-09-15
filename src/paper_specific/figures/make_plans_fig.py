@@ -25,6 +25,8 @@ matplotlib.use("Agg")
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import PathPatch
+from matplotlib.path import Path
 
 RUN = "/app/logs/eval_steer_2026_09_15_16_33_40_plans8"   # 3 requests x 8 contexts, video on
 OUT = "/app/logs/paper_icra_2027/plans.png"
@@ -42,6 +44,32 @@ KEEP = [
     ("clock", "ep001_t0219", (1, 8, 16, 26)),
     ("clock", "ep003_t0367", (1, 52, 77, 128)),
 ]
+
+
+def rounded_path(pts, r):
+    """Open polyline with interior corners rounded -- the paper's brace primitive, copied from
+    paper_specific/figures/make_sequence_figs.py so the braces here match the ones there."""
+    pts = [np.asarray(q, float) for q in pts]
+    verts, codes = [pts[0]], [Path.MOVETO]
+    for i in range(1, len(pts) - 1):
+        prev, cur, nxt = pts[i - 1], pts[i], pts[i + 1]
+        u_in, u_out = cur - prev, nxt - cur
+        l_in, l_out = np.linalg.norm(u_in) or 1.0, np.linalg.norm(u_out) or 1.0
+        d = min(r, 0.5 * l_in, 0.5 * l_out)
+        verts += [cur - d * u_in / l_in, cur, cur + d * u_out / l_out]
+        codes += [Path.LINETO, Path.CURVE3, Path.CURVE3]
+    verts.append(pts[-1]); codes.append(Path.LINETO)
+    return Path(verts, codes)
+
+
+def brace_left(fig, x, y0, y1, x_stem, r=0.006, **kw):
+    """A vertical brace spanning y0..y1 at x, nibs turning toward the images, stem out to the label."""
+    mid = 0.5 * (y0 + y1)
+    for ye in (y0, y1):
+        pts = [(x + 0.012, ye), (x, ye), (x, mid), (x - 0.010, mid)]
+        fig.add_artist(PathPatch(rounded_path(pts, r), fill=False, transform=fig.transFigure, **kw))
+    fig.add_artist(PathPatch(rounded_path([(x - 0.010, mid), (x_stem, mid)], r), fill=False,
+                             transform=fig.transFigure, **kw))
 
 
 def frames(path):
@@ -77,11 +105,11 @@ def main() -> int:
             groups[-1][1].append(k)
         else:
             groups.append((req, [k]))
-    fig = plt.figure(figsize=(3.4, 3.4 * (len(rows) * ih * 1.34) / (NC * iw)))
-    # THE STEPS DIFFER PER ROW -- table shows +1..+52 and mannequin +1..+103 -- so the numbers go on
-    # every row, not in one header. The request label is rotated in the left margin, once per group.
-    gs = fig.add_gridspec(len(rows), NC, hspace=0.34, wspace=0.03,
-                          left=0.085, right=0.999, top=0.965, bottom=0.005)
+    fig = plt.figure(figsize=(3.4, 3.4 * (len(rows) * ih * 1.20) / (NC * iw)))
+    # NO GAP INSIDE A SEQUENCE: the frames of one plan are one strip. Rows stay apart just enough for
+    # the step numbers, and each request is braced across its own pair.
+    gs = fig.add_gridspec(len(rows), NC, hspace=0.26, wspace=0.0,
+                          left=0.135, right=0.999, top=0.97, bottom=0.004)
     axes = []
     for r, (req, imgs, steps) in enumerate(rows):
         row = []
@@ -97,9 +125,10 @@ def main() -> int:
     fig.canvas.draw()
     for req, idxs in groups:
         pos = [axes[i][0].get_position() for i in idxs]
-        y = 0.5 * (pos[0].y1 + pos[-1].y0)
-        fig.text(0.018, y, "\u201c" + req + "\u201d", ha="center", va="center", fontsize=FS,
-                 style="italic", rotation=90)
+        y0, y1 = pos[-1].y0, pos[0].y1
+        brace_left(fig, 0.115, y0, y1, 0.085, color="0.35", lw=0.9)
+        fig.text(0.030, 0.5 * (y0 + y1), "\u201c" + req + "\u201d", ha="center", va="center",
+                 fontsize=FS * 1.5, style="italic", rotation=90)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
     print(f"  wrote {OUT}  ({os.path.getsize(OUT) / 1e6:.1f} MB)")
     return 0

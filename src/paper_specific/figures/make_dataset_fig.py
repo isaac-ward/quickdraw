@@ -112,7 +112,7 @@ def main() -> int:
             ax.add_patch(Rectangle((x, y0), IMG_W, img_h, fill=False, ec=vis, lw=IMG_LW / 2))
         y_s = y0 + img_h + gap
         cells(ax, o, xs, y_s, CMAP["proprio"], rows=2, lw=LW / 2)
-        cells(ax, a, xs, y_s + 2 * CELL + gap, CMAP["action"], rows=1, needles=True)
+        cells(ax, a, xs, y_s + 2 * CELL + gap, CMAP["action"], rows=1, needles=True, lw=LW / 2)
         y_t = y_s + 3 * CELL + gap + 30
         ax.annotate("", xy=(xs[-1] + IMG_W, y_t), xytext=(0, y_t),
                     arrowprops=dict(arrowstyle="-|>", lw=1.1, color="#4d4d4d"))

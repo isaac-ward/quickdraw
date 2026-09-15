@@ -103,8 +103,8 @@ def brace_up(fig, xa, xb, y, up_to, x_stem, r=0.010, inset=0.004, **kw):
         pts = [(xe, y - 0.007), (xe, y), (mid, y), (mid, y + 0.005)]
         fig.add_artist(PathPatch(rounded_path(pts, r), fill=False, transform=fig.transFigure, **kw))
     rise = up_to - (y + 0.005)
-    pts = [(mid, y + 0.005), (mid, y + 0.005 + 0.32 * rise),
-           (x_stem, y + 0.005 + 0.74 * rise), (x_stem, up_to)]
+    pts = [(mid, y + 0.005), (mid, y + 0.005 + 0.34 * rise),
+           (x_stem, y + 0.005 + 0.72 * rise), (x_stem, up_to)]
     fig.add_artist(PathPatch(rounded_path(pts, r * 0.8), fill=False, transform=fig.transFigure, **kw))
 
 
@@ -260,9 +260,9 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     x0 = float(g[have][0])
     gx = g - x0
     t_away, t_back, t_end = -x0, D - x0, float(gx[have][-1])
-    fig = plt.figure(figsize=(3.4, 4.4))
+    fig = plt.figure(figsize=(3.4, 4.1))
     # the images take the larger share, and the gap holds the braces and their labels
-    outer = fig.add_gridspec(2, 1, height_ratios=(1.15, 1.45), hspace=0.30)
+    outer = fig.add_gridspec(2, 1, height_ratios=(1.02, 1.45), hspace=0.20)
     gim = outer[0].subgridspec(2, 3, hspace=0.0, wspace=0.08)
     gcur = outer[1].subgridspec(2, 1, hspace=0.0, height_ratios=(1.15, 1.0))
     im_axes, top_axes = [], []
@@ -270,7 +270,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
         k = int(np.clip(k, 0, len(pred_fr) - 1))
         for r, (img, nm) in enumerate(((pred_fr[k], "Predicted"), (true_fr[k], "Truth"))):
             A = fig.add_subplot(gim[r, c])
-            A.imshow(img, interpolation="bilinear", aspect="auto")
+            A.imshow(img, interpolation="bilinear")   # equal aspect: never stretch a frame
             A.set_xticks([]); A.set_yticks([])
             for sp_ in A.spines.values():
                 sp_.set_linewidth(0.9); sp_.set_color("black")
@@ -309,13 +309,13 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     # the brace sits high enough that its two-line label clears the axes below it
-    y_br = AC.get_position().y1 + 0.018
+    y_br = AC.get_position().y1 + 0.012
     steps = [int(np.clip(k, 0, len(pred_fr) - 1)) + 1 for _, k in EV]
     for i, ((xa, xb), A, txt) in enumerate(zip(((0.0, t_away), (t_away, t_back), (t_back, t_end)),
                                                im_axes,
-                                               (f"Looking at\naltered region ($+${steps[0]})",
-                                                f"Looking away from\naltered region ($+${steps[1]})",
-                                                f"Looking back at\naltered region ($+${steps[2]})"))):
+                                               (f"Looking at\nOOD region ($+${steps[0]})",
+                                                f"Looking away from\nOOD region ($+${steps[1]})",
+                                                f"Looking back at\nOOD region ($+${steps[2]})"))):
         fa = inv.transform(AC.transData.transform((xa, 0)))[0]
         fb = inv.transform(AC.transData.transform((xb, 0)))[0]
         col = A.get_position()

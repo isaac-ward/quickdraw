@@ -261,33 +261,38 @@ def ood(paper, dev="cuda"):
     sur = best_sur
     # A SECOND ANOMALOUS FRAME, later than the first, chosen the same way: the pair shows the noodle
     # moving through the scene and the map following it.
-    later = [t for t in top_pink if t > t_in] or [t for t in inside if t > t_in]
-    t_late, sur_late = t_in, best_sur
-    for t in later[:3]:
+    # THE BEST of the later candidates, not the first: same contrast rule the first frame uses.
+    later = [t for t in inside if t > t_in]
+    t_late, sur_late, q_late = t_in, best_sur, -1.0
+    for t in later:
         ob = torch.from_numpy(fr[key][t]).float().div(255.0).to(dev)
         mm, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t, dev, n=32), ob)
         sm = mm["surprise_patch"].cpu().numpy()
         q = float(np.percentile(sm, 99) / max(1e-6, np.median(sm)))
-        if t != t_in and q > -1:
-            t_late, sur_late = t, sm
-            break
-    print(f"      second frame t={t_late}")
+        print(f"      later candidate t={t}: contrast {q:.2f}")
+        if q > q_late:
+            t_late, sur_late, q_late = t, sm, q
+    # ...and the CLEAN frame's map too, which should be near-empty -- that is the control for the pair
+    ob = torch.from_numpy(fr[key][t_out]).float().div(255.0).to(dev)
+    mm, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t_out, dev, n=32), ob)
+    sur_out = mm["surprise_patch"].cpu().numpy()
+    print(f"      second frame t={t_late} (contrast {q_late:.2f})")
     photo = _scene_photo(paper, "pool-noodle.png", shape=fr[key][0].shape)
     fig = plt.figure(figsize=(7.2, 3.5))
     outer = fig.add_gridspec(2, 1, height_ratios=(1.42, 1.0), hspace=0.16)
     # 2x4. Row one: how it was applied, a clean frame, the anomalous frame, and a LATER anomalous
     # frame. Row two: the per-pixel surprise under each of the two anomalous frames, with the first two
     # cells blank -- the map belongs under the frame it explains, not in a row of its own.
-    top = outer[0].subgridspec(2, 4, wspace=0.06, hspace=0.10)
+    top = outer[0].subgridspec(2, 4, wspace=0.06, hspace=0.16)
     panes = [(0, 0, photo, "Disturbance is applied"),
              (0, 1, fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
              (0, 2, fr[key][t_in], f"Anomalous ($t{{=}}{t_in}$)"),
              (0, 3, fr[key][t_late], f"Anomalous ($t{{=}}{t_late}$)"),
-             (1, 2, None, None), (1, 3, None, None)]
+             (1, 1, None, None), (1, 2, None, None), (1, 3, None, None)]
     for r_, c_, img, lab in panes:
         A = fig.add_subplot(top[r_, c_])
         if img is None:
-            m = sur if c_ == 2 else sur_late
+            m = {1: sur_out, 2: sur, 3: sur_late}[c_]
             A.imshow(m, cmap="inferno", vmin=np.percentile(m, 50), vmax=np.percentile(m, 99))
         else:
             A.imshow(img)
@@ -324,28 +329,31 @@ def ood(paper, dev="cuda"):
     t_peak = int(r["steps"][int(np.argmax(np.where((r["steps"] >= w0) & (r["steps"] < w1), v, -1)))])
     pov = fr[key][t_peak]
     photo = _scene_photo(paper, "leaf-blower.png", shape=pov.shape)
-    fig = plt.figure(figsize=(7.2, 2.9))
-    gb = fig.add_gridspec(2, 2, width_ratios=(1.5, 1.0), wspace=0.22, hspace=0.34)
-    A = fig.add_subplot(gb[1, 1]); A.imshow(pov)
+    fig = plt.figure(figsize=(7.2, 2.6))
+    gb = fig.add_gridspec(1, 2, width_ratios=(1.55, 1.0), wspace=0.18)
+    # THE TWO PLOTS SHARE AN X AXIS, so they are joined with no gap and only the lower one is labelled;
+    # the two images are joined the same way. The POV caption is gone -- the figure's own caption says it.
+    gp = gb[0, 0].subgridspec(2, 1, hspace=0.0)
+    gi = gb[0, 1].subgridspec(2, 1, hspace=0.0)
+    AI = fig.add_subplot(gi[0]); AI.imshow(photo)
+    AI.set_xticks([]); AI.set_yticks([])
+    for sp_ in AI.spines.values():
+        sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
+    AI.set_title("Disturbance is applied", fontsize=FS)
+    A = fig.add_subplot(gi[1]); A.imshow(pov)
     A.set_xticks([]); A.set_yticks([])
     for sp_ in A.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    A.set_title("Disturbance is not visually detectable", fontsize=FS)
-    AP = fig.add_subplot(gb[0, 1]); AP.imshow(photo)
-    AP.set_xticks([]); AP.set_yticks([])
-    for sp_ in AP.spines.values():
-        sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    AP.set_title("Disturbance is applied", fontsize=FS)
-    AV = fig.add_subplot(gb[0, 0])
+    AV = fig.add_subplot(gp[0])
     for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
         AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
     AV.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0)
     AV.set_ylabel("Observed $\\omega$\n(rad/s)", fontsize=FS, labelpad=2)
     AV.legend(fontsize=FS - 2, ncol=1, loc="lower right", frameon=False, handlelength=1.1,
               labelspacing=0.25)
-    AV.tick_params(labelsize=FS - 1.5); AV.grid(alpha=0.25)
+    AV.tick_params(labelsize=FS - 1.5, labelbottom=False); AV.grid(alpha=0.25)
     AV.set_xlim(0, len(o) - 1)
-    AE = fig.add_subplot(gb[1, 0], sharex=AV)
+    AE = fig.add_subplot(gp[1], sharex=AV)
     AE.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
     AE.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
     AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)
