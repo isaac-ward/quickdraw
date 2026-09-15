@@ -259,10 +259,11 @@ def ood(paper, dev="cuda"):
     cand = [t for t in range(P, len(o)) if not (w0 <= t < w1)]
     t_out = max(cand, key=lambda t: abs(t - t_in)) if cand else P
     sur = best_sur
-    # A SECOND ANOMALOUS FRAME, later than the first, chosen the same way: the pair shows the noodle
-    # moving through the scene and the map following it.
-    # THE BEST of the later candidates, not the first: same contrast rule the first frame uses.
-    later = [t for t in inside if t > t_in]
+    # A SECOND ANOMALOUS FRAME, later than the first: the pair shows the noodle moving through the scene
+    # and the map following it. PINNED by the author (t=27) rather than picked by contrast -- the
+    # contrast rule kept landing on t=23, where the noodle reads less clearly to the eye.
+    T_LATE = 27
+    later = [t for t in inside if t > t_in and (T_LATE is None or t == T_LATE)]
     t_late, sur_late, q_late = t_in, best_sur, -1.0
     for t in later:
         ob = torch.from_numpy(fr[key][t]).float().div(255.0).to(dev)
@@ -277,42 +278,70 @@ def ood(paper, dev="cuda"):
     mm, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t_out, dev, n=32), ob)
     sur_out = mm["surprise_patch"].cpu().numpy()
     print(f"      second frame t={t_late} (contrast {q_late:.2f})")
+    # ONE BRIGHTNESS SCALE FOR ALL THREE MAPS. Per-panel percentiles made the control LIE: an
+    # in-distribution map whose values are uniformly low got stretched to its own 50th-99th range, so its
+    # noise floor rendered as bright as a real detection. The scale is now shared, taken from the
+    # anomalous maps, and the control is plotted on it -- if it looks dark, it IS dark.
+    # FLOOR FROM THE CLEAN FRAME, CEILING FROM THE ANOMALY. The surprise field is never zero anywhere --
+    # the decoder ensemble disagrees about ordinary texture too (clean median 3.5 vs anomalous 4.0-5.1) --
+    # so what separates an anomaly is the PEAK, not the floor (clean p99 11.5 vs 57.1). Anchoring vmin on
+    # the clean map's own median puts that floor at black by construction and leaves the peak to carry
+    # the signal, which is the claim the figure is actually making.
+    SUR_LO = float(np.median(sur_out))
+    SUR_HI = float(np.percentile(np.concatenate([sur.ravel(), sur_late.ravel()]), 99))
+    for nm, m in (("in-distribution", sur_out), (f"anomalous t={t_in}", sur),
+                  (f"anomalous t={t_late}", sur_late)):
+        print(f"      {nm:22s} median {np.median(m):.3f}  p99 {np.percentile(m, 99):.3f}  "
+              f"frac above shared vmin {float((m > SUR_LO).mean()):.2f}")
     photo = _scene_photo(paper, "pool-noodle.png", shape=fr[key][0].shape)
-    fig = plt.figure(figsize=(7.2, 3.5))
-    outer = fig.add_gridspec(2, 1, height_ratios=(1.42, 1.0), hspace=0.16)
-    # 2x4. Row one: how it was applied, a clean frame, the anomalous frame, and a LATER anomalous
-    # frame. Row two: the per-pixel surprise under each of the two anomalous frames, with the first two
-    # cells blank -- the map belongs under the frame it explains, not in a row of its own.
-    top = outer[0].subgridspec(2, 4, wspace=0.06, hspace=0.16)
+    ih, iw = fr[key][0].shape[:2]                     # 112x192; the patch map is 7x12, the SAME aspect
+    # ONE GRID BY HAND. The images must line up with the TRACE -- leftmost left edge and rightmost right
+    # edge flush with its axes box -- and a gridspec cannot do that, because the trace's box is inset by
+    # its own tick labels and ylabel while the image grid is not. So every panel is placed with add_axes
+    # in figure coordinates: the 2x4 block of images is CONTIGUOUS (no gaps, as in the dynamical figure)
+    # and spans exactly [L, 1-R], and the trace below spans the same. The figure height is then SOLVED
+    # from the image width so that equal aspect fills each box exactly -- never aspect="auto".
+    FIG_W, L, R = 7.2, 0.086, 0.004      # L must clear the trace's ylabel AND its tick labels
+    W = 1.0 - L - R
+    cw_in = W * FIG_W / 4.0                           # one image column, in inches
+    ch_in = cw_in * ih / iw
+    TOP_IN, PAD_IN, TR_IN, BOT_IN = 0.17, 0.22, 0.92, 0.42   # titles, gap, trace height, xlabel+ticks
+    FIG_H = TOP_IN + 2 * ch_in + PAD_IN + TR_IN + BOT_IN
+    fig = plt.figure(figsize=(FIG_W, FIG_H))
+    cw, ch = W / 4.0, ch_in / FIG_H
+    y0 = 1.0 - (TOP_IN + ch_in) / FIG_H               # top image row
+    y1 = y0 - ch                                      # surprise row, touching it
+    # Row one: how it was applied, a clean frame, the anomalous frame, and a LATER anomalous frame.
+    # Row two: the per-pixel surprise under each, with the first cell blank -- the map belongs under the
+    # frame it explains, and the in-distribution map is the control that shows it stays dark.
     panes = [(0, 0, photo, "Disturbance is applied"),
              (0, 1, fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
              (0, 2, fr[key][t_in], f"Anomalous ($t{{=}}{t_in}$)"),
              (0, 3, fr[key][t_late], f"Anomalous ($t{{=}}{t_late}$)"),
              (1, 1, None, None), (1, 2, None, None), (1, 3, None, None)]
     for r_, c_, img, lab in panes:
-        A = fig.add_subplot(top[r_, c_])
+        A = fig.add_axes([L + c_ * cw, y0 if r_ == 0 else y1, cw, ch])
         if img is None:
             m = {1: sur_out, 2: sur, 3: sur_late}[c_]
-            A.imshow(m, cmap="inferno", vmin=np.percentile(m, 50), vmax=np.percentile(m, 99))
+            A.imshow(m, cmap="inferno", vmin=SUR_LO, vmax=SUR_HI)
         else:
             A.imshow(img)
         if lab:
-            A.set_title(lab, fontsize=FS)
+            A.set_title(lab, fontsize=FS, pad=2.5)
         A.set_xticks([]); A.set_yticks([])
         for sp_ in A.spines.values():
             sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    A = fig.add_subplot(outer[1])                      # row three: the trace, across the width
+    A = fig.add_axes([L, BOT_IN / FIG_H, W, TR_IN / FIG_H])       # the trace, on the images' own span
     v = np.asarray(r[chan])
     A.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
     A.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
-    out = (r["steps"] < w0) | (r["steps"] >= w1)
     A.set_xlim(0, len(o) - 1)
     A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("Prediction step", fontsize=FS)
     A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25)
     mark_context(A)
     A.legend(fontsize=FS - 1.5, loc="upper left")
     f = os.path.join(paper, "figures", "ood-visual.png")
-    fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(f, dpi=DPI); plt.close(fig)            # NO bbox_inches: tight would re-trim the margins
     print("  figures/ood-visual.png")
 
     # ================= (b) DYNAMICAL =================================================================
@@ -329,22 +358,34 @@ def ood(paper, dev="cuda"):
     t_peak = int(r["steps"][int(np.argmax(np.where((r["steps"] >= w0) & (r["steps"] < w1), v, -1)))])
     pov = fr[key][t_peak]
     photo = _scene_photo(paper, "leaf-blower.png", shape=pov.shape)
-    fig = plt.figure(figsize=(7.2, 2.6))
-    gb = fig.add_gridspec(1, 2, width_ratios=(1.55, 1.0), wspace=0.18)
+    ph, pw = pov.shape[:2]                             # 112x192; the photo is cropped to the same aspect
+    # HAND-PLACED, for the same reason the visual figure is: in a gridspec the image column's cell is
+    # wider than the image's own aspect, so imshow (adjustable="box") shrinks the axes and centres it,
+    # leaving a gap between the plots and the images that no wspace can close. Here the image block is
+    # butted straight against the plot block, and the figure height is SOLVED so the two plots together
+    # are exactly as tall as the two images -- no frame is ever rescaled anisotropically.
+    FIG_W, L, GAP, R = 7.2, 0.64, 0.10, 0.02           # inches: ylabel+ticks, plot-to-image gap, margin
+    WI = 2.02                                          # image width; the plots take whatever is left
+    TOP_IN, BOT_IN = 0.17, 0.42                        # the image title, and the xlabel + tick labels
+    hi = WI * ph / pw                                  # one image, and therefore one plot, in inches
+    PW = FIG_W - L - GAP - WI - R
+    FIG_H = TOP_IN + 2 * hi + BOT_IN
+    fig = plt.figure(figsize=(FIG_W, FIG_H))
+    hr, y_top = hi / FIG_H, 1.0 - TOP_IN / FIG_H
+    xp, wp = L / FIG_W, PW / FIG_W
+    xi, wi_ = (L + PW + GAP) / FIG_W, WI / FIG_W
     # THE TWO PLOTS SHARE AN X AXIS, so they are joined with no gap and only the lower one is labelled;
     # the two images are joined the same way. The POV caption is gone -- the figure's own caption says it.
-    gp = gb[0, 0].subgridspec(2, 1, hspace=0.0)
-    gi = gb[0, 1].subgridspec(2, 1, hspace=0.0)
-    AI = fig.add_subplot(gi[0]); AI.imshow(photo)
+    AI = fig.add_axes([xi, y_top - hr, wi_, hr]); AI.imshow(photo)
     AI.set_xticks([]); AI.set_yticks([])
     for sp_ in AI.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    AI.set_title("Disturbance is applied", fontsize=FS)
-    A = fig.add_subplot(gi[1]); A.imshow(pov)
+    AI.set_title("Disturbance is applied", fontsize=FS, pad=2.5)
+    A = fig.add_axes([xi, y_top - 2 * hr, wi_, hr]); A.imshow(pov)
     A.set_xticks([]); A.set_yticks([])
     for sp_ in A.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    AV = fig.add_subplot(gp[0])
+    AV = fig.add_axes([xp, y_top - hr, wp, hr])
     for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
         AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
     AV.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0)
@@ -353,7 +394,7 @@ def ood(paper, dev="cuda"):
               labelspacing=0.25)
     AV.tick_params(labelsize=FS - 1.5, labelbottom=False); AV.grid(alpha=0.25)
     AV.set_xlim(0, len(o) - 1)
-    AE = fig.add_subplot(gp[1], sharex=AV)
+    AE = fig.add_axes([xp, y_top - 2 * hr, wp, hr], sharex=AV)
     AE.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
     AE.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
     AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)
@@ -361,7 +402,7 @@ def ood(paper, dev="cuda"):
     mark_context(AE)
     AE.legend(fontsize=FS - 1.5, loc="upper right", ncol=1)
     f = os.path.join(paper, "figures", "ood-dynamical.png")
-    fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(f, dpi=DPI); plt.close(fig)             # NO bbox_inches: tight would re-trim the margins
     print("  figures/ood-dynamical.png")
 
 

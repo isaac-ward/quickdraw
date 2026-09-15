@@ -105,11 +105,17 @@ def main() -> int:
             groups[-1][1].append(k)
         else:
             groups.append((req, [k]))
-    fig = plt.figure(figsize=(3.4, 3.4 * (len(rows) * ih * 1.20) / (NC * iw)))
     # NO GAP INSIDE A SEQUENCE: the frames of one plan are one strip. Rows stay apart just enough for
     # the step numbers, and each request is braced across its own pair.
-    gs = fig.add_gridspec(len(rows), NC, hspace=0.26, wspace=0.0,
-                          left=0.135, right=0.999, top=0.97, bottom=0.004)
+    NR, HSP = len(rows), 0.26   # exactly the step-number title's own height, now that the letterbox is gone
+    LEFT, RIGHT, TOP, BOT = 0.135, 0.999, 0.955, 0.004
+    # SOLVE the height so each cell is EXACTLY the frame's aspect. A guessed multiplier left every row
+    # letterboxed inside its own box -- with adjustable="box" imshow shrinks the axes to the data aspect
+    # and the slack became vertical whitespace. This removes it without rescaling a single frame.
+    ch_in = (RIGHT - LEFT) * 3.4 / NC * ih / iw
+    fig = plt.figure(figsize=(3.4, ch_in * (NR + (NR - 1) * HSP) / (TOP - BOT)))
+    gs = fig.add_gridspec(NR, NC, hspace=HSP, wspace=0.0,
+                          left=LEFT, right=RIGHT, top=TOP, bottom=BOT)
     axes = []
     for r, (req, imgs, steps) in enumerate(rows):
         row = []
@@ -126,7 +132,7 @@ def main() -> int:
     for req, idxs in groups:
         pos = [axes[i][0].get_position() for i in idxs]
         y0, y1 = pos[-1].y0, pos[0].y1
-        brace_left(fig, 0.115, y0, y1, 0.085, color="0.35", lw=0.9)
+        brace_left(fig, 0.115, y0, y1, 0.085, color="black", lw=0.9)
         fig.text(0.030, 0.5 * (y0 + y1), "\u201c" + req + "\u201d", ha="center", va="center",
                  fontsize=FS * 1.5, style="italic", rotation=90)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
