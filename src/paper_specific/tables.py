@@ -20,13 +20,28 @@ LOGS = "logs"
 # Row labels say what the setting IS, not what the run was called: `vl128 base` named a file, not a
 # configuration, and stride 5 with summed actions is the thing a reader needs to know.
 WM_ROWS = [
-    ("train_world_model_2026_09_05_20_21_02_starling2_vl128", r"Stride $5$, summed actions", ""),
-    ("train_world_model_2026_09_07_03_45_54_starling2_heavy", r"\quad + denoiser depth 4", "rejected"),
-    ("train_world_model_2026_09_12_08_06_49_s2_sub4_concat_deriv", r"\quad + derivative actions", "rejected"),
-    ("train_world_model_2026_09_11_03_17_22_s2_sub3_concat", r"\quad stride $3$, concatenated", ""),
-    ("train_world_model_2026_09_08_21_46_53_s2_sub1", r"\quad stride $1$, concatenated", ""),
-    ("train_world_model_2026_09_08_22_04_09_s2_sub4", r"\quad stride $4$, summed", ""),
-    ("train_world_model_2026_09_11_03_17_47_s2_sub4_concat", r"\quad stride $4$, concatenated (\textbf{ours})", "kept"),
+    # LABELS ARE "stride / actions", which is all that separates most of these runs, plus the one extra
+    # change where there is one. Verified against each run's own config.json -- the stride-1 run uses
+    # SUMMED actions, not concatenated, which an earlier version of this table got wrong.
+    ("train_world_model_2026_09_05_20_21_02_starling2_vl128", r"$5$ / sum", ""),
+    ("train_world_model_2026_09_07_03_45_54_starling2_heavy", r"$5$ / sum, depth $4$", "rejected"),
+    ("train_world_model_2026_09_12_08_06_49_s2_sub4_concat_deriv", r"$4$ / concat, $\Delta a$", "rejected"),
+    ("train_world_model_2026_09_11_03_17_22_s2_sub3_concat", r"$3$ / concat", ""),
+    ("train_world_model_2026_09_08_21_46_53_s2_sub1", r"$1$ / sum", ""),
+    ("train_world_model_2026_09_08_22_04_09_s2_sub4", r"$4$ / sum", ""),
+    ("train_world_model_2026_09_11_03_17_47_s2_sub4_concat", r"$4$ / concat (\textbf{ours})", "kept"),
+]
+# ---- the Action Model: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
+AH_ROWS = [
+    # BLOCKED BY CHUNK so the context x target interaction is readable within a block: at chunk 8 the
+    # 2x2 is pooled/grouped against none/PIT, with pooled+none never trained (it is the cell nothing
+    # recommends). Chunk 32 then repeats the winner and adds the increment target.
+    ("train_action_2026_09_13_21_57_41_s2_ah_pit", "8", "pooled", "PIT", ""),
+    ("train_action_2026_09_14_01_15_48_s2_ah_grouped", "8", "grouped", "none", ""),
+    ("train_action_2026_09_13_23_42_49_s2_ah_pit", "8", "grouped", "PIT", r"\textbf{ours}"),
+    ("train_action_2026_09_14_04_41_17_s2_ah_chunk32_full", "32", "grouped", "PIT", ""),
+    ("train_action_model_2026_09_14_22_28_22_s2_ah_chunk32_pitdelta", "32", "grouped", "PIT-$\\Delta$",
+     "rejected"),
 ]
 # ---- the Action Model: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
 AH_ROWS = [
@@ -40,12 +55,14 @@ AH_ROWS = [
 
 def wm_table() -> str:
     hs = [1, 8, 32, 128]
-    L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
+    L = [r"\begin{table}[t]", r"  \centering", r"  \small",
+         r"  \setlength{\tabcolsep}{3pt}",
          r"  \caption{\textbf{World Model.} Open-loop prediction on held-out \texttt{starling-2} flight, by "
          r"horizon: how far the action-conditioned observation prediction holds up. The first row is the "
          r"recipe as inherited from a manipulation dataset; every row below it changes one setting, and the "
          r"best per column is bold. The autoencoder floor re-encodes and decodes the true frame, so it "
-         r"bounds what any dynamics model on this tokenizer can reach.}",
+         r"bounds what any dynamics model on this tokenizer can reach. Rows are labelled "
+         r"\emph{frame stride} / \emph{action aggregation}, the two settings that separate most of them.}",
          r"  \label{tab:longhorizon}", r"  \begin{tabular}{lcccc}", r"    \toprule",
          r"    & \multicolumn{4}{c}{LPIPS $\downarrow$ at open-loop horizon} \\",
          r"    \cmidrule(lr){2-5}",
@@ -70,51 +87,58 @@ def wm_table() -> str:
         L.append(f"    {name} & {cells} \\\\")
     L += [r"    \midrule",
           r"    Autoencoder floor & \multicolumn{4}{c}{" + fmt(sum(floors) / len(floors), 4) + r"} \\",
-          r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
+          r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
     return "\n".join(L) + "\n"
 
 
 def ah_table() -> str:
-    L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
+    L = [r"\begin{table}[t]", r"  \centering", r"  \small",
+         r"  \setlength{\tabcolsep}{3pt}",
          r"  \caption{\textbf{Action Model.} The counterpart of Table~\ref{tab:longhorizon} for the other "
          r"half of what \modelname{} predicts: not what follows from an action, but what action follows from "
-         r"a context. Rows change one setting at a time, best per column in bold. Energy skill is measured "
-         r"against a context-blind null, so $0$ is a model that ignores its context, reported at the first "
-         r"lead time and at the worst. Rest AUC asks whether the model identifies the stick being HELD at "
-         r"rest, mass a rectified flow cannot place without the percentile transform. $W_1$ is to the "
-         r"recorded action marginal. $\uparrow$ higher is better, $\downarrow$ lower.}",
-         r"  \label{tab:actionhead}", r"  \begin{tabular}{lllcccc}", r"    \toprule",
-         r"    Chunk & Context & Target & Skill$_{+1}$ $\uparrow$ & Skill$_{\max}$ $\uparrow$ "
-         r"& $W_1$ $\downarrow$ & Rest AUC $\uparrow$ \\", r"    \midrule"]
+         r"a context. Blocked by chunk length, so the context $\times$ target interaction is readable "
+         r"inside a block; best per column in bold. Energy skill is the only column that measures "
+         r"\emph{conditioning}, against a context-blind null, so $0$ is a model that ignores its context; "
+         r"it is given at the first lead time and at the worst. $W_1$ is the distance to the recorded action "
+         r"marginal, i.e. whether it flies like the data. Rest AUC asks whether the model can place mass on "
+         r"a stick being HELD still, which is what the percentile transform buys and what a flow cannot do "
+         r"without it. No row wins every column, because the trade is real -- Fig.~\ref{fig:marginals} is "
+         r"the same question answered by eye.}",
+         r"  \label{tab:actionhead}", r"  \begin{tabular}{llcccc}", r"    \toprule",
+         r"    & & Skill$_{+1}$ & Skill$_{\max}$ & $W_1$ & Rest AUC \\",
+         r"    Context & Target & $\uparrow$ & $\uparrow$ & $\downarrow$ & $\uparrow$ \\"]
     rows = []
     for run, chunk, ctx, tgt, note in AH_ROWS:
+        # the SAME lookups the previous version used: metrics() is keyed by each run's own tag names, so
+        # contains() finds them by suffix rather than by a guessed full key
         d = metrics(os.path.join(LOGS, run))
         if not d:
             continue
-        rows.append((f"{chunk} & {ctx} & {tgt}", note,
+        rows.append((chunk, ctx, tgt, note,
                      [contains(d, "lead_00/energy_skill"), contains(d, "energy_skill"),
                       contains(d, "w1_mean"), contains(d, "rest_auc")]))
-    hi = [True, True, False, True]        # higher-is-better per column; W1 is lower-is-better
-    best = []
-    for j, up in enumerate(hi):
-        vs = [r[2][j] for r in rows if r[2][j] is not None]
-        best.append((max if up else min)(vs) if vs else None)
-    for nm, note, vals in rows:
-        cells = []
-        for j, v in enumerate(vals):
-            t = fmt(v, 4 if j == 2 else 3)
-            if v is not None and best[j] is not None and abs(v - best[j]) < 1e-9:
-                t = r"\textbf{" + t + "}"
-            cells.append(t)
-        tail = f"  {note}" if note and "rejected" in note else ""
-        L.append(f"    {nm} & " + " & ".join(cells) + (r" \\" if not tail else r" \\"))
-    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
+    best = [None] * 4
+    for k, lo in enumerate((False, False, True, False)):
+        vs = [r[4][k] for r in rows if r[4][k] is not None]
+        if vs:
+            best[k] = min(vs) if lo else max(vs)
+    for ch in ("8", "32"):
+        L += [r"    \midrule", r"    \multicolumn{6}{c}{chunk $=" + ch + r"$} \\", r"    \midrule"]
+        for chunk, ctx, tgt, note, vals in rows:
+            if chunk != ch:
+                continue
+            cells = []
+            for k, v in enumerate(vals):
+                t = "--" if v is None else (f"{v:.3f}" if k != 2 else f"{v:.4f}")
+                if v is not None and best[k] is not None and abs(v - best[k]) < 1e-12:
+                    t = r"\textbf{" + t + "}"
+                cells.append(t)
+            lab = ctx + ((" (" + note + ")") if note and "textbf" in note else "")
+            L.append(f"    {lab} & {tgt} & " + " & ".join(cells) + r" \\")
+    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
     return "\n".join(L) + "\n"
 
 
-
-
-# ---- OOD detection: the columns the paper asks for, with metric variants as the baselines ----------
 OOD_ROWS = {
     "eval_ood_noodle": [("latent_cos", r"latent surprise (\textbf{ours})"), ("lpips", "image LPIPS"),
                         ("l2", "image RMSE"), ("angvel_err", "angular velocity error"),
@@ -132,7 +156,8 @@ def ood_table(paper: str) -> str:
     # walking up from the paper directory -- the paper repo lives outside quickdraw and its depth varies.
     j = json.load(open(os.path.join(LOGS, "paper_icra_2027", "wm_anomaly_classification.json")))
     cov = j.get("coverage", 0.9)
-    L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
+    L = [r"\begin{table}[t]", r"  \centering", r"  \small",
+         r"  \setlength{\tabcolsep}{3pt}",
          r"  \caption{\textbf{Out-of-distribution detection}, from one-step prediction error, scored per "
          # ESCAPE THE PERCENT SIGN. `{cov:.0%}` emits a bare % and LaTeX comments out the rest of the
          # caption, which ends as "Runaway argument? ... File ended while scanning use of \caption".
@@ -155,7 +180,7 @@ def ood_table(paper: str) -> str:
             if r"\textbf" in label:
                 cells = [r"\textbf{" + c + "}" for c in cells]
             L.append(f"    {label} & " + " & ".join(cells) + r" \\")
-    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
+    L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
     return "\n".join(L) + "\n"
 
 

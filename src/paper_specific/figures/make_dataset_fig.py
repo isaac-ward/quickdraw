@@ -82,22 +82,24 @@ def cells(ax, mat, x0, y0, cmap, rows, lo=CMAP_LO, needles=False):
             if needles:
                 # A NEEDLE, NOT AN UP/DOWN ARROW: the angle sweeps from straight up (stick fully
                 # positive) through horizontal (centred) to straight down (fully negative), so a
-                # part-pushed stick reads as a diagonal and every cell carries a direction.
+                # part-pushed stick reads as a diagonal and every cell carries a direction. SNAPPED to
+                # 45 degrees -- eight directions read at a glance where a continuous angle does not.
                 v = float(mat[i, k] / max(float(rng[0, k]), 1e-9))
-                ang = (1.0 - v) * np.pi / 2.0
+                q = np.pi / 4.0
+                ang = round((1.0 - v) * np.pi / 2.0 / q) * q
                 L = CELL * 0.62
                 dx, dy = L * np.sin(ang), -L * np.cos(ang)
                 ax.add_patch(FancyArrow(cx + CELL / 2 - dx / 2, cy + CELL / 2 - dy / 2, dx, dy,
-                                        width=LW * 0.9, head_width=CELL * 0.30,
-                                        head_length=CELL * 0.30, length_includes_head=True,
-                                        fc="white", ec=EDGE, lw=LW * 0.5))
+                                        width=LW * 1.1, head_width=CELL * 0.32,
+                                        head_length=CELL * 0.32, length_includes_head=True,
+                                        fc=EDGE, ec=EDGE, lw=0.0))
         ax.add_patch(Rectangle((x0[i], y0), per * CELL, rows * CELL, fill=False, ec=EDGE, lw=LW))
 
 
 def main() -> int:
     img_h = IMG_W * SEQ[0][0][0].shape[0] / SEQ[0][0][0].shape[1]
     gap, colw = 12.0, IMG_W + 10.0            # columns nearly touch: the room buys the bigger cells
-    seq_h = img_h + gap + 3 * CELL + 64.0     # image + 2 proprio rows + 1 action row + the time arrow
+    seq_h = img_h + 2 * gap + 3 * CELL + 64.0  # image, gap, 2 proprio rows, THE SAME gap, action row
     xs = [i * colw for i in range(N)]
     vis = plt.get_cmap(CMAP["vision"])(0.78)
     fig = plt.figure(figsize=(7.0, 7.0 * (len(SEQ) * seq_h) / (N * colw + 30)))
@@ -110,8 +112,8 @@ def main() -> int:
             ax.add_patch(Rectangle((x, y0), IMG_W, img_h, fill=False, ec=vis, lw=IMG_LW))
         y_s = y0 + img_h + gap
         cells(ax, o, xs, y_s, CMAP["proprio"], rows=2)
-        cells(ax, a, xs, y_s + 2 * CELL, CMAP["action"], rows=1, lo=ACT_LO, needles=True)
-        y_t = y_s + 3 * CELL + 30
+        cells(ax, a, xs, y_s + 2 * CELL + gap, CMAP["action"], rows=1, lo=ACT_LO, needles=True)
+        y_t = y_s + 3 * CELL + gap + 30
         ax.annotate("", xy=(xs[-1] + IMG_W, y_t), xytext=(0, y_t),
                     arrowprops=dict(arrowstyle="-|>", lw=1.1, color="#4d4d4d"))
         ax.text(xs[-1] + IMG_W + 14, y_t, "$t$", ha="left", va="center", fontsize=12, color="#4d4d4d")

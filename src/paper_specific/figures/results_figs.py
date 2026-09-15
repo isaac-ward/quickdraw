@@ -27,6 +27,7 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis"))
 
+from quickdraw.evaluation.openloop import image_curves
 from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate, set_subsample
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes, load_checkpoint,
                                       normalizer, resolve_data_root)
@@ -47,20 +48,18 @@ def _model(dev="cuda"):
 
 @torch.no_grad()
 def longhorizon(paper, dev="cuda", n_show=8):
-    """Open-loop rollout on RECORDED actions: Predicted above, Truth directly below, Time left to right.
+    """Open-loop rollout on RECORDED actions: Predicted above, Truth directly below, and under each pair
+    the three image errors over the WHOLE rollout, not just the eight frames shown.
 
     Recorded actions, not planned ones: this figure is about the dynamics, so the action sequence has to
     be one the drone actually flew.
 
-    HOW LONG CAN WE GO? The horizon is capped by the shortest val episode, not by the model: 7 episodes of
-    1763-1796 frames, which at stride 4 and P=8 context leaves 432 steps = 115 s. The first pair is shown
-    at +128 (34 s, the horizon the project is characterised at) and the other two at the full 432, which
-    is what the cap allows."""
-    # THE CAP IS THE EPISODE, AND THE START MATTERS. At t0=0 the context is the first 8 frames, which is
-    # takeoff -- a near-static view of the floor -- and even the +1 prediction came out wrong from it.
-    # Skipping 24 steps costs 32 of the available horizon and buys a context the model has seen.
-    H_SHORT, H_LONG, T0_LONG = 128, 400, 24
-    PLAN = [(0, H_SHORT, 40), (1, H_LONG, T0_LONG), (2, H_LONG, T0_LONG)]
+    HOW LONG: the horizon is capped by the shortest val episode, not by the model -- 7 episodes of
+    1763-1796 frames, which at stride 4 leaves 440 steps, minus P=8 of context and the 8 steps of takeoff
+    that a rollout should not start from. That is 423, which is 113 s, and it is what the long pair uses.
+    The short pair is at +128 (34 s), the horizon the project is characterised at."""
+    H_SHORT, H_LONG, T0 = 128, 423, 8
+    PLAN = [(0, H_SHORT, 40), (2, H_LONG, T0)]
     cfg, core, norm, P, key = _model(dev)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
                                  cam=image_head_cams(cfg), repo_id="starling-2")
@@ -73,36 +72,64 @@ def longhorizon(paper, dev="cuda", n_show=8):
         acts = norm.norm_act(torch.from_numpy(a[t0:t0 + P - 1 + h])).float()[None].to(dev)
         pr = core.imagine_eval(ctx, acts, h, heads=[key], norm=norm)[key][0].clamp(0, 1)
         gt = fr[key][t0 + P:t0 + P + h]
+        gt_t = torch.from_numpy(gt).float().div(255.0).to(dev)
+        c = image_curves(pr.unsqueeze(0), gt_t.unsqueeze(0))     # every step, not just the shown ones
+        cur = {"$L_1$": np.asarray(c["l1"]), "$L_2$": np.sqrt(np.asarray(c["mse"])),
+               "LPIPS": np.asarray(c["lpips"])}
         ks = np.unique(np.linspace(0, h - 1, n_show).round().astype(int))
         rows.append(([(pr[k].cpu().numpy() * 255).astype(np.uint8) for k in ks], [gt[k] for k in ks],
-                     ks, h))
+                     ks, h, cur))
         print(f"    episode {ei}: {h} steps ({h * 4 / 15.0:.0f} s), columns "
               + ", ".join(f"+{k + 1}" for k in ks))
 
     ih, iw = rows[0][0][0].shape[:2]
     NC = len(rows[0][2])
-    # ONE GRID, BUILT BY HAND. gridspec with wspace=hspace=0 is the only way the Truth row touches the
-    # Predicted row with no white gap; a per-axes imshow with tight_layout always leaves one.
-    fig = plt.figure(figsize=(14, 14 * (2 * len(rows) * ih + 0.34 * len(rows) * ih) / (NC * iw)))
-    gs = fig.add_gridspec(3 * len(rows), NC, hspace=0.0, wspace=0.0,
-                          height_ratios=[0.34, 1.0, 1.0] * len(rows))
-    for r, (pred, true, ks, h) in enumerate(rows):
+    # ONE GRID, BY HAND: gridspec with hspace=0 is the only way the Truth row touches the Predicted row.
+    # Per pair: a label strip, the two image rows, then a full-width curve panel.
+    fig = plt.figure(figsize=(14, 14 * (2 * len(rows) * ih * 1.62) / (NC * iw)))
+    # FIVE rows per pair: label strip, the two images, the curve panel, and a SPACER -- with hspace=0
+    # (which the flush image pair needs) the next pair's step labels otherwise land on this pair's ticks.
+    gs = fig.add_gridspec(5 * len(rows), NC, hspace=0.0, wspace=0.0,
+                          height_ratios=[0.34, 1.0, 1.0, 0.95, 0.42] * len(rows))
+    for r, (pred, true, ks, h, cur) in enumerate(rows):
         for c in range(NC):
-            lab = fig.add_subplot(gs[3 * r, c]); lab.axis("off")
-            lab.text(0.5, 0.12, f"$+${ks[c] + 1}", ha="center", va="bottom", fontsize=11)
+            lab = fig.add_subplot(gs[5 * r, c]); lab.axis("off")
+            lab.text(0.5, 0.12, f"$+${ks[c] + 1}", ha="center", va="bottom", fontsize=13)
             for k, img in ((1, pred[c]), (2, true[c])):
-                A = fig.add_subplot(gs[3 * r + k, c])
-                A.imshow(img, interpolation="bilinear")
+                A = fig.add_subplot(gs[5 * r + k, c])
+                A.imshow(img, interpolation="bilinear", aspect="auto")
                 A.set_xticks([]); A.set_yticks([])
                 for sp in A.spines.values():                 # the frame outline: black, and the same
                     sp.set_linewidth(2.0); sp.set_color("black")   # weight as the green one in Fig. 4
                 if c == 0:
-                    A.set_ylabel("Predicted" if k == 1 else "Truth", fontsize=11)
-    # THE ARROW OF TIME, along the bottom of the whole figure
-    fig.subplots_adjust(bottom=0.045)
-    fig.patches.append(FancyArrowPatch((0.045, 0.021), (0.995, 0.021), transform=fig.transFigure,
+                    A.set_ylabel("Predicted" if k == 1 else "Truth", fontsize=13)
+        # THE ERRORS OVER THE WHOLE ROLLOUT, under the pair they belong to and on the same x
+        AC = fig.add_subplot(gs[5 * r + 3, :])
+        x = np.arange(1, h + 1)
+        for (nm, v), col in zip(cur.items(), ("tab:blue", "tab:green", "tab:red")):
+            AC.plot(x, v, lw=1.3, color=col, label=nm)
+        for k in ks:                                          # which steps the frames above came from
+            AC.axvline(k + 1, color="0.75", lw=0.6, ls=":")
+        AC.set_xlim(1, h); AC.set_ylim(0, None)
+        AC.set_ylabel("error", fontsize=12); AC.tick_params(labelsize=10)
+        AC.grid(alpha=0.25)
+        AC.legend(fontsize=10, ncol=3, loc="upper right", framealpha=0.85)
+        if r == len(rows) - 1:                                # ticks and the label on the last panel only
+            AC.set_xlabel("open-loop prediction step", fontsize=12)
+        else:
+            AC.tick_params(labelbottom=False)
+    # THE ARROW OF TIME, matched to the width of the sequences rather than the whole figure
+    fig.canvas.draw()
+    first = fig.axes[1].get_position(); last = None
+    for A in fig.axes:                                        # the last image axes in the top row
+        pos = A.get_position()
+        if abs(pos.y0 - first.y0) < 1e-6:
+            last = pos
+    fig.subplots_adjust(bottom=0.055)
+    x0, x1 = first.x0, (last or first).x1
+    fig.patches.append(FancyArrowPatch((x0, 0.022), (x1, 0.022), transform=fig.transFigure,
                                        arrowstyle="-|>", mutation_scale=22, lw=1.6, color="#333333"))
-    fig.text(0.52, 0.030, "Time", ha="center", va="bottom", fontsize=13, color="#333333")
+    fig.text(x1 + 0.006, 0.022, "$t$", ha="left", va="center", fontsize=15, color="#333333")
     f = os.path.join(paper, "figures", "longhorizon.png")
     fig.savefig(f, dpi=DPI_IMG, bbox_inches="tight"); plt.close(fig)
     print(f"  figures/longhorizon.png  {len(rows)} pairs, horizons "
@@ -125,85 +152,143 @@ def memory(paper):
 
 
 @torch.no_grad()
+def _scene_photo(paper, name):
+    """The third-person shot out of the author's own composite figure (figures/leaf-blower.png etc).
+
+    Only the TOP panel is wanted -- the scene with the disturbance in it -- and the panels in those files
+    are separated by a black rule, so the cut is found rather than hard-coded: the first almost-black row
+    below the halfway point of the top third."""
+    f = os.path.join(paper, "figures", name)
+    if not os.path.exists(f):
+        return None
+    im = cv2.imread(f)[:, :, ::-1]
+    h = im.shape[0]
+    dark = (im.max(axis=(1, 2)) < 40)
+    rows = [r for r in range(int(h * 0.20), int(h * 0.60)) if dark[r]]
+    cut = rows[0] if rows else int(h * 0.42)
+    return im[2:cut - 2, 2:-2]
+
+
 def ood(paper, dev="cuda"):
-    """Two blocks, one per anomaly kind: frames plus the per-pixel surprise map, over the trace of the
-    channel that detects it with the conformal threshold drawn.
+    """Two blocks, one per anomaly kind, and they are deliberately NOT the same figure.
 
-    The channels differ ON PURPOSE and that is the figure's point -- the noodle is invisible to proprio and
-    the blower is invisible in the image -- so each block shows the channel carrying its own anomaly.
+    (a) The pool noodle is IN THE IMAGE, so frames plus the per-pixel surprise map carry it.
+    (b) The leaf blower is not: two camera frames of it look identical, which is what made the first
+        version of this panel the weakest thing in the paper. The evidence there is the third-person
+        scene (what is physically happening), the RECORDED angular velocity (the array the detector
+        reads), and the detector's own channel with its conformal threshold.
 
-    FRAMES ARE CHOSEN BY PEAK, not by window midpoint. The midpoint of a reviewed window is often a moment
-    when the object is edge-on or half out of shot, which made the first version of this figure show two
-    near-identical frames and prove nothing. The anomalous frame is the one where the ground-truth evidence
-    is strongest (pink fraction for the noodle, the detection channel for the blower); the in-distribution
-    frame is taken as far from the window as the clip allows."""
+    Episodes are picked so the reviewed window sits MID-RUN -- with the window at a clip's edge there is
+    no before-and-after to see. Frames within the window are still chosen by peak evidence, since the
+    midpoint of a window is often a moment when the object is edge-on."""
     from quickdraw.data.ood_windows import kept, window_steps
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis"))
     from detect_anomalies_wm import one_step
     from localise_ood_pixels import ensemble, maps_from, pink_mask
     cfg, core, norm, P, key = _model(dev)
-    BLOCK = [("eval_ood_noodle", "latent_cos", "latent surprise",
-              "Visual anomaly: a pool noodle enters frame"),
-             ("eval_ood_leafblower", "angvel_err", "angular velocity error",
-              "Dynamical anomaly: an off-camera leaf blower pushes the drone")]
-    fig = plt.figure(figsize=(7.2, 6.9))
-    outer = fig.add_gridspec(2, 1, hspace=0.30)
-    for bi, (split, chan, chan_lab, title) in enumerate(BLOCK):
+    FS = 8.0
+    fig = plt.figure(figsize=(7.2, 7.4))
+    outer = fig.add_gridspec(2, 1, hspace=0.34, height_ratios=(1.0, 1.05))
+
+    def pick(split, need_out=4, min_width=3):
+        """The kept episode with the most usable margin either side of its window.
+
+        MID-RUN IS NOT ALWAYS AVAILABLE, and the data says so: every reviewed noodle window touches an
+        edge of its clip -- the noodle is either already in view at the first predicted step or still
+        there at the last -- so no noodle episode has clean flight on BOTH sides. The leaf blower does
+        (ep4: 5 steps before, 14 after). So rank by the smaller margin first and the total second, which
+        gives the blower a genuinely central window and the noodle the longest clean stretch available,
+        and require a window at least `min_width` steps wide so it is visible at all."""
         eps = load_split_episodes_mm(resolve_data_root(cfg), split, img_size=image_head_sizes(cfg),
                                      cam=image_head_cams(cfg), repo_id="starling-2")
-        # pick the episode/step with the strongest ground-truth evidence inside its window
-        best = None
+        cands = []
         for ep in kept(split):
-            o, a, fr = eps[ep]
+            o = eps[ep][0]
             w0, w1 = window_steps(split, ep, SUB)
             inside = [t for t in range(max(P, w0), min(w1, len(o)))]
             outside = [t for t in range(P, len(o)) if not (w0 <= t < w1)]
-            # BOTH CLASSES REQUIRED: an episode whose window covers every predicted step has no
-            # in-distribution baseline, so the panel would show shading everywhere and no threshold --
-            # which is exactly what the first version of this figure did.
-            if not inside or len(outside) < 4:
+            n_bef = len([t for t in outside if t < w0])
+            n_aft = len([t for t in outside if t >= w1])
+            if not inside or len(outside) < need_out or (w1 - w0) < min_width:
                 continue
-            if split.endswith("noodle"):
-                sc = [(pink_mask(fr[key][t]).mean(), t) for t in inside]
-            else:
-                r0 = one_step(core, norm, o, a, fr[key], key, P, dev)
-                m = {int(t): float(v) for t, v in zip(r0["steps"], np.asarray(r0[chan]))}
-                sc = [(m.get(t, 0.0), t) for t in inside]
-            v, t = max(sc)
-            if best is None or v > best[0]:
-                best = (v, ep, t, w0, w1)
-        _, ep, t_in, w0, w1 = best
-        o, a, fr = eps[ep]
-        r = one_step(core, norm, o, a, fr[key], key, P, dev)
-        cand = [t for t in range(P, len(o)) if not (w0 <= t < w1)]
-        t_out = max(cand, key=lambda t: abs(t - t_in)) if cand else P
-        obs = torch.from_numpy(fr[key][t_in]).float().div(255.0).to(dev)
-        mp, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t_in, dev, n=32), obs)
-        sur = mp["surprise_patch"].cpu().numpy()
+            cands.append((min(n_bef, n_aft), n_bef + n_aft,
+                          abs(0.5 * (w0 + w1) / max(1, len(o)) - 0.5), ep, w0, w1))
+        assert cands, f"no usable episode in {split}"
+        # WHERE BOTH MARGINS EXIST, CENTRALITY DECIDES -- that is what "mid-run" means, and margin alone
+        # picked a later window (ep10, centre at 0.69) over a dead-central one (ep4, 0.48). Where no
+        # episode has both margins, as for the noodle, fall back to the longest clean stretch.
+        ok = [c for c in cands if c[0] >= 3]
+        mn, tot, ctr, ep, w0, w1 = min(ok, key=lambda c: c[2]) if ok else max(cands, key=lambda c: c[:2])
+        print(f"    {split}: ep{ep} window {w0}-{w1} | margins min {mn} total {tot} | "
+              f"centre offset {ctr:.2f} | {'central' if ok else 'no episode has both margins'}")
+        return eps, (0.0, ep, w0, w1)
 
-        gs = outer[bi].subgridspec(2, 3, height_ratios=[1.35, 1.0], hspace=0.30, wspace=0.05)
-        for jx, (img, lab) in enumerate((
-                (fr[key][t_out], f"in distribution ($t{{=}}{t_out}$)"),
-                (fr[key][t_in], f"anomalous ($t{{=}}{t_in}$)"), (None, "per-pixel surprise"))):
-            A = fig.add_subplot(gs[0, jx])
-            if img is None:
-                A.imshow(sur, cmap="inferno", vmin=np.percentile(sur, 50), vmax=np.percentile(sur, 99))
-            else:
-                A.imshow(img)
-            A.set_title(lab, fontsize=7); A.axis("off")
-        fig.add_subplot(gs[0, :]).set_axis_off()
-        fig.text(0.02, {0: 0.955, 1: 0.475}[bi], f"({'ab'[bi]}) {title}   [episode {ep}]",
-                 fontsize=8.5, weight="bold", ha="left")
-        A = fig.add_subplot(gs[1, :])
-        v = np.asarray(r[chan])
-        A.plot(r["steps"], v, color="crimson", lw=1.4)
-        A.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0, label="reviewed anomaly window")
-        out = (r["steps"] < w0) | (r["steps"] >= w1)
-        if out.any():
-            A.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
-                      label="90% conformal threshold")
-        A.set_ylabel(chan_lab, fontsize=7.5); A.set_xlabel("model step", fontsize=7.5)
-        A.tick_params(labelsize=6.5); A.grid(alpha=0.25); A.legend(fontsize=6.5, loc="best")
+    # ---- (a) the visual anomaly ---------------------------------------------------------------------
+    split, chan, chan_lab = "eval_ood_noodle", "latent_cos", "latent surprise"
+    eps, (_, ep, w0, w1) = pick(split)
+    o, a, fr = eps[ep]
+    r = one_step(core, norm, o, a, fr[key], key, P, dev)
+    inside = [t for t in range(max(P, w0), min(w1, len(o)))]
+    t_in = max(((pink_mask(fr[key][t]).mean(), t) for t in inside))[1]
+    cand = [t for t in range(P, len(o)) if not (w0 <= t < w1)]
+    t_out = max(cand, key=lambda t: abs(t - t_in)) if cand else P
+    obs = torch.from_numpy(fr[key][t_in]).float().div(255.0).to(dev)
+    mp, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t_in, dev, n=32), obs)
+    sur = mp["surprise_patch"].cpu().numpy()
+    print(f"    (a) {split} ep{ep}: window {w0}-{w1} of {len(o)} steps, frames {t_out} / {t_in}")
+    gs = outer[0].subgridspec(2, 3, height_ratios=[1.35, 1.0], hspace=0.34, wspace=0.05)
+    for jx, (img, lab) in enumerate(((fr[key][t_out], f"in distribution ($t{{=}}{t_out}$)"),
+                                     (fr[key][t_in], f"anomalous ($t{{=}}{t_in}$)"),
+                                     (None, "per-pixel surprise"))):
+        A = fig.add_subplot(gs[0, jx])
+        if img is None:
+            A.imshow(sur, cmap="inferno", vmin=np.percentile(sur, 50), vmax=np.percentile(sur, 99))
+        else:
+            A.imshow(img)
+        A.set_title(lab, fontsize=FS - 0.5); A.axis("off")
+    A = fig.add_subplot(gs[1, :])
+    v = np.asarray(r[chan])
+    A.plot(r["steps"], v, color="crimson", lw=1.4)
+    A.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0, label="reviewed anomaly window")
+    out = (r["steps"] < w0) | (r["steps"] >= w1)
+    if out.any():
+        A.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
+                  label="90% conformal threshold")
+    A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("model step", fontsize=FS)
+    A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25); A.legend(fontsize=FS - 1.5, loc="best")
+    fig.text(0.02, 0.975, "(a) Visual anomaly: a pool noodle enters frame   "
+             f"[episode {ep}]", fontsize=FS + 0.5, weight="bold", ha="left")
+
+    # ---- (b) the dynamical anomaly ------------------------------------------------------------------
+    split, chan, chan_lab = "eval_ood_leafblower", "angvel_err", "angular velocity error"
+    eps, (_, ep, w0, w1) = pick(split)
+    o, a, fr = eps[ep]
+    r = one_step(core, norm, o, a, fr[key], key, P, dev)
+    print(f"    (b) {split} ep{ep}: window {w0}-{w1} of {len(o)} steps")
+    photo = _scene_photo(paper, "leaf-blower.png")
+    gb = outer[1].subgridspec(2, 2, width_ratios=(1.0, 1.55), wspace=0.22, hspace=0.12)
+    if photo is not None:
+        A = fig.add_subplot(gb[:, 0]); A.imshow(photo); A.axis("off")
+        A.set_title("the disturbance", fontsize=FS - 0.5)
+    AV = fig.add_subplot(gb[0, 1])
+    for c, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
+        AV.plot(np.arange(len(o)), o[:, c], lw=1.1, label=lab)
+    AV.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0)
+    AV.set_ylabel("recorded\n$\\omega$ (rad/s)", fontsize=FS)
+    AV.legend(fontsize=FS - 2, ncol=3, loc="upper left", frameon=False)
+    AV.tick_params(labelsize=FS - 1.5, labelbottom=False); AV.grid(alpha=0.25)
+    AE = fig.add_subplot(gb[1, 1], sharex=AV)
+    v = np.asarray(r[chan])
+    AE.plot(r["steps"], v, color="crimson", lw=1.4)
+    AE.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0, label="reviewed anomaly window")
+    out = (r["steps"] < w0) | (r["steps"] >= w1)
+    if out.any():
+        AE.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
+                   label="90% conformal threshold")
+    AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("model step", fontsize=FS)
+    AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25); AE.legend(fontsize=FS - 1.5, loc="upper left")
+    fig.text(0.02, 0.487, "(b) Dynamical anomaly: an off-camera leaf blower pushes the drone   "
+             f"[episode {ep}]", fontsize=FS + 0.5, weight="bold", ha="left")
     f = os.path.join(paper, "figures", "ood-detection.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print("  figures/ood-detection.png")

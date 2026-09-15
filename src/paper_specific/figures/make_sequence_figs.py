@@ -108,11 +108,14 @@ BLK_LABELS   = False      # draw A/B/C on the three faces so they can be referre
 # one scalar out.
 RM_ON        = True
 RM_TITLE     = "Reward model\n(contrastive)"
-RM_ROWS      = ("MLP $f_z$  (latent)", "MiniLM + MLP $f_t$  (text)", "cosine similarity")
-RM_REQ       = "\u201cgo forward to the ladder\nin the middle of the room\u201d"
+RM_LAT       = "MLP $f_z$"            # the latent branch, fed by the brace, drawn ON TOP
+RM_TXT       = "MiniLM + MLP $f_t$"   # the text branch, fed by the request, drawn BELOW it
+RM_COS       = "cosine"
+RM_REQ       = "\u201cgo forward to the ladder in the middle of the room\u201d"   # ONE line, no box
 RM_OUT       = "$u^{\\top}w \\in [-1, 1]$"
 RM_ROW_H     = 58.0      # internal row height
-RM_ROW_SEP   = 16.0      # between internals, which sit SIDE BY SIDE: stacked, the block was 300 units
+RM_ROW_SEP   = 16.0      # between the two stacked branches
+RM_COS_GAP   = 110.0     # branch boxes -> the cosine: the two feed arrows have to be visible in it
 #                          tall and the figure has no room under the token column for that
 RM_PAD       = 26.0
 RM_GAP_BR    = 70.0      # column bottom -> brace line
@@ -1296,8 +1299,12 @@ def solve_layout():
         # with the bottom of the canvas -- measured, zero free height. So reserve its band here, which
         # is what makes the figure ~250 units taller than it would otherwise be, and the only place the
         # block can go without crossing something.
-        _rm_h = RM_GAP_BR + RM_GAP_BOX + 2 * RM_PAD + text_extent(RM_TITLE, ENC_FS)[1] + RM_ROW_H \
-                + 2 * MIN_SEG
+        # THE ANGLED BRACE DROPS AS IT RUNS. It is drawn at the cascade angle, so its midpoint sits
+        # half a span times the slope BELOW where a flat brace would -- leaving that out clipped the
+        # bottom of the box off the canvas.
+        _rm_span = PRED_BOX[2] - min(b[0] for L in LAYERS for b in L["blk_box"])
+        _rm_h = RM_GAP_BR + 0.5 * _rm_span * SLOPE + RM_GAP_BOX + 2 * RM_PAD \
+                + text_extent(RM_TITLE, ENC_FS)[1] + 2 * RM_ROW_H + RM_ROW_SEP + 4 * MIN_SEG
         bot = max(bot, max([b[3] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[3]]) + _rm_h)
     for L in LAYERS:
         L["sx"], L["sy"] = MARGIN - x_min, MARGIN - top + L["sy0"] - lift
@@ -1776,16 +1783,23 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         bl = min(b[0] for L in LAYERS for b in L["blk_box"]) + sx
         br = PRED_BOX[2] + sx
         by = max([b[3] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[3]]) + dy_
-        # THE BRACE: along the column's bottom face, including the predicted slice, because the reward is
-        # read on IMAGINED latents. Same primitive as the summariser's, mirrored below.
-        poly, mid = brace_between((bl, by), (br, by), RM_GAP_BR, u=(1.0, 0.0), off=(0.0, 1.0))
+        # THE BRACE: the summariser's own primitive at the cascade angle, mirrored to the BOTTOM face of
+        # the column -- and it spans the predicted slice too, because the reward is read on IMAGINED
+        # latents, which is the whole point of where it is attached.
+        poly, mid = brace_between((bl, by), (br, by), RM_GAP_BR, off=(0.0, 1.0))
         draw_arrow(ax, poly, Z_ARROW)
-        rows = RM_ROWS
-        rws = [text_extent(t, ENC_FS * 0.62)[0] + 1.6 * RM_PAD for t in rows]
-        rw = sum(rws) + (len(rows) - 1) * RM_ROW_SEP + 2 * RM_PAD
+        # the two branches, STACKED: latent on top (fed by the brace), text below (fed by the request),
+        # both entering from the LEFT and both leaving into one cosine on the right.
+        w_lat = text_extent(RM_LAT, ENC_FS * 0.62)[0] + 1.7 * RM_PAD
+        w_txt = text_extent(RM_TXT, ENC_FS * 0.62)[0] + 1.7 * RM_PAD
+        w_br = max(w_lat, w_txt)
+        w_cos = text_extent(RM_COS, ENC_FS * 0.62)[0] + 1.7 * RM_PAD
         ttl_h = text_extent(RM_TITLE, ENC_FS)[1]
-        rh = 2 * RM_PAD + ttl_h + RM_ROW_H
-        rx0 = mid[0] - 0.22 * rw
+        rw = 2 * RM_PAD + w_br + RM_COS_GAP + w_cos
+        rh = 2 * RM_PAD + ttl_h + 2 * RM_ROW_H + RM_ROW_SEP
+        # PUSHED RIGHT: the request is a long single line entering from the left, so the box sits to the
+        # right of the column's midline, which is also what keeps this band shallow.
+        rx0 = mid[0] + 0.30 * rw
         ry0 = mid[1] + RM_GAP_BOX
         rx1 = rx0 + rw
         ax.add_patch(PathPatch(rounded_polygon([(rx0, ry0), (rx1, ry0), (rx1, ry0 + rh), (rx0, ry0 + rh)],
@@ -1793,38 +1807,45 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                                zorder=Z_TOKENIZER))
         ax.text(0.5 * (rx0 + rx1), ry0 + RM_PAD * 0.45 + ttl_h / 2, RM_TITLE, ha="center", va="center",
                 fontsize=ENC_FS, linespacing=1.25, zorder=Z_TOKENIZER + 1)
-        cx = rx0 + RM_PAD
-        cyc = ry0 + RM_PAD + ttl_h + RM_ROW_H / 2
-        cells = []
-        for t, ww in zip(rows, rws):
-            ax.add_patch(PathPatch(rounded_polygon([(cx, cyc - RM_ROW_H / 2), (cx + ww, cyc - RM_ROW_H / 2),
-                                                    (cx + ww, cyc + RM_ROW_H / 2),
-                                                    (cx, cyc + RM_ROW_H / 2)], CORNER_R * 0.8),
-                                   fc="white", ec=BOX_EC, lw=ENC_LW * 0.5, zorder=Z_TOKENIZER + 1))
-            ax.text(cx + ww / 2, cyc, t, ha="center", va="center", fontsize=ENC_FS * 0.62,
+        bx0 = rx0 + RM_PAD
+        y_lat = ry0 + RM_PAD + ttl_h + RM_ROW_H / 2
+        y_txt = y_lat + RM_ROW_H + RM_ROW_SEP
+        for yy, lab in ((y_lat, RM_LAT), (y_txt, RM_TXT)):
+            ax.add_patch(PathPatch(rounded_polygon([(bx0, yy - RM_ROW_H / 2), (bx0 + w_br, yy - RM_ROW_H / 2),
+                                                    (bx0 + w_br, yy + RM_ROW_H / 2), (bx0, yy + RM_ROW_H / 2)],
+                                                   CORNER_R * 0.8), fc="white", ec=BOX_EC,
+                                   lw=ENC_LW * 0.5, zorder=Z_TOKENIZER + 1))
+            ax.text(bx0 + w_br / 2, yy, lab, ha="center", va="center", fontsize=ENC_FS * 0.62,
                     zorder=Z_TOKENIZER + 2)
-            cells.append((cx, cx + ww))
-            cx += ww + RM_ROW_SEP
-        # the latent comes down the brace stem into the first cell
-        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], ry0 - ARROW_L)], Z_ARROW, tip=(mid[0], ry0),
-                   head_dir=(0.0, 1.0))
-        # the sentence arrives from the LEFT, into the second
-        tb_lines = RM_REQ.split(chr(10))
-        tb_w = max(text_extent(l, ENC_FS * 0.62)[0] for l in tb_lines) + 1.6 * RM_PAD
-        tb_h = text_extent(RM_REQ, ENC_FS * 0.62)[1] + RM_PAD
-        tb_x1, tb_cy = rx0 - RM_GAP_TXT - 2.0 * ARROW_L, cyc
-        ax.add_patch(PathPatch(rounded_polygon([(tb_x1 - tb_w, tb_cy - tb_h / 2), (tb_x1, tb_cy - tb_h / 2),
-                                                (tb_x1, tb_cy + tb_h / 2), (tb_x1 - tb_w, tb_cy + tb_h / 2)],
-                                               CORNER_R * 1.6), fc="white", ec=BOX_EC,
-                               lw=ENC_LW * 0.6, zorder=Z_TOKENIZER))
-        ax.text(tb_x1 - tb_w / 2, tb_cy, RM_REQ, ha="center", va="center", fontsize=ENC_FS * 0.62,
-                linespacing=1.25, zorder=Z_TOKENIZER + 1, style="italic")
-        draw_arrow(ax, [(tb_x1, tb_cy), (rx0 - ARROW_L, tb_cy)], Z_ARROW, tip=(rx0, tb_cy),
-                   head_dir=(1.0, 0.0))
+        cx0 = bx0 + w_br + RM_COS_GAP
+        y_cos = 0.5 * (y_lat + y_txt)
+        ax.add_patch(PathPatch(rounded_polygon([(cx0, y_cos - RM_ROW_H / 2), (cx0 + w_cos, y_cos - RM_ROW_H / 2),
+                                                (cx0 + w_cos, y_cos + RM_ROW_H / 2), (cx0, y_cos + RM_ROW_H / 2)],
+                                               CORNER_R * 0.8), fc="white", ec=BOX_EC,
+                               lw=ENC_LW * 0.5, zorder=Z_TOKENIZER + 1))
+        ax.text(cx0 + w_cos / 2, y_cos, RM_COS, ha="center", va="center", fontsize=ENC_FS * 0.62,
+                zorder=Z_TOKENIZER + 2)
+        # both branches into the cosine. ABOVE THE BOX: the box fill is Z_TOKENIZER, which is far above
+        # Z_ARROW, so an arrow drawn INSIDE the box at arrow depth is painted over and invisible.
+        _z_in = Z_TOKENIZER + 1.5
+        for yy in (y_lat, y_txt):
+            draw_arrow(ax, [(bx0 + w_br, yy), (0.5 * (bx0 + w_br + cx0), yy),
+                            (0.5 * (bx0 + w_br + cx0), y_cos), (cx0 - ARROW_L, y_cos)], _z_in,
+                       tip=(cx0, y_cos), head_dir=(1.0, 0.0))
+        # the brace stem comes down and THROUGH the box wall into the latent branch
+        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], y_lat), (bx0 - ARROW_L, y_lat)], Z_ARROW,
+                   tip=(bx0, y_lat), head_dir=(1.0, 0.0))
+        # ...and the request, one line, no box, into the text branch
+        tw = text_extent(RM_REQ, ENC_FS * 0.93)[0]
+        tx1 = bx0 - 3.2 * ARROW_L
+        ax.text(tx1 - tw, y_txt, RM_REQ, ha="left", va="center", fontsize=ENC_FS * 0.93,
+                style="italic", color=EDGE, zorder=Z_TOKENIZER + 1)
+        draw_arrow(ax, [(tx1 + 0.4 * ARROW_L, y_txt), (bx0 - ARROW_L, y_txt)], Z_ARROW,
+                   tip=(bx0, y_txt), head_dir=(1.0, 0.0))
         # one scalar out, to the right
-        draw_arrow(ax, [(rx1, cyc), (rx1 + 1.2 * ARROW_L, cyc)], Z_ARROW,
-                   tip=(rx1 + 2.2 * ARROW_L, cyc), head_dir=(1.0, 0.0))
-        ax.text(rx1 + 2.6 * ARROW_L, cyc, RM_OUT, ha="left", va="center", fontsize=ENC_FS * 0.7,
+        draw_arrow(ax, [(cx0 + w_cos, y_cos), (rx1 + 1.2 * ARROW_L, y_cos)], _z_in,
+                   tip=(rx1 + 2.2 * ARROW_L, y_cos), head_dir=(1.0, 0.0))
+        ax.text(rx1 + 2.6 * ARROW_L, y_cos, RM_OUT, ha="left", va="center", fontsize=ENC_FS * 0.7,
                 zorder=Z_ARROW + 1)
         ROUTES.append(("Reward model", "brace", "column bottom + predicted slice -> f_z"))
     if legend:
