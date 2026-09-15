@@ -2,7 +2,7 @@
 
 Emits every component on ONE SHARED CANVAS so the PNGs overlay exactly in a figure editor:
 
-    final.png                       everything, in the folder root
+    architecture.png                everything, in the folder root -- this is paper Fig. 4
     elements/items_vision.png       the image cascade alone, no braces, no tokenizer
     elements/items_proprio.png      the observation-vector cascade alone
     elements/items_action.png       the action-vector cascade alone
@@ -11,7 +11,7 @@ Emits every component on ONE SHARED CANVAS so the PNGs overlay exactly in a figu
     elements/tokenizers.png         the three tokenizer blocks, nothing else
 
 Because the layout is solved once and every render draws into it, dropping all six on top of each other
-reproduces final.png pixel for pixel.
+reproduces architecture.png pixel for pixel.
 
 Real data: frames from starling-2's train split and the matching rows of its parquet. The action is
 rebuilt the way data/dataset.py::_subsample_episodes does under action_aggregate=concat.
@@ -49,6 +49,8 @@ ASTERISKS    = ((7, "*\u2081"), (8, "*\u2082"))
 OFFSET_X     = 48.0      # per-item step in x
 OFFSET_Y     = OFFSET_X / 2          # ...and half that in y: the cascade angle
 IMG_W        = 300.0     # image item width
+PRED_BAND_PX = 16.0      # predicted IMAGES are hatched only in a band this many IMAGE PIXELS in from
+#                          the edge: hatching the whole frame greyed out the thing the figure is for
 CELL         = 32.0      # square vector cell
 PROPRIO_CELLS = 7        # observation dims DRAWN (the vector is 16-D; this is a schematic)
 # ONE COLOURMAP PER MODALITY, and everything that modality touches is drawn from it: the cascade's cells,
@@ -80,7 +82,7 @@ STREAM_FRAC  = 1.0      # vertical spacing between the three cascades, as a frac
 #                         heads, the token blocks, the decoders), not by the streams. Lifting the streams
 #                         only moves whitespace around inside the same box.
 TIME_M       = 40.0      # clearance between the last cascade and the arrow of time
-TIME_LAB     = "Time"   # capitalised, like every arrow-of-time label in the paper
+TIME_LAB     = "$t$"    # at the ARROWHEAD, not the middle of the axis
 BRACE_HALO   = 6.0       # white halo width, as a multiple of LW
 
 ENC_GAP      = 170.0     # gap between the cascade and its tokenizer (holds the stem risers)
@@ -98,6 +100,24 @@ BLK_RUN      = 150.0     # horizontal run of the 45-degree arrow from a tokenize
 BLK_ROW_SEP  = 150.0     # vertical separation between the two feed points on the action tokenizer
 BLK_DIAG     = 210.0     # length of the 45-degree feed arrow, from the tokenizer edge to the block
 BLK_LABELS   = False      # draw A/B/C on the three faces so they can be referred to unambiguously
+
+# ---- THE REWARD MODEL, bottom right ----------------------------------------------------------------
+# It is not part of the world model, so it is drawn as its own block rather than solved into the stack:
+# a brace along the BOTTOM face of the token column (mirroring the summariser's, and including the
+# predicted slice, because the reward is read on IMAGINED latents), a sentence entering from below, and
+# one scalar out.
+RM_ON        = True
+RM_TITLE     = "Reward model\n(contrastive)"
+RM_ROWS      = ("MLP $f_z$  (latent)", "MiniLM + MLP $f_t$  (text)", "cosine similarity")
+RM_REQ       = "\u201cgo forward to the ladder\nin the middle of the room\u201d"
+RM_OUT       = "$u^{\\top}w \\in [-1, 1]$"
+RM_ROW_H     = 58.0      # internal row height
+RM_ROW_SEP   = 16.0      # between internals, which sit SIDE BY SIDE: stacked, the block was 300 units
+#                          tall and the figure has no room under the token column for that
+RM_PAD       = 26.0
+RM_GAP_BR    = 70.0      # column bottom -> brace line
+RM_GAP_BOX   = 95.0      # brace line -> box top
+RM_GAP_TXT   = 70.0      # box -> the sentence, which sits to its LEFT
 # ---- Z ORDER (one place, because the stacking rules are not obvious) --------------------------------
 # RULE: A FEED ARROW MUST NEVER CROSS A TOKENIZER OUTLINE. The tokenizers therefore sit ABOVE every
 # arrow, and the arrows sit above the blocks (the extension feed has to thread past the stacked column
@@ -124,9 +144,10 @@ BLK_EC       = "#5b82ab"
 # and what marks it as PREDICTED is diagonal hatching, not hue. That separates the two questions a reader
 # asks of a block ("which modality" and "observed or predicted") onto two channels instead of making one
 # hue answer both, which is what forced the slice to orange and made it look like a third stream.
-PRED_HATCH   = "//"     # THICKER AND SPARSER than the default: "///" at the block line weight read as a
+PRED_HATCH   = "/"      # THICKER AND SPARSER than the default: "///" at the block line weight read as a
 #                         grey wash at print size rather than as a texture, so the stripe count is halved
-#                         and hatch.linewidth is tripled below. Every predicted thing carries it: the
+#                         and hatch.linewidth is tripled below. Halved a second time to a single
+#                         stripe. Every predicted thing carries it: the
 #                         slice in the token column, both
 #                         decoded outputs, the sampled chunk. The hatch always takes the object's OWN
 #                         outline colour, so it never introduces a hue -- it only adds a texture.
@@ -1258,11 +1279,28 @@ def solve_layout():
               + [b[1] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[1], DEC_BOX[1],
                                                                  BB["y0"], DT["y0"], AH["y0"]]
               + _ld_box[:1] + _as_y[:1])
-    bot = max([stack_bot] + [L["enc_cy_abs"] + ENC_H / 2 for L in LAYERS]
-              + [b[3] for L in LAYERS for b in L["blk_box"]]
-              + [BB["y1"], DT["y1"], AH["y1"], PRED_BOX[3], DEC_BOX[3]] + _ld_box[1:] + _as_y[1:])
+    # LIFT THE THREE STREAMS AS A GROUP. They descend diagonally and the arrow of time hangs below the
+    # last one, so the cascades -- not the right-hand column -- set the bottom of the canvas, 248 units
+    # below the lowest ink anything else contributes. Lift them until the arrow is level with that, and
+    # the figure loses that height outright. The tokenizers do NOT move, so every stem re-routes: they
+    # are drawn from the brace midpoint (which moves with sy) to the tokenizer entry (which does not),
+    # and route() re-solves each one. The lift is capped by the headroom above the topmost cascade.
+    bot_ns = max([L["enc_cy_abs"] + ENC_H / 2 for L in LAYERS]
+                 + [b[3] for L in LAYERS for b in L["blk_box"]]
+                 + [BB["y1"], DT["y1"], AH["y1"], PRED_BOX[3], DEC_BOX[3]] + _ld_box[1:] + _as_y[1:])
+    lift = float(np.clip(stack_bot - bot_ns, 0.0, max(0.0, stack_top - top)))
+    globals()["STREAM_LIFT"] = lift
+    bot = max(stack_bot - lift, bot_ns)
+    if RM_ON:
+        # THE REWARD MODEL HANGS BELOW THE TOKEN COLUMN, and after the stream lift the column is flush
+        # with the bottom of the canvas -- measured, zero free height. So reserve its band here, which
+        # is what makes the figure ~250 units taller than it would otherwise be, and the only place the
+        # block can go without crossing something.
+        _rm_h = RM_GAP_BR + RM_GAP_BOX + 2 * RM_PAD + text_extent(RM_TITLE, ENC_FS)[1] + RM_ROW_H \
+                + 2 * MIN_SEG
+        bot = max(bot, max([b[3] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[3]]) + _rm_h)
     for L in LAYERS:
-        L["sx"], L["sy"] = MARGIN - x_min, MARGIN - top + L["sy0"]
+        L["sx"], L["sy"] = MARGIN - x_min, MARGIN - top + L["sy0"] - lift
         L["enc_cy"] = L["enc_cy_abs"] + MARGIN - top
         L["entry"] = [y + MARGIN - top for y in L["entry_abs"]]
         L["feed"] = [(x, y + MARGIN - top) for x, y in L["feed_abs"]]
@@ -1533,8 +1571,10 @@ def draw_legend(ax):
     about TEXTURE: colour already means modality everywhere in this figure, and a coloured swatch here
     would read as a fifth stream."""
     w_lab = max(text_extent(t, ENC_FS)[0] for t in (LEG_TRUE, LEG_PRED))
-    lx = CANVAS_W - MARGIN - LEG_S - LEG_GAP - w_lab
-    ly = CANVAS_H - MARGIN - 2 * LEG_S - LEG_SEP
+    # TOP LEFT. It used to sit bottom-right; the streams now occupy less of the lower band and the
+    # top-left corner above the first cascade is the emptiest part of the figure.
+    lx = MARGIN
+    ly = MARGIN
     for k, (lab, hatch) in enumerate(((LEG_TRUE, None), (LEG_PRED, PRED_HATCH))):
         y = ly + k * (LEG_S + LEG_SEP)
         ax.add_patch(Rectangle((lx, y), LEG_S, LEG_S, fc="white", ec=EDGE, lw=LW * 1.6, hatch=hatch,
@@ -1544,7 +1584,8 @@ def draw_legend(ax):
 
 
 def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, backbone=False, dit=False,
-           pred=False, decoders=False, group=False, action_head=False, legend=False):
+           pred=False, decoders=False, group=False, action_head=False, legend=False,
+           reward=False):
     """`items` = indices of LAYERS whose cascades to draw. Every component uses the SAME canvas, so the
     outputs stack exactly."""
     fig = plt.figure(figsize=(CANVAS_W / 100, CANVAS_H / 100), dpi=DPI)
@@ -1567,10 +1608,8 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
             p0, p1 = (tx0 + sx, ty0 + sy), (tx1 + sx, ty1 + sy)
             u = np.array([OFFSET_X, OFFSET_Y], float); u /= np.linalg.norm(u)
             draw_arrow(ax, [p0, tuple(np.asarray(p1) - u * ARROW_L)], Z_ARROW, tip=p1, head_dir=tuple(u))
-            mid = 0.5 * (np.asarray(p0) + np.asarray(p1))
-            ax.text(mid[0], mid[1] + MIN_SEG, TIME_LAB, ha="center", va="top", fontsize=ENC_FS,
-                    color=EDGE, rotation=-np.degrees(np.arctan(SLOPE)), rotation_mode="anchor",
-                    zorder=Z_ARROW + 1)
+            ax.text(p1[0] + 2.0 * MIN_SEG, p1[1] + 0.6 * MIN_SEG, TIME_LAB, ha="left", va="center",
+                    fontsize=ENC_FS * 1.15, color=EDGE, zorder=Z_ARROW + 1)
             ROUTES.append(("Time", "axis", "parallel to the cascade"))
         if braces:
             for bi, (i0, i1) in enumerate(L["braces"]):
@@ -1685,8 +1724,18 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                 if D["label"].startswith("Vision") and PRED_IMG is not None:
                     ax.imshow(PRED_IMG[t_], extent=(ox, ox + D["ow"], oy + D["oh"], oy), zorder=zt,
                               interpolation="bilinear")
+                    # A HATCHED BAND, NOT A HATCHED IMAGE: a ring path (outer rectangle, inner rectangle
+                    # reversed) carries the hatch, so the predicted frame is marked at its border and
+                    # left legible in the middle.
+                    bw = PRED_BAND_PX * D["ow"] / PRED_IMG[t_].shape[1]
+                    W_, H_ = D["ow"], D["oh"]
+                    for bx, by, bwd, bht in ((ox, oy, W_, bw), (ox, oy + H_ - bw, W_, bw),
+                                             (ox, oy + bw, bw, H_ - 2 * bw),
+                                             (ox + W_ - bw, oy + bw, bw, H_ - 2 * bw)):
+                        ax.add_patch(Rectangle((bx, by), bwd, bht, fc="none", ec=VIS_EC, lw=0.0,
+                                               hatch=PRED_HATCH, zorder=zt + 0.4))
                     ax.add_patch(Rectangle((ox, oy), D["ow"], D["oh"], fill=False, ec=VIS_EC,
-                                           lw=LW * 2, hatch=PRED_HATCH, zorder=zt + 0.5))
+                                           lw=LW * 2, zorder=zt + 0.5))
                 elif PRED_OBS is not None:
                     # FLAT, and re-centred on the arrow: horizontal makes the tile CELL tall rather than
                     # D*CELL, so the oy computed for a column would hang it below the tip.
@@ -1721,6 +1770,63 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                 ax.text(0.5 * (AH["x1"] + AH["exit_tip"][0]) + sx, AH["exit_tip"][1] - MIN_SEG,
                         SAMPLE_LAB, ha="center", va="bottom", fontsize=BOX_FS * 0.78, color=EDGE,
                         zorder=Z_ARROW + 2)
+    if reward and RM_ON:
+        sx = LAYERS[0]["sx"]
+        dy_ = LAYERS[0]["tip"][0][1] - LAYERS[0]["tip_abs"][0][1]      # solve_layout's own y offset
+        bl = min(b[0] for L in LAYERS for b in L["blk_box"]) + sx
+        br = PRED_BOX[2] + sx
+        by = max([b[3] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[3]]) + dy_
+        # THE BRACE: along the column's bottom face, including the predicted slice, because the reward is
+        # read on IMAGINED latents. Same primitive as the summariser's, mirrored below.
+        poly, mid = brace_between((bl, by), (br, by), RM_GAP_BR, u=(1.0, 0.0), off=(0.0, 1.0))
+        draw_arrow(ax, poly, Z_ARROW)
+        rows = RM_ROWS
+        rws = [text_extent(t, ENC_FS * 0.62)[0] + 1.6 * RM_PAD for t in rows]
+        rw = sum(rws) + (len(rows) - 1) * RM_ROW_SEP + 2 * RM_PAD
+        ttl_h = text_extent(RM_TITLE, ENC_FS)[1]
+        rh = 2 * RM_PAD + ttl_h + RM_ROW_H
+        rx0 = mid[0] - 0.22 * rw
+        ry0 = mid[1] + RM_GAP_BOX
+        rx1 = rx0 + rw
+        ax.add_patch(PathPatch(rounded_polygon([(rx0, ry0), (rx1, ry0), (rx1, ry0 + rh), (rx0, ry0 + rh)],
+                                               CORNER_R), fc="white", ec=BOX_EC, lw=ENC_LW * 0.8,
+                               zorder=Z_TOKENIZER))
+        ax.text(0.5 * (rx0 + rx1), ry0 + RM_PAD * 0.45 + ttl_h / 2, RM_TITLE, ha="center", va="center",
+                fontsize=ENC_FS, linespacing=1.25, zorder=Z_TOKENIZER + 1)
+        cx = rx0 + RM_PAD
+        cyc = ry0 + RM_PAD + ttl_h + RM_ROW_H / 2
+        cells = []
+        for t, ww in zip(rows, rws):
+            ax.add_patch(PathPatch(rounded_polygon([(cx, cyc - RM_ROW_H / 2), (cx + ww, cyc - RM_ROW_H / 2),
+                                                    (cx + ww, cyc + RM_ROW_H / 2),
+                                                    (cx, cyc + RM_ROW_H / 2)], CORNER_R * 0.8),
+                                   fc="white", ec=BOX_EC, lw=ENC_LW * 0.5, zorder=Z_TOKENIZER + 1))
+            ax.text(cx + ww / 2, cyc, t, ha="center", va="center", fontsize=ENC_FS * 0.62,
+                    zorder=Z_TOKENIZER + 2)
+            cells.append((cx, cx + ww))
+            cx += ww + RM_ROW_SEP
+        # the latent comes down the brace stem into the first cell
+        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], ry0 - ARROW_L)], Z_ARROW, tip=(mid[0], ry0),
+                   head_dir=(0.0, 1.0))
+        # the sentence arrives from the LEFT, into the second
+        tb_lines = RM_REQ.split(chr(10))
+        tb_w = max(text_extent(l, ENC_FS * 0.62)[0] for l in tb_lines) + 1.6 * RM_PAD
+        tb_h = text_extent(RM_REQ, ENC_FS * 0.62)[1] + RM_PAD
+        tb_x1, tb_cy = rx0 - RM_GAP_TXT - 2.0 * ARROW_L, cyc
+        ax.add_patch(PathPatch(rounded_polygon([(tb_x1 - tb_w, tb_cy - tb_h / 2), (tb_x1, tb_cy - tb_h / 2),
+                                                (tb_x1, tb_cy + tb_h / 2), (tb_x1 - tb_w, tb_cy + tb_h / 2)],
+                                               CORNER_R * 1.6), fc="white", ec=BOX_EC,
+                               lw=ENC_LW * 0.6, zorder=Z_TOKENIZER))
+        ax.text(tb_x1 - tb_w / 2, tb_cy, RM_REQ, ha="center", va="center", fontsize=ENC_FS * 0.62,
+                linespacing=1.25, zorder=Z_TOKENIZER + 1, style="italic")
+        draw_arrow(ax, [(tb_x1, tb_cy), (rx0 - ARROW_L, tb_cy)], Z_ARROW, tip=(rx0, tb_cy),
+                   head_dir=(1.0, 0.0))
+        # one scalar out, to the right
+        draw_arrow(ax, [(rx1, cyc), (rx1 + 1.2 * ARROW_L, cyc)], Z_ARROW,
+                   tip=(rx1 + 2.2 * ARROW_L, cyc), head_dir=(1.0, 0.0))
+        ax.text(rx1 + 2.6 * ARROW_L, cyc, RM_OUT, ha="left", va="center", fontsize=ENC_FS * 0.7,
+                zorder=Z_ARROW + 1)
+        ROUTES.append(("Reward model", "brace", "column bottom + predicted slice -> f_z"))
     if legend:
         draw_legend(ax)
     fig.savefig(path, transparent=True, dpi=DPI, pad_inches=0)
@@ -1743,9 +1849,10 @@ render(f"{ELEM}/latent_dynamics.png", group=True)
 render(f"{ELEM}/predicted.png", pred=True)
 render(f"{ELEM}/decoders.png", decoders=True)
 render(f"{ELEM}/legend.png", legend=True)
-render(f"{OUT}/final.png", items=(0, 1, 2), braces=True, tokenizers=True, blocks=True,
+render(f"{ELEM}/reward.png", reward=True)
+render(f"{OUT}/architecture.png", items=(0, 1, 2), braces=True, tokenizers=True, blocks=True,
        backbone=True, dit=True, pred=True, decoders=True, group=LD_ON, action_head=True,
-       legend=True)
+       legend=True, reward=True)
 print(f"  canvas {int(CANVAS_W * DPI / 100)} x {int(CANVAS_H * DPI / 100)} px, identical for every component")
 print(f"\n  ONE SPACING, both axes: {_GAP:.1f} u ({_GAP * 3:.0f} px)")
 print(f"    MEASURED as proprioception riser x - right edge of the last image item, then reused as the")

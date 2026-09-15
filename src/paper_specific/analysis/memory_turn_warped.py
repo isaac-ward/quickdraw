@@ -45,6 +45,7 @@ from quickdraw.training.setup import (build_model, image_head_cams, image_head_s
                                       normalizer, resolve_data_root)
 
 PRE, POST = 10, 14          # real steps kept either side of the warped turn
+FS = 9.5                    # ONE font size for every label in this figure, 1.5x the old 6.4
 METRICS = [("l1", "open-loop $L_1$"), ("l2", "open-loop $L_2$"), ("lpips", "open-loop LPIPS")]
 
 
@@ -89,16 +90,22 @@ def rounded_path(pts, r):
     return Path(verts, codes)
 
 
-def brace_up(fig, xa, xb, y, up_to, x_stem, r=0.010, **kw):
+def brace_up(fig, xa, xb, y, up_to, x_stem, r=0.010, inset=0.004, **kw):
     """ONE brace: a flat span from xa to xb at y, ends turned down, and a stem from its middle up to
-    (x_stem, up_to). Figure coordinates."""
+    (x_stem, up_to). Figure coordinates.
+
+    `inset` pulls each end in so two adjacent braces do not touch -- consecutive periods share a
+    boundary in x, and without it the pair reads as one continuous line. The stem is VERTICAL, then
+    angled, then VERTICAL again, so it leaves the brace and meets the image square on."""
+    xa, xb = xa + inset, xb - inset
     mid = 0.5 * (xa + xb)
-    pts = [(xa, y - 0.013), (xa, y), (mid, y), (mid, y + 0.012)]
-    fig.add_artist(PathPatch(rounded_path(pts, r), fill=False, transform=fig.transFigure, **kw))
-    pts = [(xb, y - 0.013), (xb, y), (mid, y), (mid, y + 0.012)]
-    fig.add_artist(PathPatch(rounded_path(pts, r), fill=False, transform=fig.transFigure, **kw))
-    fig.add_artist(PathPatch(rounded_path([(mid, y + 0.012), (mid, up_to - 0.016), (x_stem, up_to)],
-                                          r), fill=False, transform=fig.transFigure, **kw))
+    for xe in (xa, xb):
+        pts = [(xe, y - 0.013), (xe, y), (mid, y), (mid, y + 0.010)]
+        fig.add_artist(PathPatch(rounded_path(pts, r), fill=False, transform=fig.transFigure, **kw))
+    rise = up_to - (y + 0.010)
+    pts = [(mid, y + 0.010), (mid, y + 0.010 + 0.32 * rise),
+           (x_stem, y + 0.010 + 0.74 * rise), (x_stem, up_to)]
+    fig.add_artist(PathPatch(rounded_path(pts, r * 0.8), fill=False, transform=fig.transFigure, **kw))
 
 
 def warp(steps, away, back, D):
@@ -253,23 +260,26 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     x0 = float(g[have][0])
     gx = g - x0
     t_away, t_back, t_end = -x0, D - x0, float(gx[have][-1])
-    fig = plt.figure(figsize=(7.1, 5.3))
+    fig = plt.figure(figsize=(7.1, 5.6))
     # the images take the larger share, and the gap holds the braces and their labels
-    outer = fig.add_gridspec(2, 1, height_ratios=(1.60, 1.25), hspace=0.42)
+    outer = fig.add_gridspec(2, 1, height_ratios=(1.42, 1.30), hspace=0.30)
     gim = outer[0].subgridspec(2, 3, hspace=0.0, wspace=0.16)
     gcur = outer[1].subgridspec(2, 1, hspace=0.0, height_ratios=(1.15, 1.0))
-    im_axes = []
+    im_axes, top_axes = [], []
     for c, (lab, k) in enumerate(EV):
         k = int(np.clip(k, 0, len(pred_fr) - 1))
         for r, (img, nm) in enumerate(((pred_fr[k], "Predicted"), (true_fr[k], "Truth"))):
             A = fig.add_subplot(gim[r, c])
-            A.imshow(img, interpolation="bilinear"); A.set_xticks([]); A.set_yticks([])
+            A.imshow(img, interpolation="bilinear", aspect="auto")
+            A.set_xticks([]); A.set_yticks([])
             for sp_ in A.spines.values():
                 sp_.set_linewidth(1.4); sp_.set_color("black")
             if c == 0:
-                A.set_ylabel(nm, fontsize=7.5)
+                A.set_ylabel(nm, fontsize=FS)
             if r == 1:
                 im_axes.append(A)
+            else:
+                top_axes.append(A)
     AC = fig.add_subplot(gcur[0])
     for (kk, name), col in zip(METRICS, ("tab:blue", "tab:green", "tab:red")):
         S = d[kk]
@@ -278,18 +288,19 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
         keep = cnt >= 1                          # EVERY step with data, however few episodes reach it
         AC.plot(gx[keep], mu[keep], color=col, lw=1.5, label=name.replace("open-loop ", ""))
         AC.fill_between(gx[keep], (mu - sem)[keep], (mu + sem)[keep], color=col, alpha=0.16)
-    AC.set_ylabel("Prediction\nerror", fontsize=8)
-    AC.legend(fontsize=7, ncol=1, loc="lower right", handlelength=1.2, borderpad=0.35,
+    AC.set_ylabel("Prediction\nerror", fontsize=FS)
+    AC.legend(fontsize=FS - 1.0, ncol=1, loc="lower right", handlelength=1.2, borderpad=0.35,
               labelspacing=0.25, framealpha=0.85)
     AH = fig.add_subplot(gcur[1], sharex=AC)
     S = d["heading"]
     mu = np.nanmean(S, axis=0); cnt = np.sum(~np.isnan(S), axis=0); keep = cnt >= 1
     AH.plot(gx[keep], mu[keep], color="0.25", lw=1.6)
-    AH.set_ylabel("Heading ($^\circ$)", fontsize=8)
+    AH.set_ylabel("Heading ($^\circ$)", fontsize=FS)
+    AH.set_xlabel("Open-loop prediction step", fontsize=FS)
     for A in (AC, AH):
         A.axvspan(t_away, t_back, color="tab:orange", alpha=0.12, lw=0)
         A.axvline(t_away, color="k", ls="--", lw=0.8); A.axvline(t_back, color="k", ls="--", lw=0.8)
-        A.grid(alpha=0.25); A.tick_params(labelsize=6.5)
+        A.grid(alpha=0.25); A.tick_params(labelsize=FS - 1.5)
         A.set_xlim(0, t_end)
     AC.tick_params(labelbottom=False)
     # ...and TIE EACH PERIOD TO ITS IMAGE COLUMN with the paper's own brace: a flat span over the period,
@@ -298,16 +309,19 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     # the brace sits high enough that its two-line label clears the axes below it
-    y_br = AC.get_position().y1 + 0.072
-    for (xa, xb), A, txt in zip(((0.0, t_away), (t_away, t_back), (t_back, t_end)), im_axes,
-                                ("Looking at\naltered region", "Looking away from\naltered region",
-                                 "Looking back at\naltered region")):
+    y_br = AC.get_position().y1 + 0.008
+    for i, ((xa, xb), A, txt) in enumerate(zip(((0.0, t_away), (t_away, t_back), (t_back, t_end)),
+                                               im_axes,
+                                               ("Looking at\naltered region",
+                                                "Looking away from\naltered region",
+                                                "Looking back at\naltered region"))):
         fa = inv.transform(AC.transData.transform((xa, 0)))[0]
         fb = inv.transform(AC.transData.transform((xb, 0)))[0]
         col = A.get_position()
         brace_up(fig, fa, fb, y_br, col.y0, 0.5 * (col.x0 + col.x1), color="0.35", lw=0.9)
-        fig.text(0.5 * (fa + fb), y_br - 0.018, txt, ha="center", va="top", fontsize=6.4,
-                 color="0.25", linespacing=1.15)
+        # the period's name goes ABOVE its image pair, not under the brace
+        fig.text(0.5 * (col.x0 + col.x1), top_axes[i].get_position().y1 + 0.006, txt, ha="center",
+                 va="bottom", fontsize=FS, color="0.25", linespacing=1.2)
     f2 = os.path.join(out_root, "eval_memory", "_memory_paper.png")
     fig.savefig(f2, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", f2)
