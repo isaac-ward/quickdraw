@@ -225,13 +225,14 @@ COLS = [("data", r"\makecell{Data Retrieval\\(ceiling)$^{\ddagger}$}"), ("gauss"
 # by what the corpus happens to contain, so calling it "best" asserts a target none of the priors could
 # reach by construction. Bolding therefore runs over the generative columns only.
 BOLD_COLS = [m for m, _ in COLS if m != "data"]
-# The place block needs DECODED VIDEO for the labeller, so these are the video-on 26-request suites
-# rather than the 16-context physical runs above.
+# The place block needs DECODED VIDEO for the labeller, which is why it used to run at 4 contexts while
+# the motion block ran at 16: the video suites were built at 4. These are the 15-context re-runs, 16
+# object/region requests each, 224 plans per arm (14 contexts survive the horizon at 15 requested).
 VLM_RUNS = {
-    "gauss": "logs/eval_steer_2026_09_15_06_29_37_suite_gauss",
-    "prior": "logs/eval_steer_2026_09_14_21_57_53_best_prior_guided",
-    "pitdelta": "logs/eval_steer_2026_09_15_01_29_12_suite_pitdelta",
-    "data": "logs/eval_steer_2026_09_15_01_28_55_suite_data_retrieved",
+    "gauss": "logs/eval_steer_2026_09_15_22_20_22_loc15_gauss",
+    "prior": "logs/eval_steer_2026_09_15_22_42_19_loc15_prior",
+    "pitdelta": "logs/eval_steer_2026_09_15_22_42_20_loc15_pitdelta",
+    "data": "logs/eval_steer_2026_09_15_22_20_23_loc15_data",
 }
 UNIT = {"yaw": r"$^\circ$", "altitude": "m", "forward": "m", "lateral": "m"}
 PILOT = {"yaw": 471.75, "altitude": 0.58, "forward": 23.63, "lateral": 19.92}   # analysis/steer_physical
@@ -359,7 +360,7 @@ def avg_motion(ph):
     for m, _ in COLS:
         f = [float(np.mean([v > 0.05 * PILOT[WANTS[q][0]] for v in ph[m][q][2]]))
              for q in MOTION_ROWS if ph[m].get(q)]
-        out[m] = 15.0 * float(np.mean(f)) if f else None
+        out[m] = float(np.mean(f)) if f else None
     return out
 
 
@@ -368,7 +369,7 @@ def avg_locations(vl):
     out = {}
     for m, _ in COLS:
         f = [v[0] for v in (vl.get(m, {}).get(q) for q in LOC_ROWS) if v]
-        out[m] = 4.0 * float(np.mean(f)) if f else None
+        out[m] = float(np.mean(f)) if f else None
     return out
 
 
@@ -405,12 +406,12 @@ def wacc_locations(vl):
     return out
 
 
-def _avg_row(wa, denom, what):
+def _avg_row(wa, what):
     best = max((v for m, v in wa.items() if v is not None and m in BOLD_COLS), default=None)
     cells = ["--" if wa[m] is None else
-             ((r"\textbf{" + f"{100 * wa[m] / denom:.0f}" + r"}\%")
+             ((r"\textbf{" + f"{100 * wa[m]:.0f}" + r"}\%")
               if (m in BOLD_COLS and best and abs(wa[m] - best) < 1e-9)
-              else f"{100 * wa[m] / denom:.0f}\%") for m, _ in COLS]
+              else f"{100 * wa[m]:.0f}\%") for m, _ in COLS]
     return r"    \midrule" + "\n" + f"    Mean over {what} " + r"$\uparrow$ & " \
         + " & ".join(cells) + r" \\"
 
@@ -442,7 +443,8 @@ def steer_table(paper: str) -> str:
          r"learned prior can offer is not fidelity but reach: it can propose a motion the corpus does "
          r"not contain, and retrieval never can. $^{\S}$The corpus contains no backward flight at all, "
          r"and no arm gets more than one context out of fifteen -- a motion primitive absent from the "
-         r"data is not reachable by steering, however the candidates are drawn.}",
+         r"data is not reachable by steering, however the candidates are drawn. Motion primitives are "
+         r"scored over $15$ starting contexts and locations over $14$.}",
          r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nc + "}", r"    \toprule",
          r"    \diagbox[width=0.19\textwidth, height=2.1\line]{Request}{Action Model} & "
          + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
@@ -471,7 +473,7 @@ def steer_table(paper: str) -> str:
     # THE AGGREGATE ROWS ARE GONE, at the author's ask: obeyed, motion against a pilot and the two
     # jerk multiples summarised the per-request cells above them and a continuity comparison this
     # table no longer makes. hits_all/frac_all stay accumulated -- the prose quotes them.
-    L += [_avg_row(avg_motion(ph), 15, "motion primitives"),
+    L += [_avg_row(avg_motion(ph), "motion primitives"),
           r"    \midrule", r"    \multicolumn{" + str(1 + nc) +
           r"}{c}{Locations} \\", r"    \midrule"]
     for q in LOC_ROWS:
@@ -485,7 +487,7 @@ def steer_table(paper: str) -> str:
                   if (m in BOLD_COLS and best and abs(v[0] / v[1] - best) < 1e-9)
                   else f"{100 * v[0] / v[1]:.0f}\%") for (m, _), v in zip(COLS, vals)]
         L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
-    L += [_avg_row(avg_locations(vl), 4, "locations"),
+    L += [_avg_row(avg_locations(vl), "locations"),
           r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     # THE FALSE-POSITIVE-AWARE VERSION, printed rather than tabulated. The author wants the plain mean in
     # the table; this stays reproducible because the results prose quotes it, and it is the number that
