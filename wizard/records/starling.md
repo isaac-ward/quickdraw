@@ -709,7 +709,8 @@ in review live in `src/quickdraw/data/ood_windows.py` -- noodle keeps 10/12, lea
 ## 5. THE PAPER (09-15)
 
 `github.com/isaac-ward/icra2027-seamstress`, cloned OUTSIDE quickdraw at `../icra2027-seamstress`. The
-paper is split one file per section, imported from `root_code.text` (literal name, the author's choice):
+paper is split one file per section, imported from `root_code.tex` (the old single-file `root.tex` is kept, untouched, as the
+author's archive of the pre-split draft):
 `sections/{00_abstract,01_introduction,02_related_work,03_methods,04_results,05_conclusion,06_appendix}.tex`.
 
   * EVERY SECTION CARRIES A CHARACTER BUDGET. The lipsum calls the draft was laid out with are a length
