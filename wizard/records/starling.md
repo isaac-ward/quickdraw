@@ -448,3 +448,256 @@ dies past lead 8 -- was an artefact of the pooled context and is WITHDRAWN.
     pooled PIT field; neither describes this one.
   * `data=starling_ctx` (P 8 -> 24) is better motivated now than in 1.7, but it should be re-argued against
     the grouped ceiling rather than the pooled one.
+
+## 3. LANGUAGE STEERING IN IMAGINATION: YAW WORKS, THE PRIOR CANNOT HOLD A STICK (09-14)
+
+**IF YOU READ NOTHING ELSE: the world model and the reward head are not the bottleneck; the action prior's
+SMOOTHNESS is. Steering works on the axes where the prior's commands resemble real ones (yaw, weakly
+vertical) and fails on the axes where they do not (lateral, fore/aft). Replacing the prior's draws with
+REAL recorded chunks -- keeping everything else -- triples the commanded motion and brings a dead axis
+back. 3.6 is the retrain that follows from it.**
+
+`eval_steer` (`src/quickdraw/eval_steer.py`, routine in `evaluation/routines.py`, planner in
+`evaluation/steering.py`) plans INSIDE the imagination: draw candidate action chunks, roll them through the
+frozen WM, score the imagined latents with the language reward head, commit the best, re-plan, out to 128
+steps at `subsample=4` = 34 s. No environment -- starling has no simulator, which is why this is not
+`eval_control`. Artifacts: one folder per (request, context) with `image.mp4`, `proprio_3d.png`,
+`proprio_axes.png`, `actions.npy`, `proprio.npy`, `latents.npy`, `plan.json`.
+
+### 3.1 THE METRIC WAS WRONG TWICE BEFORE IT WAS RIGHT
+
+  * `reward_gain` (last eighth minus first eighth of the reward curve) measures NOTHING at horizon 128: the
+    reward saturates by step ~12 and is flat for the remaining 116. Positive gains seen at horizon 32 were
+    the jump from the start into the plateau, not progress.
+  * "did the commanded stick carry the requested sign" is contaminated by a STANDING BIAS: the fore/aft
+    stick sits at -0.28..-0.60 in all 26 requests regardless of what was asked, so `fly forward` scores a
+    win for free and `fly backward` cannot score at all.
+  * Differencing OPPOSING requests planned from the same context cancels that bias and was the metric for
+    several hours -- but it is in joystick units with no scale, it scores the planner's INPUT rather than
+    the trajectory, and it exists for only 8 of 26 requests.
+  * THE METRIC: net physical motion of the IMAGINED trajectory along the axis the request names, in metres
+    and degrees, against what a pilot covers in the same 34 s. `scratch/steer_physical.py`, computed from
+    the `proprio.npy` every run already writes.
+
+    TWO CALIBRATION FINDINGS, both of which would have silently corrupted it:
+      - a pilot turns ~470 deg per 34 s segment, so projecting NET displacement onto the START heading
+        measures nothing (corr of the fore/aft stick with "forward" came out -0.07). Path-integrate each
+        step's displacement in that step's own heading instead: corr becomes 0.99.
+      - THE QUATERNION'S HEADING IS 180 DEG FROM THE CAMERA'S FORWARD. Uncorrected the calibration reads
+        `fore/aft + = forward` (contradicting the optical-flow result in the joystick mapping) and
+        `lateral + = strafe left` (contradicting conf/interpret/starling.yaml). One 180 deg offset explains
+        both; |corr| on the diagonal is 0.99/1.00/0.99 after flipping. Negate forward and lateral.
+
+### 3.2 WHAT STEERS (16 contexts, chunk-32 prior + prefix guidance, objective `level`)
+
+        request        wants        achieved     pilot   % of pilot
+        rotate right   yaw -       -513.35deg   471.75      109%
+        descend        altitude -    +0.43m       0.58       74%
+        fly forward    forward +    +14.50m      23.63       61%
+        rotate left    yaw +       +196.92deg   471.75       42%
+        strafe right   lateral +     +7.08m      19.92       36%
+        strafe left    lateral -     +2.07m      19.92       10%
+        climb          altitude +    +0.03m       0.58        5%
+        fly backward   forward -    -12.91m      23.63      -55%
+
+  The three weakest are the three AGAINST-THE-GRAIN directions -- the data descends and flies forward, and
+  the prior's mode is unbreakable there. No plan in any run exceeds the recorded MAXIMUM rate on any axis,
+  so nothing is extrapolating; ">100% of pilot" means SUSTAINED, because the pilot baseline is a mean net
+  and net motion cancels.
+
+  `objective: level` (mean R over the chunk) beats `progress` (R_end - R_start), 5/8 vs 2/8 physical and
+  +0.494 vs +0.194 on the older stick metric. A 4-CONTEXT RESULT SAID THE OPPOSITE and was wrong; 4
+  contexts flipped the conclusion twice in one day, once here and once on the proposal comparison. Do not
+  conclude from 4.
+
+  The 18 object/region requests have NO honest readout -- nothing in the imagination measures "is the
+  ladder in view". Their reward rising is the quantity the planner maximised. Closing this needs the VLM
+  labeller run over the PLANNED imaginations; the machinery exists (`eval_interpret`), only the calls cost.
+
+### 3.3 THE PROPOSAL IS AN INTERFACE, AND THE TRAINED PRIOR LOSES TO RAW DATA
+
+  MPPI's candidates were hardcoded gaussian noise, so the action prior was never in the planner. Now
+  `sample(mean, k, ctx, g, prefix) -> (G,k,H,A)` with three sources -- `prior`, `data` (real recorded
+  chunks), `gaussian` -- shared by `eval_steer` and `eval_control` (`control.proposal`, default gaussian,
+  bit-identical to the inlined arithmetic; torus parity asserted in `scratch/check_proposals.py`).
+
+        proposal                within-chunk jerk    holds (f-a)    physical    yaw sep
+        RECORDED                1.00x  (0.0545)          13.41           --         --
+        data (real chunks)      1.00x                     5.7-14.9      6/8      +0.801
+        prior (trained head)    2.47x                     2.0           7/8      +0.312
+
+  The data proposal is state-BLIND and still achieves ~3x the motion (mean 104% of pilot vs 35%). That is
+  what pins the fault on the action head rather than on the planner or the reward head.
+
+### 3.4 THE JERK DECOMPOSES, AND ONLY HALF OF IT IS THE PLANNER'S
+
+  * BETWEEN chunks (the SEAM, where one chunk ends and a fresh draw begins with nothing connecting them):
+    8.70x the recorded step-to-step change. THE PLANNER'S. Fixed by RTC-style prefix guidance (arXiv
+    2506.07339): steer the flow while it integrates so the draw continues the previous chunk. 8.70x ->
+    2.58x, i.e. seam/interior 1.05 -- the join is indistinguishable from an ordinary step -- and yaw
+    steering IMPROVED (+0.208 7/8 -> +0.308 8/8). Needs `commit < lookahead` so an overlap exists;
+    defaults are now `commit: 16`, `prefix_guidance: true`.
+  * WITHIN a chunk: 2.47x recorded, holds 2.0 steps against a pilot's 13.4. THE HEAD'S. Nothing at the
+    planner level touches it, and three things were tried:
+      - `beta_jerk` (penalise |da| in the objective): 2.66x -> 2.14x and it cost most of the steering.
+        Selection cannot produce a behaviour absent from the candidate set.
+      - `Held` (snap sub-tolerance changes to exact holds): NO EFFECT at any tolerance up to 0.2, four
+        times the recorded mean step change. The draws contain no near-holds to snap -- the jitter is real
+        movement, not dither. A clean negative, and the argument that the atom must be LEARNED.
+      - `crossfade` (ACT temporal ensembling): works, strictly worse than guidance on the prior, and
+        actively DAMAGES the data proposal (holds 4.43 -> 3.17). Kept as the documented baseline.
+  * `prefix_retrieval` for the data proposal (draw bank chunks that already open where the plan continues)
+    was REJECTED on a measurement and the measurement was wrong: on a 365-chunk bank (val at stride 8) 0%
+    of seams had a full 64-candidate pool within one recorded step. On the real bank (train at stride 1,
+    24,737 chunks) it is 46%, and retrieval gives agreement 0.40 -> 0.18 with fore/aft holds 5.7 -> 10.6.
+    The verdict was about the bank, not the idea. Bank defaults are now `train` / stride 1.
+
+### 3.5 WHY THE HEAD CANNOT HOLD, MEASURED
+
+        axis        P(rest)  rec / prior     P(rest | prev rest)  rec / prior
+        yaw           0.248 / 0.108              0.666 / 0.241
+        vertical      0.135 / 0.037              0.881 / 0.094
+        lateral       0.332 / 0.246              0.960 / 0.665
+        fore/aft      0.580 / 0.529              0.996 / 0.824
+
+  PIT fixed the MARGINAL and not the JOINT. Note the pattern: the head captures 91% of the true rest-rate
+  on the axis whose atom is LARGEST (fore/aft, 0.580) and 27% on the smallest (vertical, 0.135) -- it
+  learns big atoms well. And a hold needs several chunk slots to independently agree on the same LEVEL,
+  which the conditional column says they do not.
+
+### 3.6 `target_transform: pit_delta` -- SMOOTHNESS FIXED, THE LEVEL LOST (09-15)
+
+  Predict `[a_0, da_1 .. da_K-1]` and fit the percentile transform to the INCREMENTS, so the slab sits on
+  "the stick did not move" rather than "the stick is at rest". Two reasons it should work where `pit` did
+  not: a hold becomes ONE draw in ONE slab with no coordination between slots, and that slab covers
+  0.67-0.996 of the data, moving every axis into the big-atom regime the head already handles best.
+
+  `none` and `pit` are untouched (separate branch, early return). The increment knots are fitted at BUILD
+  time from the strided train split, NOT shipped in `normalization_stats.json`: a value's distribution is
+  stride-independent under `concat` but `a[t+1]-a[t]` between kept steps is not, and a stored table would
+  be silently wrong at any other `subsample` -- the same shape as the `sum`-vs-`concat` bug in 2.4.
+  `n_knots` fixed at 1024 so the buffer shape cannot move with a config knob.
+
+  Verified before launching (`scratch/check_pit_delta.py`): round trip max |err| 1.05e-04 (float32 over a
+  32-term cumsum; mean 4.4e-07), and 380,371 of 380,371 true holds exactly held with ZERO drift -- an
+  increment inverting to exactly 0.0 adds exactly 0.0, so a hold is held and not nearly held.
+
+  READ IT WITH: hold length against 13.4, step-to-step change against 0.0545
+  (`scratch/check_prior_smoothness.py`), the rest-conditional table above
+  (`scratch/check_atom_coordination.py`), then whether the planner reaches the data proposal's motion while
+  keeping the conditioning real chunks lack. `train_loss` is NOT comparable to the `pit` run -- different
+  target space, different likelihood scale.
+
+  IT WORKED ON WHAT IT WAS FOR, AND THAT IS NOT ENOUGH.
+
+        readout (chunk 32, grouped)          pit      pit_delta     recorded
+        within-chunk |da|                  2.47x         1.28x        1.00x  (0.0541)
+        HOLD length, fore/aft                2.0          4.40        13.41
+        HOLD length, mean over axes           --          3.34         5.95
+        W1 to the action marginal         0.0635        0.3784           --
+        skill @+1 / @max              0.640/0.302   0.633/0.158           --
+        rest AUC                           0.996         0.997           --
+        physical steering (16 ctx)           7/8           6/8           --
+
+  Smoothness is genuinely repaired: the step-to-step change falls from 2.47x the recorded value to 1.28x,
+  and the fore/aft hold more than doubles. But `cumsum` over 32 increments is a RANDOM WALK in the
+  absolute level, and W1 comes out 6x worse -- the plan is smooth and in the wrong place, which the
+  physical readout then shows as less motion on every axis except yaw. `skill_max` halving says the same
+  thing: conditioning survives at the first lead and decays over the chunk.
+
+  VERDICT: NOT the model. It is the paper's PIT-vs-PIT-delta ablation row, and the clean statement of the
+  tradeoff -- a head that predicts values lands in the right place, a head that predicts changes moves
+  smoothly, and nothing tried here does both. The obvious next thing is to predict the first action as a
+  VALUE and the rest as increments, which is what the `pit_delta` target already does for slot 0 only;
+  the drift is in the 31 increments after it, so anchoring more than one slot is the experiment.
+
+## 4. OUT-OF-DISTRIBUTION AND MEMORY, ON THE FOUR HELD-OUT SPLITS (09-14/15)
+
+**IF YOU READ NOTHING ELSE: one-step prediction error detects both anomalies, each in its own channel, at
+0.900 and 0.828 weighted accuracy with a 90% conformal threshold and no anomaly training. Memory is a
+NEGATIVE result and it is horizon-controlled.**
+
+Four recorded eval splits, never trained on, each holding the commanded action roughly constant so any
+departure from hover is the disturbance: `eval_ood_noodle` (a pool noodle waved into frame -- VISUAL),
+`eval_ood_leafblower` (an off-camera leaf blower pushing the airframe -- DYNAMICAL), `eval_memory_backwall1`
+and `_backwall2` (turn away from a scene and back). The reviewed anomaly windows and the episodes dropped
+in review live in `src/quickdraw/data/ood_windows.py` -- noodle keeps 10/12, leafblower 7/12.
+
+### 4.1 EACH ANOMALY IS CAUGHT IN ITS OWN CHANNEL, AND THE CROSS TERMS ARE THE CONTROL
+
+        anomaly              score                     nominal   failure   weighted
+        noodle (visual)      latent surprise             0.889     0.911      0.900
+        noodle               image LPIPS                 0.844     0.902      0.873
+        noodle               angular velocity error      0.889     0.260      0.575
+        leafblower (dyn)     angular velocity error      0.874     0.783      0.828
+        leafblower           velocity error              0.883     0.652      0.768
+        leafblower           image LPIPS                 0.883     0.565      0.724
+        either               position error              0.900     0.122      0.511
+
+  Weighted accuracy is the mean of the two class accuracies, so 0.500 is chance under ANY imbalance --
+  which matters here because the windows are a small fraction of each episode and raw accuracy would read
+  0.9 for a detector that never fires. Position error resolves nothing at a one-step window: the drift is
+  slower than the step. LPIPS DOES see the leafblower (0.724) and that is not leakage -- being pushed
+  changes what the camera sees even though the cause never enters frame.
+
+  THE CALIBRATION IS THE PART THAT WAS WRONG FIRST. A threshold fitted on the VAL split gave recall 0.016
+  at AUC 0.94: val is a different regime (different lighting, different flight), so its score
+  distribution sits elsewhere. Leave-one-episode-out INSIDE the split fixes it -- the threshold is the 90%
+  quantile of the OTHER episodes' in-distribution steps.
+
+  WINDOWS ARE IN FRAMES, PREDICTIONS ARE IN MODEL STEPS. Comparing them directly gave nan AUCs that looked
+  like missing data. `ood_windows.window_steps()` is the conversion and every analysis goes through it.
+
+### 4.2 THE SURPRISE IS AN IMAGE, SO IT LOCALISES
+
+  Decode 64 samples of the next latent, take `|obs - mean| / (std + eps)` per pixel, pool over patches:
+  pixel-level AUC (does a noodle pixel outrank a background pixel) 0.961 at an 8x8 pool, 0.944 at 4x4.
+  4x4 is the one to show -- it is sharper and the number is within noise of the blurrier map.
+  Rejected on measurement: raw `absdiff` 0.909, bare `std` 0.530, and my own `surprise_bg`
+  (background-normalised) 0.917 -- worse than the thing it was meant to improve.
+
+### 4.3 MEMORY: NO, AND THE ARCHITECTURE SAYS SO
+
+  OPEN-LOOP, not teacher-forced. Under teacher forcing the true last 8 frames are handed back at every
+  step, so the wall is already in the context when the drone turns around and nothing about retention is
+  being tested. Open-loop, only the first 8 frames are real.
+
+  Turn duration varies (8-21 model steps), so aligning on the turn START smears the return and vice versa.
+  The fix is a piecewise-linear TIME WARP: real spacing either side, the turn itself rescaled to the
+  split's mean duration (`paper_specific/analysis/memory_turn_warped.py`).
+
+        split        n   turn   EXCESS over val at matched horizon
+                                before      during       after
+        backwall1   10   11.3   +0.0398     +0.0959     +0.1387
+        backwall2    9   11.1   +0.1482     +0.0332     +0.1713
+
+  The excess does not come back down after the return. Raw error DIPS during the turn -- a featureless
+  wall sweeping past is easy to predict -- which is exactly why the horizon-matched control is required:
+  uncontrolled, the ordinary growth of open-loop error reads as forgetting, and the easy turn reads as
+  memory working.
+
+  The context is 8 frames, ~2 s at stride 4, and nothing recurrent carries state past it. A scene that
+  leaves the window leaves the model. This is a statement about the architecture, not a tuning failure.
+
+## 5. THE PAPER (09-15)
+
+`github.com/isaac-ward/icra2027-seamstress`, cloned OUTSIDE quickdraw at `../icra2027-seamstress`. The
+paper is split one file per section, imported from `root_code.text` (literal name, the author's choice):
+`sections/{00_abstract,01_introduction,02_related_work,03_methods,04_results,05_conclusion,06_appendix}.tex`.
+
+  * EVERY SECTION CARRIES A CHARACTER BUDGET. The lipsum calls the draft was laid out with are a length
+    spec, so each file's first line is `%budget for this section: X words Y characters Z paragraphs as
+    pulled from lorem ipsum` and each replaced paragraph is written to the length of the lipsum it
+    replaced (`[1-4]`=226, `[1-8]`=398, `[1-16]`=755 characters; measured from texlive's
+    `lipsum.ltd.tex`). `python -m paper_specific.budget <file.tex>` checks it.
+  * EVERY TABLE CARRIES A BASELINE. A rule from the author, not a convention: no row is interpretable
+    without something differing from it in one named way. Where no competing method exists on this data
+    the baseline is one of our own rejected settings, a bound (the autoencoder floor), or a different
+    candidate source (gaussian noise / real data chunks / PIT vs PIT-delta).
+  * The toy (torus) problem was CUT from the paper, and memory folded under out-of-distribution.
+  * Paper-specific code lives in `src/paper_specific/`: `tables.py` (the four .tex tables),
+    `harvest.py` (reads run metrics/configs), `figures/` (the architecture, dataset, overview and
+    planning diagrams, and `results_figs.py`), `analysis/` (26 one-off measurements, all of which are
+    cited in this record).
+  * `src/paper_specific/build_paper.sh` builds the PDF -- texlive is in the quickdraw container and the paper repo
+    is not mounted, so it copies the repo into `scratch/paperbuild` and runs pdflatex there.

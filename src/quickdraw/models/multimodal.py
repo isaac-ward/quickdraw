@@ -941,6 +941,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  # ...and the SPACE its target lives in. "none" is the z-scored action (bit-identical to every
                  # run before 2026-09-13); "pit" is Phi^-1(F(a)), whose knots arrive here from the dataset.
                  action_head_target_transform: str = "none", action_pit_knots=None,
+                 action_delta_pit_knots=None,
                  action_head_context: str = "pooled",
                  dynamics_detach_encoder: bool = False, p_tf_dynamics: float | None = 1.0, **kw):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
@@ -1032,11 +1033,35 @@ class MultiModalFlow(MultiModalSequenceModel):
             # SLAB, which a smooth field can hit, and the inverse returns the atom's exact value. The knots
             # are a persistent BUFFER so they travel inside the checkpoint: a head reloaded without the
             # exact map it trained under would be silently wrong, not obviously broken.
-            if str(action_head_target_transform) not in ("none", "pit"):
-                raise ValueError(f"action_head.target_transform must be 'none' or 'pit', got "
+            if str(action_head_target_transform) not in ("none", "pit", "pit_delta"):
+                raise ValueError(f"action_head.target_transform must be 'none', 'pit' or 'pit_delta', got "
                                  f"{action_head_target_transform!r}")
             self.action_head_target_transform = str(action_head_target_transform)
-            if self.action_head_target_transform == "pit":
+            if self.action_head_target_transform == "pit_delta":
+                # THE ATOM MOVES FROM THE VALUE TO THE CHANGE. Under `pit` the slab a smooth flow can land
+                # in sits where the stick is at REST, which fixes the marginal -- measured, the prior gets
+                # 91% of the rest-rate on the axis whose atom is biggest. It does not fix HOLDS: a run of
+                # held steps needs several chunk slots to independently agree on the same LEVEL, and
+                # measured the head does not (P(rest | prev rest) 0.88 -> 0.09 on the vertical axis, so
+                # holds collapse to 2.0 steps against a pilot's 13.4). Predicting [a_0, da_1 .. da_K-1]
+                # puts the slab on "did not move" instead, which is a far LARGER atom (0.67-0.996 of the
+                # data) and needs no coordination at all: one draw in one slab is one held step. That also
+                # moves every axis into the big-atom regime the head already handles best.
+                if action_delta_pit_knots is None:
+                    raise ValueError(
+                        "action_head.target_transform=pit_delta needs the INCREMENT knots; they are fitted "
+                        "at build time from the strided train split (training/setup._action_delta_pit_knots) "
+                        "because an increment's distribution depends on data.subsample.")
+                if int(self.action_head_chunk) < 2:
+                    raise ValueError("action_head.target_transform=pit_delta needs chunk >= 2: with one "
+                                     "action per chunk there are no increments, so it would be `pit` under "
+                                     "another name.")
+                dk = torch.as_tensor(action_delta_pit_knots, dtype=torch.float32)
+                if dk.shape[0] != action_dim:
+                    raise ValueError(f"increment knots are fitted for {dk.shape[0]} dims but action_dim is "
+                                     f"{action_dim}")
+                self.register_buffer("action_delta_pit_knots", dk, persistent=True)
+            if self.action_head_target_transform in ("pit", "pit_delta"):
                 if action_pit_knots is None:
                     raise ValueError(
                         "action_head.target_transform=pit needs the PIT knots, which come from the dataset's "
@@ -1149,6 +1174,17 @@ class MultiModalFlow(MultiModalSequenceModel):
         if L < K + 2:                                            # not even one chunk fits in the window
             return None, None
         A = act_seq[:, 1:L - 1]                                  # (B, L-2, a): a[1..L-2]
+        if getattr(self, "action_head_target_transform", "none") == "pit_delta":
+            # SEPARATE BRANCH so `none` and `pit` stay byte-for-byte the code they were. The differencing
+            # has to happen AFTER the unfold, inside each chunk -- differencing the sequence first would
+            # take deltas across chunk boundaries, which is a different quantity.
+            from ..data.transforms import PIT
+            W = A.unfold(1, K, 1)                                # (B, N, a, K)
+            C = W.permute(0, 1, 3, 2)                            # (B, N, K, a) chunk, time-major
+            head = PIT(self.action_pit_knots).apply(C[:, :, :1])         # the chunk's first ACTION
+            dlt = PIT(self.action_delta_pit_knots).apply(C[:, :, 1:] - C[:, :, :-1])   # its INCREMENTS
+            T = torch.cat([head, dlt], dim=2).reshape(C.shape[0], C.shape[1], K * C.shape[-1])
+            return h_ctx[:, :T.shape[1]], T.detach()
         # THE TARGET SPACE, applied per STEP (width action_dim) before the chunk is flattened, so one map
         # covers every lead time. getattr, not an attribute read: smoke stand-ins bind this method to a
         # bare object, and "none" must be untouched code for them and for every pre-2026-09-13 run.
@@ -1195,7 +1231,8 @@ class MultiModalFlow(MultiModalSequenceModel):
         h = self.backbone(self._to_input(z[:, :-1], act_seq[:, :L - 1]))   # (B, L-1, n_input, d)
         return self.pool_context(h)                              # (B, L-1, context_dim) per step
 
-    def sample_action(self, h_ctx: Tensor, *, deterministic: bool = False, eps: Tensor | None = None) -> Tensor:
+    def sample_action(self, h_ctx: Tensor, *, deterministic: bool = False, eps: Tensor | None = None,
+                      hook=None) -> Tensor:
         """Sample from the learned action PRIOR given a per-step context vector `h_ctx` (..., d) — the pooled
         backbone context h[t-1]. Returns NORMALIZED actions (..., action_dim * action_head_chunk), i.e. the
         chunk flattened time-major; reshape to (..., K, action_dim) for per-lead-time use. The caller denorms.
@@ -1204,7 +1241,7 @@ class MultiModalFlow(MultiModalSequenceModel):
         Under target_transform=pit the flow lives in z-space and its draw is inverted HERE, so the boundary
         of this method is unchanged: callers still get a normalized action and never learn the difference."""
         out = self.action_flow.sample(h_ctx, steps=self.action_head_sampling_steps,
-                                      deterministic=deterministic, eps=eps)
+                                      deterministic=deterministic, eps=eps, hook=hook)
         if getattr(self, "action_head_target_transform", "none") == "pit":
             if deterministic:
                 # F^-1(Phi(E[z])) is the MEDIAN action, not the mean: the inverse is nonlinear, so a
@@ -1217,6 +1254,20 @@ class MultiModalFlow(MultiModalSequenceModel):
             from ..data.transforms import PIT
             K, a = self.action_head_chunk, self.action_pit_knots.shape[0]
             out = PIT(self.action_pit_knots).invert(out.reshape(*out.shape[:-1], K, a)).reshape(out.shape)
+        elif getattr(self, "action_head_target_transform", "none") == "pit_delta":
+            if deterministic:
+                raise ValueError(
+                    "sample_action(deterministic=True) is not defined under target_transform=pit_delta, for "
+                    "the same reason as pit: inverting the mean of z gives a median, not a mean.")
+            from ..data.transforms import PIT
+            K, a = self.action_head_chunk, self.action_pit_knots.shape[0]
+            z = out.reshape(*out.shape[:-1], K, a)
+            # invert each slot in ITS OWN space, then cumulative-sum: [a_0, da_1, ...] -> [a_0, a_1, ...].
+            # The atom guarantee survives the sum -- an increment that inverts to exactly 0 leaves the
+            # running value bit-identical, which is what makes a HOLD exactly held rather than nearly so.
+            act = torch.cat([PIT(self.action_pit_knots).invert(z[..., :1, :]),
+                             PIT(self.action_delta_pit_knots).invert(z[..., 1:, :])], dim=-2)
+            out = act.cumsum(dim=-2).reshape(out.shape)
         return out
 
 

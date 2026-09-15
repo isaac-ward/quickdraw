@@ -854,11 +854,15 @@ def _pad3(P, frac=0.05):
 _GT_C, _PRED_C, _CTX_C = "black", "0.55", "black"
 
 
-def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0):
+def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0, curve_labels=("GT", "pred")):
     """Geometry-FREE 3D open-loop trajectory (the torus atlas' cross-env sibling): GT vs PRED world positions
     for a recorded env with no renderable geometry. `true_xyz`/`pred_xyz` START at the fork anchor (the last
     context point) so both branch from the same place; `ctx_xyz` is the pre-fork context. All inputs (·,3)
-    physical positions. Visual language: see _GT_C/_PRED_C above."""
+    physical positions. Visual language: see _GT_C/_PRED_C above.
+
+    `curve_labels` renames the two curves for callers where "GT" would be a LIE: eval_steer plans its own
+    actions, so the recorded future is not the ground truth of that rollout -- it is a different trajectory
+    entirely, shown only for scale. Default unchanged."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3d projection)
     ctx = np.asarray(ctx_xyz, float).reshape(-1, 3)
     tru = np.asarray(true_xyz, float).reshape(-1, 3)
@@ -870,8 +874,8 @@ def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0):
     ax.set_box_aspect((xl[1] - xl[0], yl[1] - yl[0], zl[1] - zl[0]))
     if len(ctx) > 1:
         ax.plot(ctx[:, 0], ctx[:, 1], ctx[:, 2], color=_CTX_C, ls="--", lw=1.3, label="context")
-    ax.plot(tru[:, 0], tru[:, 1], tru[:, 2], color=_GT_C, lw=1.8, label="GT")
-    ax.plot(prd[:, 0], prd[:, 1], prd[:, 2], color=_PRED_C, lw=1.8, label="pred")
+    ax.plot(tru[:, 0], tru[:, 1], tru[:, 2], color=_GT_C, lw=1.8, label=curve_labels[0])
+    ax.plot(prd[:, 0], prd[:, 1], prd[:, 2], color=_PRED_C, lw=1.8, label=curve_labels[1])
     ax.scatter(*tru[-1], color=_GT_C, s=70, depthshade=False)          # GT end ball
     ax.scatter(*prd[-1], color=_PRED_C, s=70, depthshade=False)        # pred end ball
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
@@ -882,7 +886,8 @@ def fig_paths_3d(ctx_xyz, true_xyz, pred_xyz, *, title="", size=6.0):
     return fig
 
 
-def fig_pos_vs_time(ctx_xyz, true_xyz, pred_xyz, *, fork_step, labels=None, title=""):
+def fig_pos_vs_time(ctx_xyz, true_xyz, pred_xyz, *, fork_step, labels=None, title="",
+                    curve_labels=("GT", "pred")):
     """Per-axis position-vs-step panels (one row per position dim) — the readable companion to fig_paths_3d for
     a docking-style approach (you see each coordinate converge or diverge). Same visual language; a faint
     vertical dotted line marks the fork (a LINE, not a sphere). `true_xyz`/`pred_xyz` START at the fork anchor;
@@ -901,8 +906,8 @@ def fig_pos_vs_time(ctx_xyz, true_xyz, pred_xyz, *, fork_step, labels=None, titl
         ax = axes[d][0]
         if P > 1:
             ax.plot(tc, ctx[:, d], color=_CTX_C, ls="--", lw=1.2, label="context")
-        ax.plot(tf, tru[:, d], color=_GT_C, lw=1.6, label="GT")
-        ax.plot(tf, prd[:, d], color=_PRED_C, lw=1.6, label="pred")
+        ax.plot(tf, tru[:, d], color=_GT_C, lw=1.6, label=curve_labels[0])
+        ax.plot(tf, prd[:, d], color=_PRED_C, lw=1.6, label=curve_labels[1])
         ax.scatter(tf[-1], tru[-1, d], color=_GT_C, s=40, zorder=5)
         ax.scatter(tf[-1], prd[-1, d], color=_PRED_C, s=40, zorder=5)
         ax.axvline(fork_step - 1, color="0.8", lw=1.0, ls=":")     # fork marker (a line, not a sphere)

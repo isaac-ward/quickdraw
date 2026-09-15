@@ -23,6 +23,15 @@ vlm:
 #   source: analytic -> computed exactly from the imagined proprio (deterministic, no API).
 # `analytic` params double as the cross-check when source is vlm (VLM image reading graded vs proprio truth).
 # buckets = the label set (also the legend order); colors = a matplotlib color per bucket for the legend.
+# Required per environment (see interpret.build_action_text): what each raw action axis means. Torus's
+# action is (a_theta, a_phi), accelerations around the main ring and around the tube cross-section
+# (environments/examples/torus.py step()). NOTE the sign wording is the MATHEMATICAL direction, not a
+# verified visual one -- unlike the starling config these were not checked against optical flow, and torus's
+# factors (colour, positioning) do not depend on the action, so the text is context and never a label.
+action_axes:
+  - {name: around ring, positive: increasing theta, negative: decreasing theta}
+  - {name: around tube, positive: increasing phi,   negative: decreasing phi}
+
 factors:
   color:                       # the surface the agent is standing on
     source: vlm                # VLM reads the image -> the independent probe; analytic (environments/torus.color_at) cross-checks it

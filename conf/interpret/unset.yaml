@@ -1,0 +1,19 @@
+# NO INTERPRETABILITY ENVIRONMENT SELECTED. This is the DEFAULT, and it is deliberately unusable.
+#
+# WHY. The factor definitions -- which semantic axes exist, what their buckets are, what each action axis
+# means -- are properties of an ENVIRONMENT, and every consumer of them reads `cfg.interpret`. The default
+# used to be `torus`, so running eval_interpret or train_reward_model on starling without saying
+# `interpret=starling` silently supplied TORUS buckets (colour, positioning) for flight footage. When the
+# factor names happen not to overlap that surfaces as a confusing KeyError; when they do overlap it would
+# label one environment's data with another's categories and say nothing at all.
+#
+# `interpret` cannot be made Hydra-mandatory (`???`) because the group is composed for EVERY run, including
+# world-model training runs that never touch interpretability -- those would all fail at startup. So the
+# default is this sentinel instead: harmless to compose, fatal to read.
+#
+#     python -m quickdraw.eval_interpret     interpret=starling ...
+#     python -m quickdraw.train_reward_model interpret=starling ...
+#
+# Available: conf/interpret/{starling,torus,pendulum}.yaml
+_unset: true
+factors: {}

@@ -89,7 +89,7 @@ def main(cfg):
     assert str(cfg.model.name) in ("mm_flow", "flow"), (
         f"the action-flow head needs a flow world model (model.name in mm_flow/flow; got {cfg.model.name!r})")
 
-    run_dir = make_run_dir("train_action", cfg.experiment)   # logs/train_action_<ts>_<exp>
+    run_dir = make_run_dir("train_action_model", cfg.experiment)   # logs/train_action_model_<ts>_<exp>
     os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
     OmegaConf.save(cfg, os.path.join(run_dir, "checkpoints", "config.resolved.yaml"))
 

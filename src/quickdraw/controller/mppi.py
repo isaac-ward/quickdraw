@@ -60,20 +60,65 @@ def _score(p_xyz, v_xyz, cand, goal, mppi, dist=None, reward_fn=None):
     return ret
 
 
-def _mppi_step(rollout_fn, mean, goal, mppi, a_max, g, reward_fn=None):
-    """One MPPI update: sample candidates, score via rollout_fn, return the new weighted mean (G,H,2)
-    and the first action (G,2). rollout_fn(cand) -> (p_xyz, v_xyz, dist): dist is a per-step distance
-    override (G,K,H) for the language reward, or None -> score with reward_fn (the env's reward). _score
-    applies the same velocity/control shaping either way."""
-    G, H, A = mean.shape[0], mppi.horizon, mean.shape[-1]      # A: env action_dim (torus: 2, unchanged)
-    K = mppi.num_samples
-    noise = torch.randn(G, K, H, A, device=mean.device, generator=g) * mppi.noise_sigma
-    cand = (mean[:, None] + noise).clamp(-a_max, a_max)        # (G,K,H,A)
+def _commit(cand, ret, mppi, proposal):
+    """Turn scored candidates (G,K,H,A) + returns (G,K) into the plan (G,H,A).
+
+    `mean` is MPPI proper: the softmax-weighted average of the candidates. `best` commits the single
+    highest-scoring candidate instead, which is what a STRUCTURED proposal needs -- the average of two
+    plausible manoeuvres is an implausible one, so weighting a prior's draws together throws away exactly
+    the structure the prior was trained to have. Each proposal declares which it wants (`.commit`)."""
+    if proposal.commit == "best":
+        return cand[torch.arange(cand.shape[0], device=cand.device), ret.argmax(dim=1)]   # (G,H,A)
+    assert proposal.commit == "mean", f"unknown commit rule {proposal.commit!r} on {proposal.name}"
+    w = torch.softmax(ret / max(mppi.lambda_, 1e-6), dim=1)   # (G,K)
+    return (w[..., None, None] * cand).sum(dim=1)             # (G,H,A)
+
+
+def _mppi_step(rollout_fn, mean, goal, mppi, proposal, g, reward_fn=None, h_ctx=None):
+    """One MPPI update: sample candidates, score via rollout_fn, return the plan (G,H,2) and its first
+    action (G,2). rollout_fn(cand) -> (p_xyz, v_xyz, dist): dist is a per-step distance override (G,K,H)
+    for the language reward, or None -> score with reward_fn (the env's reward). _score applies the same
+    velocity/control shaping either way.
+
+    `proposal` (evaluation/steering.py) is where candidates come from. GaussianProposal reproduces the
+    `mean + noise_sigma * randn` this function used to inline, bit-for-bit; PriorProposal draws from the
+    trained action prior conditioned on `h_ctx` (G,d), so the candidates look like real pilot commands
+    instead of white noise."""
+    cand = proposal.sample(mean, mppi.num_samples, ctx=h_ctx, g=g)        # (G,K,H,A)
     p_xyz, v_xyz, dist = rollout_fn(cand)                     # dist: per-step (G,K,H) override, or None
     ret = _score(p_xyz, v_xyz, cand, goal, mppi, dist=dist, reward_fn=reward_fn)   # (G,K) higher = better
-    w = torch.softmax(ret / max(mppi.lambda_, 1e-6), dim=1)   # (G,K)
-    new_mean = (w[..., None, None] * cand).sum(dim=1)         # (G,H,2)
-    return new_mean, new_mean[:, 0], p_xyz, ret               # p_xyz/ret expose the candidate fan
+    plan = _commit(cand, ret, mppi, proposal)                 # (G,H,A)
+    return plan, plan[:, 0], p_xyz, ret                       # p_xyz/ret expose the candidate fan
+
+
+def _h_ctx(core, normalizer, obs_win, fpv_win, pa, img_head):
+    """The pooled backbone context the action prior conditions on, for a controller's CURRENT window.
+
+    ALIGNMENT, which is the whole difficulty. `_to_input` pairs state t with the action taken AT t, and the
+    head was trained to predict a_t from h[t-1] -- the window ending at (state t-1, action a_{t-1}). Here a_t
+    is exactly what we are planning, so the freshest observation has no action to pair with and is dropped:
+    obs_win is (B,P,*) and `pa` the P-1 actions leading into it, so the last P-1 states pair with all P-1
+    actions and h[-1] is the context for a_t. It costs one frame of context and buys the exact
+    (state t-1, action t-1) -> a_t rule the head was trained under -- the same rule steering.plan applies.
+
+    obs_win (B,P,obs_dim) RAW proprio; fpv_win (B,P,s,s,3) or None; pa (B,P-1,A) RAW actions -> (B,d_ctx)."""
+    assert pa.shape[1] + 1 == obs_win.shape[1], (
+        f"_h_ctx needs P-1 actions for P states, got {pa.shape[1]} for {obs_win.shape[1]}")
+    if obs_win.shape[1] < 2:
+        # FIRST REPLAN: the env has been reset and nothing has been executed, so there is no (state, action)
+        # pair to pool at all. Repeat the state and pair it with a RAW-zero action -- "here, stick centred",
+        # which is what an episode actually starts from. The backbone front-pads the rest of the window.
+        obs_win = torch.cat([obs_win, obs_win], dim=1)
+        if fpv_win is not None:
+            fpv_win = torch.cat([fpv_win, fpv_win], dim=1)
+        pa = torch.zeros(obs_win.shape[0], 1, pa.shape[-1], device=obs_win.device, dtype=obs_win.dtype)
+    ctx = {"proprio": normalizer.norm_obs(obs_win)}
+    if img_head is not None:
+        ctx[img_head] = fpv_win
+    bag = core.encode_state(ctx)[:, :-1]                         # (B,P-1,n_state,d) drop the freshest state
+    W = int(core.window)
+    zs, aa = bag[:, -W:], normalizer.norm_act(pa)[:, -W:]
+    return core.pool_context(core.backbone(core._to_input(zs, aa)))[:, -1]      # (B,d_ctx)
 
 
 def _true_rollout_fn(env):
@@ -129,7 +174,7 @@ def _init_controller(cfg, B, device, seed, env_factory=None):
 @torch.no_grad()
 def run_control(model, normalizer, env_cfg, mppi: MPPIConfig, device="cpu", log=None, fpv=None,
                 reward=None, request=None, oracle=True, n_plot=1, requests=None, reward_fn=None,
-                env=None, env_factory=None):
+                env=None, env_factory=None, proposal=None):
     """MPPI GOAL-RACE control (torus: byte-identical to the legacy torus-only version). Default: race the
     oracle (true dynamics) vs the learned model through
     spatial goals. `oracle=False` -> learned controller only (same code spine). `reward` (a
@@ -143,7 +188,12 @@ def run_control(model, normalizer, env_cfg, mppi: MPPIConfig, device="cpu", log=
     env (the run's live WorldEnv) + env_factory (fresh batch-B instances for the controllers) make this
     env-agnostic: goals come from env.control_goals, the oracle forks the real env (env.fork), and a
     generic image-head env renders its in-loop image context via env.render_obs. Both None (legacy torus
-    callers) -> the exact torus-only construction (TorusEnv + module-level control_goals), unchanged."""
+    callers) -> the exact torus-only construction (TorusEnv + module-level control_goals), unchanged.
+
+    `proposal` (evaluation/steering.py) is WHERE THE CANDIDATES COME FROM, and None keeps the historic
+    behaviour: GaussianProposal(mppi.noise_sigma, a_max) reproduces the inlined `mean + sigma * randn`
+    bit-for-bit, so every torus number is unchanged. PriorProposal draws from the trained action prior
+    instead -- see the horizon assert below for the one constraint that imposes."""
     core = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
     use_fpv = img_head is not None and fpv is not None                     # render FPV in the loop ONLY with a real image head
@@ -191,6 +241,19 @@ def run_control(model, normalizer, env_cfg, mppi: MPPIConfig, device="cpu", log=
     if reward_fn is None:   # default scorer: the TRUE env's reward with the config's shaping knobs
         reward_fn = lambda o, gl: ctrls[kinds[0]]["env"].reward(o, gl, beta_vel=mppi.beta_vel,
                                                                 r_settle=mppi.r_settle)
+    if proposal is None:                     # historic behaviour, bit-identical (see GaussianProposal.sample)
+        from ..evaluation.steering import GaussianProposal
+        proposal = GaussianProposal(mppi.noise_sigma, a_max)
+    if getattr(proposal, "needs_ctx", False):
+        # THE PRIOR'S ONE CONSTRAINT. It emits `action_head_chunk` actions from ONE context, so a longer
+        # planning horizon would score actions drawn for a state the plan has already left. Pinning
+        # horizon == chunk makes MPPI the chunk-wise receding-horizon planner eval_steer already is.
+        assert H <= int(getattr(proposal, "K", H)), (
+            f"control.horizon {H} exceeds the prior's chunk {getattr(proposal, 'K', None)} -- set "
+            f"control.horizon (and control.chunk) to the chunk, or use proposal=gaussian")
+        assert not oracle, (
+            "a prior proposal needs the model's pooled context, which the true-dynamics controller does not "
+            "build (it tracks no image context) -- run with oracle=false")
     arange = torch.arange(B, device=device)
     for c in ctrls.values():
         c["mean"] = torch.zeros(B, H, A, device=device)
@@ -224,9 +287,13 @@ def run_control(model, normalizer, env_cfg, mppi: MPPIConfig, device="cpu", log=
                 ctx_fpv = torch.stack(c["fpv"][-P:], dim=1) if use_fpv else None   # (B,p,s,s,3) FPV context, or None (proprio-only)
                 rollout = _mm_model_rollout_fn(model, normalizer, ctx, ctx_fpv, pa, img_head if use_fpv else None,
                                                dist_bag=dist_bag)   # reward mode -> per-step distance 1-R on the rolled bag
+                h_ctx = (_h_ctx(core, normalizer, ctx, ctx_fpv, pa, img_head if use_fpv else None)
+                         if getattr(proposal, "needs_ctx", False) else None)
             else:
                 rollout = _true_rollout_fn(c["env"])
-            c["plan"], _, p_xyz, ret = _mppi_step(rollout, c["mean"], cur, mppi, a_max, g, reward_fn)
+                h_ctx = None
+            c["plan"], _, p_xyz, ret = _mppi_step(rollout, c["mean"], cur, mppi, proposal, g, reward_fn,
+                                                  h_ctx=h_ctx)
             if kind == "pred":  # per-episode candidate fan, ANCHORED at the current known position: prepend
                 # the dot (last true obs) so the first segment joins where-we-are -> first prediction.
                 anchor = c["obs"][-1][:NP, :3].cpu().numpy()                    # (NP,3) current positions
@@ -369,20 +436,16 @@ def run_control(model, normalizer, env_cfg, mppi: MPPIConfig, device="cpu", log=
 # sequence, no gidx advancement, runs to max_steps) with env.reward(obs, None) as the per-step objective.
 # Generic action_dim/obs_dim (the goal-based helpers above are torus-shaped: 2D actions, obs split p/v).
 # --------------------------------------------------------------------------------------
-def _mppi_step_reward(rollout_fn, mean, mppi, a_max, g, reward_fn):
-    """One MPPI update for reward-only control: sample candidates around `mean` (G,H,A), roll them out to
-    obs (G,K,H,obs_dim), score sum_h env.reward(obs_h, None) (+ the optional control cost), softmax-weight.
+def _mppi_step_reward(rollout_fn, mean, mppi, proposal, g, reward_fn, h_ctx=None):
+    """One MPPI update for reward-only control: draw candidates from `proposal`, roll them out to
+    obs (G,K,H,obs_dim), score sum_h env.reward(obs_h, None) (+ the optional control cost), commit.
     `reward_fn(obs, None)` must broadcast over leading dims ((...,obs_dim) -> (...))."""
-    G, H, A = mean.shape
-    K = mppi.num_samples
-    noise = torch.randn(G, K, H, A, device=mean.device, generator=g) * mppi.noise_sigma
-    cand = (mean[:, None] + noise).clamp(-a_max, a_max)        # (G,K,H,A)
+    cand = proposal.sample(mean, mppi.num_samples, ctx=h_ctx, g=g)        # (G,K,H,A)
     obs = rollout_fn(cand)                                     # (G,K,H,obs_dim)
     ret = reward_fn(obs, None).sum(dim=-1)                     # (G,K) env reward summed over the horizon
     if mppi.beta_ctrl > 0.0:                                   # cheaper thrust preferred (energy/jitter)
         ret = ret - mppi.beta_ctrl * cand.pow(2).sum(dim=-1).sum(dim=-1)
-    w = torch.softmax(ret / max(mppi.lambda_, 1e-6), dim=1)    # (G,K)
-    return (w[..., None, None] * cand).sum(dim=1)              # (G,H,A) new mean == the plan
+    return _commit(cand, ret, mppi, proposal)                  # (G,H,A) the plan
 
 
 def _model_rollout_obs_fn(model, normalizer, ctx_pro, pa, obs_dim):
@@ -416,14 +479,17 @@ def _true_rollout_obs_fn(env):
 
 @torch.no_grad()
 def run_control_reward_only(model, normalizer, env_factory, mppi: MPPIConfig, device="cpu", log=None,
-                            oracle=True, n_plot=1, reward_fn=None):
+                            oracle=True, n_plot=1, reward_fn=None, proposal=None):
     """REWARD-ONLY MPPI control for an env with NO goal source: maximize the env's own reward. `env_factory`
     builds a fresh batched WorldEnv (batch == mppi.n_episodes, exposing action_dim/obs_dim/a_max); each
     controller gets its OWN instance, reset with the same seed (2, matching _init_controller) so oracle and
     learned race the same inits. oracle=True -> dual true-dynamics vs learned controllers (same spine as the
     goal race); the oracle plans via deepcopy env forks (_true_rollout_obs_fn). No goal sequence / advancement
     / markers: every episode runs the full max_steps and logs its realized per-step env reward.
-    reward_fn(obs, goal) -> per-step reward, broadcasting over leading dims; None -> env.reward."""
+    reward_fn(obs, goal) -> per-step reward, broadcasting over leading dims; None -> env.reward.
+    `proposal` (evaluation/steering.py): None -> GaussianProposal(mppi.noise_sigma, a_max), bit-identical to
+    the candidate noise this function used to inline. This branch is proprio-only, so BOTH controllers can
+    build the prior's context from their own observation window and the oracle race stays matched."""
     B, P, H = mppi.n_episodes, model.window, mppi.horizon
     NP = max(1, min(n_plot, B))
     chunk = max(1, min(mppi.chunk, H))
@@ -441,6 +507,13 @@ def run_control_reward_only(model, normalizer, env_factory, mppi: MPPIConfig, de
         "reward-only control is proprio-only (a generic env has no in-loop image renderer)"
     if reward_fn is None:
         reward_fn = env0.reward
+    if proposal is None:                     # historic behaviour, bit-identical (see GaussianProposal.sample)
+        from ..evaluation.steering import GaussianProposal
+        proposal = GaussianProposal(mppi.noise_sigma, a_max)
+    if getattr(proposal, "needs_ctx", False):    # see run_control for why the horizon is pinned to the chunk
+        assert H <= int(getattr(proposal, "K", H)), (
+            f"control.horizon {H} exceeds the prior's chunk {getattr(proposal, 'K', None)} -- set "
+            f"control.horizon (and control.chunk) to the chunk, or use proposal=gaussian")
     for c in ctrls.values():
         c["mean"] = torch.zeros(B, H, A, device=device)
 
@@ -451,13 +524,18 @@ def run_control_reward_only(model, normalizer, env_factory, mppi: MPPIConfig, de
     while step < mppi.max_steps:
         n_chunks += 1
         for kind, c in ctrls.items():  # plan once per chunk (re-grounded on the latest true state)
+            # built for EVERY controller, not just `pred`: proprio-only means the prior's context comes
+            # from a controller's own observation window, so the oracle can draw from the same proposal --
+            # same candidates, different dynamics, which is what makes that race fair.
+            ctx = torch.stack(c["obs"][-P:], dim=1)
+            pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, A, device=device)
             if kind == "pred":
-                ctx = torch.stack(c["obs"][-P:], dim=1)
-                pa = torch.stack(c["act"][-(P - 1):], dim=1) if c["act"] else torch.zeros(B, 0, A, device=device)
                 rollout = _model_rollout_obs_fn(model, normalizer, ctx, pa, obs_dim)
             else:
                 rollout = _true_rollout_obs_fn(c["env"])
-            c["plan"] = _mppi_step_reward(rollout, c["mean"], mppi, a_max, g, reward_fn)
+            h_ctx = (_h_ctx(core, normalizer, ctx, None, pa, None)
+                     if getattr(proposal, "needs_ctx", False) else None)
+            c["plan"] = _mppi_step_reward(rollout, c["mean"], mppi, proposal, g, reward_fn, h_ctx=h_ctx)
         for j in range(chunk):         # execute `chunk` actions of each plan open-loop, then replan
             if step >= mppi.max_steps:
                 break

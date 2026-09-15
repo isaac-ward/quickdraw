@@ -270,7 +270,7 @@ action_head:
   #   REQUIRED to load one: the conditioning width changes, so a head trained under one setting cannot load
   #   under the other (load_checkpoint fails on the size mismatch rather than silently mis-reading).
   #   The world model is untouched either way -- this is the prior's input only.
-  target_transform: pit     # pit | none. THE SPACE THE PRIOR'S TARGET LIVES IN, and it should be `pit`
+  target_transform: pit     # pit | pit_delta | none. THE SPACE THE PRIOR'S TARGET LIVES IN, and it should be `pit`
   #   wherever the dataset supports it. z = Phi^-1(F(a)), with F the empirical CDF of the TRAIN actions.
   #   WHY: a rectified flow integrates a finite-Lipschitz velocity field, so noise -> action is a
   #   diffeomorphism and its terminal law is ABSOLUTELY CONTINUOUS -- it cannot place an atom. Measured on
@@ -306,6 +306,18 @@ action_head:
   #   ALSO REQUIRES a FRESH head (weights live in the target space; load_checkpoint refuses a mismatch rather
   #   than silently sampling from the wrong distribution) and forbids sample_action(deterministic=True),
   #   which under PIT returns a median rather than a mean.
+  # pit_delta -----------------------------------------------------------------------------
+  #   `pit_delta` predicts [a_0, da_1 .. da_K-1] and fits the percentile transform
+  #   to the INCREMENTS, so the slab sits on "the stick did not move" rather than on
+  #   "the stick is at rest". Measured motivation: under `pit` the head gets the
+  #   rest MARGINAL roughly right but not the JOINT -- P(rest | prev rest) is 0.88
+  #   in the data and 0.09 from the head on the vertical axis -- so holds collapse
+  #   to 2.0 consecutive steps against a pilot's 13.4, and the planned trajectories
+  #   thrash (2.5-4x the recorded step-to-step change). Under pit_delta a hold is
+  #   ONE draw in ONE slab, no coordination between slots needed, and that slab
+  #   covers 0.67-0.996 of the data. Requires chunk >= 2 and action_aggregate=concat;
+  #   the increment knots are fitted at build time from the STRIDED train split
+  #   (they depend on data.subsample, so they cannot ship with the dataset).
   n_freq: 16                # tau Fourier features for the prior (FlowField's own default)
   time_dim: 32              # tau embedding width for the prior (FlowField's own default)
   chunk: 1                  # how many consecutive POST-SUBSAMPLE actions the prior predicts JOINTLY.

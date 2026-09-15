@@ -96,7 +96,8 @@ def _write_lr(job: dict):
     """One split's lerobot dataset (vectors, plus the pre-encoded clips as observation.images.<cam>
     when this dataset has a camera; vector-only when `ego_dir` is None)."""
     write_lerobot_split(job["root_split"], job["repo_id"], job["obs"], job["act"], job["fps"],
-                        fpv_dir=job["ego_dir"], fpv_size=job["hw"], cam=job["cam"], task=job["task"])
+                        fpv_dir=job["ego_dir"], fpv_size=job["hw"], cam=job["cam"], task=job["task"],
+                        obs_names=job.get("obs_names"), act_names=job.get("act_names"))
     return job["name"]
 
 
@@ -113,7 +114,9 @@ def _frame_hw(frames) -> tuple[int, int]:
 def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, log=None,
                            extra_splits: dict[str, list[Episode]] | None = None,
                            val_ids: set[int] | None = None,
-                           obs_identity: list[int] | None = None) -> str:
+                           obs_identity: list[int] | None = None,
+                           obs_names: "list[str] | None" = None,
+                           act_names: "list[str] | None" = None) -> str:
     """Turn canonical `Episode`s into a standard recorded run folder. Returns the run_dir.
 
     make_run_dir -> deterministic ~10% val split BY EPISODE (seed 0) of `episodes` into train/val ->
@@ -201,6 +204,9 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
                 "hw": hw, "cam": cams,
                 # PER-EPISODE task labels, falling back to the dataset name for processors that set none.
                 "task": [e.task or name for e in eps],
+                # DIM NAMES, when the processor knows its layout. Without these the published dataset is
+                # anonymous floats -- see write_lerobot_split.
+                "obs_names": obs_names, "act_names": act_names,
                 "ego_dir": {c: os.path.join(ego_roots[c], sp) for c in cams} if has_frames else None}
                for sp, eps in split_eps.items()]
     log(f"[lerobot] writing {len(lr_jobs)} split datasets "
@@ -509,7 +515,12 @@ def starling_bags(cfg) -> tuple[str, list[Episode], int, str, dict[str, list[Epi
             extra[plan[c]] = eps
     if not main_pool:
         raise ValueError(f"no train/val campaigns matched in {root} (eval_globs={eval_globs})")
-    return name, main_pool, int(round(hz)), "ego", (extra or None)
+    # The 6th element carries the DIM NAMES into the published metadata. This processor is the only place
+    # that knows the flight state layout, and shipping it as 16 anonymous floats is exactly the mistake
+    # rosbag.py's STATE_COLUMNS comment was written to stop repeating.
+    from .rosbag import ACTION_COLUMNS, STATE_COLUMNS
+    return (name, main_pool, int(round(hz)), "ego", (extra or None),
+            {"obs_names": list(STATE_COLUMNS), "act_names": list(ACTION_COLUMNS)})
 
 
 def _longest_first_val(lengths: list[int], frac: float, min_eps: int = 2) -> set[int]:

@@ -1,0 +1,29 @@
+# =============================================================================================
+# vl128_starling_gaussian -- the DREAMER-STYLE BASELINE for the paper's long-horizon table.
+#
+# Identical to `vl128_starling` in every respect that is not the dynamics head: same encoder, same
+# decoder, same codec sizes, same 112x192 image, same 32 tokens, same latent_loss_weight, same depth and
+# width. The ONLY change is what predicts the next latent -- a rectified-flow field (ours) versus an
+# explicit distribution with a KL-regularised posterior (gaussian), which is what DreamerV1/V3 do.
+# Keeping everything else fixed is the point: any difference in the table is attributable to the head.
+#
+# Launch (matching the settled recipe exactly, only `model=` differs):
+#   python -m quickdraw.train_world_model model=vl128_starling_gaussian data=starling2 \
+#     environments=recorded data.subsample=4 data.action_aggregate=concat data.autobatch=true \
+#     trainer.max_epochs=40 eval.horizon=128
+# =============================================================================================
+defaults:
+  - vl128_starling
+  - _self_
+
+name: mm_dist
+dist_head: gaussian
+diffusion: null             # REQUIRED: the builder refuses a dist head and a rectified-flow head together
+#                             ("pick ONE prediction mechanism"), and `diffusion` is inherited from vl128.
+gaussian:                   # the PlaNet / Dreamer-v1 STOCHASTIC latent (loss: kl), not Ward-2026's nll
+  loss: kl
+  min_std: 0.1
+  max_std: 2.0
+  dyn_scale: 1.0
+  rep_scale: 0.1
+  free_nats: 1.0

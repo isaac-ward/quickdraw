@@ -374,6 +374,8 @@ def build_model(cfg):
                                        action_head_context=str(ahg("context", "pooled")),
                                        action_pit_knots=_action_pit_knots(cfg, str(ahg("target_transform",
                                                                                        "none"))),
+                                       action_delta_pit_knots=_action_delta_pit_knots(
+                                           cfg, str(ahg("target_transform", "none"))),
                                        dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)),
                                        # default 1.0 (always-clean) so an old config adopted by
                                        # run_standalone rebuilds the behaviour it TRAINED under.
@@ -917,17 +919,55 @@ def data_exists(cfg) -> bool:
     return bool(root) and os.path.exists(os.path.join(root, "normalization_stats.json"))
 
 
+def _action_delta_pit_knots(cfg, mode: str, n_knots: int = 1024):
+    """PIT knots for the WITHIN-CHUNK INCREMENT a[t+1]-a[t], or None unless target_transform=pit_delta.
+
+    WHY THESE ARE FITTED HERE AND NOT SHIPPED WITH THE DATASET. The value knots can live in
+    normalization_stats.json because under `concat` every slot holds the raw action distribution whatever
+    the stride. An INCREMENT does not: a[t+1]-a[t] between kept steps depends entirely on data.subsample,
+    so a table written at dataset-build time would be silently wrong at any other stride -- the exact shape
+    of the `sum`-vs-`concat` bug this project already hit once. Fitting from the strided loader makes the
+    stride impossible to get wrong.
+
+    Cheap despite the name: `load_split_episodes` reads the parquet's action column only, no video.
+
+    n_knots is FIXED rather than min(n, len(data)) so the buffer's shape does not depend on the stride --
+    a shape that moved with a config knob would fail to load a checkpoint trained at a different one."""
+    if mode != "pit_delta":
+        return None
+    import numpy as np
+    from ..data.dataset import load_split_episodes, set_action_aggregate, set_subsample
+    from ..data.transforms import PIT
+    agg = str(cfg.data.get("action_aggregate", "sum"))
+    if agg != "concat":
+        raise ValueError(f"action_head.target_transform=pit_delta requires data.action_aggregate=concat, "
+                         f"got {agg!r} (same reason as `pit`: see _action_pit_knots).")
+    # PIN BOTH LOADER KNOBS, not just the stride. `run_standalone` calls build_model BEFORE it calls
+    # set_subsample/set_action_aggregate, so at eval time this fit would otherwise run under the process
+    # defaults: `sum` aggregation returns 4-wide actions while the Normalizer is tiled to 16, which fails
+    # loudly (size 4 vs 16) -- and would have fitted the wrong distribution if the widths had happened to
+    # agree. The increment depends on both knobs, so both come from the config that trained the head.
+    set_subsample(int(cfg.data.get("subsample", 1) or 1))
+    set_action_aggregate(agg)
+    n = normalizer(cfg)
+    eps = load_split_episodes(resolve_data_root(cfg), "train", repo_id=cfg.data.get("repo_id", "torus"))
+    d = np.concatenate([np.diff(n.norm_act(torch.from_numpy(a).float()).numpy(), axis=0) for _, a in eps])
+    if len(d) < n_knots:
+        raise ValueError(f"only {len(d)} increments in train; need >= {n_knots} to fit stable knots")
+    return PIT.fit(d, n_knots=n_knots).knots
+
+
 def _action_pit_knots(cfg, mode: str):
     """The PIT knots for the action prior's target, tiled to the aggregated action, or None when off.
 
     Read through `normalizer(cfg)` rather than from the file directly, because that is the one place the
     concat tiling rule lives -- and the knots have to be tiled exactly as mean/std are."""
-    if mode != "pit":
+    if mode not in ("pit", "pit_delta"):     # pit_delta still needs value knots for the chunk's FIRST action
         return None
     agg = str(cfg.data.get("action_aggregate", "sum"))
     if agg != "concat":
         raise ValueError(
-            f"action_head.target_transform=pit requires data.action_aggregate=concat, got {agg!r}.\n"
+            f"action_head.target_transform={mode} requires data.action_aggregate=concat, got {agg!r}.\n"
             f"  The knots are fitted ONCE at dataset build time, but the aggregation happens at LOAD time and "
             f"depends on data.subsample -- a training-time knob the dataset cannot know. Under concat every "
             f"slot holds the RAW action distribution whatever the stride, so tiled raw knots are exactly "

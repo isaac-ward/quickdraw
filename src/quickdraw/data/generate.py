@@ -155,7 +155,8 @@ def _read_frames(path: str) -> np.ndarray:
 
 
 def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
-                        fpv_dir=None, fpv_size=256, cam="fpv", task="torus"):
+                        fpv_dir=None, fpv_size=256, cam="fpv", task="torus",
+                        obs_names=None, act_names=None):
     """Write episodes to a LeRobotDataset on disk. ISOLATED lerobot API surface.
 
     MULTI-CAMERA. `cam` is a camera name OR a list of them, and `fpv_dir` correspondingly a directory
@@ -184,9 +185,22 @@ def write_lerobot_split(root, repo_id: str, obs, act, fps: int,
     cams = [cam] if isinstance(cam, str) else list(cam)
     dirs = {cams[0]: fpv_dir} if isinstance(fpv_dir, str) else dict(fpv_dir or {})
     video = bool(dirs)
+    # NAMES, and they are not optional politeness. A published dataset whose observation_vector has
+    # `names: None` is 16 anonymous floats: it cost a day of reverse-engineering on robocasa, it is why
+    # data/rosbag.py had to write the starling layout down in a comment, and it blocks any analytic
+    # interpretability factor (which needs to know which dim is altitude). Processors that know their
+    # layout pass it; the None fallback is only for generated data whose dims have no meaning.
+    def _named(arr, names, what):
+        n = arr[0].shape[-1]
+        if names is None:
+            return {"dtype": "float32", "shape": (n,), "names": None}
+        names = list(names)
+        assert len(names) == n, f"{what}: {len(names)} names for {n} dims -- {names}"
+        return {"dtype": "float32", "shape": (n,), "names": names}
+
     features = {
-        "observation_vector": {"dtype": "float32", "shape": (obs[0].shape[-1],), "names": None},
-        "action": {"dtype": "float32", "shape": (act[0].shape[-1],), "names": None},
+        "observation_vector": _named(obs, obs_names, "observation_vector"),
+        "action": _named(act, act_names, "action"),
     }
     if video:   # vector-only splits pass fpv_dir=None and no fpv_size -> no image feature
         h, w = (fpv_size, fpv_size) if isinstance(fpv_size, int) else tuple(fpv_size)

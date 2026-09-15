@@ -188,9 +188,17 @@ class TransportHead(nn.Module):
 
     # ---- inference: integrate the ODE ----
     def _sample(self, cond: Tensor, *, event_shape, lead, steps: int, deterministic: bool,
-                eps: Tensor | None = None, record_path: bool = False):
+                eps: Tensor | None = None, record_path: bool = False, hook=None):
         """Euler-integrate dx/dtau = v from tau=1 (x=eps) -> tau=0. eps=0 (deterministic) -> reproducible
-        committed prediction. `event_shape`/`lead` let heads with different target shapes reuse this."""
+        committed prediction. `event_shape`/`lead` let heads with different target shapes reuse this.
+
+        `hook(x, tau, eps) -> x` runs after every Euler step and is how a caller CONDITIONS the sample on
+        part of its own output -- inpainting. Nothing about the model changes: at time tau the state is a
+        known blend of noise and the eventual sample, so overwriting some coordinates with the correctly
+        noised version of a target keeps the canvas self-consistent and lets the velocity field carry the
+        FREE coordinates toward values coherent with the fixed ones. That is prefix guidance (RTC,
+        arXiv 2506.07339), and it needs no retraining because conditioning a joint the model already
+        learned is a legitimate query of it. None -> bit-identical to every sample drawn before."""
         ts = tuple(lead) + (1,) * self.event_dims
         if self.no_noise:                             # mse decode: one deterministic cond->target prediction (x=0, tau=1)
             # Routed through predict() so the formula lives in ONE place. `predict` only uses its second
@@ -219,6 +227,8 @@ class TransportHead(nn.Module):
         for k in range(steps):                        # param="v": Euler-integrate dx/dtau = v, tau=1 -> 0
             tau = cond.new_full(ts, 1.0 - k / steps)
             x = x - self.velocity(x, self._temb(tau), cond, demb) * (1.0 / steps)
+            if hook is not None:                      # inpainting: re-impose the caller's constraint
+                x = hook(x, 1.0 - (k + 1) / steps, eps)
             if record_path:
                 path.append(x)
         return (x, path) if record_path else x
@@ -313,10 +323,10 @@ class FlowField(TransportHead):
         return self.out(y).reshape(*lead, n, self.dz)
 
     def sample(self, h: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
-               record_path: bool = False):
+               record_path: bool = False, hook=None):
         """Preserves the original signature (cond=h, dz-shaped output) so the dynamics call sites are unchanged."""
         return self._sample(h, event_shape=(self.dz,), lead=h.shape[:-1], steps=steps,
-                            deterministic=deterministic, eps=eps, record_path=record_path)
+                            deterministic=deterministic, eps=eps, record_path=record_path, hook=hook)
 
 
 class ImageFlowHead(TransportHead):

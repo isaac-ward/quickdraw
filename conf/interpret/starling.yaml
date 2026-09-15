@@ -1,0 +1,268 @@
+# Per-environment interpretability config (eval_interpret) for the RECORDED starling flightroom footage.
+# Select with `interpret=starling`. conf/interpret/torus.yaml is the annotated reference; design/
+# interpretability.md describes the products.
+#
+# WHAT IS IN THIS FILE, in the order it matters:
+#   1. how many clips to imagine, how long, and how many frames of each the VLM sees
+#   2. the FACTORS -- the semantic axes each clip gets labelled on, each with a label SOURCE:
+#        source: vlm       a VLM reads the RENDERED frames (independent of the latent's own proprio)
+#        analytic: {...}   an EXACT label computed from the imagined proprio, which both colours the
+#                          plots and GRADES the VLM (confusion matrix + agreement)
+#   3. the PROMPT the VLM is given, and the caption prompt that produces the free-form text the reward
+#      head is actually trained on
+#
+# WHAT THE GRADING MEANS HERE, and it is not what it means on torus. On torus the analytic label is ground
+# truth about a simulated world. Here BOTH sides come from the same imagined rollout: the VLM reads the
+# imagined IMAGE and the analytic label is computed from the imagined PROPRIO. Agreement therefore measures
+# the world model's CROSS-MODAL CONSISTENCY -- whether the picture it paints and the state it reports are
+# the same flight -- which is a property worth knowing on its own, but is NOT evidence that either matches
+# reality. Read a confusion matrix here as "the two heads agree", never as "the model is right".
+#
+# The observation layout is data/rosbag.py STATE_COLUMNS (the published dataset ships NO `names` metadata):
+#   0-2 position xyz | 3-5 velocity xyz | 6-9 orientation quat xyzw | 10-12 imu ang vel | 13-15 imu lin acc
+
+n_clips: 1024         # imagined clips to label + embed (more (latent,caption) pairs -> better reward head)
+n_captions: 4         # free-form captions PER SEGMENT (not per clip). THESE train the reward head
+#                       (CLIP-style, f_z vs f_t); the factors below only colour projections and drive the
+#                       steering-readiness probe. Was 16 per clip: 16 paraphrases of a 4 s clip meant every
+#                       latent in the clip was paired with the same text, i.e. H x 16 near-duplicate pairs,
+#                       which is a plausible cause of the reward head's train 0.1 / val 1.9 overfit. Four
+#                       paraphrases per segment keeps the phrasing diversity that makes any wording steer,
+#                       while each latent is paired with text about the steps it actually belongs to.
+point: per_step       # every step's latent, clip label broadcast (~n_clips * clip_len points)
+clip_len: 15          # 15 imagined steps. starling-2 is 15 Hz and the WM trains at subsample=4, so one
+#                       step is 0.267 s -> 4.0 s of imagined flight. Was 12 (3.2 s), briefly 30 (8.0 s):
+#                       under `point: per_step` the projection cost scales with n_clips * clip_len, and 30
+#                       took that from 12k to 31k points and roughly tripled the supervised UMAP stage.
+batch: 32             # clips imagined per forward pass (image-decode memory)
+vlm_frames: 15        # = clip_len, i.e. EVERY step is shown. Required for segmentation: the VLM cannot say
+#                       where a change happens if it only sees 6 of 15 frames, and interpolating the other 9
+#                       invents labels whose boundaries land wherever the sampling happened to fall. At
+#                       112x192 these are low-detail tokens (~85 each), so the call grows modestly.
+n_caption_examples: 32   # clips rendered into examples_captions/ with the caption drawn under the frame.
+#                       0 = off. A browsable sample -- burning text into video is slow and the point is to
+#                       read a few captions against the footage they describe, not all 1024.
+drop_first_step: true # exclude step 0 from the projections -- see the note at the point-assembly code.
+#                       Step 0 is built from the ENCODED REAL CONTEXT and steps 1+ are autoregressive; the
+#                       measured step0->step1 jump is 42.3 in latent space against ~0.6 by step 10, and in
+#                       UMAP every clip's step 0 collapses into one blob 15 units from the rollout.
+
+# SEGMENTATION. The VLM splits each clip into runs and labels each run, so a label describes the steps it
+# covers instead of being broadcast over a clip in which the view changed.
+segments:
+  max: 4              # enforced structurally by the schema's maxItems
+  min_frames: 3       # ~0.8 s. NOT enforceable in a schema -- requested in the prompt below and then
+  #                     enforced in code by repair_segments(), which merges shorter runs into a neighbour.
+  #                     The merge count is logged and IS the flicker rate.
+  prompt: |
+    SEGMENT THE CLIP. The {H} frames are in order. Split them into AT MOST {n_max} consecutive segments,
+    each at least {k} frames long, cut where what the drone is looking at MEANINGFULLY changes -- a new wall
+    comes into view, a different object dominates. Do not cut for small wobbles or brief glimpses; if
+    nothing meaningful changes, return ONE segment covering all {H} frames. For every segment give
+    start_frame and end_frame (0-based, contiguous, together covering every frame), its {per_frame}, and its
+    captions describing THAT STRETCH of the clip.
+seed: 0
+imaginations: true    # per-clip imagination dumps for the web explorer
+umap_sup_weights: []  # OFF. Supervised UMAP forces separation USING the labels, so it is presentation
+#                       rather than evidence, and it was 56% of the run: the supervised pass fits once per
+#                       (weight x dim x FACTOR), i.e. 3 x 2 x 6 = 36 UMAP fits against the unsupervised
+#                       pass's 6. Plain unsupervised umap (below) still runs and is the honest picture.
+#                       Put weights back only to make a figure that has to show the classes apart.
+projection_methods: [pca, tsne, umap]   # which unsupervised projections to run. pca is seconds, tsne ~180 s
+#                       and umap ~160 s at 30k points. [pca] alone is the fast iteration setting.
+# COST MODEL, measured on 1024 clips x 30 steps (41 min total): imagining 36 s, VLM ~600 s at 8 workers,
+# projections ~2500 s. THE PROJECTIONS DOMINATE, and the two projection knobs are INDEPENDENT loops:
+#   projection_methods -> UNSUPERVISED: n_methods x n_dims(3D,2D)       = 3 x 2     =  6 fits
+#   umap_sup_weights   -> SUPERVISED:   n_weights x n_dims x n_FACTORS  = 3 x 2 x 6 = 36 fits
+# so `projection_methods: [pca]` does NOT cut the supervised stage -- only emptying umap_sup_weights does.
+# That stage also grows with the FACTOR COUNT (4 factors in the first run, 6 now). LDA is prepended to the
+# supervised list unconditionally and always runs, but is cheap (~54 s).
+# Point count is n_clips * clip_len under `point: per_step` (15k here), or n_clips under `point: mean`.
+# FAST PROFILE for iterating: umap_sup_weights=[] projection_methods=[pca] point=mean -> a few minutes.
+
+vlm:
+  model: gpt-4o
+  max_workers: 24     # concurrent Responses-API calls. Labeling is purely I/O-bound and was ~600 s of a
+  #                     41 min run at 8; raise until the API rate-limits rather than leaving cores idle.
+  # OPENAI_API_KEY is read from the environment (falls back to a repo-root .env)
+
+# Three graded factors and one ungraded. Every graded one is a quantity the drone state defines exactly AND
+# a VLM can read off the picture -- that pairing is the whole point, and it is why "which corner of the room
+# is in view" is left ungraded rather than faked: there is no room map in the state vector.
+# EVERY RAW ACTION AXIS, IN ORDER, AND WHAT ITS SIGN MEANS. Required (routines asserts it): this text goes
+# into the VLM prompt, and a number whose meaning is not stated is worse than no number.
+# MEASURED, not assumed. Correlating each stick against the state over all 106k training steps gives the
+# axis roles unambiguously (yaw r=+0.85, vertical r=-0.73, lateral r=-0.69, fore/aft r=+0.70), but the SIGN
+# of the fore/aft axis cannot be had that way: the camera does not look along the body +x axis, so the
+# quaternion-derived heading says the pilot flies BACKWARD 61% of the time. Optical flow settles it -- with
+# axis3 pushed negative the scene EXPANDS (mean radial flow +0.555 against +0.045 centred), i.e. the camera
+# moves toward what it sees. Every sign below is confirmed the same way (axis0 POS: flow +2.35 rightward =
+# turning left; axis2 NEG: flow +2.15 rightward = strafing left; axis1 NEG: scene flows down = climbing).
+action_axes:
+  - {name: yaw,      positive: rotate left,   negative: rotate right}    # joy_axis_0
+  - {name: vertical, positive: descend,       negative: climb}           # joy_axis_1 (inverted stick)
+  - {name: lateral,  positive: strafe right,  negative: strafe left}     # joy_axis_2
+  - {name: fore/aft, positive: fly backward,  negative: fly forward}     # joy_axis_3 (inverted stick)
+
+# FOUR MOTION FACTORS, ONE PER STICK AXIS, each analytic and exact from the COMMANDED action -- not from
+# the imagined proprio, because "does the video show the motion it was TOLD to make" is the sharper question
+# and the actions are exact inputs to the rollout rather than predictions.
+#
+# WHY FOUR TERNARY FACTORS RATHER THAN ONE EIGHT-WAY `motion`. The eight motions are four axes with a sign
+# each, and a pilot pushing forward WHILE yawing is the normal case at 8 s, not an edge case. Four
+# independent factors represent that by construction, give four separate confusion matrices (so you learn
+# WHICH motion the model renders faithfully), and need no code change -- the schema is one enum per factor.
+# `none` is the middle bucket of each.
+#
+# THRESHOLDS ARE THE 8 s CLIP MEAN of the stick, in stick units, chosen off the measured distribution of
+# that mean (not guessed -- an earlier altitude guess put 96% of clips in one bucket). The resulting split
+# across the training set is noted per factor.
+#
+# Under data.action_aggregate=concat one stored action holds 4 raw commands time-major, so axis j lives at
+# dims [j, j+4, j+8, j+12]; obs_mean averages over those and over the clip, keeping the sign.
+factors:
+  motion_yaw:                  # joy_axis_0
+    source: analytic
+    buckets: [rotate right, none, rotate left]
+    colors: {rotate right: "#e66101", none: "#cccccc", rotate left: "#5e3c99"}
+    analytic: {kind: obs_mean, from: action, dims: [0, 4, 8, 12], thresholds: [-0.10, 0.10]}   # 31/29/40%
+  motion_vertical:             # joy_axis_1, inverted: + is descend
+    source: analytic
+    buckets: [climb, none, descend]
+    colors: {climb: "#d7191c", none: "#cccccc", descend: "#2c7bb6"}
+    analytic: {kind: obs_mean, from: action, dims: [1, 5, 9, 13], thresholds: [-0.05, 0.05]}   # 24/44/33%
+  motion_lateral:              # joy_axis_2
+    source: analytic
+    buckets: [strafe left, none, strafe right]
+    colors: {strafe left: "#1b9e77", none: "#cccccc", strafe right: "#d95f02"}
+    analytic: {kind: obs_mean, from: action, dims: [2, 6, 10, 14], thresholds: [-0.10, 0.10]}  # 15/66/19%
+  motion_foreaft:              # joy_axis_3, inverted: - is forward
+    source: analytic
+    buckets: [fly forward, none, fly backward]
+    #   `fly backward` is measured to be EMPTY on this corpus (axis3 p95 = 0.000; the pilot never reverses).
+    #   Kept because it is a real category the stick can express, not a bucketing artefact -- an empty
+    #   legend entry is honest, a missing one hides that the data only ever goes one way.
+    colors: {fly forward: "#7570b3", none: "#cccccc", fly backward: "#e7298a"}
+    analytic: {kind: obs_mean, from: action, dims: [3, 7, 11, 15], thresholds: [-0.10, 0.10]}  # 61/39/0%
+  motion_dominant:             # THE DIAGNOSTIC, and the only factor with a cross-check: what the VLM reads
+    source: vlm                # off the FRAMES against what was actually commanded. Restores the confusion
+    #   matrix that making the four motion factors analytic had removed -- an analytic factor is TOLD to the
+    #   VLM, never asked, so none of them can be graded.
+    #   READ ITS AGREEMENT AS AN UPPER BOUND. The VLM is given the stick inputs and the four analytic motion
+    #   labels in the same prompt, so it can score well by copying rather than looking. The prompt tells it
+    #   the frames are an IMAGINATION that may disagree and to report what it SEES, which makes disagreement
+    #   meaningful, but a clean measurement needs the action text removed -- at the cost of caption accuracy.
+    buckets: [none, rotate right, rotate left, climb, descend, strafe left, strafe right,
+              fly forward, fly backward]
+    #   ORDER IS LOAD-BEARING: axis_dominant returns 1 + 2*axis + (sign > 0), so this must read
+    #   [none, axis0-, axis0+, axis1-, axis1+, axis2-, axis2+, axis3-, axis3+].
+    colors:
+      none: "#cccccc"
+      rotate right: "#e66101"
+      rotate left: "#5e3c99"
+      climb: "#d7191c"
+      descend: "#2c7bb6"
+      strafe left: "#1b9e77"
+      strafe right: "#d95f02"
+      fly forward: "#7570b3"
+      fly backward: "#e7298a"
+    analytic:
+      kind: axis_dominant
+      from: action
+      axes: [[0, 4, 8, 12], [1, 5, 9, 13], [2, 6, 10, 14], [3, 7, 11, 15]]
+      deadbands: [0.10, 0.05, 0.10, 0.10]   # IS ANYTHING ACTIVE: absolute, per axis. Nothing above its
+      #   own deadband -> `none` (2.1% of clips).
+      scales: [0.448, 0.221, 0.738, 0.953]  # WHICH IS DOMINANT: each axis's p90 |4 s clip mean| over the
+      #   corpus, so the comparison is "how hard is this stick pushed relative to how hard it ever gets
+      #   pushed". Using the deadbands for this too was a bug -- the sticks are used at very different
+      #   magnitudes (fore/aft 0.5-0.9, yaw ~0.2), so translation won 97-100% of the clips it was active in
+      #   and yaw won 5%, producing ONE `rotate right` clip in 1024. With p90 scales the split is
+      #   fore/aft- 33% | lateral+ 15% | vertical+ 12% | yaw+ 11% | lateral- 9% | yaw- 9% | vertical- 9%.
+  facing:                      # WHICH PART OF THE ROOM IS DIRECTLY IN FRONT. Ungraded (nothing in the state
+    source: vlm                # vector knows the room layout), but it is the factor a spoken steering
+    per_frame: true            # asked PER SEGMENT: a region is well defined at an instant, so a clip-level
+    #   request would actually name -- "fly toward the windows" -- and unlike object_in_view it does not
+    #   depend on resolving small objects in a 112x192 imagined frame. object_in_view came back 67% `black
+    #   panel` with five of ten buckets under 2%; a REGION is a coarser, better-posed question.
+    buckets: [floor to ceiling glass wall, wall with black panels, white wall with flat window and door,
+              white wall with table, center of room over mats, center of room near ladder]
+    colors:
+      floor to ceiling glass wall: "#4ea3d1"
+      wall with black panels: "#333333"
+      white wall with flat window and door: "#b15928"
+      white wall with table: "#a6761d"
+      center of room over mats: "#c14fb0"
+      center of room near ladder: "#e0a020"
+  object_in_view:              # PER SEGMENT too, for the same reason: "what is in front" is an instant
+    per_frame: true            # property, and a 4 s clip can point at two different things.
+    #   the ONE thing the VLM is asked to read. Ungraded: nothing in the state
+    source: vlm                # vector knows where the clock is, and the MOST PROMINENT object is enough --
+    #                            the full set of what is visible is carried by the captions, which are what
+    #                            the reward head actually trains on.
+    buckets: [black panel, ladder, clock, mannequin, black floor mat, colored floor mat, door, window,
+              whiteboard, table]
+    colors:
+      black panel: "#333333"
+      ladder: "#e0a020"
+      clock: "#8dd3c7"
+      mannequin: "#fb8072"
+      black floor mat: "#666666"
+      colored floor mat: "#c14fb0"
+      door: "#b15928"
+      window: "#4ea3d1"
+      whiteboard: "#dddddd"
+      table: "#a6761d"
+
+prompt: |
+  You are labeling a short first-person video clip (about 8 seconds) recorded by a small drone flying inside
+  an indoor robotics lab. The room has white walls, a low ceiling covered in fluorescent strip lights, a wall
+  of glass partitions and windows along one side, large black backdrop panels on stands, a yellow-and-blue
+  goalpost-shaped frame, a step ladder, a mannequin on a stand, workbenches and tables, a wall clock, a
+  whiteboard, doors, a black rubber floor mat, and a patch of coloured floor mats (blue, pink, purple,
+  green). The frames are LOW-RESOLUTION and may be blurry or distorted — judge the overall layout, not fine
+  detail. You are also given the stick inputs the pilot used over this clip, so you already know how the
+  drone moved; use them to understand the clip, and do not second-guess them.
+
+  Report three things. Two of them are about WHAT IS DIRECTLY IN FRONT OF THE DRONE — the part of the scene
+  the camera is pointed at and flying toward, in the CENTRE of the frame at the END of the clip. Ignore what
+  is off to the sides, behind, or only glimpsed in passing.
+    facing — which part of the room is in front. Pick one:
+      floor to ceiling glass wall — the long side of the room walled in full-height glass panels/windows.
+      wall with black panels — the end of the room where the large black backdrop panels stand.
+      white wall with flat window and door — a plain white wall carrying a small flat window and a door.
+      white wall with table — a plain white wall with workbenches or tables against it.
+      center of room over mats — NOT facing a wall: looking out across the open middle, coloured floor mats
+        below or ahead.
+      center of room near ladder — NOT facing a wall: the open middle, with the step ladder nearby.
+      If the drone faces a wall, name the wall even when open floor fills the lower frame; choose a `center
+      of room` option only when no wall is the subject of the view.
+    object_in_view — the single MOST PROMINENT object in front of the drone. Choose the one that dominates
+      the view, is closest, or the drone is clearly heading toward. If several are visible, pick the one a
+      person describing the clip would name first.
+    motion_dominant — the ONE movement that dominates the clip, judged FROM THE FRAMES THEMSELVES. These
+      frames are a world model's IMAGINATION of a flight, not a recording, so what they show MAY NOT MATCH
+      the stick inputs you were given. Report what you actually SEE: disagreement is expected, and is the
+      useful signal. MIND THE DIRECTION, it is the opposite of the
+      obvious: the scene slides the OTHER WAY from the drone. The scene sliding LEFT across the frame means
+      the drone is turning or strafing RIGHT, and the scene sliding RIGHT means it is going LEFT. Likewise
+      the scene sliding DOWN means the drone is CLIMBING. The scene expanding (things growing and flowing
+      outward from the centre) means flying forward; contracting means backward. Turning and strafing look
+      alike -- both slide the scene sideways -- so use parallax to tell them apart: when STRAFING, near
+      objects slide much faster than far ones and you see around them; when TURNING, everything sweeps
+      across together. Answer
+      `none` if nothing clearly dominates.
+
+  In "reasoning", FIRST describe in a few words what you see and how it moves, THEN commit to the label.
+  Also give a self_reported_confidence in [0,1], lowering it when the frames are blurry or ambiguous.
+  Return ONLY the structured fields.
+
+caption_prompt: |
+  For EACH SEGMENT write exactly {n} short, natural-language captions, each describing THAT SEGMENT in a
+  DIFFERENT way, as if telling someone what the drone is seeing and doing during those frames. Use the stick inputs you were given to
+  describe the MOTION accurately (flying forward, climbing, descending, strafing left or right, rotating
+  left or right, hovering — and note when several happen at once, such as turning while climbing), and
+  describe what is in view (the black panels, the ladder, the mannequin, the clock, the whiteboard, a door,
+  the windows, a table, the black mat, the coloured mats, the ceiling lights, open floor). Vary the wording
+  and the emphasis between captions — some short and blunt, some descriptive — and do not use a fixed
+  template. These captions are what a person might later say to steer the drone, so phrase them the way
+  someone would actually speak.

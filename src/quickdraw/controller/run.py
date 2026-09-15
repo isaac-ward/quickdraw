@@ -47,9 +47,16 @@ def _agent(res, i, color, R, r):
 
 
 def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) -> dict:
+    # LANGUAGE STEERING reads the per-environment factor definitions (bucket names, and for torus the
+    # ground-truth reward hooks), so the `interpret` group must be the right environment rather than the
+    # default sentinel -- see conf/interpret/unset.yaml.
+    if cfg.get("language", {}).get("head") and cfg.interpret.get("_unset"):
+        raise AssertionError("language-steered control needs `interpret=<env>` set explicitly "
+                             "(starling | torus | pendulum): it reads that environment's factor buckets.")
     # reuse_render / reward_override are control-config knobs that aren't MPPIConfig fields; strip them
     # before building MPPIConfig so MPPIConfig(**...) doesn't choke on the extra keys.
-    mppi_kwargs = {k: v for k, v in cfg.control.items() if k not in ("reuse_render", "reward_override")}
+    mppi_kwargs = {k: v for k, v in cfg.control.items()
+                   if k not in ("reuse_render", "reward_override", "proposal")}
     fpv = None                                    # image models: render FPV context in the MPPI loop
     core = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)   # image head name, or None (proprio-only)
@@ -113,6 +120,20 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     env_factory = lambda: make_env(cfg.environments.get("name", "torus_world"), cfg.environments,
                                    mppi_cfg.n_episodes, device)
     env = env_factory()
+    # WHERE CANDIDATES COME FROM (control.proposal, default gaussian == every run before 2026-09-14).
+    # `prior` swaps MPPI's white noise for draws from the trained action prior, conditioned on the imagined
+    # context -- the same proposal object eval_steer uses, so the two routines cannot drift apart. The prior
+    # describes ONE chunk from one context, so it pins horizon/chunk (asserted in mppi.run_control).
+    proposal = None
+    if str(cfg.control.get("proposal", "gaussian")) == "prior":
+        from ..evaluation.steering import PriorProposal
+        assert getattr(core, "action_head_enabled", False), (
+            "control.proposal=prior needs a checkpoint with a trained action head (train_action_model)")
+        # RAW action space: MPPI candidates are env actions clamped to a_max and normalized on their way
+        # into the model, while the prior emits normalized actions -- so it must denormalize on the way out.
+        proposal = PriorProposal(core, a_max=float(getattr(env, "a_max", None) or ecfg.a_max), norm=normalizer)
+        _plog(writer, f"[eval_control @ep{step}] proposal {proposal.name} (MPPI candidates from the action "
+                      f"prior, not gaussian noise); commit={proposal.commit}")
     knobs = {k: getattr(mppi_cfg, k) for k in ("beta_vel", "r_settle")
              if k in inspect.signature(env.reward).parameters}
     reward_fn = functools.partial(env.reward, **knobs)
@@ -132,12 +153,12 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
     if reward is None and (goals_fn is None
                            or goals_fn(mppi_cfg.n_episodes, mppi_cfg.n_goals, None, device) is None):
         return _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, device, step,
-                                                env, mppi_cfg, n_plot, reward_fn)
+                                                env, mppi_cfg, n_plot, reward_fn, proposal)
     t = time.perf_counter()
     res, _ = run_control(model, normalizer, ecfg, mppi_cfg, device=device,
                          log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"), fpv=fpv,
                          reward=reward, request=request, requests=requests, oracle=(reward is None), n_plot=n_plot,
-                         reward_fn=reward_fn, env=env, env_factory=env_factory)
+                         reward_fn=reward_fn, env=env, env_factory=env_factory, proposal=proposal)
     t_ctrl = time.perf_counter() - t
     # what matters: cost of ONE MPPI replan (= one action chunk). t_ctrl covers the controller(s) + chunk
     # execution over n_chunks replans, so per-chunk wall time = t_ctrl / n_chunks.
@@ -395,7 +416,7 @@ def run_and_log_control(cfg, model, normalizer, ecfg, writer, device, step=0) ->
 
 
 def _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, device, step,
-                                     env, mppi_cfg, n_plot, reward_fn) -> dict:
+                                     env, mppi_cfg, n_plot, reward_fn, proposal=None) -> dict:
     """REWARD-ONLY control eval for an env with NO goal source (WorldEnv.control_goals -> None): the env's
     OWN reward is the objective (mppi.run_control_reward_only), so there are no goals/success metrics —
     logs eval_control/{true,pred,diff}/{mean_reward,final_reward} instead, per-episode reward curves, and a
@@ -410,7 +431,7 @@ def _run_and_log_control_reward_only(cfg, model, normalizer, ecfg, writer, devic
     t = time.perf_counter()
     res = run_control_reward_only(model, normalizer, env_factory, mppi_cfg, device=device,
                                   log=lambda m: _plog(writer, f"[eval_control @ep{step}]   {m}"),
-                                  oracle=True, n_plot=n_plot, reward_fn=reward_fn)
+                                  oracle=True, n_plot=n_plot, reward_fn=reward_fn, proposal=proposal)
     t_ctrl = time.perf_counter() - t
     mppi_chunk_s = t_ctrl / max(1, res["n_chunks"])
     mppi_chunk_hz = 1.0 / mppi_chunk_s if mppi_chunk_s > 0 else 0.0

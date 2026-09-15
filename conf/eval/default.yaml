@@ -19,6 +19,16 @@ action_dist_episodes: 64   # LOCKED (user, 2026-07-20): action-distribution eval
 #                            split) for DENSE histograms (~256/bin with window pooling). NEVER lower this — a
 #                            lower value made the plots look sparse (n~30). DO NOT CHANGE / do not override lower.
 horizon: 2048              # long-horizon / ood rollout length (capped by episode length); image heads roll it too
+# HELD-OUT SPLIT EVALUATION (quickdraw.eval_splits, routine `held_out_splits`). Empty = off. Names are
+# dataset split DIRECTORIES; starling-2 ships eval_ood_noodle, eval_ood_leafblower, eval_memory_backwall1
+# and eval_memory_backwall2 beside train/val (manifest in conf/data/starling2.yaml). Include `val` to get
+# the in-distribution baseline from the same invocation, on the same metric code, so the OOD and memory
+# figures are comparable to the headline numbers by construction rather than by argument.
+splits: []
+horizon_split: val         # which split eval_ood_horizon reads when it is called on its own
+horizon_n_episodes: null   # null -> 8 with an image head, a DECODE cap sized for val's ~1785-step
+#                             episodes. The OOD/memory clips are ~31 model steps, so 12 scores every
+#                             episode in those splits instead of discarding a fifth of a 10-episode one.
 closed_loop_steps: [1, 16] # eval_ood_horizon extra modes: re-inject the GROUND-TRUTH obs as context every X steps
 #                            (X in this list) -> products under eval_ood_horizon/closed_loop_<X>_steps/ alongside
 #                            eval_ood_horizon/open_loop/. Env-agnostic.
