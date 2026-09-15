@@ -273,14 +273,13 @@ def ood(paper, dev="cuda"):
             break
     print(f"      second frame t={t_late}")
     photo = _scene_photo(paper, "pool-noodle.png", shape=fr[key][0].shape)
-    # the trace is as tall as the two image rows together
-    fig = plt.figure(figsize=(7.2, 3.6))
-    outer = fig.add_gridspec(1, 2, width_ratios=(1.0, 0.85), wspace=0.16)
+    fig = plt.figure(figsize=(7.2, 3.5))
+    outer = fig.add_gridspec(2, 1, height_ratios=(1.42, 1.0), hspace=0.16)
     # 2x4. Row one: how it was applied, a clean frame, the anomalous frame, and a LATER anomalous
     # frame. Row two: the per-pixel surprise under each of the two anomalous frames, with the first two
     # cells blank -- the map belongs under the frame it explains, not in a row of its own.
     top = outer[0].subgridspec(2, 4, wspace=0.06, hspace=0.10)
-    panes = [(0, 0, photo, "Applying the disturbance"),
+    panes = [(0, 0, photo, "Disturbance is applied"),
              (0, 1, fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
              (0, 2, fr[key][t_in], f"Anomalous ($t{{=}}{t_in}$)"),
              (0, 3, fr[key][t_late], f"Anomalous ($t{{=}}{t_late}$)"),
@@ -297,7 +296,7 @@ def ood(paper, dev="cuda"):
         A.set_xticks([]); A.set_yticks([])
         for sp_ in A.spines.values():
             sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    A = fig.add_subplot(outer[1])
+    A = fig.add_subplot(outer[1])                      # row three: the trace, across the width
     v = np.asarray(r[chan])
     A.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
     A.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
@@ -336,7 +335,7 @@ def ood(paper, dev="cuda"):
     AP.set_xticks([]); AP.set_yticks([])
     for sp_ in AP.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    AP.set_title("Disturbance application", fontsize=FS)
+    AP.set_title("Disturbance is applied", fontsize=FS)
     AV = fig.add_subplot(gb[0, 0])
     for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
         AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
@@ -420,11 +419,11 @@ def curves(paper):
                 x = sorted(cur[k])
                 A.plot(x, [cur[k][v] for v in x], color=c, lw=1.3, label=k)
         A.set_title(name, fontsize=8)
-        A.set_xlabel("epoch", fontsize=7); A.tick_params(labelsize=6); A.grid(alpha=0.25)
+        A.set_xlabel("Epoch", fontsize=7); A.tick_params(labelsize=6); A.grid(alpha=0.25)
         if cur["train"] or cur["val"]:
             A.legend(fontsize=6)
         if i == 0:
-            A.set_ylabel("loss", fontsize=7)
+            A.set_ylabel("Loss", fontsize=7)
         h = float(np.mean(hrs)) if hrs else fallback_h
         if h:
             # UNIT PER PANEL. The world model took 45 h and the Reward Model 91 s; one axis in hours makes
@@ -432,7 +431,7 @@ def curves(paper):
             span = h * max(max(cur["train"] or [0]), max(cur["val"] or [0]))
             mul, unit = (3600.0, "s") if span < 0.05 else (60.0, "min") if span < 0.2 else (1.0, "h")
             tw = A.twiny(); tw.set_xlim(*[x * h * mul for x in A.get_xlim()])
-            tw.set_xlabel(f"wall clock ({unit})", fontsize=7); tw.tick_params(labelsize=6)
+            tw.set_xlabel(f"Wall clock ({unit})", fontsize=7); tw.tick_params(labelsize=6)
     fig.tight_layout(w_pad=0.5, pad=0.4)
     f = os.path.join(paper, "figures", "training-curves.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)

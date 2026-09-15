@@ -91,7 +91,8 @@ def main(run: str = RUN) -> int:
     for r, k in enumerate(LOOKAHEADS):
         for c in range(NA):
             A_ = fig.add_subplot(gh[r, c])
-            x0, x1 = -1.0, 1.0
+            # fore/aft never goes positive in this corpus, so it gets its own range
+            x0, x1 = (-1.0, 0.0) if AXES[c].startswith("fore") else (-1.0, 1.0)
             bins = np.linspace(x0, x1, BINS)
             last = (r == len(LOOKAHEADS) - 1 and c == NA - 1)
             A_.hist(real[:, k, c], bins=bins, density=True, color="tab:green", alpha=0.45,

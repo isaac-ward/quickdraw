@@ -26,7 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.colors
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Ellipse, FancyArrow, PathPatch, Polygon, Rectangle
+from matplotlib.patches import Circle, Ellipse, FancyArrow, PathPatch, Polygon, Rectangle
 from matplotlib.path import Path
 
 # ----------------------------------------------------------------------------------------------------
@@ -150,7 +150,7 @@ BLK_EC       = "#5b82ab"
 # and what marks it as PREDICTED is diagonal hatching, not hue. That separates the two questions a reader
 # asks of a block ("which modality" and "observed or predicted") onto two channels instead of making one
 # hue answer both, which is what forced the slice to orange and made it look like a third stream.
-PRED_HATCH   = "/"      # THICKER AND SPARSER than the default: "///" at the block line weight read as a
+PRED_HATCH   = "//"     # THICKER AND SPARSER than the default: "///" at the block line weight read as a
 #                         grey wash at print size rather than as a texture, so the stripe count is halved
 #                         and hatch.linewidth is tripled below. Halved a second time to a single
 #                         stripe. Every predicted thing carries it: the
@@ -309,6 +309,8 @@ BB_SUBSEP    = 22.0      # gap between sublayer boxes -- where the residual arcs
 BB_ARC       = 26.0      # width of the channel the residual bypass arcs run down, left of the boxes
 BB_BRACE     = 16.0      # how far right of the sublayer boxes the "x 4" brace line sits
 BB_FS        = 14.0
+BADGE_R      = 26.0      # the circled number in each head's top-left corner: 1 observation, 2 action,
+BADGE_FS     = 20.0      #   3 reward -- the order the paper introduces them in
 # The flow head's ENTRY BAR. flow.py refuses cond="adaln": every input is CONCATENATED once, here, and
 # after that it is a plain transformer. Linear(544 -> 128) over [x_tau 128 | tau_emb 32 | cond 384].
 # TWO bars, because they are two different operations: the concatenation (whose arguments are the whole
@@ -1221,9 +1223,11 @@ def solve_layout():
     # thread past the action head to get there. They share an x, so their left edges line up and the h
     # bus can serve both from one vertical.
     dt = box(m_dt, _dt_x1, bb_y1 - m_dt["h"], DT_SUBS, DT_DEPTH, DT_TITLE, -1, glyph=GLYPH_OBS)
+    dt["badge"] = 1
     ah = box(m_ah, _dt_x1, dt["y0"] - HEAD_GAP - m_ah["h"], AH_SUBS, AH_DEPTH, AH_TITLE, -1,
              bars=(AH_BAR,), tail=AH_TAIL, exit_kind="stub", residual=False, steps=AH_STEPS,
              glyph=GLYPH_ACT)
+    ah["badge"] = 2
     # The arrow carries the notation ONLY when the draws are missing: with the panel there, the caption
     # under it says the same thing properly, and a HAT on the arrow would claim a point estimate.
     ah["out_lab"] = "" if ACT_SMP is not None else AH_OUT
@@ -1309,7 +1313,9 @@ def solve_layout():
     bot_ns = max([L["enc_cy_abs"] + ENC_H / 2 for L in LAYERS]
                  + [b[3] for L in LAYERS for b in L["blk_box"]]
                  + [BB["y1"], DT["y1"], AH["y1"], PRED_BOX[3], DEC_BOX[3]] + _ld_box[1:] + _as_y[1:])
-    lift = float(np.clip(stack_bot - bot_ns, 0.0, max(0.0, stack_top - top)))
+    # 24 units of that lift is given back, at the author's ask: flush with the lowest other ink
+    # read as slightly too high.
+    lift = float(np.clip(stack_bot - bot_ns - 24.0, 0.0, max(0.0, stack_top - top)))
     globals()["STREAM_LIFT"] = lift
     bot = max(stack_bot - lift, bot_ns)
     if RM_ON:
@@ -1373,6 +1379,13 @@ CANVAS_W, CANVAS_H, ENC_X, BLK_X = solve_layout()
 # ----------------------------------------------------------------------------------------------------
 # RENDER
 # ----------------------------------------------------------------------------------------------------
+def badge(ax, cx, cy, n):
+    """A circled number, for the three heads in the order the paper introduces them."""
+    ax.add_patch(Circle((cx, cy), BADGE_R, fc="white", ec=EDGE, lw=LW * 1.6, zorder=Z_TOKENIZER + 5))
+    ax.text(cx, cy, str(n), ha="center", va="center", fontsize=BADGE_FS, color=EDGE,
+            zorder=Z_TOKENIZER + 6)
+
+
 def dist_glyph(ax, modes, box, z):
     """The implicit-distribution mark, in FIGURE coordinates. `box` is (x0, y0, x1, y1) with y0 the TOP
     (the axis is inverted), so the mark scales with the box instead of being a pasted bitmap.
@@ -1412,10 +1425,15 @@ def draw_box(ax, D, sx):
     ax.text(0.5 * (x0 + x1), D["title_cy"], D["title"], ha="center", va="center",
             fontsize=BOX_FS, color="black", linespacing=1.3, zorder=Z_TOKENIZER + 4,
             fontweight="bold" if "head" in D["title"] else "normal")
+    if D.get("badge"):
+        badge(ax, x0 + BB_PAD + BADGE_R, y0 + BB_PAD + BADGE_R, D["badge"])
     if D.get("glyph"):
         gx1 = x1 - BB_PAD
-        dist_glyph(ax, D["glyph"], (gx1 - GLYPH_W, D["title_cy"] - GLYPH_H / 2.0, gx1,
-                                    D["title_cy"] + GLYPH_H / 2.0), Z_TOKENIZER + 4)
+        # IN LINE WITH THE REPEAT LABEL, not with the title: the glyph says what the head EMITS, and
+        # that reads with the denoising loop rather than with the name.
+        _gy = D.get("glyph_cy", D["title_cy"])
+        dist_glyph(ax, D["glyph"], (gx1 - GLYPH_W, _gy - GLYPH_H / 2.0, gx1,
+                                    _gy + GLYPH_H / 2.0), Z_TOKENIZER + 4)
     ys = [D["sub_y"] - f * i * (D["subh"] + D["subsep"]) for i in range(len(D["subs"]))]
     # the trunk spans the whole run, from where the signal enters to where it leaves
     trunk = (y1, D["out_y"]) if f > 0 else (D["bars"][-1][3], D["loop_y"])
@@ -1490,6 +1508,7 @@ def draw_box(ax, D, sx):
             f"{D['title'].splitlines()[0]}: '{D['x4_steps']}' runs past the box edge -- narrow DT_LOOP")
         ax.text(lx + MIN_SEG, xmid[1], D["x4_steps"], ha="left", va="center",
                 fontsize=D["x4_fs"], color=EDGE, zorder=Z_TOKENIZER + 5)   # same styling as the "x N" brace
+        D["glyph_cy"] = xmid[1]                          # ...and the glyph lines up with it
         ax.text(0.5 * (cx + lx), tap + MIN_SEG, "denoising", ha="center", va="top",
                 fontsize=BB_FS, color=EDGE, zorder=Z_TOKENIZER + 5)
         # x_0 leaves the BOTTOM of the box and descends into the top faces of the predicted slices. It
@@ -1532,9 +1551,11 @@ def draw_box(ax, D, sx):
             # vertical and a label above it would sit on the box it just left.
             # ROTATED to run along the shaft it names: horizontal beside a vertical line reads as a
             # label for something else.
-            ax.text(cx + MIN_SEG, 0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="center", va="bottom",
-                    rotation=90, rotation_mode="anchor", fontsize=BOX_FS * 0.78, color=EDGE,
-                    zorder=Z_TOKENIZER + 5)
+            # CENTRED ON ITS OWN BOX, offset clear of the shaft. rotation_mode="anchor" put the
+            # baseline on the line itself, so the word straddled it whatever the offset.
+            ax.text(cx + 2.2 * MIN_SEG + text_extent(SAMPLE_LAB, BOX_FS * 0.78)[1],
+                    0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="center", va="center", rotation=90,
+                    fontsize=BOX_FS * 0.78, color=EDGE, zorder=Z_TOKENIZER + 5)
             ROUTES.append((D["title"].splitlines()[0], "x_0", f"45 arrival x {len(legs)}"))
             kind = "up-and-out"
         else:
@@ -1841,6 +1862,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                                zorder=Z_TOKENIZER))
         ax.text(0.5 * (rx0 + rx1), ry0 + RM_PAD * 0.45 + ttl_h / 2, RM_TITLE, ha="center", va="center",
                 fontsize=BOX_FS, linespacing=1.3, zorder=Z_TOKENIZER + 4, fontweight="bold")
+        badge(ax, rx0 + BB_PAD + BADGE_R, ry0 + BB_PAD + BADGE_R, 3)
         w_cos = text_extent(RM_COS, BB_FS)[0] + 1.7 * RM_PAD
         # THE BRANCH CELLS MUST FIT THEIR OWN TEXT. The box width is fixed (it matches the two heads), so
         # what gives is the gap before the cosine -- sizing the cells from the leftover instead clipped
@@ -1852,6 +1874,8 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         bx0 = rx0 + RM_PAD
         y_lat = ry0 + RM_PAD + ttl_h + sub_h / 2
         y_txt = y_lat + sub_h + RM_ROW_SEP
+        _z_in = Z_TOKENIZER + 1.5          # above the box fill, or the arrows inside it are painted over
+
         def _cell(x, y, w, lab):
             ax.add_patch(PathPatch(rounded_polygon([(x, y - sub_h / 2), (x + w, y - sub_h / 2),
                                                     (x + w, y + sub_h / 2), (x, y + sub_h / 2)],
@@ -1877,13 +1901,14 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                                zorder=Z_TOKENIZER + 2))
         ax.text(cx0 + w_cos / 2, y_cos, RM_COS, ha="center", va="center", fontsize=BB_FS,
                 zorder=Z_TOKENIZER + 3)
-        _z_in = Z_TOKENIZER + 1.5          # above the box fill, or the arrows inside it are painted over
         for yy in (y_lat, y_txt):
             draw_arrow(ax, [(px0 + w_prj, yy), (0.5 * (px0 + w_prj + cx0), yy),
                             (0.5 * (px0 + w_prj + cx0), y_cos), (cx0 - ARROW_L, y_cos)], _z_in,
                        tip=(cx0, y_cos), head_dir=(1.0, 0.0))
         # the brace stem comes down and turns into the latent branch
-        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], y_lat), (px0 - ARROW_L, y_lat)], Z_ARROW,
+        # AT _z_in, NOT Z_ARROW: the last leg runs INSIDE the box, and the box fill sits far above
+        # arrow depth, so at Z_ARROW the line vanished the moment it crossed the wall.
+        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], y_lat), (px0 - ARROW_L, y_lat)], _z_in,
                    tip=(px0, y_lat), head_dir=(1.0, 0.0))
         # ...and the request runs in from the SAME x the brace stem turns at, so the two inputs align
         lines = RM_REQ.split(chr(10))
@@ -1898,7 +1923,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                                     (_tx1 + MIN_SEG, y_txt + _th / 2 + BRACE_T),
                                     BRACE_M * 0.7, u=(0.0, 1.0), off=(1.0, 0.0))
         draw_arrow(ax, rpoly, Z_ARROW)
-        draw_arrow(ax, [rmid, (bx0 - ARROW_L, y_txt)], Z_ARROW, tip=(bx0, y_txt), head_dir=(1.0, 0.0))
+        draw_arrow(ax, [rmid, (bx0 - ARROW_L, y_txt)], _z_in, tip=(bx0, y_txt), head_dir=(1.0, 0.0))
         draw_arrow(ax, [(cx0 + w_cos, y_cos), (rx1 + 1.2 * ARROW_L, y_cos)], _z_in,
                    tip=(rx1 + 2.2 * ARROW_L, y_cos), head_dir=(1.0, 0.0))
         ax.text(rx1 + 2.6 * ARROW_L, y_cos, RM_OUT, ha="left", va="center", fontsize=BOX_FS * 0.8,

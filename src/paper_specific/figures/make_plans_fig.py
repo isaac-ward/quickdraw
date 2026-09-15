@@ -58,34 +58,48 @@ def frames(path):
 
 def main() -> int:
     rows = []
-    for req, prefix, steps in KEEP:
+    for req, name, steps in KEEP:
         folder = req.replace(" ", "_")
-        hits = sorted(glob.glob(os.path.join(RUN, "logs", "epoch_*", "eval_steer", "plans", folder,
-                                             prefix + "*")))
-        assert hits, f"no plan matching {req}/{prefix}"
-        for d in hits:                                   # both start times when the prefix is ambiguous
-            fr = frames(os.path.join(d, "image.mp4"))
-            ks = [min(int(t) - 1, len(fr) - 1) for t in steps]
-            rows.append((req, os.path.basename(d), fr[ks], steps))
-    print(f"  {len(rows)} rows from {len(KEEP)} selections")
+        d = os.path.join(RUN, "logs", "epoch_0000", "eval_steer", "plans", folder, name)
+        assert os.path.isdir(d), d
+        fr = frames(os.path.join(d, "image.mp4"))
+        ks = [min(int(t) - 1, len(fr) - 1) for t in steps]
+        rows.append((req, fr[ks], steps))
+    print(f"  {len(rows)} rows")
 
-    ih, iw = rows[0][2][0].shape[:2]
-    NC = max(len(r[3]) for r in rows)
-    fig = plt.figure(figsize=(3.4, 3.4 * (len(rows) * ih * 1.62) / (NC * iw)))
-    gs = fig.add_gridspec(2 * len(rows), NC, hspace=0.0, wspace=0.02,
-                          height_ratios=[0.52, 1.0] * len(rows))
-    for r, (req, ctx, imgs, steps) in enumerate(rows):
-        lab = fig.add_subplot(gs[2 * r, :]); lab.axis("off")
-        lab.text(0.0, 0.16, "\u201c" + req + "\u201d", ha="left", va="bottom", fontsize=FS,
-                 style="italic")
-        lab.text(1.0, 0.16, ctx, ha="right", va="bottom", fontsize=FS - 2.0, color="0.45")
+    ih, iw = rows[0][1][0].shape[:2]
+    NC = max(len(r[2]) for r in rows)
+    # ONE LABEL PER REQUEST, not per row: consecutive rows of the same request share it, and the start
+    # time is dropped -- it identified a context for the author to choose from and means nothing now.
+    groups = []
+    for k, (req, _, _) in enumerate(rows):
+        if groups and groups[-1][0] == req:
+            groups[-1][1].append(k)
+        else:
+            groups.append((req, [k]))
+    fig = plt.figure(figsize=(3.4, 3.4 * (len(rows) * ih * 1.34) / (NC * iw)))
+    # THE STEPS DIFFER PER ROW -- table shows +1..+52 and mannequin +1..+103 -- so the numbers go on
+    # every row, not in one header. The request label is rotated in the left margin, once per group.
+    gs = fig.add_gridspec(len(rows), NC, hspace=0.34, wspace=0.03,
+                          left=0.085, right=0.999, top=0.965, bottom=0.005)
+    axes = []
+    for r, (req, imgs, steps) in enumerate(rows):
+        row = []
         for c in range(len(steps)):
-            A = fig.add_subplot(gs[2 * r + 1, c])
+            A = fig.add_subplot(gs[r, c])
             A.imshow(imgs[c], interpolation="bilinear")
             A.set_xticks([]); A.set_yticks([])
             for sp in A.spines.values():
-                sp.set_linewidth(1.2); sp.set_color("black")
-            A.set_title(f"$+${steps[c]}", fontsize=FS - 1.5, pad=1.5)
+                sp.set_linewidth(0.6); sp.set_color("black")
+            A.set_title(f"$+${steps[c]}", fontsize=FS - 1.0, pad=1.2)
+            row.append(A)
+        axes.append(row)
+    fig.canvas.draw()
+    for req, idxs in groups:
+        pos = [axes[i][0].get_position() for i in idxs]
+        y = 0.5 * (pos[0].y1 + pos[-1].y0)
+        fig.text(0.018, y, "\u201c" + req + "\u201d", ha="center", va="center", fontsize=FS,
+                 style="italic", rotation=90)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
     print(f"  wrote {OUT}  ({os.path.getsize(OUT) / 1e6:.1f} MB)")
     return 0
