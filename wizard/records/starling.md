@@ -514,6 +514,39 @@ steps at `subsample=4` = 34 s. No environment -- starling has no simulator, whic
   ladder in view". Their reward rising is the quantity the planner maximised. Closing this needs the VLM
   labeller run over the PLANNED imaginations; the machinery exists (`eval_interpret`), only the calls cost.
 
+  DONE (09-15), AND IT COST A FALSE RESULT FIRST. `paper_specific/analysis/steer_vlm_objects.py` labels
+  the decoded plan with the SAME gpt-4o prompt and schema the reward head's training labels came from, and
+  the null is inside the run: P(VLM sees X | asked for X) against P(VLM sees X | asked for something
+  else).
+
+  THE VLM WAS READING THE REQUEST OFF THE FRAME. The plan mp4 writes a caption bar under the image
+  ("ladder | step 0/128 reward +0.163"), and the crop that was supposed to remove it looked for the first
+  NON-BLACK row from the bottom -- but the white glyphs are non-black, so it stopped at the last line of
+  text and left the band. 152 rows became 142 of a 112-row image. Every number from it was the VLM
+  transcribing the request:
+
+        arm                    objects hit/base/lift        regions hit/base/lift
+        WITH THE LEAK, gauss     --                          0.92 / 0.02 /  55.0
+        fixed, gaussian        0.23 / 0.09 / 2.6             0.50 / 0.10 /  5.0
+        fixed, prior (ours)    0.12 / 0.10 / 1.3             0.42 / 0.12 /  3.6
+        fixed, PIT-delta       0.15 / 0.09 / 1.6             0.33 / 0.13 /  2.5
+        fixed, data chunks     0.23 / 0.09 / 2.6             0.38 / 0.12 /  3.0
+
+  WHAT CAUGHT IT: the GAUSSIAN CONTROL. A proposal that moves the drone 2% of a pilot's distance cannot
+  reach a named region 92% of the time, and there is no way to read 55x lift as anything but leakage. The
+  control was added for the paper's baseline rule and it paid for itself immediately. The crop now cuts at
+  IMG_H=112 with an assert that the discarded band is mostly dark.
+
+  THE CORRECTED RESULT IS INCONCLUSIVE AND THE PAPER SAYS SO. Every arm beats its own null, so language
+  does bias the plan toward the named place, but the gaussian control is at the TOP of both ranges -- the
+  place readout does not separate the candidate sources, and at 4 contexts x 16 requests it has no power
+  to. The steering claim rests on the DIRECTION block, where the physical readout separates the arms
+  cleanly (7/8 at 35% of pilot vs 4/8 at 2%).
+
+  Generalisation worth remembering: WHEN A JUDGE READS AN IMAGE, CHECK WHAT IS IN THE IMAGE. Any overlay a
+  renderer adds for humans -- request text, step counter, reward -- is an answer key if it survives into
+  the crop, and the failure mode is a suspiciously GOOD number, not a bad one.
+
 ### 3.3 THE PROPOSAL IS AN INTERFACE, AND THE TRAINED PRIOR LOSES TO RAW DATA
 
   MPPI's candidates were hardcoded gaussian noise, so the action prior was never in the planner. Now

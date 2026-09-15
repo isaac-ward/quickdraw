@@ -37,6 +37,7 @@ REG = list(IC["factors"]["facing"]["buckets"])
 MODEL = IC.get("model") or "gpt-4o"      # conf/interpret/starling.yaml:84 -- the SAME model the
 #                                          training labels came from, which is the point of reusing it
 NFR = int(IC.get("vlm_frames", 15))
+IMG_H = 112                              # the starling camera is 112x192; rows below this are caption
 
 
 def read_mp4(path, n):
@@ -49,12 +50,19 @@ def read_mp4(path, n):
         fr.append(x[..., ::-1])
     cap.release()
     fr = np.stack(fr)
-    # the plan mp4 carries a caption bar under the frame; crop it off so the VLM sees only the imagination
-    h = fr.shape[1]
-    for cut in range(h - 1, h // 2, -1):
-        if fr[:, cut - 1:cut].max() > 8:            # first non-black row from the bottom
-            fr = fr[:, :cut]
-            break
+    # CROP THE CAPTION BAR, AND CROP ALL OF IT. The plan mp4 writes the REQUEST TEXT under the frame
+    # ("ladder | step 0/128 reward +0.163"), so a bar left even partly intact hands the VLM the answer --
+    # measured: with the old crop the gaussian control scored 0.92 hit against a 0.02 base rate on the
+    # region requests, i.e. lift 55x from a proposal that barely moves the drone, because gpt-4o was
+    # transcribing the caption. The first-non-black-row-from-the-bottom rule failed because the white
+    # glyphs ARE non-black: it stopped at the last text row and kept the rest of the band.
+    # The image is IMG_H rows tall and everything below it is caption, so cut there and assert it.
+    assert fr.shape[1] >= IMG_H, f"{path}: {fr.shape[1]} rows, shorter than the {IMG_H}-row image"
+    if fr.shape[1] > IMG_H:
+        band = fr[:, IMG_H:]
+        assert float((band > 8).mean()) < 0.35, (f"{path}: the band below row {IMG_H} is {100 * (band > 8).mean():.0f}% "
+                                                 f"non-black -- that is not a caption bar, check IMG_H")
+        fr = fr[:, :IMG_H]
     idx = np.unique(np.linspace(0, len(fr) - 1, min(n, len(fr))).round().astype(int))
     return fr[idx]
 

@@ -166,7 +166,10 @@ STEER_RUNS = {
 }
 COLS = [("gauss", "Gaussian"), ("data", "Data chunks"), ("prior", r"Prior (\textbf{ours})"),
         ("pitdelta", r"Prior, PIT-$\Delta$")]
+# The place block needs DECODED VIDEO for the labeller, so these are the video-on 26-request suites
+# rather than the 16-context physical runs above.
 VLM_RUNS = {
+    "gauss": "logs/eval_steer_2026_09_15_06_29_37_suite_gauss",
     "prior": "logs/eval_steer_2026_09_14_21_57_53_best_prior_guided",
     "pitdelta": "logs/eval_steer_2026_09_15_01_29_12_suite_pitdelta",
     "data": "logs/eval_steer_2026_09_15_01_28_55_suite_data_retrieved",
@@ -279,7 +282,9 @@ def steer_table(paper: str) -> str:
          r"motion along the axis the words name, signed so positive means obeyed, in physical units and "
          r"independent of the reward the planner maximised. For a request naming a \emph{place} it is a "
          r"VLM's label of the imagined video, with `null' --- how often that place is reached when "
-         r"something \emph{else} was asked for --- as the context-blind baseline beside it.}",
+         r"something \emph{else} was asked for --- as the context-blind baseline beside it. The place block "
+         r"is inconclusive and we report it as such: every arm beats its own null, but so does the gaussian "
+         r"control, and at four contexts per request the differences between columns are noise.}",
          r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{ll" + "c" * nc + "}", r"    \toprule",
          r"    Request & Asked for & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
          r"    \multicolumn{" + str(2 + nc) + r"}{c}{Directions --- net motion achieved, and $\%$ of what a "
