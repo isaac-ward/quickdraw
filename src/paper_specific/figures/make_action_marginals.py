@@ -85,17 +85,8 @@ def main(run: str = RUN) -> int:
     print(f"  chunk {K} | recorded {real.shape} | sampled {pred.shape} "
           f"({len(h)} contexts x {N_DRAW} draws)")
 
-    # CONDITIONING, computed from the same draws: spread within a context against spread across all of
-    # them. If the model is using its context, its samples for one context are tighter than the pooled
-    # population; if it has stopped using it, the two coincide and this goes to zero. That is the thing
-    # that decays with lookahead, and the marginals above cannot show it -- they are pooled.
-    within = pred_g.std(axis=1).mean(axis=0)                     # (K, NA)
-    pooled = pred_g.reshape(-1, K, NA).std(axis=0)               # (K, NA)
-    cond = 1.0 - within / np.maximum(pooled, 1e-9)               # (K, NA)
-
-    fig = plt.figure(figsize=(7.1, 3.9))
-    outer = fig.add_gridspec(2, 1, height_ratios=(2.5, 1.0), hspace=0.42)
-    gh = outer[0].subgridspec(len(LOOKAHEADS), NA, hspace=0.0, wspace=0.30)
+    fig = plt.figure(figsize=(7.1, 2.9))
+    gh = fig.add_gridspec(len(LOOKAHEADS), NA, hspace=0.0, wspace=0.30)
     for r, k in enumerate(LOOKAHEADS):
         for c in range(NA):
             A_ = fig.add_subplot(gh[r, c])
@@ -107,9 +98,7 @@ def main(run: str = RUN) -> int:
                     label="Truth" if (r == 0 and c == 0) else None)
             A_.hist(pred[:, k, c], bins=bins, density=True, color="tab:red", alpha=0.45,
                     label="Prediction" if (r == 0 and c == 0) else None)
-            # LOG COUNTS: the atom at rest is one or two orders of magnitude above the body, so on a
-            # linear axis the body is a flat smear under a spike.
-            A_.set_yscale("log"); A_.set_yticks([])
+            A_.set_yticks([])
             A_.set_xlim(x0, x1)
             A_.tick_params(labelsize=FS - 2.5, labelbottom=(r == len(LOOKAHEADS) - 1))
             for sp in A_.spines.values():
@@ -121,19 +110,8 @@ def main(run: str = RUN) -> int:
                 A_.set_ylabel(f"$+${k + 1}", fontsize=FS)
             if r == 0 and c == 0:
                 A_.legend(fontsize=FS - 2.0, frameon=False, loc="upper left")
-    AC = fig.add_subplot(outer[1])
-    for c in range(NA):
-        AC.plot(np.arange(1, K + 1), cond[:, c], lw=0.9, alpha=0.55,
-                label=AXES[c].capitalize() if not AXES[c].startswith("fore") else "Fore/aft")
-    AC.plot(np.arange(1, K + 1), cond.mean(axis=1), lw=2.0, color="k", label="Mean")
-    AC.axhline(0.0, color="k", ls=":", lw=0.8)
-    AC.set_xlim(1, K); AC.set_xlabel("Lookahead (steps into the chunk)", fontsize=FS)
-    AC.set_ylabel("Conditioning", fontsize=FS)
-    AC.tick_params(labelsize=FS - 2.0); AC.grid(alpha=0.25)
-    AC.legend(fontsize=FS - 2.5, ncol=5, loc="upper right", frameon=False)
     fig.supylabel("Lookahead", fontsize=FS)
-    print("  conditioning: mean {:.3f} at +1 -> {:.3f} at +{}".format(
-        cond.mean(axis=1)[0], cond.mean(axis=1)[-1], K))
+    fig.tight_layout(h_pad=0.1, w_pad=0.35)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", OUT)
     return 0

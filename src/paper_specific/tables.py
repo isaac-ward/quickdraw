@@ -20,49 +20,46 @@ LOGS = "logs"
 # Row labels say what the setting IS, not what the run was called: `vl128 base` named a file, not a
 # configuration, and stride 5 with summed actions is the thing a reader needs to know.
 WM_ROWS = [
-    # LABELS ARE "stride / actions", which is all that separates most of these runs, plus the one extra
-    # change where there is one. Verified against each run's own config.json -- the stride-1 run uses
-    # SUMMED actions, not concatenated, which an earlier version of this table got wrong.
-    ("train_world_model_2026_09_05_20_21_02_starling2_vl128", r"$5$ / sum", ""),
-    ("train_world_model_2026_09_07_03_45_54_starling2_heavy", r"$5$ / sum, depth $4$", "rejected"),
-    ("train_world_model_2026_09_12_08_06_49_s2_sub4_concat_deriv", r"$4$ / concat, $\Delta a$", "rejected"),
-    ("train_world_model_2026_09_11_03_17_22_s2_sub3_concat", r"$3$ / concat", ""),
-    ("train_world_model_2026_09_08_21_46_53_s2_sub1", r"$1$ / sum", ""),
-    ("train_world_model_2026_09_08_22_04_09_s2_sub4", r"$4$ / sum", ""),
-    ("train_world_model_2026_09_11_03_17_47_s2_sub4_concat", r"$4$ / concat (\textbf{ours})", "kept"),
+    # PLAIN TEXT, not codes: a reader should not have to decode "4 / concat" to know what a row is.
+    # Verified against each run's own config.json -- the stride-1 run uses SUMMED actions, which an
+    # earlier version of this table got wrong.
+    ("train_world_model_2026_09_05_20_21_02_starling2_vl128", "Inherited recipe", ""),
+    ("train_world_model_2026_09_07_03_45_54_starling2_heavy", r"\quad deeper denoiser", "rejected"),
+    ("train_world_model_2026_09_12_08_06_49_s2_sub4_concat_deriv", r"\quad action increments", "rejected"),
+    ("train_world_model_2026_09_08_21_46_53_s2_sub1", r"\quad every frame, summed", ""),
+    ("train_world_model_2026_09_11_03_17_22_s2_sub3_concat", r"\quad every third frame", ""),
+    ("train_world_model_2026_09_08_22_04_09_s2_sub4", r"\quad every fourth frame, summed", ""),
+    ("train_world_model_2026_09_11_03_17_47_s2_sub4_concat",
+     r"\quad every fourth frame, concatenated$^{*}$", "kept"),
 ]
 # ---- the Action Model: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
 AH_ROWS = [
-    # BLOCKED BY CHUNK so the context x target interaction is readable within a block: at chunk 8 the
-    # 2x2 is pooled/grouped against none/PIT, with pooled+none never trained (it is the cell nothing
-    # recommends). Chunk 32 then repeats the winner and adds the increment target.
-    ("train_action_2026_09_13_21_57_41_s2_ah_pit", "8", "pooled", "PIT", ""),
-    ("train_action_2026_09_14_01_15_48_s2_ah_grouped", "8", "grouped", "none", ""),
-    ("train_action_2026_09_13_23_42_49_s2_ah_pit", "8", "grouped", "PIT", r"\textbf{ours}"),
-    ("train_action_2026_09_14_04_41_17_s2_ah_chunk32_full", "32", "grouped", "PIT", ""),
-    ("train_action_model_2026_09_14_22_28_22_s2_ah_chunk32_pitdelta", "32", "grouped", "PIT-$\\Delta$",
-     "rejected"),
-]
-# ---- the Action Model: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
-AH_ROWS = [
-    ("train_action_2026_09_13_21_57_41_s2_ah_pit", "8", "pooled", "PIT", ""),
-    ("train_action_2026_09_14_01_15_48_s2_ah_grouped", "8", "grouped", "none", ""),
-    ("train_action_2026_09_13_23_42_49_s2_ah_pit", "8", "grouped", "PIT", r"\textbf{ours}"),
-    ("train_action_2026_09_14_04_41_17_s2_ah_chunk32_full", "32", "grouped", "PIT", ""),
-    ("train_action_model_2026_09_14_22_28_22_s2_ah_chunk32_pitdelta", "32", "grouped", "PIT-$\\Delta$", "rejected"),
+    # ONE PLAIN-TEXT CONFIGURATION COLUMN, like the World Model table. The 2x2 of context x target is
+    # incomplete by design: pooled context with a raw target is the cell nothing recommends and it was
+    # never trained, which the caption says.
+    ("train_action_2026_09_13_21_57_41_s2_ah_pit", "Pooled context, percentile target"),
+    ("train_action_2026_09_14_01_15_48_s2_ah_grouped", "Grouped context, raw target"),
+    ("train_action_2026_09_13_23_42_49_s2_ah_pit",
+     r"Grouped context, percentile target$^{*}$"),
+    ("train_action_2026_09_14_04_41_17_s2_ah_chunk32_full", r"\quad longer chunk ($32$)"),
+    ("train_action_model_2026_09_14_22_28_22_s2_ah_chunk32_pitdelta",
+     r"\quad longer chunk, increment target"),
 ]
 
 
 def wm_table() -> str:
     hs = [1, 8, 32, 128]
-    L = [r"\begin{table}[t]", r"  \centering", r"  \small",
+    L = [r"\begin{table}[t]", r"  \centering", r"  \footnotesize",
          r"  \setlength{\tabcolsep}{3pt}",
          r"  \caption{\textbf{World Model.} Open-loop prediction on held-out \texttt{starling-2} flight, by "
          r"horizon: how far the action-conditioned observation prediction holds up. The first row is the "
          r"recipe as inherited from a manipulation dataset; every row below it changes one setting, and the "
          r"best per column is bold. The autoencoder floor re-encodes and decodes the true frame, so it "
-         r"bounds what any dynamics model on this tokenizer can reach. Rows are labelled "
-         r"\emph{frame stride} / \emph{action aggregation}, the two settings that separate most of them.}",
+         r"bounds what any dynamics model on this tokenizer can reach. The inherited recipe kept every "
+         r"fifth frame and summed the commands it skipped; each row below changes one thing. "
+         r"$^{\dagger}$The autoencoder floor is not a model: it encodes and decodes the TRUE frame, so "
+         r"it is the same at every horizon and no dynamics model on this tokenizer can beat it. "
+         r"$^{*}$The configuration \modelname{} uses.}",
          r"  \label{tab:longhorizon}", r"  \begin{tabular}{lcccc}", r"    \toprule",
          r"    & \multicolumn{4}{c}{LPIPS $\downarrow$ at open-loop horizon} \\",
          r"    \cmidrule(lr){2-5}",
@@ -86,68 +83,64 @@ def wm_table() -> str:
             else fmt(v, 4) for j, v in enumerate(vals))
         L.append(f"    {name} & {cells} \\\\")
     L += [r"    \midrule",
-          r"    Autoencoder floor & \multicolumn{4}{c}{" + fmt(sum(floors) / len(floors), 4) + r"} \\",
+          # A ROW LIKE ANY OTHER, with the same number in every column: the floor does not depend on
+          # horizon, and spanning it across the four columns made it look like a different kind of thing.
+          r"    Autoencoder floor$^{\dagger}$ & "
+          + " & ".join([fmt(sum(floors) / len(floors), 4)] * 4) + r" \\",
           r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
     return "\n".join(L) + "\n"
 
 
 def ah_table() -> str:
-    L = [r"\begin{table}[t]", r"  \centering", r"  \small",
+    L = [r"\begin{table}[t]", r"  \centering", r"  \footnotesize",
          r"  \setlength{\tabcolsep}{3pt}",
          r"  \caption{\textbf{Action Model.} The counterpart of Table~\ref{tab:longhorizon} for the other "
-         r"half of what \modelname{} predicts: not what follows from an action, but what action follows from "
-         r"a context. Blocked by chunk length, so the context $\times$ target interaction is readable "
-         r"inside a block; best per column in bold. Energy skill is the only column that measures "
-         r"\emph{conditioning}, against a context-blind null, so $0$ is a model that ignores its context; "
-         r"it is given at the first lead time and at the worst. $W_1$ is the distance to the recorded action "
-         r"marginal, i.e. whether it flies like the data. Rest AUC asks whether the model can place mass on "
-         r"a stick being HELD still, which is what the percentile transform buys and what a flow cannot do "
-         r"without it. No row wins every column, because the trade is real -- Fig.~\ref{fig:marginals} is "
-         r"the same question answered by eye.}",
-         r"  \label{tab:actionhead}", r"  \begin{tabular}{llcccc}", r"    \toprule",
-         r"    & & Skill$_{+1}$ & Skill$_{\max}$ & $W_1$ & Rest AUC \\",
-         r"    Context & Target & $\uparrow$ & $\uparrow$ & $\downarrow$ & $\uparrow$ \\"]
+         r"half of what \modelname{} predicts: not what follows from an action, but what action follows "
+         r"from a context. One setting changes per row, best per column in bold. Energy skill is the only "
+         r"column that measures \emph{conditioning}, against a context-blind null, so $0$ is a model that "
+         r"ignores its context; it is given at the first lead time and at the worst. $W_1$ is the distance "
+         r"to the recorded action marginal, i.e.\ whether it flies like the data. Rest AUC asks whether "
+         r"the model can place mass on a stick being HELD still, which is what the percentile transform "
+         r"buys and what a flow cannot do without it. Pooled context with a raw target is the one cell of "
+         r"the $2\times2$ that was never trained: nothing recommends it. No row wins every column, because "
+         r"the trade is real --- Fig.~\ref{fig:marginals} is the same question answered by eye. "
+         r"$^{*}$The configuration \modelname{} uses, at the chunk length the planner wants.}",
+         r"  \label{tab:actionhead}", r"  \begin{tabular}{lcccc}", r"    \toprule",
+         r"    & Skill$_{+1}$ & Skill$_{\max}$ & $W_1$ & Rest AUC \\",
+         r"    Configuration & $\uparrow$ & $\uparrow$ & $\downarrow$ & $\uparrow$ \\", r"    \midrule"]
     rows = []
-    for run, chunk, ctx, tgt, note in AH_ROWS:
-        # the SAME lookups the previous version used: metrics() is keyed by each run's own tag names, so
-        # contains() finds them by suffix rather than by a guessed full key
+    for run, lab in AH_ROWS:
         d = metrics(os.path.join(LOGS, run))
         if not d:
             continue
-        rows.append((chunk, ctx, tgt, note,
-                     [contains(d, "lead_00/energy_skill"), contains(d, "energy_skill"),
-                      contains(d, "w1_mean"), contains(d, "rest_auc")]))
+        rows.append((lab, [contains(d, "lead_00/energy_skill"), contains(d, "energy_skill"),
+                           contains(d, "w1_mean"), contains(d, "rest_auc")]))
     best = [None] * 4
-    for k, lo in enumerate((False, False, True, False)):
-        vs = [r[4][k] for r in rows if r[4][k] is not None]
+    for k, lo in enumerate((False, False, True, False)):    # W1 is the only lower-is-better column
+        vs = [r[1][k] for r in rows if r[1][k] is not None]
         if vs:
             best[k] = min(vs) if lo else max(vs)
-    for ch in ("8", "32"):
-        L += [r"    \midrule", r"    \multicolumn{6}{c}{chunk $=" + ch + r"$} \\", r"    \midrule"]
-        for chunk, ctx, tgt, note, vals in rows:
-            if chunk != ch:
-                continue
-            cells = []
-            for k, v in enumerate(vals):
-                t = "--" if v is None else (f"{v:.3f}" if k != 2 else f"{v:.4f}")
-                if v is not None and best[k] is not None and abs(v - best[k]) < 1e-12:
-                    t = r"\textbf{" + t + "}"
-                cells.append(t)
-            lab = ctx + ((" (" + note + ")") if note and "textbf" in note else "")
-            L.append(f"    {lab} & {tgt} & " + " & ".join(cells) + r" \\")
+    for lab, vals in rows:
+        cells = []
+        for k, v in enumerate(vals):
+            t = "--" if v is None else (f"{v:.3f}" if k != 2 else f"{v:.4f}")
+            if v is not None and best[k] is not None and abs(v - best[k]) < 1e-12:
+                t = r"\textbf{" + t + "}"
+            cells.append(t)
+        L.append(f"    {lab} & " + " & ".join(cells) + r" \\")
     L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
     return "\n".join(L) + "\n"
 
 
 OOD_ROWS = {
-    "eval_ood_noodle": [("latent_cos", r"latent surprise (\textbf{ours})"), ("lpips", "image LPIPS"),
-                        ("l2", "image RMSE"), ("angvel_err", "angular velocity error"),
-                        ("pos_err", "position error")],
-    "eval_ood_leafblower": [("angvel_err", r"angular velocity error (\textbf{ours})"),
-                            ("vel_err", "velocity error"), ("lpips", "image LPIPS"),
-                            ("rot_err", "orientation error"), ("pos_err", "position error")],
+    "eval_ood_noodle": [("latent_cos", r"Latent surprise (\textbf{ours})"), ("lpips", "Image LPIPS"),
+                        ("l2", "Image RMSE"), ("angvel_err", "Angular velocity error"),
+                        ("pos_err", "Position error")],
+    "eval_ood_leafblower": [("angvel_err", r"Angular velocity error (\textbf{ours})"),
+                            ("vel_err", "Velocity error"), ("lpips", "Image LPIPS"),
+                            ("rot_err", "Orientation error"), ("pos_err", "Position error")],
 }
-OOD_NAME = {"eval_ood_noodle": "Visual anomaly: a pool noodle enters frame", "eval_ood_leafblower": "Dynamical anomaly: an off-camera leaf blower pushes the drone"}
+OOD_NAME = {"eval_ood_noodle": "Visual anomaly: a pink pool noodle enters the frame", "eval_ood_leafblower": "Dynamical anomaly: an off-camera leaf blower pushes the drone"}
 
 
 def ood_table(paper: str) -> str:
@@ -170,7 +163,7 @@ def ood_table(paper: str) -> str:
          r"makes them controls. $\uparrow$ higher is better.}",
          r"  \label{tab:ood}", r"  \begin{tabular}{lccc}", r"    \toprule",
          r"    & Nominal & Failure & Weighted \\",
-         r"    Score & acc.\ (\%) $\uparrow$ & acc.\ (\%) $\uparrow$ & acc.\ (\%) $\uparrow$ \\"]
+         r"    Scoring mechanism & acc.\ (\%) $\uparrow$ & acc.\ (\%) $\uparrow$ & acc.\ (\%) $\uparrow$ \\"]
     for split, rows in OOD_ROWS.items():
         L += [r"    \midrule", r"    \multicolumn{4}{c}{" + OOD_NAME[split] + r"} \\", r"    \midrule"]
         m = j[split]["metrics"]
@@ -198,8 +191,8 @@ STEER_RUNS = {
     "prior": "logs/eval_steer_2026_09_14_22_08_46_phys16_prior",
     "pitdelta": "logs/eval_steer_2026_09_15_01_12_15_phys16_pitdelta",
 }
-COLS = [("gauss", "Gaussian prior"), ("data", "Data prior"),
-        ("prior", r"Learned PIT prior (\textbf{ours})"), ("pitdelta", r"Learned PIT-$\Delta$ prior")]
+COLS = [("gauss", "Gaussian AM"), ("data", r"Data Retrieval AM$^{\ddagger}$"),
+        ("prior", r"Learned AM (\textbf{ours})"), ("pitdelta", r"Learned $\Delta$ AM")]
 # The place block needs DECODED VIDEO for the labeller, so these are the video-on 26-request suites
 # rather than the 16-context physical runs above.
 VLM_RUNS = {
@@ -299,53 +292,77 @@ def _vlm(run):
 
 
 def steer_table(paper: str) -> str:
-    """Per-request steering, as FRACTIONS OF CONTEXTS THAT MET THE REQUIREMENT.
-
-    The earlier version printed net motion in metres and degrees, which needs the pilot scale beside it to
-    mean anything and cannot be compared across axes. A request either moved the drone the way it named or
-    it did not, per starting context, so x/16 (directions) and x/4 (places, as judged by the VLM) says the
-    same thing without the units -- and the aggregate motion, which is the part a fraction loses, is in
-    Table~\ref{tab:continuity}."""
+    """Per-request steering as fractions of contexts, plus the aggregates the continuity table used to
+    carry on its own -- the author asked for one table, since the second was mostly the same comparison
+    summarised."""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
     from steer_physical import WANTS
     ph = {k: _phys(v) for k, v in STEER_RUNS.items()}
+    jk = {k: _jerk(v) for k, v in STEER_RUNS.items()}
     vl = {k: _vlm(v) for k, v in VLM_RUNS.items()}
     nc = len(COLS)
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
-         r"  \caption{\textbf{Language steering}, per request, with the candidate source as the only "
-         r"difference between columns. Every cell is the fraction of starting contexts that met the "
-         r"request: for a motion primitive, that the imagined trajectory moved along the axis the words "
-         r"name by more than $5\%$ of what a pilot covers in the same $34$\,s, read off the imagined "
-         r"proprioception and independent of the reward the planner maximised; for a location, that a VLM "
-         r"labelling the imagined video reports the drone reached it. `null\' beside a location is how "
-         r"often it is reached when something \emph{else} was requested, the context-blind baseline from "
-         r"inside the same run. The location block does not separate the columns -- every arm beats its "
-         r"own null and so does the gaussian control -- and at four contexts per request it has no power "
-         r"to.}",
+         r"  \caption{\textbf{Language steering.} The Action Model (AM) is the only thing that differs "
+         r"between columns. Every cell is the fraction of starting contexts that met the request: for a "
+         r"motion primitive, that the imagined trajectory moved along the axis the words name by more "
+         r"than $5\%$ of what a pilot covers in the same $34$\,s, read off the imagined proprioception "
+         r"and independent of the reward the planner maximised; for a location, that a VLM labelling the "
+         r"imagined video named it. Best per row in bold. $^{\ddagger}$Data Retrieval is the BASELINE: it "
+         r"draws real recorded chunks, so it is perfectly flyable and completely blind to the request, "
+         r"and beating it is the bar a learned prior has to clear. $^{\S}$The corpus contains no "
+         r"backward flight at all, and no arm gets more than one context out of fifteen -- a motion "
+         r"primitive absent from the data is not reachable by steering, however the candidates are "
+         r"drawn. The location block does "
+         r"not separate the columns and is scored strictly: the VLM names ONE object and ONE region per "
+         r"clip, so a plan that reaches the table while the ladder is also in view scores nothing here.}",
          r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nc + "}", r"    \toprule",
          r"    Request & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
          r"    \multicolumn{" + str(1 + nc) + r"}{c}{Motion primitives} \\", r"    \midrule"]
+    hits_all = {m: [] for m, _ in COLS}
+    frac_all = {m: [] for m, _ in COLS}
     for q in ("rotate left", "rotate right", "climb", "descend", "strafe left", "strafe right",
               "fly forward", "fly backward"):
         key = WANTS[q][0]
-        cells = []
+        vals = []
         for m, _ in COLS:
             v = ph[m].get(q)
             if v is None:
-                cells.append("--"); continue
+                vals.append(None); continue
             hits = sum(x > 0.05 * PILOT[key] for x in v[2])
-            cells.append(f"{hits}/{len(v[2])}")
-        L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
-    L += [r"    \midrule", r"    \multicolumn{" + str(1 + nc) + r"}{c}{Locations} \\", r"    \midrule"]
+            hits_all[m].append(v[0] > 0.05 * PILOT[key])   # the MEAN, as in the original
+            frac_all[m].append(sum(v[2]) / len(v[2]) / PILOT[key])
+            vals.append((hits, len(v[2])))
+        best = max((h for h, _ in (x for x in vals if x)), default=None)
+        cells = ["--" if v is None else
+                 ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if v[0] == best and best else
+                  f"{v[0]}/{v[1]}") for v in vals]
+        nm = q + (r"$^{\S}$" if q == "fly backward" else "")
+        L.append(f"    ``{nm}\'\' & " + " & ".join(cells) + r" \\")
+    # THE AGGREGATES the continuity table used to hold: obeyed, motion against a pilot, and the two jerk
+    # columns, which is what makes the comparison between candidate sources legible in one place.
+    L += [r"    \midrule",
+          r"    Primitives obeyed (of $8$) & " + " & ".join(
+              (r"\textbf{" + f"{sum(hits_all[m])}" + "}/8")
+              if sum(hits_all[m]) == max(sum(h) for h in hits_all.values()) else f"{sum(hits_all[m])}/8"
+              for m, _ in COLS) + r" \\",
+          r"    Motion, fraction of a pilot & " + " & ".join(
+              f"{sum(frac_all[m]) / max(1, len(frac_all[m])):+.2f}" for m, _ in COLS) + r" \\",
+          r"    $|\Delta a|$ in a chunk ($\times$ recorded) & " + " & ".join(
+              "--" if jk[m] is None else f"{jk[m][0] / REC_DA:.2f}" for m, _ in COLS) + r" \\",
+          r"    $|\Delta a|$ at the seam ($\times$ recorded) & " + " & ".join(
+              "--" if jk[m] is None else f"{jk[m][1] / REC_DA:.2f}" for m, _ in COLS) + r" \\"]
+    L += [r"    \midrule", r"    \multicolumn{" + str(1 + nc) +
+          r"}{c}{Locations} \\", r"    \midrule"]
     for q in ("wall with black panels", "center of room over mats", "floor to ceiling glass wall",
               "white wall with table", "ladder", "mannequin", "colored floor mat", "table"):
-        cells = []
+        vals = []
         for m, _ in COLS:
             v = vl.get(m, {}).get(q)
-            if v is None:
-                cells.append("--"); continue
-            n = int(v[2])
-            cells.append(f"{round(v[0] * n)}/{n}~({v[1]:.2f})")
+            vals.append(None if v is None else (round(v[0] * int(v[2])), int(v[2])))
+        best = max((h for h, _ in (x for x in vals if x)), default=None)
+        cells = ["--" if v is None else
+                 ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if best and v[0] == best else
+                  f"{v[0]}/{v[1]}") for v in vals]
         L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
     L += [r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
     return "\n".join(L) + "\n"
@@ -384,9 +401,11 @@ def cont_table(paper: str) -> str:
 def main(paper: str) -> int:
     out = os.path.join(paper, "tables")
     os.makedirs(out, exist_ok=True)
+    # cont_table is retired: its aggregates now live in the steering table, which is where the
+    # comparison they summarise already was.
     for name, fn in (("longhorizon", wm_table), ("actionhead", ah_table), ("ood", ood_table),
-                     ("steering", steer_table), ("continuity", cont_table)):
-        t = fn(paper) if fn in (ood_table, steer_table, cont_table) else fn()
+                     ("steering", steer_table)):
+        t = fn(paper) if fn in (ood_table, steer_table) else fn()
         open(os.path.join(out, f"{name}.tex"), "w").write(t)
         print(f"  tables/{name}.tex  {len(t.splitlines())} lines")
     return 0

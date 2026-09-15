@@ -170,10 +170,10 @@ def _scene_photo(paper, name, shape=None):
     cut = rows[0] if rows else int(h * 0.42)
     im = im[2:cut - 2, 2:-2]
     if shape is not None:
-        # MATCH THE CAMERA FRAMES' ASPECT by cropping off the TOP, so the photo sits in the row at the
-        # same size as the frames beside it instead of being taller than all of them.
-        want = shape[0] / shape[1]
+        # A SLIGHT TOP CROP ONLY. Forcing the frames' exact aspect distorted nothing but made the photo
+        # a letterbox; this trims the ceiling, which carries nothing, and leaves the photo's own shape.
         hh, ww = im.shape[:2]
+        want = 1.35 * shape[0] / shape[1]
         keep = int(min(hh, ww * want))
         im = im[hh - keep:, :]
     return im
@@ -232,7 +232,7 @@ def ood(paper, dev="cuda"):
     def mark_context(A):
         # a SOLID line named in the legend, not text on the plot: the first P frames are context, so
         # there is no prediction to the left of it
-        A.axvline(P, color="tab:blue", ls="-", lw=1.2, label="Prediction starts")
+        A.axvline(P, color="black", ls="-", lw=1.2, label="Prediction starts")
 
     # ================= (a) VISUAL =====================================================================
     split, chan, chan_lab = "eval_ood_noodle", "latent_cos", "Latent surprise"
@@ -270,27 +270,23 @@ def ood(paper, dev="cuda"):
     for jx, (img, lab) in enumerate(panes):
         A = fig.add_subplot(top[0, jx])
         if img is None:
-            A.imshow(sur, cmap="inferno", vmin=np.percentile(sur, 50), vmax=np.percentile(sur, 99),
-                     aspect="auto")
+            A.imshow(sur, cmap="inferno", vmin=np.percentile(sur, 50), vmax=np.percentile(sur, 99))
         else:
-            A.imshow(img, aspect="auto")
+            A.imshow(img)
         A.set_title(lab, fontsize=FS)
         A.set_xticks([]); A.set_yticks([])
         for sp_ in A.spines.values():                    # every image in the paper carries this border
             sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
     A = fig.add_subplot(outer[1])
     v = np.asarray(r[chan])
-    A.plot(r["steps"], v, color="crimson", lw=1.4)
-    A.axvspan(w0, w1, color="tab:purple", alpha=0.16, lw=0, label="Anomaly window")
+    A.plot(r["steps"], v, color="tab:purple", lw=1.6)
+    A.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
     out = (r["steps"] < w0) | (r["steps"] >= w1)
-    if out.any():
-        A.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
-                  label="90% threshold")
     A.set_xlim(0, len(o) - 1)
     A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("Prediction step", fontsize=FS)
     A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25)
     mark_context(A)
-    A.legend(fontsize=FS - 1.5, loc="upper right")
+    A.legend(fontsize=FS - 1.5, loc="upper left")
     f = os.path.join(paper, "figures", "ood-visual.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print("  figures/ood-visual.png")
@@ -302,10 +298,11 @@ def ood(paper, dev="cuda"):
     o, a, fr = eps[ep]
     r = one_step(core, norm, o, a, fr[key], key, P, dev)
     photo = _scene_photo(paper, "leaf-blower.png", shape=fr[key][0].shape)
-    fig = plt.figure(figsize=(7.2, 3.3))
-    gb = fig.add_gridspec(2, 2, width_ratios=(1.0, 1.7), wspace=0.20, hspace=0.14)
+    fig = plt.figure(figsize=(7.2, 3.6))
+    gb = fig.add_gridspec(2, 2, width_ratios=(1.0, 1.7), wspace=0.20, hspace=0.34,
+                          height_ratios=(1.0, 0.8))
     if photo is not None:
-        A = fig.add_subplot(gb[:, 0]); A.imshow(photo, aspect="auto")
+        A = fig.add_subplot(gb[0, 0]); A.imshow(photo)
         A.set_xticks([]); A.set_yticks([])
         for sp_ in A.spines.values():
             sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
@@ -313,23 +310,21 @@ def ood(paper, dev="cuda"):
     AV = fig.add_subplot(gb[0, 1])
     for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
         AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
-    AV.axvspan(w0, w1, color="tab:purple", alpha=0.16, lw=0)
+    AV.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0)
     AV.set_ylabel("Observed $\\omega$\n(rad/s)", fontsize=FS, labelpad=2)
-    AV.legend(fontsize=FS - 2, ncol=3, loc="upper left", frameon=False)
-    AV.tick_params(labelsize=FS - 1.5, labelbottom=False); AV.grid(alpha=0.25)
+    AV.legend(fontsize=FS - 2, ncol=1, loc="lower left", frameon=False, handlelength=1.1,
+              labelspacing=0.25)
+    AV.tick_params(labelsize=FS - 1.5); AV.grid(alpha=0.25)
     AV.set_xlim(0, len(o) - 1)
-    AE = fig.add_subplot(gb[1, 1], sharex=AV)
+    AE = fig.add_subplot(gb[1, :])
     v = np.asarray(r[chan])
-    AE.plot(r["steps"], v, color="crimson", lw=1.4)
-    AE.axvspan(w0, w1, color="tab:purple", alpha=0.16, lw=0, label="Anomaly window")
+    AE.plot(r["steps"], v, color="tab:purple", lw=1.6)
+    AE.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
     out = (r["steps"] < w0) | (r["steps"] >= w1)
-    if out.any():
-        AE.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
-                   label="90% threshold")
     AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)
     AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25)
     mark_context(AE)
-    AE.legend(fontsize=FS - 1.5, loc="upper right", ncol=1)
+    AE.legend(fontsize=FS - 1.5, loc="upper left", ncol=1)
     f = os.path.join(paper, "figures", "ood-dynamical.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print("  figures/ood-dynamical.png")
@@ -350,7 +345,10 @@ def curves(paper):
             # from a series that does not exist.
             ("logs/paper_icra_2027/result_backups/train_reward_model_2026_09_14_08_19_38_reward_starling_v5",
              "Reward Model", 91.0 / 3600.0 / 300.0)]
-    fig, ax = plt.subplots(3, 1, figsize=(3.4, 5.4))
+    # ONE ROW, NOT THREE. Stacked, three panels with their own x axis and a twin wall-clock axis
+    # each cost 5.4 inches of page; side by side they cost 1.9, and nothing about the curves needs the
+    # extra width -- they are each a single decaying line.
+    fig, ax = plt.subplots(1, 3, figsize=(7.1, 1.95))
     for i, (run, name, fallback_h) in enumerate(RUNS):
         p = os.path.join(run, "logs", "metrics.jsonl")
         rows = []
@@ -383,9 +381,16 @@ def curves(paper):
                 x = sorted(acc[k])
                 A.plot(x, [float(np.mean(acc[k][v])) for v in x], color=c, lw=1.3, label=k)
             A.axhline(chance, color="k", ls=":", lw=0.9)
+            # THE DEPLOYED CHECKPOINT. The probe peaks early and then drifts down -- ordinary
+            # overfitting on 12k pairs -- and early stopping on val loss means the head that ships is
+            # the best one, not the last. Marking it stops the decline reading as what we deployed.
+            xb = max(acc["val"], key=lambda k: float(np.mean(acc["val"][k])))
+            A.axvline(xb, color="tab:green", lw=0.9, ls="--")
+            A.text(xb, A.get_ylim()[0], " deployed", fontsize=5.5, color="tab:green", ha="left",
+                   va="bottom")
             A.text(0.98, chance, "chance", ha="right", va="bottom", fontsize=6, color="k",
                    transform=A.get_yaxis_transform())
-            A.set_title(f"{name}  (steering probe)", fontsize=8)
+            A.set_title(name, fontsize=8)
             A.set_xlabel("epoch", fontsize=7); A.set_ylabel("probe accuracy", fontsize=7)
             A.tick_params(labelsize=6); A.grid(alpha=0.25); A.legend(fontsize=6)
             A.set_ylim(0.0, None)
@@ -417,11 +422,12 @@ def curves(paper):
             if cur[k]:
                 x = sorted(cur[k])
                 A.plot(x, [cur[k][v] for v in x], color=c, lw=1.3, label=k)
-        A.set_title(f"{name}  ({pair.split('/')[-1]})", fontsize=8)
+        A.set_title(name, fontsize=8)
         A.set_xlabel("epoch", fontsize=7); A.tick_params(labelsize=6); A.grid(alpha=0.25)
         if cur["train"] or cur["val"]:
             A.legend(fontsize=6)
-        A.set_ylabel("loss", fontsize=7)
+        if i == 0:
+            A.set_ylabel("loss", fontsize=7)
         h = float(np.mean(hrs)) if hrs else fallback_h
         if h:
             # UNIT PER PANEL. The world model took 45 h and the Reward Model 91 s; one axis in hours makes
@@ -430,7 +436,7 @@ def curves(paper):
             mul, unit = (60.0, "min") if span < 0.2 else (1.0, "h")
             tw = A.twiny(); tw.set_xlim(*[x * h * mul for x in A.get_xlim()])
             tw.set_xlabel(f"wall clock ({unit})", fontsize=7); tw.tick_params(labelsize=6)
-    fig.tight_layout(h_pad=1.6)
+    fig.tight_layout(w_pad=1.1)
     f = os.path.join(paper, "figures", "training-curves.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print(f"  figures/training-curves.png")

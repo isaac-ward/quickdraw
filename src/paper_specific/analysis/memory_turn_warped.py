@@ -45,7 +45,7 @@ from quickdraw.training.setup import (build_model, image_head_cams, image_head_s
                                       normalizer, resolve_data_root)
 
 PRE, POST = 10, 14          # real steps kept either side of the warped turn
-FS = 9.5                    # ONE font size for every label in this figure, 1.5x the old 6.4
+FS = 6.4                    # ONE font size for every label; the figure is ONE COLUMN wide
 METRICS = [("l1", "open-loop $L_1$"), ("l2", "open-loop $L_2$"), ("lpips", "open-loop LPIPS")]
 
 
@@ -260,10 +260,10 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     x0 = float(g[have][0])
     gx = g - x0
     t_away, t_back, t_end = -x0, D - x0, float(gx[have][-1])
-    fig = plt.figure(figsize=(7.1, 5.6))
+    fig = plt.figure(figsize=(3.4, 4.4))
     # the images take the larger share, and the gap holds the braces and their labels
-    outer = fig.add_gridspec(2, 1, height_ratios=(1.42, 1.30), hspace=0.24)
-    gim = outer[0].subgridspec(2, 3, hspace=0.0, wspace=0.16)
+    outer = fig.add_gridspec(2, 1, height_ratios=(1.15, 1.45), hspace=0.30)
+    gim = outer[0].subgridspec(2, 3, hspace=0.0, wspace=0.08)
     gcur = outer[1].subgridspec(2, 1, hspace=0.0, height_ratios=(1.15, 1.0))
     im_axes, top_axes = [], []
     for c, (lab, k) in enumerate(EV):
@@ -273,7 +273,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
             A.imshow(img, interpolation="bilinear", aspect="auto")
             A.set_xticks([]); A.set_yticks([])
             for sp_ in A.spines.values():
-                sp_.set_linewidth(1.4); sp_.set_color("black")
+                sp_.set_linewidth(0.9); sp_.set_color("black")
             if c == 0:
                 A.set_ylabel(nm, fontsize=FS)
             if r == 1:
@@ -310,11 +310,12 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     inv = fig.transFigure.inverted()
     # the brace sits high enough that its two-line label clears the axes below it
     y_br = AC.get_position().y1 + 0.018
+    steps = [int(np.clip(k, 0, len(pred_fr) - 1)) + 1 for _, k in EV]
     for i, ((xa, xb), A, txt) in enumerate(zip(((0.0, t_away), (t_away, t_back), (t_back, t_end)),
                                                im_axes,
-                                               ("Looking at\naltered region",
-                                                "Looking away from\naltered region",
-                                                "Looking back at\naltered region"))):
+                                               (f"Looking at\naltered region ($+${steps[0]})",
+                                                f"Looking away from\naltered region ($+${steps[1]})",
+                                                f"Looking back at\naltered region ($+${steps[2]})"))):
         fa = inv.transform(AC.transData.transform((xa, 0)))[0]
         fb = inv.transform(AC.transData.transform((xb, 0)))[0]
         col = A.get_position()

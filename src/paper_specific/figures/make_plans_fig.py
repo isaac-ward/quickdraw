@@ -26,16 +26,14 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
-RUN = "/app/logs/eval_steer_2026_09_14_21_57_53_best_prior_guided"
+RUN = "/app/logs/eval_steer_2026_09_15_16_33_40_plans8"   # 3 requests x 8 contexts, video on
 OUT = "/app/logs/paper_icra_2027/plans.png"
 IMG_H = 112                # the starling camera; rows below this in the mp4 are the caption bar
 N_SHOW = 6
 FS = 9.5
-# (request, plan folder) -- each one VLM-confirmed. Two objects and one region, so the figure shows both
-# kinds of request the reward head was trained on.
-PLANS = [("black panel", "plans/black_panel/ep003_t0367"),
-         ("table", "plans/table/ep004_t0055"),
-         ("floor to ceiling glass wall", "plans/floor_to_ceiling_glass_wall/ep004_t0055")]
+# THE CONTACT SHEET, for choosing from: three requests, every context that was planned for each. The
+# final figure keeps a subset -- this iteration shows them all so the illustrative ones can be picked.
+REQS = ["table", "mannequin", "clock"]
 
 
 def frames(path):
@@ -52,33 +50,34 @@ def frames(path):
 
 def main() -> int:
     rows = []
-    for req, rel in PLANS:
-        d = os.path.join(RUN, "logs", "epoch_0000", "eval_steer", rel)
-        fr = frames(os.path.join(d, "image.mp4"))
-        H = len(fr)
-        ks = np.unique(np.linspace(0, H - 1, N_SHOW).round().astype(int))
-        rows.append((req, fr[ks], ks, H))
-        print(f"  {req:32s} {H} steps -> " + ", ".join(f"+{k + 1}" for k in ks))
+    for req in REQS:
+        folder = req.replace(" ", "_")
+        for d in sorted(glob.glob(os.path.join(RUN, "logs", "epoch_*", "eval_steer", "plans", folder,
+                                               "*"))):
+            fr = frames(os.path.join(d, "image.mp4"))
+            H = len(fr)
+            ks = np.unique(np.linspace(0, H - 1, N_SHOW).round().astype(int))
+            rows.append((req, os.path.basename(d), fr[ks], ks, H))
+    print(f"  {len(rows)} demonstrations over {len(REQS)} requests")
 
-    ih, iw = rows[0][1][0].shape[:2]
-    NC = len(rows[0][2])
-    fig = plt.figure(figsize=(7.1, 7.1 * (len(rows) * ih * 1.68) / (NC * iw)))
-    # THREE rows per plan: the prompt, the frames, and a spacer -- with hspace=0 (which the frames want)
-    # the step numbers under one row otherwise land on the next row's prompt.
-    gs = fig.add_gridspec(3 * len(rows), NC, hspace=0.0, wspace=0.02,
-                          height_ratios=[0.34, 1.0, 0.34] * len(rows))
-    for r, (req, imgs, ks, H) in enumerate(rows):
-        lab = fig.add_subplot(gs[3 * r, :]); lab.axis("off")
-        lab.text(0.0, 0.10, "\u201c" + req + "\u201d", ha="left", va="bottom", fontsize=FS + 1.0,
+    ih, iw = rows[0][2][0].shape[:2]
+    NC = len(rows[0][3])
+    fig = plt.figure(figsize=(7.1, 7.1 * (len(rows) * ih * 1.62) / (NC * iw)))
+    gs = fig.add_gridspec(2 * len(rows), NC, hspace=0.0, wspace=0.02,
+                          height_ratios=[0.52, 1.0] * len(rows))
+    for r, (req, ctx, imgs, ks, H) in enumerate(rows):
+        lab = fig.add_subplot(gs[2 * r, :]); lab.axis("off")
+        lab.text(0.0, 0.16, "\u201c" + req + "\u201d", ha="left", va="bottom", fontsize=FS,
                  style="italic")
+        lab.text(1.0, 0.16, ctx, ha="right", va="bottom", fontsize=FS - 2.0, color="0.45")
         for c in range(NC):
-            A = fig.add_subplot(gs[3 * r + 1, c])
-            A.imshow(imgs[c], interpolation="bilinear", aspect="auto")
+            A = fig.add_subplot(gs[2 * r + 1, c])
+            A.imshow(imgs[c], interpolation="bilinear")
             A.set_xticks([]); A.set_yticks([])
             for sp in A.spines.values():
-                sp.set_linewidth(1.4); sp.set_color("black")
-            A.set_xlabel(f"$+${ks[c] + 1}", fontsize=FS - 1.0, labelpad=1.5)
-    fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
+                sp.set_linewidth(1.2); sp.set_color("black")
+            A.set_title(f"$+${ks[c] + 1}", fontsize=FS - 1.5, pad=1.5)
+    fig.savefig(OUT, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"  wrote {OUT}  ({os.path.getsize(OUT) / 1e6:.1f} MB)")
     return 0
 

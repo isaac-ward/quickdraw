@@ -107,7 +107,7 @@ BLK_LABELS   = False      # draw A/B/C on the three faces so they can be referre
 # predicted slice, because the reward is read on IMAGINED latents), a sentence entering from below, and
 # one scalar out.
 RM_ON        = True
-RM_TITLE     = "Reward model\n(contrastive)"
+RM_TITLE     = "Reward head\n(contrastive)"
 RM_LAT       = "MLP $f_z$"            # the latent branch, fed by the brace, drawn ON TOP
 RM_TXT       = "MiniLM + MLP $f_t$"   # the text branch, fed by the request, drawn BELOW it
 RM_COS       = "cosine"
@@ -171,6 +171,10 @@ PRED_STEPS   = 1       # ONE predicted slice in this variant. Everything downstr
 #                        decoder feeds leave that one slice's face, and each decoder emits one item.
 BLK_LW       = 1.1
 plt.rcParams["hatch.linewidth"] = BLK_LW * 2.7   # 3x the old 0.9x: a hatch that reads AS a hatch
+# ONE PLACE FOR HATCH TRANSPARENCY. Set per-patch it would need every hatched call site to split into a
+# fill and an overlay; hatch.color overrides the patch edge for hatch strokes only, so the outlines stay
+# solid and just the stripes go to 50%.
+plt.rcParams["hatch.color"] = (0.0, 0.0, 0.0, 0.5)
 # ---- decoders: mirrored trapezia off the RED blocks, producing the predicted frame and vector --------
 DEC_GAP      = 170.0     # red column's right face -> decoder input edge
 OUT_GAP      = 150.0     # decoder output edge -> the predicted item
@@ -1510,8 +1514,11 @@ def draw_box(ax, D, sx):
             # THE SAME WORD THE ACTION HEAD'S OUTPUT CARRIES: x_0 is a draw from this head's terminal
             # law, not its mean. Beside the vertical shaft rather than over it, since that shaft is
             # vertical and a label above it would sit on the box it just left.
-            ax.text(cx + MIN_SEG, 0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="left", va="center",
-                    fontsize=BOX_FS * 0.78, color=EDGE, zorder=Z_TOKENIZER + 5)
+            # ROTATED to run along the shaft it names: horizontal beside a vertical line reads as a
+            # label for something else.
+            ax.text(cx + MIN_SEG, 0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="center", va="bottom",
+                    rotation=90, rotation_mode="anchor", fontsize=BOX_FS * 0.78, color=EDGE,
+                    zorder=Z_TOKENIZER + 5)
             ROUTES.append((D["title"].splitlines()[0], "x_0", f"45 arrival x {len(legs)}"))
             kind = "up-and-out"
         else:
@@ -1749,19 +1756,15 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                     ax.add_patch(Rectangle((ox, oy), D["ow"], D["oh"], fill=False, ec=VIS_EC,
                                            lw=LW * 2, zorder=zt + 0.5))
                 elif PRED_OBS is not None:
-                    # FLAT, and re-centred on the arrow: horizontal makes the tile CELL tall rather than
-                    # D*CELL, so the oy computed for a column would hang it below the tip.
-                    _p_prop_vec(ax, ox, D["out_cy"] - CELL / 2 + t_ * OFFSET_Y, D["ow"], D["oh"],
-                                PRED_OBS[t_], 1.0, zt, hatch=PRED_HATCH, horizontal=True)
+                    _p_prop_vec(ax, ox, oy, D["ow"], D["oh"], PRED_OBS[t_], 1.0, zt,
+                                hatch=PRED_HATCH)
                 else:
                     D["draw"](ax, ox, oy, D["ow"], D["oh"], PRED_AT, 1.0, zt)
     if dit:
         sx = LAYERS[0]["sx"]
         draw_box(ax, DT, sx)
-        # h is labelled on the SHARED STEM, before the bus splits it -- putting it on one branch would
-        # read as though only that head gets it.
-        ax.text(BB["x1"] + sx + 0.4 * DT_GAP, BB["out_y"] - MIN_SEG, "$h$", ha="center", va="bottom",
-                fontsize=BB_FS, color=EDGE, zorder=Z_ARROW + 1)
+        # (the `h` label that used to sit on the shared stem is gone: the text says what h is, and the
+        #  figure was carrying a symbol nothing else in it defines)
     if action_head:
         # THE BOX. Its h arrives as one branch of the summariser's fan (draw_box, flow > 0), because that
         # fan is one connected set of lines and splitting it across two render calls would let one halo
@@ -1794,34 +1797,33 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         # runs from the ACTION (blue) block's left edge to the PROPRIOCEPTION (orange) block's right
         # edge exactly, which is the width of the token bag the reward reads. The lift is BRACE_M, the
         # same depth as the summariser's input brace.
-        bl = min(b[0] for b in LAYERS[-1]["blk_box"]) + sx
-        br = max(b[2] for b in LAYERS[1]["blk_box"]) + sx
-        by = max([b[3] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[3]]) + dy_
-        poly, mid = brace_between((bl, by), (br, by), RM_GAP_BR, u=(1.0, 0.0), off=(0.0, 1.0))
+        # FLUSH WITH THE BLUE CUBOID, and built exactly the way the summariser's input brace is built --
+        # from the block's OWN bottom edge rather than from a bounding box. The action block's depth edge
+        # runs at the cascade angle (ISO_C, ISO_S is OFFSET_X, OFFSET_Y normalised), which is why
+        # brace_between's default direction is the right one here: same primitive, lift the other way.
+        _O = np.asarray(LAYERS[-1]["blk_O"][0], float) + np.array([sx, dy_])
+        _d = LAYERS[-1]["blks"][0][0]
+        _vdu = np.array([-BLK_S * ISO_C, -BLK_S * ISO_S])
+        poly, mid = brace_between(tuple(_O + _vdu * _d), tuple(_O), RM_GAP_BR)
         draw_arrow(ax, poly, Z_ARROW)
         # SAME RENDERING AS THE HEADS: outer box at ENC_LW with a BOX_FS title, internals at ENC_LW*0.6
         # with BB_FS text, which is what draw_box uses -- the reward model was drawn at its own weights
         # and read as a different kind of object.
         sub_h = text_extent(RM_LAT, BB_FS)[1] * 2.5
-        w_lat = text_extent(RM_LAT, BB_FS)[0] + 1.7 * RM_PAD
-        w_txt = text_extent(RM_TXT, BB_FS)[0] + 1.7 * RM_PAD
-        w_br = max(w_lat, w_txt)
-        w_cos = text_extent(RM_COS, BB_FS)[0] + 1.7 * RM_PAD
         ttl_h = text_extent(RM_TITLE, BOX_FS)[1]
-        rw = 2 * RM_PAD + w_br + RM_COS_GAP + w_cos
         rh = 2 * RM_PAD + ttl_h + 2 * sub_h + RM_ROW_SEP
-        # RIGHT EDGE IN LINE WITH THE DECODERS', and never further left than the blue cuboid's right
-        # edge, so the block does not sit under the column it hangs off.
-        blue_r = max(b[2] for b in LAYERS[-1]["blk_box"]) + sx
-        rx1 = DEC_BOX[2] + sx
-        rx0 = max(rx1 - rw, blue_r + 2 * MIN_SEG)
-        rx1 = rx0 + rw
+        # ALIGNED WITH THE TWO HEADS: same left and right edges as the observation and action head
+        # boxes, so the three things the model runs read as one column of boxes.
+        rx0, rx1 = AH["x0"] + sx, AH["x1"] + sx
+        rw = rx1 - rx0
         ry0 = mid[1] + RM_GAP_BOX
         ax.add_patch(PathPatch(rounded_polygon([(rx0, ry0), (rx1, ry0), (rx1, ry0 + rh), (rx0, ry0 + rh)],
                                                CORNER_R), fc=ENC_FC, ec=BOX_EC, lw=ENC_LW,
                                zorder=Z_TOKENIZER))
         ax.text(0.5 * (rx0 + rx1), ry0 + RM_PAD * 0.45 + ttl_h / 2, RM_TITLE, ha="center", va="center",
                 fontsize=BOX_FS, linespacing=1.3, zorder=Z_TOKENIZER + 4)
+        w_cos = text_extent(RM_COS, BB_FS)[0] + 1.7 * RM_PAD
+        w_br = rw - 2 * RM_PAD - RM_COS_GAP - w_cos          # the branches take what the box leaves them
         bx0 = rx0 + RM_PAD
         y_lat = ry0 + RM_PAD + ttl_h + sub_h / 2
         y_txt = y_lat + sub_h + RM_ROW_SEP

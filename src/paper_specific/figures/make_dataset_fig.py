@@ -38,13 +38,13 @@ ENDS = (304, 1664)                    # the frame each sequence ends on. The sec
 IMG_W = 300.0                         # image width in figure units
 CELL = IMG_W / 8.0                    # TWICE the old cell: the 16-vector is drawn as 8 x 2 rather than
 #                                       16 x 1, which doubles the cell without widening the column
-LW, EDGE = 0.9, "#000000"
+LW, EDGE = 1.4, "#000000"   # 0.0375 x CELL, which is figure 4's LW/CELL ratio exactly
 IMG_LW = 0.9                          # matched to the architecture figure RELATIVE TO THE IMAGE: its
 #                                       outline is 2.4 pt on a 3 in image, and here the image is 1.1 in
 CMAP = {"vision": "Greens", "proprio": "Oranges", "action": "Blues"}
 CMAP_LO, CMAP_HI = 0.20, 0.95         # the window make_sequence_figs uses; a white cell reads as empty
-ACT_LO = 0.55                         # ACTION cells use only the BRIGHT half of their map, so the white
-#                                       needle on them stays legible
+# NO SEPARATE ACTION WINDOW: figure 4 draws all three streams through CMAP_LO..CMAP_HI, and a different
+# window here made the same data look like a different figure.
 # make_sequence_figs draws the architecture on a 7663 px canvas for one \textwidth (7.16 in) = 1070
 # px/in. This figure is one \columnwidth (3.4 in) wide on the page, so it needs ~3640 px to match.
 DPI = 520
@@ -112,7 +112,7 @@ def main() -> int:
             ax.add_patch(Rectangle((x, y0), IMG_W, img_h, fill=False, ec=vis, lw=IMG_LW))
         y_s = y0 + img_h + gap
         cells(ax, o, xs, y_s, CMAP["proprio"], rows=2)
-        cells(ax, a, xs, y_s + 2 * CELL + gap, CMAP["action"], rows=1, lo=ACT_LO, needles=True)
+        cells(ax, a, xs, y_s + 2 * CELL + gap, CMAP["action"], rows=1, needles=True)
         y_t = y_s + 3 * CELL + gap + 30
         ax.annotate("", xy=(xs[-1] + IMG_W, y_t), xytext=(0, y_t),
                     arrowprops=dict(arrowstyle="-|>", lw=1.1, color="#4d4d4d"))
