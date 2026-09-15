@@ -25,6 +25,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.colors
 import matplotlib.pyplot as plt
+import cv2
 import numpy as np
 from matplotlib.patches import Circle, Ellipse, FancyArrow, PathPatch, Polygon, Rectangle
 from matplotlib.path import Path
@@ -122,7 +123,7 @@ RM_COS_GAP   = 110.0     # branch boxes -> the cosine: the two feed arrows have 
 #                          tall and the figure has no room under the token column for that
 RM_PAD       = 26.0
 RM_GAP_BR    = BRACE_M   # column bottom -> brace line: THE SAME LIFT the summariser's input brace uses
-RM_GAP_BOX   = 94.0      # brace line -> box top (lowered twice now, at the author's ask)
+RM_GAP_BOX   = 102.0     # brace line -> box top (lowered three times now, at the author's ask)
 RM_GAP_TXT   = 70.0      # box -> the sentence, which sits to its LEFT
 # ---- Z ORDER (one place, because the stacking rules are not obvious) --------------------------------
 # RULE: A FEED ARROW MUST NEVER CROSS A TOKENIZER OUTLINE. The tokenizers therefore sit ABOVE every
@@ -1559,8 +1560,9 @@ def draw_box(ax, D, sx):
             # label for something else.
             # CENTRED ON ITS OWN BOX, offset clear of the shaft. rotation_mode="anchor" put the
             # baseline on the line itself, so the word straddled it whatever the offset.
-            ax.text(cx + 2.2 * MIN_SEG + text_extent(SAMPLE_LAB, BOX_FS * 0.78)[1],
-                    0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="center", va="center", rotation=90,
+            # rotation 270, NOT 90: turned end over end so it reads down the shaft.
+            ax.text(cx + 2.2 * MIN_SEG + text_extent(SAMPLE_LAB, BOX_FS * 0.78)[1] - 4.0,
+                    0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="center", va="center", rotation=270,
                     fontsize=BOX_FS * 0.78, color=EDGE, zorder=Z_TOKENIZER + 5)
             ROUTES.append((D["title"].splitlines()[0], "x_0", f"45 arrival x {len(legs)}"))
             kind = "up-and-out"
@@ -1647,7 +1649,7 @@ def draw_legend(ax):
 
 
 def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, backbone=False, dit=False,
-           pred=False, decoders=False, group=False, action_head=False, legend=False,
+           pred=False, decoders=False, group=False, action_head=False, legend=False, crop_bottom=False,
            reward=False):
     """`items` = indices of LAYERS whose cascades to draw. Every component uses the SAME canvas, so the
     outputs stack exactly."""
@@ -1902,8 +1904,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         _cell(px0, y_lat, w_prj, RM_LAT)
         _cell(bx0, y_txt, w_enc, RM_ENC)
         _cell(px0, y_txt, w_prj, RM_TXT)
-        draw_arrow(ax, [(bx0 + w_enc, y_txt), (bx0 + w_enc + RM_ROW_SEP - ARROW_L * 0.7, y_txt)],
-                   Z_TOKENIZER + 2.5, tip=(bx0 + w_enc + RM_ROW_SEP, y_txt), head_dir=(1.0, 0.0))
+        draw_arrow(ax, [(bx0 + w_enc, y_txt), (bx0 + w_enc + RM_ROW_SEP, y_txt)], Z_TOKENIZER + 2.5)
         cx0 = bx0 + w_br + cos_gap
         y_cos = 0.5 * (y_lat + y_txt)
         ax.add_patch(PathPatch(rounded_polygon([(cx0, y_cos - sub_h / 2), (cx0 + w_cos, y_cos - sub_h / 2),
@@ -1949,6 +1950,13 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         draw_legend(ax)
     fig.savefig(path, transparent=True, dpi=DPI, pad_inches=0)
     plt.close(fig)
+    if crop_bottom:
+        im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        rows = np.where(im[:, :, 3].max(axis=1) > 0)[0]
+        keep = min(im.shape[0], int(rows[-1] + 1 + MARGIN * DPI / 100))
+        cv2.imwrite(path, im[:keep])
+        print(f"  wrote {path.split('/')[-1]}  (bottom trimmed {im.shape[0] - keep} px)")
+        return
     print(f"  wrote {path.split('/')[-1]}")
 
 
@@ -1970,7 +1978,7 @@ render(f"{ELEM}/legend.png", legend=True)
 render(f"{ELEM}/reward.png", reward=True)
 render(f"{OUT}/architecture.png", items=(0, 1, 2), braces=True, tokenizers=True, blocks=True,
        backbone=True, dit=True, pred=True, decoders=True, group=LD_ON, action_head=True,
-       legend=True, reward=True)
+       legend=True, reward=True, crop_bottom=True)
 print(f"  canvas {int(CANVAS_W * DPI / 100)} x {int(CANVAS_H * DPI / 100)} px, identical for every component")
 print(f"\n  ONE SPACING, both axes: {_GAP:.1f} u ({_GAP * 3:.0f} px)")
 print(f"    MEASURED as proprioception riser x - right edge of the last image item, then reused as the")

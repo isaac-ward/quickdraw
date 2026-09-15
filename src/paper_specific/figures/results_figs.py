@@ -229,9 +229,15 @@ def ood(paper, dev="cuda"):
         return eps, c
 
     def mark_context(A):
-        # a SOLID line named in the legend, not text on the plot: the first P frames are context, so
-        # there is no prediction to the left of it
-        A.axvline(P, color="black", ls="-", lw=1.2, label="Prediction starts")
+        # A DASHED LINE plus the hatched span it bounds, both named in the legend rather than written on
+        # the plot. Everything left of the line is context, so there is no prediction there at all --
+        # hatching it says that, where an unmarked white gap read as a flat score.
+        A.axvline(P, color="black", ls="--", lw=1.2, label="Prediction starts")
+        # SPARSE AND PALE. At "///" in mid grey the hatch was the loudest thing in the panel; it is
+        # background, so it reads as background. hatch.linewidth is an rcParam, not a patch property.
+        plt.rcParams["hatch.linewidth"] = 0.6
+        A.axvspan(0, P, facecolor="none", edgecolor="0.72", hatch="//", lw=0.0,
+                  label="Context frames")
 
     # ================= (a) VISUAL =====================================================================
     split, chan, chan_lab = "eval_ood_noodle", "latent_cos", "Latent surprise"
@@ -340,7 +346,7 @@ def ood(paper, dev="cuda"):
     A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("Prediction step", fontsize=FS)
     A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25)
     mark_context(A)
-    A.legend(fontsize=FS - 1.5, loc="upper left")
+    A.legend(fontsize=FS - 1.5, loc="upper center")
     f = os.path.join(paper, "figures", "ood-visual.png")
     fig.savefig(f, dpi=DPI); plt.close(fig)            # NO bbox_inches: tight would re-trim the margins
     print("  figures/ood-visual.png")
@@ -417,11 +423,15 @@ def curves(paper):
              "World Model", None),
             ("logs/paper_icra_2027/model_backups/train_action_2026_09_14_04_41_17_s2_ah_chunk32_full",
              "Action Model", None),
-            # The reward model logs no epoch timing: it trains in 91 s wall clock (08:19:40 -> 08:21:11 in
-            # its progress.log) over 300 epochs, so the per-epoch figure is passed in rather than averaged
-            # from a series that does not exist.
-            ("logs/paper_icra_2027/result_backups/train_reward_model_2026_09_14_08_19_38_reward_starling_v5",
-             "Reward Model", 91.0 / 3600.0 / 300.0)]
+            # THE DENSE RE-RUN, report_every=1. The deployed head logged every 10th epoch, so inside the
+            # first twenty the curve had three points and read as two straight segments. Same config,
+            # same seed; it lands at val 6.211 @ ep 8 against the deployed head's 6.233 @ ep 10, because
+            # evaluating every epoch draws from the same CUDA generator the batching does and the
+            # trajectories diverge. The head that SHIPS is still the original -- the steering evals ran
+            # against it -- this run exists to draw the curve.
+            # It logs no epoch timing either: 93 s wall clock (20:17:15 -> 20:18:48) over 89 epochs.
+            ("logs/train_reward_model_2026_09_15_20_17_13_rw_dense",
+             "Reward Model", 93.0 / 3600.0 / 89.0)]
     # ONE ROW, NOT THREE. Stacked, three panels with their own x axis and a twin wall-clock axis
     # each cost 5.4 inches of page; side by side they cost 1.9, and nothing about the curves needs the
     # extra width -- they are each a single decaying line.
@@ -464,11 +474,11 @@ def curves(paper):
                 A.plot(x, [cur[k][v] for v in x], color=c, lw=1.3, label=k)
         A.set_title(name, fontsize=8)
         A.set_xlabel("Epoch", fontsize=7); A.tick_params(labelsize=6); A.grid(alpha=0.25)
-        if name == "Reward Model":
-            # ZOOMED TO THE FIRST 20 EPOCHS. Everything happens there -- val bottoms at epoch 10 and the
-            # remaining 70 are flat -- and the wall-clock axis follows, because it is derived from this
-            # limit. The chance and best-attainable lines are gone; the numbers live in the caption.
-            A.set_xlim(0, 20)
+        # ZOOMED PAST THE FLAT TAIL, per panel. Each model's curve is over well before its last epoch,
+        # and the wall-clock axis follows because it is derived from this limit.
+        XLIM = {"World Model": 30, "Action Model": 50, "Reward Model": 20}
+        if name in XLIM:
+            A.set_xlim(0, XLIM[name])
         if cur["train"] or cur["val"]:
             A.legend(fontsize=6)
         if i == 0:
