@@ -27,6 +27,8 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import PathPatch
+from matplotlib.path import Path
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -66,6 +68,37 @@ def open_loop_multi(core, norm, o, a, fr, key, P, dev, want_frames=False):
         return np.arange(P, P + H), cur
     fr8 = ((pred.cpu().numpy() * 255).astype(np.uint8), (true.cpu().numpy() * 255).astype(np.uint8))
     return np.arange(P, P + H), cur, fr8
+
+
+def rounded_path(pts, r):
+    """Open polyline with interior corners rounded to radius ~r -- copied from
+    paper_specific/figures/make_sequence_figs.py, which is where the paper's braces come from. A stroked
+    polyline's `round` joinstyle only rounds by half the line width, so it cannot honour a radius; this
+    trims each corner back by r along both edges and joins them with a quadratic through the vertex."""
+    pts = [np.asarray(q, float) for q in pts]
+    rs = [float(r)] * max(0, len(pts) - 2)
+    verts, codes = [pts[0]], [Path.MOVETO]
+    for i in range(1, len(pts) - 1):
+        prev, cur, nxt = pts[i - 1], pts[i], pts[i + 1]
+        u_in, u_out = cur - prev, nxt - cur
+        l_in, l_out = np.linalg.norm(u_in) or 1.0, np.linalg.norm(u_out) or 1.0
+        dd = min(rs[i - 1], 0.5 * l_in, 0.5 * l_out)
+        verts += [cur - dd * u_in / l_in, cur, cur + dd * u_out / l_out]
+        codes += [Path.LINETO, Path.CURVE3, Path.CURVE3]
+    verts.append(pts[-1]); codes.append(Path.LINETO)
+    return Path(verts, codes)
+
+
+def brace_up(fig, xa, xb, y, up_to, x_stem, r=0.010, **kw):
+    """ONE brace: a flat span from xa to xb at y, ends turned down, and a stem from its middle up to
+    (x_stem, up_to). Figure coordinates."""
+    mid = 0.5 * (xa + xb)
+    pts = [(xa, y - 0.013), (xa, y), (mid, y), (mid, y + 0.012)]
+    fig.add_artist(PathPatch(rounded_path(pts, r), fill=False, transform=fig.transFigure, **kw))
+    pts = [(xb, y - 0.013), (xb, y), (mid, y), (mid, y + 0.012)]
+    fig.add_artist(PathPatch(rounded_path(pts, r), fill=False, transform=fig.transFigure, **kw))
+    fig.add_artist(PathPatch(rounded_path([(mid, y + 0.012), (mid, up_to - 0.016), (x_stem, up_to)],
+                                          r), fill=False, transform=fig.transFigure, **kw))
 
 
 def warp(steps, away, back, D):
@@ -182,26 +215,52 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     fig.savefig(f, dpi=120); plt.close(fig)
 
     # ---- the PAPER figure: one split, the three image errors, the heading, and what it looks like ----
-    # BACKWALL2 ONLY. Averaging two splits with opposite turn directions and different approaches put two
-    # stories in one axis; the author asked for the cleaner split, and every claim in the text is stated
-    # per split anyway.
+    # BACKWALL2 ONLY, as asked: averaging two splits with opposite turn directions put two stories in one
+    # axis. The three errors SHARE an axis (they are all in 0..0.5) and sit directly above the heading
+    # they are explained by, on one x axis that starts at 0.
     SP = MEM[1]
     d = allsp[SP]
-    g, D, feat = d["grid"], d["D"], d["feat"]
+    g, D = d["grid"], d["D"]
+    # THE FEATURED EPISODE IS CHOSEN SO THE RETURN IS REAL. "back" is the first step where the heading is
+    # within 25 deg of its start, which is not the same as being back in front of the wall -- in the first
+    # version the final Truth frame was still facing away. Score every candidate by how closely SOME
+    # post-return truth frame matches its pre-turn truth frame, and feature the episode that returns
+    # best; the frame shown is that matching step, not `back` itself.
+    cands = []
+    for r in recs:
+        if r["away"] < P + 2 or r["back"] >= r["steps"][-1]:
+            continue
+        pf, tf = r["frames"]
+        kb = int(r["away"] - P)                                   # the pre-turn step, in rollout index
+        post = range(int(r["back"] - P), len(tf))
+        if kb < 0 or not len(post):
+            continue
+        dif = [(float(np.abs(tf[k].astype(np.float32) - tf[kb].astype(np.float32)).mean()), k)
+               for k in post]
+        best_d, best_k = min(dif)
+        cands.append((best_d, r, kb, best_k))
+    cands.sort(key=lambda x: x[0])
+    _, feat, k_before, k_after = cands[0]
     pred_fr, true_fr = feat["frames"]
-    # The three moments, in the FEATURED episode's own step index: last step before it turns away, the
-    # middle of its turn, and the first step after it is facing the scene again.
-    off = feat["steps"][0]
-    EV = [("before the turn", feat["away"]), ("during the turn", (feat["away"] + feat["back"]) // 2),
-          ("back facing it", feat["back"])]
-    fig = plt.figure(figsize=(7.1, 4.6))
-    outer = fig.add_gridspec(3, 1, height_ratios=(2.0, 1.25, 0.95), hspace=0.34)
-    # NESTED, so the Truth frame touches the Predicted frame above it (hspace 0) while the blocks below
-    # keep their own spacing -- one flat gridspec cannot do both.
+    k_during = int((feat["away"] + feat["back"]) // 2 - P)
+    print(f"  featured ep{feat['ep']}: away {feat['away']} back {feat['back']} | frames at rollout steps "
+          f"{k_before}, {k_during}, {k_after} | return match {cands[0][0]:.1f}/255 mean abs")
+    EV = [("before the turn", k_before), ("during the turn", k_during), ("facing it again", k_after)]
+
+    # RE-ZERO ON THE FIRST DATA POINT, not on the grid: the grid starts before any episode contributes,
+    # which is where the leading empty stretch and the negative ticks came from.
+    have = np.sum(~np.isnan(d[METRICS[0][0]]), axis=0) >= 1
+    x0 = float(g[have][0])
+    gx = g - x0
+    t_away, t_back, t_end = -x0, D - x0, float(gx[have][-1])
+    fig = plt.figure(figsize=(7.1, 5.3))
+    # the images take the larger share, and the gap holds the braces and their labels
+    outer = fig.add_gridspec(2, 1, height_ratios=(1.60, 1.25), hspace=0.42)
     gim = outer[0].subgridspec(2, 3, hspace=0.0, wspace=0.16)
-    gmet = outer[1].subgridspec(1, 3, wspace=0.30)
-    for c, (lab, t) in enumerate(EV):
-        k = int(np.clip(t - off, 0, len(pred_fr) - 1))
+    gcur = outer[1].subgridspec(2, 1, hspace=0.0, height_ratios=(1.15, 1.0))
+    im_axes = []
+    for c, (lab, k) in enumerate(EV):
+        k = int(np.clip(k, 0, len(pred_fr) - 1))
         for r, (img, nm) in enumerate(((pred_fr[k], "Predicted"), (true_fr[k], "Truth"))):
             A = fig.add_subplot(gim[r, c])
             A.imshow(img, interpolation="bilinear"); A.set_xticks([]); A.set_yticks([])
@@ -209,38 +268,46 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
                 sp_.set_linewidth(1.4); sp_.set_color("black")
             if c == 0:
                 A.set_ylabel(nm, fontsize=7.5)
-            if r == 0:
-                A.set_title(f"{lab}   (step $+${k + 1})", fontsize=7.5)
-    for c, (kk, name) in enumerate(METRICS):
-        A = fig.add_subplot(gmet[0, c])
+            if r == 1:
+                im_axes.append(A)
+    AC = fig.add_subplot(gcur[0])
+    for (kk, name), col in zip(METRICS, ("tab:blue", "tab:green", "tab:red")):
         S = d[kk]
-        mu = np.nanmean(S, axis=0)
-        cnt = np.sum(~np.isnan(S), axis=0)
+        mu = np.nanmean(S, axis=0); cnt = np.sum(~np.isnan(S), axis=0)
         sem = np.nanstd(S, axis=0) / np.sqrt(np.maximum(1, cnt))
         keep = cnt >= 1                          # EVERY step with data, however few episodes reach it
-        A.plot(g[keep], mu[keep], color="tab:red", lw=1.5)
-        A.fill_between(g[keep], (mu - sem)[keep], (mu + sem)[keep], color="tab:red", alpha=0.18)
-        A.axvspan(0, D, color="tab:orange", alpha=0.12, lw=0)
-        A.axvline(0, color="k", ls="--", lw=0.8); A.axvline(D, color="k", ls="--", lw=0.8)
-        A.set_title(name, fontsize=8); A.grid(alpha=0.25); A.tick_params(labelsize=6.5)
-        A2 = A.twinx()                           # how many episodes each point averages
-        A2.plot(g[keep], cnt[keep], color="0.55", lw=0.7, ls=":")
-        A2.set_ylim(0, d["n"] + 0.5)
-        if c == 2:
-            A2.tick_params(labelsize=5.5, colors="0.45")
-            A2.set_ylabel("episodes averaged", fontsize=6, color="0.45")
-        else:
-            A2.set_yticks([])
-    A = fig.add_subplot(outer[2])
+        AC.plot(gx[keep], mu[keep], color=col, lw=1.5, label=name.replace("open-loop ", ""))
+        AC.fill_between(gx[keep], (mu - sem)[keep], (mu + sem)[keep], color=col, alpha=0.16)
+    AC.set_ylabel("Prediction\nerror", fontsize=8)
+    AC.legend(fontsize=7, ncol=1, loc="lower right", handlelength=1.2, borderpad=0.35,
+              labelspacing=0.25, framealpha=0.85)
+    AH = fig.add_subplot(gcur[1], sharex=AC)
     S = d["heading"]
     mu = np.nanmean(S, axis=0); cnt = np.sum(~np.isnan(S), axis=0); keep = cnt >= 1
-    A.plot(g[keep], mu[keep], color="tab:blue", lw=1.6)
-    A.axvspan(0, D, color="tab:orange", alpha=0.12, lw=0)
-    A.axvline(0, color="k", ls="--", lw=0.8); A.axvline(D, color="k", ls="--", lw=0.8)
-    A.axhline(0, color="k", ls=":", lw=0.7)
-    A.set_ylabel("heading change (deg)", fontsize=8); A.grid(alpha=0.25); A.tick_params(labelsize=6.5)
-    A.set_xlabel(f"warped model step: $0$ = the scene leaves the frame, "
-                 f"{D:.0f} = the drone faces it again", fontsize=8)
+    AH.plot(gx[keep], mu[keep], color="0.25", lw=1.6)
+    AH.set_ylabel("Heading ($^\circ$)", fontsize=8)
+    for A in (AC, AH):
+        A.axvspan(t_away, t_back, color="tab:orange", alpha=0.12, lw=0)
+        A.axvline(t_away, color="k", ls="--", lw=0.8); A.axvline(t_back, color="k", ls="--", lw=0.8)
+        A.grid(alpha=0.25); A.tick_params(labelsize=6.5)
+        A.set_xlim(0, t_end)
+    AC.tick_params(labelbottom=False)
+    # ...and TIE EACH PERIOD TO ITS IMAGE COLUMN with the paper's own brace: a flat span over the period,
+    # its ends turned down, and a stem from the middle up to the frames drawn from it. The period's name
+    # sits between the brace and the plot.
+    fig.canvas.draw()
+    inv = fig.transFigure.inverted()
+    # the brace sits high enough that its two-line label clears the axes below it
+    y_br = AC.get_position().y1 + 0.072
+    for (xa, xb), A, txt in zip(((0.0, t_away), (t_away, t_back), (t_back, t_end)), im_axes,
+                                ("Looking at\naltered region", "Looking away from\naltered region",
+                                 "Looking back at\naltered region")):
+        fa = inv.transform(AC.transData.transform((xa, 0)))[0]
+        fb = inv.transform(AC.transData.transform((xb, 0)))[0]
+        col = A.get_position()
+        brace_up(fig, fa, fb, y_br, col.y0, 0.5 * (col.x0 + col.x1), color="0.35", lw=0.9)
+        fig.text(0.5 * (fa + fb), y_br - 0.018, txt, ha="center", va="top", fontsize=6.4,
+                 color="0.25", linespacing=1.15)
     f2 = os.path.join(out_root, "eval_memory", "_memory_paper.png")
     fig.savefig(f2, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", f2)
