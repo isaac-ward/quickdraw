@@ -260,20 +260,33 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     x0 = float(g[have][0])
     gx = g - x0
     t_away, t_back, t_end = -x0, D - x0, float(gx[have][-1])
-    fig = plt.figure(figsize=(3.4, 4.1))
-    # the images take the larger share, and the gap holds the braces and their labels
-    outer = fig.add_gridspec(2, 1, height_ratios=(1.02, 1.45), hspace=0.20)
-    gim = outer[0].subgridspec(2, 3, hspace=0.0, wspace=0.08)
-    gcur = outer[1].subgridspec(2, 1, hspace=0.0, height_ratios=(1.15, 1.0))
+    # HAND-PLACED, so the six frames are COMPLETELY FLUSH. In a gridspec the cell is not the frame's
+    # aspect, so imshow (adjustable="box") shrinks the axes inside its cell and centres it -- the slack
+    # became whitespace that no wspace/hspace could close, which is why setting them to zero never did
+    # anything. Here the figure height is SOLVED from the frame width, so each cell IS the frame. No
+    # frame is rescaled and no aspect is touched.
+    FIG_W, L, R = 3.4, 0.60, 0.01     # L clears the plots' two-line ylabel and their tick labels
+    IW = (FIG_W - L - R) / 3.0        # one frame, and there are three columns
+    IH = IW * pred_fr[0].shape[0] / pred_fr[0].shape[1]
+    # BR is the band between the frames and the plots: it holds nothing but the brace and its stem, so
+    # it is HALF what it was, at the author's ask.
+    TOP_IN, BR, PL, BOT = 0.22, 0.16, 1.55, 0.34
+    FIG_H = TOP_IN + 2 * IH + BR + PL + BOT
+    fig = plt.figure(figsize=(FIG_W, FIG_H))
+    xl, xr = L / FIG_W, 1.0 - R / FIG_W
+    iw, ih = IW / FIG_W, IH / FIG_H
+    y_r0 = 1.0 - (TOP_IN + IH) / FIG_H
+    gcur = fig.add_gridspec(2, 1, hspace=0.0, height_ratios=(1.15, 1.0),
+                            left=xl, right=xr, top=(BOT + PL) / FIG_H, bottom=BOT / FIG_H)
     im_axes, top_axes = [], []
     for c, (lab, k) in enumerate(EV):
         k = int(np.clip(k, 0, len(pred_fr) - 1))
         for r, (img, nm) in enumerate(((pred_fr[k], "Predicted"), (true_fr[k], "Truth"))):
-            A = fig.add_subplot(gim[r, c])
+            A = fig.add_axes([xl + c * iw, y_r0 - r * ih, iw, ih])
             A.imshow(img, interpolation="bilinear")   # equal aspect: never stretch a frame
             A.set_xticks([]); A.set_yticks([])
             for sp_ in A.spines.values():
-                sp_.set_linewidth(0.9); sp_.set_color("black")
+                sp_.set_linewidth(0.45); sp_.set_color("black")
             if c == 0:
                 A.set_ylabel(nm, fontsize=FS)
             if r == 1:
@@ -324,7 +337,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
         fig.text(0.5 * (col.x0 + col.x1), top_axes[i].get_position().y1 + 0.006, txt, ha="center",
                  va="bottom", fontsize=FS, color="0.25", linespacing=1.2)
     f2 = os.path.join(out_root, "eval_memory", "_memory_paper.png")
-    fig.savefig(f2, dpi=450, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(f2, dpi=450); plt.close(fig)          # NO bbox_inches: tight would re-trim the margins
     print("  wrote", f2)
     json.dump(summary, open(os.path.join(out_root, "memory_turn_warped.json"), "w"), indent=1)
     print(f"\n  -> {f}")

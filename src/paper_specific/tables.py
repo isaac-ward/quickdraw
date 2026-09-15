@@ -24,14 +24,20 @@ WM_ROWS = [
     # PLAIN TEXT, not codes: a reader should not have to decode "4 / concat" to know what a row is.
     # Verified against each run's own config.json -- the stride-1 run uses SUMMED actions, which an
     # earlier version of this table got wrong.
-    ("train_world_model_2026_09_05_20_21_02_starling2_vl128", "Inherited recipe", ""),
-    ("train_world_model_2026_09_07_03_45_54_starling2_heavy", r"\quad deeper denoiser", "rejected"),
-    ("train_world_model_2026_09_12_08_06_49_s2_sub4_concat_deriv", r"\quad action increments", "rejected"),
-    ("train_world_model_2026_09_08_21_46_53_s2_sub1", r"\quad every frame, summed", ""),
-    ("train_world_model_2026_09_11_03_17_22_s2_sub3_concat", r"\quad every third frame", ""),
-    ("train_world_model_2026_09_08_22_04_09_s2_sub4", r"\quad every fourth frame, summed", ""),
+    # THE INHERITED-RECIPE ROW AND THE STRIDE-1 ROW WERE REMOVED at the author's ask. With the reference
+    # row gone the remaining labels can no longer be deltas from it, so each one states its own stride,
+    # its own action aggregation and any change to the denoiser. The stride-1 measurement (0.0783 at +1,
+    # 0.3155 at +128) now lives only in the results prose.
+    ("train_world_model_2026_09_07_03_45_54_starling2_heavy",
+     "Every fifth frame, summed actions, deeper denoiser", "rejected"),
+    ("train_world_model_2026_09_12_08_06_49_s2_sub4_concat_deriv",
+     "Every fourth frame, concatenated action increments", "rejected"),
+    ("train_world_model_2026_09_11_03_17_22_s2_sub3_concat",
+     "Every third frame, concatenated actions", ""),
+    ("train_world_model_2026_09_08_22_04_09_s2_sub4",
+     "Every fourth frame, summed actions", ""),
     ("train_world_model_2026_09_11_03_17_47_s2_sub4_concat",
-     r"\quad every fourth frame, concatenated$^{*}$", "kept"),
+     r"Every fourth frame, concatenated actions$^{*}$", "kept"),
 ]
 # ---- the Action Model: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
 AH_ROWS = [
@@ -41,13 +47,13 @@ AH_ROWS = [
     # percentile transform buys -- rest AUC 0.500 against 0.995, W_1 0.1023 against 0.0445 -- so those
     # two comparisons now live in the results prose instead of in the table.
     ("train_action_2026_09_13_21_57_41_s2_ah_pit",
-     r"Pooled context, percentile target, chunk $8$"),
+     r"Pooled context, raw target, chunk $8$"),
     ("train_action_2026_09_13_23_42_49_s2_ah_pit",
-     r"Grouped context, percentile target, chunk $8$"),
+     r"Grouped context, raw target, chunk $8$"),
     ("train_action_2026_09_14_04_41_17_s2_ah_chunk32_full",
-     r"Grouped context, percentile target, chunk $32^{*}$"),
+     r"Grouped context, raw target, chunk $32^{*}$"),
     ("train_action_model_2026_09_14_22_28_22_s2_ah_chunk32_pitdelta",
-     r"Grouped context, percentile increment target, chunk $32$"),
+     r"Grouped context, delta target, chunk $32$"),
 ]
 
 
@@ -56,28 +62,32 @@ def wm_table() -> str:
     L = [r"\begin{table}[t]", r"  \centering", r"  \footnotesize",
          r"  \setlength{\tabcolsep}{3pt}",
          r"  \caption{\textbf{World Model.} Open-loop prediction on held-out \dataname flight, by "
-         r"horizon: how far the action-conditioned observation prediction holds up. The first row is the "
-         r"recipe as inherited from a manipulation dataset; every row below it changes one setting, and the "
-         r"best per column is bold. The autoencoder floor re-encodes and decodes the true frame, so it "
-         r"bounds what any dynamics model on this tokenizer can reach. The inherited recipe kept every "
-         r"fifth frame and summed the commands it skipped; each row below changes one thing. "
+         r"horizon: how far the action-conditioned observation prediction holds up. Each row names its "
+         r"own frame stride and how the commands skipped between kept frames are aggregated; the best "
+         r"per column is bold. The autoencoder floor re-encodes and decodes the true frame, so it "
+         r"bounds what any dynamics model on this tokenizer can reach. "
          r"$^{\dagger}$The autoencoder floor is not a model: it encodes and decodes the true frame, so "
          r"it is the same at every horizon and no dynamics model on this tokenizer can beat it. "
          r"$^{*}$The configuration \modelname{} uses.}",
-         r"  \label{tab:longhorizon}", r"  \begin{tabular}{lcccc}", r"    \toprule",
+         r"  \label{tab:longhorizon}",
+         r"  \begin{tabular}{@{}p{0.40\columnwidth}cccc@{}}", r"    \toprule",
          r"    & \multicolumn{4}{c}{LPIPS $\downarrow$ at open-loop horizon} \\",
          r"    \cmidrule(lr){2-5}",
          r"    Configuration & $+1$ & $+8$ & $+32$ & $+128$ \\", r"    \midrule"]
-    floors, rows = [], []
+    # THE FLOOR IS THE DEPLOYED MODEL'S OWN, not a mean over the rows. Averaging it moved the number
+    # every time a row was added or removed (0.0461 -> 0.0480 when two rows went), which is wrong for a
+    # quantity that is meant to be a property of the tokenizer: the rows run at different frame strides
+    # and so encode different frames.
+    floor, rows = None, []
     for run, name, verdict in WM_ROWS:
         d = metrics(os.path.join(LOGS, run))
         if not d:
             continue
         vals = [suffix(d, f"open_loop/image/lpips/@+{h}") for h in hs]
-        ae = suffix(d, "eval_ae_floor/image/lpips_mean")
-        if ae is not None:
-            floors.append(ae)
+        if verdict == "kept":
+            floor = suffix(d, "eval_ae_floor/image/lpips_mean")
         rows.append((name, vals))
+    assert floor is not None, "no WM_ROWS entry marked 'kept' carries an autoencoder floor"
     # BOLD THE BEST IN EACH COLUMN, not our own row: bolding `ours` at a horizon where an ablation wins
     # (frame stride 1 is far better at +1) would assert something the table itself contradicts.
     best = [min((r[1][j] for r in rows if r[1][j] is not None), default=None) for j in range(len(hs))]
@@ -90,7 +100,7 @@ def wm_table() -> str:
           # A ROW LIKE ANY OTHER, with the same number in every column: the floor does not depend on
           # horizon, and spanning it across the four columns made it look like a different kind of thing.
           r"    Autoencoder floor$^{\dagger}$ & "
-          + " & ".join([fmt(sum(floors) / len(floors), 4)] * 4) + r" \\",
+          + " & ".join([fmt(floor, 4)] * 4) + r" \\",
           r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
     return "\n".join(L) + "\n"
 
@@ -105,11 +115,16 @@ def ah_table() -> str:
          r"ignores its context; it is given at the first lead time and at the worst. $W_1$ is the distance "
          r"to the recorded action marginal, i.e.\ whether it flies like the data. Rest AUC asks whether "
          r"the model can place mass on a stick being held still, which is what the percentile transform "
+         r"buys --- every row here uses it, so the target column distinguishes the percentile of the "
+         r"stick's \emph{value} from the percentile of its \emph{increment}. "
          r"buys and what a flow cannot do without it. No row wins every column, because the trade is "
          r"real --- Figure~\ref{fig:marginals} is the same question answered by eye. "
          r"$^{*}$The configuration \modelname{} deploys: the planner commits $16$ steps of a $32$-step "
          r"chunk.}",
-         r"  \label{tab:actionhead}", r"  \begin{tabular}{lcccc}", r"    \toprule",
+         r"  \label{tab:actionhead}",
+         # A WRAPPING CONFIGURATION COLUMN: written out in full the labels are too long for one line, and
+         # p{} wraps them rather than overflowing the column.
+         r"  \begin{tabular}{@{}p{0.40\columnwidth}cccc@{}}", r"    \toprule",
          r"    & Skill$_{+1}$ & Skill$_{\max}$ & $W_1$ & Rest AUC \\",
          r"    Configuration & $\uparrow$ & $\uparrow$ & $\downarrow$ & $\uparrow$ \\", r"    \midrule"]
     rows = []
@@ -202,6 +217,10 @@ STEER_RUNS = {
 # with the deployed one last.
 COLS = [("data", r"Data Retrieval AM$^{\ddagger}$"), ("gauss", "Gaussian AM"),
         ("pitdelta", r"Learned $\Delta$ AM"), ("prior", r"Learned AM (\textbf{ours})")]
+# THE BASELINE IS NEVER BOLDED AS THE WINNER. Retrieval is a reference, not a competitor: it is bounded
+# by what the corpus happens to contain, so calling it "best" asserts a target none of the priors could
+# reach by construction. Bolding therefore runs over the generative columns only.
+BOLD_COLS = [m for m, _ in COLS if m != "data"]
 # The place block needs DECODED VIDEO for the labeller, so these are the video-on 26-request suites
 # rather than the 16-context physical runs above.
 VLM_RUNS = {
@@ -383,10 +402,11 @@ def wacc_locations(vl):
 
 
 def _avg_row(wa, denom):
-    best = max((v for v in wa.values() if v is not None), default=None)
+    best = max((v for m, v in wa.items() if v is not None and m in BOLD_COLS), default=None)
     cells = ["--" if wa[m] is None else
-             ((r"\textbf{" + f"{wa[m]:.1f}" + "}/" + str(denom))
-              if best and abs(wa[m] - best) < 1e-9 else f"{wa[m]:.1f}/{denom}") for m, _ in COLS]
+             ((r"\textbf{" + f"{100 * wa[m] / denom:.0f}" + r"}\%")
+              if (m in BOLD_COLS and best and abs(wa[m] - best) < 1e-9)
+              else f"{100 * wa[m] / denom:.0f}\%") for m, _ in COLS]
     return r"    \midrule" + "\n" + r"    Mean over the block $\uparrow$ & " \
         + " & ".join(cells) + r" \\"
 
@@ -407,8 +427,11 @@ def steer_table(paper: str) -> str:
          r"than $5\%$ of what a pilot covers in the same $34$\,s, read off the imagined proprioception "
          r"and independent of the reward the planner maximised; for a location, that a VLM asked to list "
          r"every object visible and every region faced \emph{at any point} in the imagined video named "
-         r"it. Best per row in bold, and the last row of each block is the plain mean of the cells above "
-         r"it. $^{\ddagger}$Data Retrieval is the \textbf{baseline}, and the informative one: its "
+         r"it, as a percentage of the contexts tried. The last row of each block is the plain mean of the "
+         r"cells above it. Bold marks the best \emph{generative} arm, which is why the reference column "
+         r"is never bold: it is bounded by what the corpus happens to contain, so calling it best would "
+         r"assert a target none of the priors could reach by construction. "
+         r"$^{\ddagger}$Data Retrieval is the \textbf{baseline}, and the informative one: its "
          r"candidates are real recorded chunks, so it is the best a fixed planner and a fixed reward can "
          r"do by searching over flight that actually happened. It is blind to the request -- the reward "
          r"alone does the steering -- and a learned prior earns its place only by beating it. What a "
@@ -433,10 +456,11 @@ def steer_table(paper: str) -> str:
             hits_all[m].append(v[0] > 0.05 * PILOT[key])   # the MEAN, as in the original
             frac_all[m].append(sum(v[2]) / len(v[2]) / PILOT[key])
             vals.append((hits, len(v[2])))
-        best = max((h for h, _ in (x for x in vals if x)), default=None)
+        best = max((v[0] / v[1] for (m, _), v in zip(COLS, vals) if v and m in BOLD_COLS), default=None)
         cells = ["--" if v is None else
-                 ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if v[0] == best and best else
-                  f"{v[0]}/{v[1]}") for v in vals]
+                 ((r"\textbf{" + f"{100 * v[0] / v[1]:.0f}" + r"}\%")
+                  if (m in BOLD_COLS and best and abs(v[0] / v[1] - best) < 1e-9)
+                  else f"{100 * v[0] / v[1]:.0f}\%") for (m, _), v in zip(COLS, vals)]
         nm = q + (r"$^{\S}$" if q == "fly backward" else "")
         L.append(f"    ``{nm}\'\' & " + " & ".join(cells) + r" \\")
     # THE AGGREGATE ROWS ARE GONE, at the author's ask: obeyed, motion against a pilot and the two
@@ -450,10 +474,11 @@ def steer_table(paper: str) -> str:
         for m, _ in COLS:
             v = vl.get(m, {}).get(q)
             vals.append(None if v is None else (round(v[0] * int(v[2])), int(v[2])))
-        best = max((h for h, _ in (x for x in vals if x)), default=None)
+        best = max((v[0] / v[1] for (m, _), v in zip(COLS, vals) if v and m in BOLD_COLS), default=None)
         cells = ["--" if v is None else
-                 ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if best and v[0] == best else
-                  f"{v[0]}/{v[1]}") for v in vals]
+                 ((r"\textbf{" + f"{100 * v[0] / v[1]:.0f}" + r"}\%")
+                  if (m in BOLD_COLS and best and abs(v[0] / v[1] - best) < 1e-9)
+                  else f"{100 * v[0] / v[1]:.0f}\%") for (m, _), v in zip(COLS, vals)]
         L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
     L += [_avg_row(avg_locations(vl), 4),
           r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]

@@ -91,14 +91,14 @@ def main(run: str = RUN) -> int:
     print(f"  chunk {K} | recorded {real.shape} | sampled {pred.shape} "
           f"({len(h)} contexts x {N_DRAW} draws)")
 
-    fig = plt.figure(figsize=(3.4, 2.05))
+    fig = plt.figure(figsize=(3.4, 2.2))
     # 2x2, FLUSH, HALF HEIGHT. Every stick is on -1..1, including fore/aft -- which never goes positive
     # in this corpus, so half its panel is empty, but a shared axis is worth more than the space. The
     # panels touch on all four sides, so only the bottom row carries tick labels and the ticks stop at
     # +-0.5: at +-1.0 the left panel's last label and the right panel's first would have collided on the
     # seam. The axis name goes inside each panel, because a title there would land on the panel above.
     gh = fig.add_gridspec(2, 2, hspace=0.0, wspace=0.0,
-                          left=0.085, right=0.995, top=0.99, bottom=0.26)
+                          left=0.085, right=0.995, top=0.875, bottom=0.115)
     k = LOOKAHEAD
     for r in range(NA):
         A_ = fig.add_subplot(gh[r // 2, r % 2])
@@ -115,22 +115,28 @@ def main(run: str = RUN) -> int:
         A_.set_xticks([-0.5, 0.0, 0.5])
         for sp in A_.spines.values():
             sp.set_visible(True); sp.set_linewidth(0.7); sp.set_color("black")
-        A_.text(0.015, 0.90, AXES[r].capitalize() if not AXES[r].startswith("fore") else "Fore/aft",
-                transform=A_.transAxes, ha="left", va="top", fontsize=FS)
+        # EQUAL PADDING ON BOTH SIDES. In axes fractions the same number is a different distance in x
+        # and in y whenever the panel is not square, and these are wide -- so the inset is given in
+        # POINTS off the top-left corner, which is the same gap left and above by construction.
+        A_.annotate(AXES[r].capitalize() if not AXES[r].startswith("fore") else "Fore/aft",
+                    xy=(0.0, 1.0), xycoords="axes fraction", xytext=(3, -3),
+                    textcoords="offset points", ha="left", va="top", fontsize=FS)
         if last:
-            # OUT OF THE PANELS, under the bottom-left one: with the panels flush there is no interior
-            # corner a legend can sit in without covering a distribution.
+            # ABOVE THE PANELS, at the author's ask, sharing one band with the axis name: with the panels
+            # flush there is no interior corner a legend can sit in without covering a distribution.
             _h, _l = A_.get_legend_handles_labels()
-            fig.legend(_h, _l, loc="lower left", bbox_to_anchor=(0.085, 0.0), ncol=1,
-                       fontsize=FS - 2.0, frameon=False, handlelength=1.3, borderaxespad=0.0)
+            fig.legend(_h, _l, loc="upper left", bbox_to_anchor=(0.085, 0.998), ncol=2,
+                       fontsize=FS - 2.0, frameon=False, handlelength=1.3, columnspacing=1.1,
+                       borderaxespad=0.0)
     # density=True, so the bars ARE a probability density over stick deflection and the four panels are
     # directly comparable now that they share one binning. Ticks stay off -- the shape is the message.
     # THE LEGEND AND THE X LABEL SHARE ONE BAND. supxlabel centres the label under the axes, which put
     # it straight on top of the tick labels; side by side with the legend the band does two jobs in the
     # height of one, which is the point of halving the figure.
-    fig.supylabel("Probability density", fontsize=FS, x=0.016, y=0.625)
-    fig.text(0.66, 0.035, "Normalised stick deflection", ha="center", va="bottom", fontsize=FS)
-    fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
+    fig.supylabel("Probability density", fontsize=FS, x=0.016, y=0.495)
+    # ...on the SAME baseline as the legend, so the header is one band and not two
+    fig.text(0.995, 0.998, "Normalised stick deflection", ha="right", va="top", fontsize=FS)
+    fig.savefig(OUT, dpi=700, bbox_inches="tight"); plt.close(fig)   # raised at the author's ask
     print("  wrote", OUT)
     return 0
 

@@ -107,10 +107,8 @@ def main() -> int:
             groups.append((req, [k]))
     # NO GAP INSIDE A SEQUENCE: the frames of one plan are one strip. Rows stay apart just enough for
     # the step numbers, and each request is braced across its own pair.
-    # ZERO GAP, EVERYWHERE. The author wants the frames completely flush, which cannot be done while the
-    # "+N" sits above its image -- the label would land on the frame above. So the step number moves
-    # INSIDE its own frame, top left, on a translucent plate so it reads over a bright ceiling or a dark
-    # panel alike. Nothing is lost: the number still names the frame it sits in.
+    # ZERO GAP, EVERYWHERE, and the author prefers it: the step number sits INSIDE its own frame, top
+    # left, on a translucent plate so it reads over a bright ceiling or a dark panel alike.
     NR, HSP = len(rows), 0.0
     LEFT, RIGHT, TOP, BOT = 0.135, 0.999, 0.999, 0.004
     # SOLVE the height so each cell is EXACTLY the frame's aspect. A guessed multiplier left every row
@@ -138,9 +136,7 @@ def main() -> int:
     for req, idxs in groups:
         pos = [axes[i][0].get_position() for i in idxs]
         y0, y1 = pos[-1].y0, pos[0].y1
-        # HALF-HEIGHT BRACKET LINES, at the author's ask: the brace hugs the middle of the pair rather
-        # than spanning it corner to corner.
-        _c, _h = 0.5 * (y0 + y1), 0.5 * (y1 - y0)
+        _c, _h = 0.5 * (y0 + y1), 0.5 * (y1 - y0)      # half-height bracket lines
         brace_left(fig, 0.115, _c - _h / 2, _c + _h / 2, 0.085, color="black", lw=0.9)
         fig.text(0.030, 0.5 * (y0 + y1), "\u201c" + req + "\u201d", ha="center", va="center",
                  fontsize=FS * 1.5, style="italic", rotation=90)
