@@ -416,6 +416,9 @@ def ood(paper, dev="cuda"):
     AV.tick_params(labelsize=FS - 1.5, labelbottom=False); AV.grid(alpha=0.25)
     AV.set_xlim(0, len(o) - 1)
     AE = fig.add_axes([xp, y_top - 2 * hr, wp, hr], sharex=AV)
+    AE.set_ylim(top=1.0)                               # a round ceiling, at the author's ask
+    AE.set_yticks([0.0, 0.5])                          # ...left unlabelled: the two panels share that
+    #                                                    boundary, so a 1.0 here landed on the -1 above
     AE.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
     AE.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly frames")
     AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)

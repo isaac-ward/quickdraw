@@ -35,16 +35,19 @@ WM_ROWS = [
 ]
 # ---- the Action Model: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
 AH_ROWS = [
-    # ONE PLAIN-TEXT CONFIGURATION COLUMN, like the World Model table. The 2x2 of context x target is
-    # incomplete by design: pooled context with a raw target is the cell nothing recommends and it was
-    # never trained, which the caption says.
-    ("train_action_2026_09_13_21_57_41_s2_ah_pit", "Pooled context, percentile target"),
-    ("train_action_2026_09_14_01_15_48_s2_ah_grouped", "Grouped context, raw target"),
+    # EVERY CONFIGURATION WRITTEN OUT IN FULL, at the author's ask: no indented "longer chunk" rows that
+    # only parse by reading upward. Each label states its context, its target transform and its chunk.
+    # THE RAW-TARGET ROW WAS REMOVED at the author's ask. It was the only measurement of what the
+    # percentile transform buys -- rest AUC 0.500 against 0.995, W_1 0.1023 against 0.0445 -- so those
+    # two comparisons now live in the results prose instead of in the table.
+    ("train_action_2026_09_13_21_57_41_s2_ah_pit",
+     r"Pooled context, percentile target, chunk $8$"),
     ("train_action_2026_09_13_23_42_49_s2_ah_pit",
-     r"Grouped context, percentile target$^{*}$"),
-    ("train_action_2026_09_14_04_41_17_s2_ah_chunk32_full", r"\quad longer chunk ($32$)"),
+     r"Grouped context, percentile target, chunk $8$"),
+    ("train_action_2026_09_14_04_41_17_s2_ah_chunk32_full",
+     r"Grouped context, percentile target, chunk $32^{*}$"),
     ("train_action_model_2026_09_14_22_28_22_s2_ah_chunk32_pitdelta",
-     r"\quad longer chunk, increment target"),
+     r"Grouped context, percentile increment target, chunk $32$"),
 ]
 
 
@@ -102,10 +105,10 @@ def ah_table() -> str:
          r"ignores its context; it is given at the first lead time and at the worst. $W_1$ is the distance "
          r"to the recorded action marginal, i.e.\ whether it flies like the data. Rest AUC asks whether "
          r"the model can place mass on a stick being held still, which is what the percentile transform "
-         r"buys and what a flow cannot do without it. Pooled context with a raw target is the one cell of "
-         r"the $2\times2$ that was never trained: nothing recommends it. No row wins every column, because "
-         r"the trade is real --- Figure~\ref{fig:marginals} is the same question answered by eye. "
-         r"$^{*}$The configuration \modelname{} uses, at the chunk length the planner wants.}",
+         r"buys and what a flow cannot do without it. No row wins every column, because the trade is "
+         r"real --- Figure~\ref{fig:marginals} is the same question answered by eye. "
+         r"$^{*}$The configuration \modelname{} deploys: the planner commits $16$ steps of a $32$-step "
+         r"chunk.}",
          r"  \label{tab:actionhead}", r"  \begin{tabular}{lcccc}", r"    \toprule",
          r"    & Skill$_{+1}$ & Skill$_{\max}$ & $W_1$ & Rest AUC \\",
          r"    Configuration & $\uparrow$ & $\uparrow$ & $\downarrow$ & $\uparrow$ \\", r"    \midrule"]
@@ -195,8 +198,10 @@ STEER_RUNS = {
     "prior": "logs/eval_steer_2026_09_14_22_08_46_phys16_prior",
     "pitdelta": "logs/eval_steer_2026_09_15_01_12_15_phys16_pitdelta",
 }
-COLS = [("gauss", "Gaussian AM"), ("data", r"Data Retrieval AM$^{\ddagger}$"),
-        ("prior", r"Learned AM (\textbf{ours})"), ("pitdelta", r"Learned $\Delta$ AM")]
+# ORDER, at the author's ask: the reference first, then the noise floor, then the two learned priors
+# with the deployed one last.
+COLS = [("data", r"Data Retrieval AM$^{\ddagger}$"), ("gauss", "Gaussian AM"),
+        ("pitdelta", r"Learned $\Delta$ AM"), ("prior", r"Learned AM (\textbf{ours})")]
 # The place block needs DECODED VIDEO for the labeller, so these are the video-on 26-request suites
 # rather than the 16-context physical runs above.
 VLM_RUNS = {
@@ -323,6 +328,27 @@ MOTION_ROWS = ("rotate left", "rotate right", "climb", "descend",
                "strafe left", "strafe right", "fly forward", "fly backward")
 
 
+def avg_motion(ph):
+    """{arm: mean hits out of 15} over MOTION_ROWS -- the plain average of the cells above it."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
+    from steer_physical import WANTS
+    out = {}
+    for m, _ in COLS:
+        f = [float(np.mean([v > 0.05 * PILOT[WANTS[q][0]] for v in ph[m][q][2]]))
+             for q in MOTION_ROWS if ph[m].get(q)]
+        out[m] = 15.0 * float(np.mean(f)) if f else None
+    return out
+
+
+def avg_locations(vl):
+    """{arm: mean hits out of 4} over LOC_ROWS."""
+    out = {}
+    for m, _ in COLS:
+        f = [v[0] for v in (vl.get(m, {}).get(q) for q in LOC_ROWS) if v]
+        out[m] = 4.0 * float(np.mean(f)) if f else None
+    return out
+
+
 def wacc_motion(ph):
     """{arm: weighted accuracy} over MOTION_ROWS. The negative class is the OPPOSING request on the same
     axis. _phys stores motion*sgn for the request it was asked under, so for the opposing request a
@@ -356,12 +382,12 @@ def wacc_locations(vl):
     return out
 
 
-def _wacc_row(wa):
+def _avg_row(wa, denom):
     best = max((v for v in wa.values() if v is not None), default=None)
     cells = ["--" if wa[m] is None else
-             ((r"\textbf{" + f"{wa[m]:.1f}" + "}") if best and abs(wa[m] - best) < 1e-9
-              else f"{wa[m]:.1f}") for m, _ in COLS]
-    return r"    \midrule" + "\n" + r"    Weighted steering acc.\ (\%) $\uparrow$ & " \
+             ((r"\textbf{" + f"{wa[m]:.1f}" + "}/" + str(denom))
+              if best and abs(wa[m] - best) < 1e-9 else f"{wa[m]:.1f}/{denom}") for m, _ in COLS]
+    return r"    \midrule" + "\n" + r"    Mean over the block $\uparrow$ & " \
         + " & ".join(cells) + r" \\"
 
 
@@ -381,17 +407,15 @@ def steer_table(paper: str) -> str:
          r"than $5\%$ of what a pilot covers in the same $34$\,s, read off the imagined proprioception "
          r"and independent of the reward the planner maximised; for a location, that a VLM asked to list "
          r"every object visible and every region faced \emph{at any point} in the imagined video named "
-         r"it. Best per row in bold. $^{\ddagger}$Data Retrieval draws real recorded chunks, so it is "
-         r"perfectly flyable and completely blind to the request; the reward still selects among them, "
-         r"so it steers. $^{\S}$The corpus contains no backward flight at all, and no arm gets more "
-         r"than one context out of fifteen -- a motion primitive absent from the data is not reachable "
-         r"by steering, however the candidates are drawn. Weighted steering accuracy is the mean of the "
-         r"true-positive and true-negative rates over the block, so its no-skill value is $50\%$ "
-         r"whatever the imbalance. The negative class is already in the run: for a motion primitive it "
-         r"is the \emph{opposing} request on the same axis, so a false positive is a context that flew "
-         r"left when right was asked for; for a location it is every context where a \emph{different} "
-         r"target was requested and this one was listed anyway. It is the only number here that cannot "
-         r"be inflated by an arm that simply moves a lot, or by a labeller that lists everything.}",
+         r"it. Best per row in bold, and the last row of each block is the plain mean of the cells above "
+         r"it. $^{\ddagger}$Data Retrieval is the \textbf{baseline}, and the informative one: its "
+         r"candidates are real recorded chunks, so it is the best a fixed planner and a fixed reward can "
+         r"do by searching over flight that actually happened. It is blind to the request -- the reward "
+         r"alone does the steering -- and a learned prior earns its place only by beating it. What a "
+         r"learned prior can offer is not fidelity but reach: it can propose a motion the corpus does "
+         r"not contain, and retrieval never can. $^{\S}$The corpus contains no backward flight at all, "
+         r"and no arm gets more than one context out of fifteen -- a motion primitive absent from the "
+         r"data is not reachable by steering, however the candidates are drawn.}",
          r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nc + "}", r"    \toprule",
          r"    Request & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
          r"    \multicolumn{" + str(1 + nc) + r"}{c}{Motion primitives} \\", r"    \midrule"]
@@ -418,7 +442,7 @@ def steer_table(paper: str) -> str:
     # THE AGGREGATE ROWS ARE GONE, at the author's ask: obeyed, motion against a pilot and the two
     # jerk multiples summarised the per-request cells above them and a continuity comparison this
     # table no longer makes. hits_all/frac_all stay accumulated -- the prose quotes them.
-    L += [_wacc_row(wacc_motion(ph)),
+    L += [_avg_row(avg_motion(ph), 15),
           r"    \midrule", r"    \multicolumn{" + str(1 + nc) +
           r"}{c}{Locations} \\", r"    \midrule"]
     for q in LOC_ROWS:
@@ -431,8 +455,15 @@ def steer_table(paper: str) -> str:
                  ((r"\textbf{" + f"{v[0]}" + "}/" + f"{v[1]}") if best and v[0] == best else
                   f"{v[0]}/{v[1]}") for v in vals]
         L.append(f"    ``{q}\'\' & " + " & ".join(cells) + r" \\")
-    L += [_wacc_row(wacc_locations(vl)),
+    L += [_avg_row(avg_locations(vl), 4),
           r"    \bottomrule", r"  \end{tabular}", r"\end{table*}"]
+    # THE FALSE-POSITIVE-AWARE VERSION, printed rather than tabulated. The author wants the plain mean in
+    # the table; this stays reproducible because the results prose quotes it, and it is the number that
+    # shows the gaussian arm is at no-skill once the opposing request is counted as a negative.
+    wm_, wl_ = wacc_motion(ph), wacc_locations(vl)
+    print("  weighted steering accuracy (%, no-skill 50) -- quoted in the results prose:")
+    for m, lab in COLS:
+        print(f"    {lab[:30]:32s} motion {wm_[m]:5.1f}   locations {wl_[m]:5.1f}")
     return "\n".join(L) + "\n"
 
 

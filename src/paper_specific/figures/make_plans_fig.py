@@ -107,11 +107,12 @@ def main() -> int:
             groups.append((req, [k]))
     # NO GAP INSIDE A SEQUENCE: the frames of one plan are one strip. Rows stay apart just enough for
     # the step numbers, and each request is braced across its own pair.
-    # THE ROWS ARE AS CLOSE AS THE STEP NUMBERS ALLOW. Truly zero gap is not available while the "+N"
-    # sits ABOVE its image, as the author asked for earlier: the label would land on the image above it.
-    # So the gap is now exactly one label high and not a point more -- 0.26 -> 0.15 of a cell.
-    NR, HSP = len(rows), 0.15
-    LEFT, RIGHT, TOP, BOT = 0.135, 0.999, 0.955, 0.004
+    # ZERO GAP, EVERYWHERE. The author wants the frames completely flush, which cannot be done while the
+    # "+N" sits above its image -- the label would land on the frame above. So the step number moves
+    # INSIDE its own frame, top left, on a translucent plate so it reads over a bright ceiling or a dark
+    # panel alike. Nothing is lost: the number still names the frame it sits in.
+    NR, HSP = len(rows), 0.0
+    LEFT, RIGHT, TOP, BOT = 0.135, 0.999, 0.999, 0.004
     # SOLVE the height so each cell is EXACTLY the frame's aspect. A guessed multiplier left every row
     # letterboxed inside its own box -- with adjustable="box" imshow shrinks the axes to the data aspect
     # and the slack became vertical whitespace. This removes it without rescaling a single frame.
@@ -128,7 +129,9 @@ def main() -> int:
             A.set_xticks([]); A.set_yticks([])
             for sp in A.spines.values():
                 sp.set_linewidth(0.3); sp.set_color("black")
-            A.set_title(f"$+${steps[c]}", fontsize=FS - 1.5, pad=0.8)
+            A.text(0.025, 0.955, f"$+${steps[c]}", transform=A.transAxes, ha="left", va="top",
+                   fontsize=FS - 1.5, color="black",
+                   bbox=dict(boxstyle="square,pad=0.12", fc="white", ec="none", alpha=0.72))
             row.append(A)
         axes.append(row)
     fig.canvas.draw()
