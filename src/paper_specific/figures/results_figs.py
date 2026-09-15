@@ -18,6 +18,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+DPI = 450          # figures whose content is text and line art: export high so print stays crisp
+DPI_IMG = 300      # figures that are mostly decoded 112x192 frames -- past this, DPI only upscales blur
+#                    and the file grows without carrying more information
 from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis"))
@@ -74,7 +78,7 @@ def longhorizon(paper, dev="cuda", n_traj=4, H=128, n_show=8):
                             fontsize=7, loc="left")
     fig.tight_layout(h_pad=0.15)
     f = os.path.join(paper, "figures", "longhorizon.png")
-    fig.savefig(f, dpi=200, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(f, dpi=DPI_IMG, bbox_inches="tight"); plt.close(fig)
     print(f"  figures/longhorizon.png  {len(rows)} episodes x {H} steps")
 
 
@@ -174,24 +178,27 @@ def ood(paper, dev="cuda"):
         A.set_ylabel(chan_lab, fontsize=7.5); A.set_xlabel("model step", fontsize=7.5)
         A.tick_params(labelsize=6.5); A.grid(alpha=0.25); A.legend(fontsize=6.5, loc="best")
     f = os.path.join(paper, "figures", "ood-detection.png")
-    fig.savefig(f, dpi=220, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print("  figures/ood-detection.png")
 
 
 def curves(paper):
-    """Train/validation curves for the three models, epochs below and wall-clock hours above."""
+    """Train/validation curves for the three models, stacked, epochs below and wall-clock hours above."""
     # TAG NAMES DIFFER PER MODEL, so they are discovered rather than assumed: the world and action models
-    # log `train|val/loss/total`, the reward head logs `train|val/loss/contrastive`. Guessing wrong here
+    # log `train|val/loss/total`, the reward model logs `train|val/loss/contrastive`. Guessing wrong here
     # produced an empty panel and a matplotlib legend warning rather than an error, which is exactly the
     # kind of silent hole a figure should not have.
     RUNS = [("logs/paper_icra_2027/model_backups/train_world_model_2026_09_11_03_17_47_s2_sub4_concat",
-             "world model"),
+             "World Model", None),
             ("logs/paper_icra_2027/model_backups/train_action_2026_09_14_04_41_17_s2_ah_chunk32_full",
-             "action prior"),
+             "Action Model", None),
+            # The reward model logs no epoch timing: it trains in 91 s wall clock (08:19:40 -> 08:21:11 in
+            # its progress.log) over 300 epochs, so the per-epoch figure is passed in rather than averaged
+            # from a series that does not exist.
             ("logs/paper_icra_2027/result_backups/train_reward_model_2026_09_14_08_19_38_reward_starling_v5",
-             "reward head")]
-    fig, ax = plt.subplots(1, 3, figsize=(7.2, 2.1))
-    for i, (run, name) in enumerate(RUNS):
+             "Reward Model", 91.0 / 3600.0 / 300.0)]
+    fig, ax = plt.subplots(3, 1, figsize=(3.4, 5.4))
+    for i, (run, name, fallback_h) in enumerate(RUNS):
         p = os.path.join(run, "logs", "metrics.jsonl")
         rows = []
         if os.path.exists(p):
@@ -205,7 +212,7 @@ def curves(paper):
         for cand in ("loss/total", "loss/contrastive"):
             if f"train/{cand}" in tags and f"val/{cand}" in tags:
                 pair = cand; break
-            if f"val/{cand}" in tags:                       # reward head logs val only under this name
+            if f"val/{cand}" in tags:                       # reward model logs val only under this name
                 pair = cand; break
         assert pair, f"no train/val loss pair found in {run}: {sorted(tags)[:6]}"
         cur = {"train": {}, "val": {}}
@@ -227,15 +234,18 @@ def curves(paper):
         A.set_xlabel("epoch", fontsize=7); A.tick_params(labelsize=6); A.grid(alpha=0.25)
         if cur["train"] or cur["val"]:
             A.legend(fontsize=6)
-        if i == 0:
-            A.set_ylabel("loss", fontsize=7)
-        if hrs:
-            h = float(np.mean(hrs))
-            tw = A.twiny(); tw.set_xlim(*[x * h for x in A.get_xlim()])
-            tw.set_xlabel("wall clock (h)", fontsize=7); tw.tick_params(labelsize=6)
-    fig.tight_layout()
+        A.set_ylabel("loss", fontsize=7)
+        h = float(np.mean(hrs)) if hrs else fallback_h
+        if h:
+            # UNIT PER PANEL. The world model took 45 h and the Reward Model 91 s; one axis in hours makes
+            # the third panel read 0.000 to 0.007, which says nothing. Switch to minutes below 12 min.
+            span = h * max(max(cur["train"] or [0]), max(cur["val"] or [0]))
+            mul, unit = (60.0, "min") if span < 0.2 else (1.0, "h")
+            tw = A.twiny(); tw.set_xlim(*[x * h * mul for x in A.get_xlim()])
+            tw.set_xlabel(f"wall clock ({unit})", fontsize=7); tw.tick_params(labelsize=6)
+    fig.tight_layout(h_pad=1.6)
     f = os.path.join(paper, "figures", "training-curves.png")
-    fig.savefig(f, dpi=220, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print(f"  figures/training-curves.png")
 
 

@@ -449,24 +449,30 @@ def vector_item_factory(mat, arrows=None, cmap=None, cmap_vec=None):
                                         length_includes_head=True, fc=EDGE, ec=EDGE, alpha=a, zorder=z + 0.4))
         ax.add_patch(Rectangle((x, y), CELL, D * CELL, fill=False, ec=EDGE, lw=LW, alpha=a, zorder=z + 0.5))
 
-    def draw_vec(ax, x, y, w, h, vec, a, z, ang=None, hatch=None):
+    def draw_vec(ax, x, y, w, h, vec, a, z, ang=None, hatch=None, horizontal=False):
         """Same tile for a vector that is NOT one of the N items -- the model's prediction. Normalised with
-        the STREAM's lo/hi, so its colours mean the same thing as the inputs' do."""
+        the STREAM's lo/hi, so its colours mean the same thing as the inputs' do.
+
+        `horizontal` lays the cells along x instead of y. The predicted observation leaves its decoder on
+        a horizontal arrow, and a column standing on the end of that arrow reads as a wall rather than as
+        the thing the arrow delivers -- flat, it sits ON the arrow, and it matches how the dataset figure
+        draws the same vector."""
         v = np.asarray(vec, float)[:D][None, :]
         u = np.where(flat, 0.5, (v - lo) / np.where(flat, 1.0, hi - lo))[0]
         for k in range(D):
-            cy0 = y + k * CELL
-            ax.add_patch(Rectangle((x, cy0), CELL, CELL, fc=_c(u[k], cmv),
+            cx0, cy0 = (x + k * CELL, y) if horizontal else (x, y + k * CELL)
+            ax.add_patch(Rectangle((cx0, cy0), CELL, CELL, fc=_c(u[k], cmv),
                                    ec=EDGE, lw=LW, alpha=a, hatch=hatch, zorder=z))
             if ang is not None:                          # same glyph the stream's own tiles carry
                 a_, L = ang[k], CELL * 0.54
-                cx, cy = x + CELL / 2, cy0 + CELL / 2
+                cx, cy = cx0 + CELL / 2, cy0 + CELL / 2
                 dx, dy = L * np.sin(a_), -L * np.cos(a_)
                 ax.add_patch(FancyArrow(cx - dx / 2, cy - dy / 2, dx, dy, width=LW * 0.8,
                                         head_width=CELL * 0.30, head_length=CELL * 0.26,
                                         length_includes_head=True, fc=EDGE, ec=EDGE, alpha=a,
                                         zorder=z + 0.4))
-        ax.add_patch(Rectangle((x, y), CELL, D * CELL, fill=False, ec=EDGE, lw=LW, alpha=a, zorder=z + 0.5))
+        ww, hh = (D * CELL, CELL) if horizontal else (CELL, D * CELL)
+        ax.add_patch(Rectangle((x, y), ww, hh, fill=False, ec=EDGE, lw=LW, alpha=a, zorder=z + 0.5))
 
     return draw, CELL, D * CELL, draw_vec
 
@@ -1662,8 +1668,10 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                     ax.add_patch(Rectangle((ox, oy), D["ow"], D["oh"], fill=False, ec=VIS_EC,
                                            lw=LW * 2, hatch=PRED_HATCH, zorder=zt + 0.5))
                 elif PRED_OBS is not None:
-                    _p_prop_vec(ax, ox, oy, D["ow"], D["oh"], PRED_OBS[t_], 1.0, zt,
-                                hatch=PRED_HATCH)
+                    # FLAT, and re-centred on the arrow: horizontal makes the tile CELL tall rather than
+                    # D*CELL, so the oy computed for a column would hang it below the tip.
+                    _p_prop_vec(ax, ox, D["out_cy"] - CELL / 2 + t_ * OFFSET_Y, D["ow"], D["oh"],
+                                PRED_OBS[t_], 1.0, zt, hatch=PRED_HATCH, horizontal=True)
                 else:
                     D["draw"](ax, ox, oy, D["ow"], D["oh"], PRED_AT, 1.0, zt)
     if dit:

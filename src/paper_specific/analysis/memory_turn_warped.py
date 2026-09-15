@@ -200,7 +200,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     axh.legend(fontsize=7, loc="lower right")
     axm[0].legend(fontsize=7)
     f2 = os.path.join(out_root, "eval_memory", "_memory_paper.png")
-    fig.savefig(f2, dpi=400, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(f2, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", f2)
     json.dump(summary, open(os.path.join(out_root, "memory_turn_warped.json"), "w"), indent=1)
     print(f"\n  -> {f}")

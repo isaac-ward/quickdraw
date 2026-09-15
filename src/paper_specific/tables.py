@@ -26,7 +26,7 @@ WM_ROWS = [
     ("train_world_model_2026_09_08_22_04_09_s2_sub4", r"\quad frame stride 4, summed actions", ""),
     ("train_world_model_2026_09_11_03_17_47_s2_sub4_concat", r"\quad frame stride 4, concatenated (\textbf{ours})", "kept"),
 ]
-# ---- the action prior: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
+# ---- the Action Model: the 2x2 of context pooling x target space, plus the chunk and pit_delta arms --
 AH_ROWS = [
     ("train_action_2026_09_13_21_57_41_s2_ah_pit", "8", "pooled", "PIT", ""),
     ("train_action_2026_09_14_01_15_48_s2_ah_grouped", "8", "grouped", "none", ""),
@@ -72,7 +72,7 @@ def wm_table() -> str:
 
 def ah_table() -> str:
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
-         r"  \caption{The play action prior. Energy skill is measured against a context-blind null, so $0$ is "
+         r"  \caption{The Action Model. Energy skill is measured against a context-blind null, so $0$ is "
          r"a model that ignores its context. Rest AUC asks whether the prior identifies the stick being held "
          r"at rest, which a rectified flow cannot place mass on without the percentile transform. $W_1$ is "
          r"against the recorded action marginal. Best per column in bold.}",
@@ -155,7 +155,7 @@ def ood_table(paper: str) -> str:
 
 # ---- steering: per-request, and then the proposal comparison ---------------------------------------
 # The direction block: one run per candidate source, all at the same 16 contexts x 8 requests, same
-# reward head, same objective, same commit -- the candidate source is the ONLY thing that differs.
+# Reward Model, same objective, same commit -- the candidate source is the ONLY thing that differs.
 # `gauss` is the control: MPPI's historic white noise, which is what the planner drew from before the
 # prior was wired into it.
 STEER_RUNS = {
@@ -323,7 +323,7 @@ def cont_table(paper: str) -> str:
     from steer_physical import WANTS
     L = [r"\begin{table*}[t]", r"  \centering", r"  \small",
          r"  \caption{The candidate source and the continuity mechanism, over the same $8$ requests "
-         r"$\times$ $16$ contexts, same reward head, same objective, same commit. `Obeyed' counts requests "
+         r"$\times$ $16$ contexts, same Reward Model, same objective, same commit. `Obeyed' counts requests "
          r"whose imagined trajectory moved along the named axis by more than $5\%$ of a pilot's mean, and "
          r"`motion' is the mean of that fraction. $|\Delta a|$ is the commanded step-to-step change as a "
          r"multiple of the recorded one, inside a chunk and at the seam where a fresh chunk begins; the "

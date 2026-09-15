@@ -134,7 +134,7 @@ def main() -> int:
     ax.text(X1 + 0.6, YM + AMP * hs[0][-1] / span, f"${hs[0][-1]:+.0f}^\\circ$", ha="left",
             va="center", fontsize=FS - 1.8, color=BLU(0.9))
 
-    fig.savefig(OUT, dpi=400, bbox_inches="tight")
+    fig.savefig(OUT, dpi=450, bbox_inches="tight")
     print("  wrote", OUT)
     return 0
 

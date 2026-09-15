@@ -94,7 +94,7 @@ def main() -> int:
             color=plt.get_cmap(CMAP["action"])(0.9))
 
     ax.set_xlim(-130, N * colw + 20); ax.set_ylim(y_bot + 16, -34)
-    fig.savefig(OUT, dpi=300, bbox_inches="tight")
+    fig.savefig(OUT, dpi=450, bbox_inches="tight")
     print("  wrote", OUT)
     return 0
 

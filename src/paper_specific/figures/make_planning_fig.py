@@ -85,7 +85,7 @@ def main() -> int:
             "hatched: the prefix the next draw is\nguided to continue", ha="left", va="top",
             fontsize=FS - 1.6, color="k", linespacing=1.15)
 
-    fig.savefig(OUT, dpi=400, bbox_inches="tight")
+    fig.savefig(OUT, dpi=450, bbox_inches="tight")
     print("  wrote", OUT)
     return 0
 
