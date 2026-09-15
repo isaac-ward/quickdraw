@@ -229,8 +229,8 @@ HEAD_IN_DX   = -32.0     # the flow heads' MECHANISM shifts left inside its own 
 #                          NOT the box outline, NOT the centred title or its badge, and NOT the
 #                          probability glyph -- the glyph is pinned to the right margin and the space this
 #                          opens in front of it is the point.
-GLYPH_W      = 52.0
-GLYPH_H      = 36.0
+GLYPH_W      = 67.6     # 1.3x, at the author's ask
+GLYPH_H      = 46.8     # ...both axes, so the density keeps its shape
 # (centre, width, weight) per mode. Two peaks each, but not the SAME two: a reader who sees one mark
 # twice reads it as one distribution, and these are distributions over different things.
 GLYPH_OBS    = ((-1.35, 0.55, 0.62), (1.30, 0.78, 0.40))    # observation head: a dominant mode and a tail
@@ -1159,13 +1159,19 @@ def solve_layout():
         d["cx"] = 0.5 * (d["sub_x0"] + d["sub_x1"])
         d["loop_x"] = d["sub_x1"] + BB_BRACE + BRACE_T + m["x4_w"] + DT_LOOP / 2.0
         d["title_cy"] = d["y0"] + m["vtop"] + m["ttl_h"] / 2.0   # BOTH boxes: the band along the TOP
-        # The glyph shares the title's band, tucked into the right margin the centred title leaves. Only
-        # its X is fixed here: the Y is read off title_cy at DRAW time, because the boxes get shifted twice
-        # after this (the x_0 lift, then the canvas offset) and a y cached now would be left behind -- which
-        # is exactly what happened: the marks drew above the boxes and were clipped off the canvas.
+        # Only the glyph's X is fixed here: the Y is read off glyph_cy at DRAW time, because the boxes get
+        # shifted twice after this (the x_0 lift, then the canvas offset) and a y cached now would be left
+        # behind -- which is exactly what happened: the marks drew above the boxes and were clipped off.
         if glyph:
-            assert d["x1"] - BB_PAD - GLYPH_W >= 0.5 * (d["x0"] + d["x1"]) + m["ttl_w"] / 2.0 + MIN_SEG, (
-                f"{title.splitlines()[0]}: the distribution glyph collides with the title")
+            # THE GLYPH SHARES THE "x N" ROW, not the title band: it says what the head EMITS, which reads
+            # with the denoising loop rather than with the name. So the collision it can actually have is
+            # with the step count on that same baseline, and that is what is checked. The old assert
+            # guarded the title, which the glyph no longer sits anywhere near -- it fired at 1.3x on a
+            # clearance that does not exist.
+            _lx = d["loop_x"] + (HEAD_IN_DX if flow < 0 else 0.0)
+            assert d["x1"] - BB_PAD - GLYPH_W >= _lx + MIN_SEG \
+                + text_extent(f"\u00d7 {steps}", ENC_FS * 0.62)[0] + MIN_SEG, (
+                f"{title.splitlines()[0]}: the distribution glyph collides with '\u00d7 {steps}'")
         span = len(subs) * m["subh"] + (len(subs) - 1) * m["subsep"]
         y = d["title_cy"] + m["ttl_h"] / 2.0 + m["subsep"]
         if flow > 0:                                       # enters BOTTOM, stacks UP, leaves RIGHT
