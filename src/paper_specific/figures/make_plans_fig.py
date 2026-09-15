@@ -136,8 +136,9 @@ def main() -> int:
     for req, idxs in groups:
         pos = [axes[i][0].get_position() for i in idxs]
         y0, y1 = pos[-1].y0, pos[0].y1
-        _c, _h = 0.5 * (y0 + y1), 0.5 * (y1 - y0)      # half-height bracket lines
-        brace_left(fig, 0.115, _c - _h / 2, _c + _h / 2, 0.085, color="black", lw=0.9)
+        # FULL HEIGHT, corner to corner of the pair it names. The half-height version came from an
+        # instruction that was about the memory figure, not this one.
+        brace_left(fig, 0.115, y0, y1, 0.085, color="black", lw=0.9)
         fig.text(0.030, 0.5 * (y0 + y1), "\u201c" + req + "\u201d", ha="center", va="center",
                  fontsize=FS * 1.5, style="italic", rotation=90)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
