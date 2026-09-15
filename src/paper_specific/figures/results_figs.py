@@ -435,12 +435,6 @@ def curves(paper):
                 except Exception:
                     pass
         tags = {r["tag"] for r in rows if r.get("tag")}
-        # THE REWARD MODEL IS SCORED ON ITS PROBE, NOT ITS LOSS. train_reward_model.py calls
-        # probe/<factor>_acc "what steering actually queries, so it's the headline", and it is the only
-        # reward series that tells a story: the contrastive val loss bottoms at 6.22 against ln(512)=6.24,
-        # i.e. held-out retrieval is at chance, while the probe reaches 2.4-4.6x chance and train and val
-        # track each other. Chance differs per factor (6, 10 and 9 buckets), so the mean of the three is
-        # plotted against the mean of their chance levels, drawn.
         # THE REWARD HEAD IS PLOTTED ON ITS LOSS, like the other two. The probe was the honest
         # headline but it is not a training curve: it peaks and drifts, which reads as a fault. The
         # contrastive loss shows the thing that actually happened -- train falls and val does not
@@ -469,8 +463,20 @@ def curves(paper):
                 A.plot(x, [cur[k][v] for v in x], color=c, lw=1.3, label=k)
         A.set_title(name, fontsize=8)
         A.set_xlabel("Epoch", fontsize=7); A.tick_params(labelsize=6); A.grid(alpha=0.25)
+        if name == "Reward Model":
+            # THE TWO REFERENCE LINES, BOTH MEASURED. Without them the reward panel reads as a flat
+            # failure. The logged loss is evaluated on a 2048-point subset of the held-out points --
+            # NOT on the training batch -- so chance is ln(2048)=7.63; and because 6.7 latents share
+            # one caption group, identical captions tie in the softmax and the attainable floor is
+            # 1.97 (simulated over the actual subset draw). Validation bottoms at 6.23: 1.39 nats
+            # below chance, a quarter of the way to the floor. Weak, but not chance.
+            for yv, lab, va_ in ((7.625, "Chance ($\\ln 2048$)", "top"),
+                                 (1.969, "Caption-tie floor", "bottom")):
+                A.axhline(yv, color="0.35", ls=":", lw=1.0)
+                A.annotate(lab, xy=(0.98, yv), xycoords=("axes fraction", "data"), ha="right",
+                           va=va_, fontsize=5.2, color="0.25")
         if cur["train"] or cur["val"]:
-            A.legend(fontsize=6)
+            A.legend(fontsize=6, loc="lower left" if name == "Reward Model" else "best")
         if i == 0:
             A.set_ylabel("Loss", fontsize=7)
         h = float(np.mean(hrs)) if hrs else fallback_h
