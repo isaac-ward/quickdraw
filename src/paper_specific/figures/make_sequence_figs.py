@@ -23,6 +23,7 @@ import re
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.colors
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Ellipse, FancyArrow, PathPatch, Polygon, Rectangle
@@ -111,7 +112,7 @@ RM_TITLE     = "Reward head\n(contrastive)"
 RM_LAT       = "Project to $f_z$"     # the latent branch, fed by the brace, drawn ON TOP
 RM_TXT       = "Project to $f_t$"     # the text branch, drawn BELOW the latent one
 RM_ENC       = "MiniLM"               # ...and its sentence encoder is its OWN block: it is frozen
-RM_COS       = "cosine"
+RM_COS       = "$\\cos(f_z, f_t)$"
 RM_REQ       = "\u201cGo forward to the ladder\nin the middle of the room\u201d"   # no box, two lines
 RM_REQ_PAD   = 90.0      # clear space between the request and the box it feeds
 RM_OUT       = "Similarity score"
@@ -121,7 +122,7 @@ RM_COS_GAP   = 110.0     # branch boxes -> the cosine: the two feed arrows have 
 #                          tall and the figure has no room under the token column for that
 RM_PAD       = 26.0
 RM_GAP_BR    = BRACE_M   # column bottom -> brace line: THE SAME LIFT the summariser's input brace uses
-RM_GAP_BOX   = 62.0      # brace line -> box top
+RM_GAP_BOX   = 78.0      # brace line -> box top (16 units lower than it was, at the author's ask)
 RM_GAP_TXT   = 70.0      # box -> the sentence, which sits to its LEFT
 # ---- Z ORDER (one place, because the stacking rules are not obvious) --------------------------------
 # RULE: A FEED ARROW MUST NEVER CROSS A TOKENIZER OUTLINE. The tokenizers therefore sit ABOVE every
@@ -172,10 +173,11 @@ PRED_STEPS   = 1       # ONE predicted slice in this variant. Everything downstr
 #                        decoder feeds leave that one slice's face, and each decoder emits one item.
 BLK_LW       = 1.1
 plt.rcParams["hatch.linewidth"] = BLK_LW * 2.7   # 3x the old 0.9x: a hatch that reads AS a hatch
-# ONE PLACE FOR HATCH TRANSPARENCY. Set per-patch it would need every hatched call site to split into a
-# fill and an overlay; hatch.color overrides the patch edge for hatch strokes only, so the outlines stay
-# solid and just the stripes go to 50%.
-plt.rcParams["hatch.color"] = (0.0, 0.0, 0.0, 0.5)
+# HATCH COLOUR IS PER MODALITY, so it cannot be an rcParam: hatch.color is global, and the author wants
+# the predicted proprioception striped in orange and the sampled action plan in purple. Hatches are
+# therefore drawn as an OVERLAY patch whose EDGE colour carries the hue and the alpha (matplotlib draws
+# hatch strokes in the patch edge colour), at HATCH_A.
+HATCH_A = 0.25
 # ---- decoders: mirrored trapezia off the RED blocks, producing the predicted frame and vector --------
 DEC_GAP      = 170.0     # red column's right face -> decoder input edge
 OUT_GAP      = 150.0     # decoder output edge -> the predicted item
@@ -489,7 +491,8 @@ def vector_item_factory(mat, arrows=None, cmap=None, cmap_vec=None):
                                         length_includes_head=True, fc=EDGE, ec=EDGE, alpha=a, zorder=z + 0.4))
         ax.add_patch(Rectangle((x, y), CELL, D * CELL, fill=False, ec=EDGE, lw=LW, alpha=a, zorder=z + 0.5))
 
-    def draw_vec(ax, x, y, w, h, vec, a, z, ang=None, hatch=None, horizontal=False):
+    def draw_vec(ax, x, y, w, h, vec, a, z, ang=None, hatch=None, horizontal=False,
+                 hatch_col=None):
         """Same tile for a vector that is NOT one of the N items -- the model's prediction. Normalised with
         the STREAM's lo/hi, so its colours mean the same thing as the inputs' do.
 
@@ -502,7 +505,10 @@ def vector_item_factory(mat, arrows=None, cmap=None, cmap_vec=None):
         for k in range(D):
             cx0, cy0 = (x + k * CELL, y) if horizontal else (x, y + k * CELL)
             ax.add_patch(Rectangle((cx0, cy0), CELL, CELL, fc=_c(u[k], cmv),
-                                   ec=EDGE, lw=LW, alpha=a, hatch=hatch, zorder=z))
+                                   ec=EDGE, lw=LW, alpha=a, zorder=z))
+            if hatch:                                    # the stripes, in their own hue and alpha
+                ax.add_patch(Rectangle((cx0, cy0), CELL, CELL, fc="none", lw=0.0,
+                                       ec=hatch_rgba(hatch_col or EDGE), hatch=hatch, zorder=z + 0.2))
             if ang is not None:                          # same glyph the stream's own tiles carry
                 a_, L = ang[k], CELL * 0.54
                 cx, cy = cx0 + CELL / 2, cy0 + CELL / 2
@@ -734,6 +740,12 @@ def ray_exit(poly, p, d):
         if t > 1e-9 and -1e-9 <= u <= 1 + 1e-9 and (best is None or t < best):
             best = t
     return p + d * (best if best is not None else 0.0)
+
+
+def hatch_rgba(col, a=None):
+    """The hatch stroke colour for a patch: the modality's own hue, at HATCH_A."""
+    r, g, b = matplotlib.colors.to_rgb(col)
+    return (r, g, b, HATCH_A if a is None else a)
 
 
 def iso_block(ax, tip, depth, height, width, z, fc=BLK_FC, ec=BLK_EC, hatch=None):
@@ -1583,7 +1595,8 @@ def _draw_action_tiles(ax, x0, y0, x1, y1):
     the word on the arrow is what says so; see SAMPLE_LAB for why the distribution is not drawn."""
     for c in range(AS_TILES):
         _p_act_vec(ax, x0 + c * OFFSET_X, y0 + c * OFFSET_Y, CELL, _vh_a, ACT_SMP[0, c], 1.0,
-                   Z_ARROW + 1 + c, ang=_smp_arrows[c], hatch=PRED_HATCH)
+                   Z_ARROW + 1 + c, ang=_smp_arrows[c], hatch=PRED_HATCH,
+                   hatch_col=plt.get_cmap(ACT_OUT_CMAP)(0.85))
     ROUTES.append(("Action head", "out", f"tiles: 1 sampled chunk, {AS_TILES} steps"))
 
 
@@ -1711,7 +1724,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
             pal = LAYERS[row]                        # row 0 predicts VISION, row 1 predicts PROPRIO
             iso_block(ax, (P["tip"][0] + LAYERS[0]["sx"], P["tip"][1]), P["d"], P["h"], P["w"],
                       Z_BLOCK["vision"] + 50 + 10 * step + (n_b - 1 - row),
-                      fc=pal["blk"], ec=pal["ec"], hatch=PRED_HATCH)
+                      fc=pal["blk"], ec=pal["ec"], hatch=PRED_HATCH)   # slice: its own hue
     if decoders:
         sx = LAYERS[0]["sx"]
         for k, D in enumerate(DEC):
@@ -1755,13 +1768,15 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                     for bx, by, bwd, bht in ((ox, oy, W_, bw), (ox, oy + H_ - bw, W_, bw),
                                              (ox, oy + bw, bw, H_ - 2 * bw),
                                              (ox + W_ - bw, oy + bw, bw, H_ - 2 * bw)):
-                        ax.add_patch(Rectangle((bx, by), bwd, bht, fc="none", ec=VIS_EC, lw=0.0,
-                                               hatch=PRED_HATCH, zorder=zt + 0.4))
+                        ax.add_patch(Rectangle((bx, by), bwd, bht, fc="none", lw=0.0,
+                                               ec=hatch_rgba(VIS_EC), hatch=PRED_HATCH,
+                                               zorder=zt + 0.4))
                     ax.add_patch(Rectangle((ox, oy), D["ow"], D["oh"], fill=False, ec=VIS_EC,
                                            lw=LW * 2, zorder=zt + 0.5))
                 elif PRED_OBS is not None:
                     _p_prop_vec(ax, ox, oy, D["ow"], D["oh"], PRED_OBS[t_], 1.0, zt,
-                                hatch=PRED_HATCH)
+                                hatch=PRED_HATCH,
+                                hatch_col=plt.get_cmap(MOD_CMAP["proprio"])(0.85))
                 else:
                     D["draw"](ax, ox, oy, D["ow"], D["oh"], PRED_AT, 1.0, zt)
     if dit:
@@ -1832,7 +1847,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         # "Project to f_t".
         w_enc = text_extent(RM_ENC, BB_FS)[0] + 1.3 * RM_PAD
         w_prj = text_extent(RM_TXT, BB_FS)[0] + 1.3 * RM_PAD
-        w_br = max(text_extent(RM_LAT, BB_FS)[0] + 1.7 * RM_PAD, w_enc + RM_ROW_SEP + w_prj)
+        w_br = w_enc + RM_ROW_SEP + max(w_prj, text_extent(RM_LAT, BB_FS)[0] + 1.3 * RM_PAD)
         cos_gap = max(2.2 * ARROW_L, rw - 2 * RM_PAD - w_br - w_cos)
         bx0 = rx0 + RM_PAD
         y_lat = ry0 + RM_PAD + ttl_h + sub_h / 2
@@ -1845,9 +1860,13 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
             ax.text(x + w / 2, y, lab, ha="center", va="center", fontsize=BB_FS,
                     zorder=Z_TOKENIZER + 3)
         # THE TEXT BRANCH IS TWO BLOCKS: a frozen sentence encoder, then the projection that is trained.
-        _cell(bx0, y_lat, w_br, RM_LAT)
+        # THE TWO PROJECTIONS ARE THE SAME BOX, one above the other: they do the same thing to two
+        # different inputs, and drawing one full-width and one inset said otherwise.
+        w_prj = max(w_prj, text_extent(RM_LAT, BB_FS)[0] + 1.3 * RM_PAD)
+        px0 = bx0 + w_enc + RM_ROW_SEP
+        _cell(px0, y_lat, w_prj, RM_LAT)
         _cell(bx0, y_txt, w_enc, RM_ENC)
-        _cell(bx0 + w_enc + RM_ROW_SEP, y_txt, w_prj, RM_TXT)
+        _cell(px0, y_txt, w_prj, RM_TXT)
         draw_arrow(ax, [(bx0 + w_enc, y_txt), (bx0 + w_enc + RM_ROW_SEP - ARROW_L * 0.7, y_txt)],
                    Z_TOKENIZER + 2.5, tip=(bx0 + w_enc + RM_ROW_SEP, y_txt), head_dir=(1.0, 0.0))
         cx0 = bx0 + w_br + cos_gap
@@ -1860,12 +1879,12 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                 zorder=Z_TOKENIZER + 3)
         _z_in = Z_TOKENIZER + 1.5          # above the box fill, or the arrows inside it are painted over
         for yy in (y_lat, y_txt):
-            draw_arrow(ax, [(bx0 + w_br, yy), (0.5 * (bx0 + w_br + cx0), yy),
-                            (0.5 * (bx0 + w_br + cx0), y_cos), (cx0 - ARROW_L, y_cos)], _z_in,
+            draw_arrow(ax, [(px0 + w_prj, yy), (0.5 * (px0 + w_prj + cx0), yy),
+                            (0.5 * (px0 + w_prj + cx0), y_cos), (cx0 - ARROW_L, y_cos)], _z_in,
                        tip=(cx0, y_cos), head_dir=(1.0, 0.0))
         # the brace stem comes down and turns into the latent branch
-        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], y_lat), (bx0 - ARROW_L, y_lat)], Z_ARROW,
-                   tip=(bx0, y_lat), head_dir=(1.0, 0.0))
+        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], y_lat), (px0 - ARROW_L, y_lat)], Z_ARROW,
+                   tip=(px0, y_lat), head_dir=(1.0, 0.0))
         # ...and the request runs in from the SAME x the brace stem turns at, so the two inputs align
         lines = RM_REQ.split(chr(10))
         tw = max(text_extent(l, BB_FS * 1.5)[0] for l in lines)

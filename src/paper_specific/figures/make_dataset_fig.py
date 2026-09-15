@@ -61,7 +61,7 @@ print(f"{len(SEQ)} sequences x {N} steps, {K * STRIDE / FPS:.1f} s apart, span "
       f"{(N - 1) * K * STRIDE / FPS:.1f} s | frames {IDX}")
 
 
-def cells(ax, mat, x0, y0, cmap, rows, lo=CMAP_LO, needles=False):
+def cells(ax, mat, x0, y0, cmap, rows, lo=CMAP_LO, needles=False, lw=LW):
     """mat (N, D) -> one block of `rows` x D/rows cells per step, left-aligned at x0[i].
 
     Normalised PER DIMENSION across the sequence, so colour shows how that dimension changed rather than
@@ -77,7 +77,7 @@ def cells(ax, mat, x0, y0, cmap, rows, lo=CMAP_LO, needles=False):
         for k in range(D):
             r, c = divmod(k, per)
             cx, cy = x0[i] + c * CELL, y0 + r * CELL
-            ax.add_patch(Rectangle((cx, cy), CELL, CELL, lw=LW, ec=EDGE,
+            ax.add_patch(Rectangle((cx, cy), CELL, CELL, lw=lw, ec=EDGE,
                                    fc=cm(lo + (CMAP_HI - lo) * u[i, k])))
             if needles:
                 # A NEEDLE, NOT AN UP/DOWN ARROW: the angle sweeps from straight up (stick fully
@@ -93,7 +93,7 @@ def cells(ax, mat, x0, y0, cmap, rows, lo=CMAP_LO, needles=False):
                                         width=LW * 1.1, head_width=CELL * 0.32,
                                         head_length=CELL * 0.32, length_includes_head=True,
                                         fc=EDGE, ec=EDGE, lw=0.0))
-        ax.add_patch(Rectangle((x0[i], y0), per * CELL, rows * CELL, fill=False, ec=EDGE, lw=LW))
+        ax.add_patch(Rectangle((x0[i], y0), per * CELL, rows * CELL, fill=False, ec=EDGE, lw=lw))
 
 
 def main() -> int:
@@ -109,9 +109,9 @@ def main() -> int:
         y0 = si * seq_h
         for i, x in enumerate(xs):
             ax.imshow(frames[i], extent=(x, x + IMG_W, y0 + img_h, y0), interpolation="bilinear")
-            ax.add_patch(Rectangle((x, y0), IMG_W, img_h, fill=False, ec=vis, lw=IMG_LW))
+            ax.add_patch(Rectangle((x, y0), IMG_W, img_h, fill=False, ec=vis, lw=IMG_LW / 2))
         y_s = y0 + img_h + gap
-        cells(ax, o, xs, y_s, CMAP["proprio"], rows=2)
+        cells(ax, o, xs, y_s, CMAP["proprio"], rows=2, lw=LW / 2)
         cells(ax, a, xs, y_s + 2 * CELL + gap, CMAP["action"], rows=1, needles=True)
         y_t = y_s + 3 * CELL + gap + 30
         ax.annotate("", xy=(xs[-1] + IMG_W, y_t), xytext=(0, y_t),

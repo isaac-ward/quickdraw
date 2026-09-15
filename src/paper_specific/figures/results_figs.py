@@ -100,7 +100,7 @@ def longhorizon(paper, dev="cuda", n_show=8):
                 A.imshow(img, interpolation="bilinear", aspect="auto")
                 A.set_xticks([]); A.set_yticks([])
                 for sp in A.spines.values():                 # the frame outline: black, and the same
-                    sp.set_linewidth(2.0); sp.set_color("black")   # weight as the green one in Fig. 4
+                    sp.set_linewidth(1.0); sp.set_color("black")   # half weight, at the author's ask
                 if c == 0:                                   # 13pt made the two labels touch
                     A.set_ylabel("Predicted" if k == 1 else "Truth", fontsize=10.5, labelpad=2)
         # THE ERRORS OVER THE WHOLE ROLLOUT, under the pair they belong to and on the same x
@@ -259,26 +259,47 @@ def ood(paper, dev="cuda"):
     cand = [t for t in range(P, len(o)) if not (w0 <= t < w1)]
     t_out = max(cand, key=lambda t: abs(t - t_in)) if cand else P
     sur = best_sur
+    # A SECOND ANOMALOUS FRAME, later than the first, chosen the same way: the pair shows the noodle
+    # moving through the scene and the map following it.
+    later = [t for t in top_pink if t > t_in] or [t for t in inside if t > t_in]
+    t_late, sur_late = t_in, best_sur
+    for t in later[:3]:
+        ob = torch.from_numpy(fr[key][t]).float().div(255.0).to(dev)
+        mm, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t, dev, n=32), ob)
+        sm = mm["surprise_patch"].cpu().numpy()
+        q = float(np.percentile(sm, 99) / max(1e-6, np.median(sm)))
+        if t != t_in and q > -1:
+            t_late, sur_late = t, sm
+            break
+    print(f"      second frame t={t_late}")
     photo = _scene_photo(paper, "pool-noodle.png", shape=fr[key][0].shape)
-    fig = plt.figure(figsize=(7.2, 2.9))
-    outer = fig.add_gridspec(2, 1, height_ratios=(0.72, 1.0), hspace=0.10)
-    top = outer[0].subgridspec(1, 4 if photo is not None else 3, wspace=0.06)
-    panes = [(photo, "How it was applied")] if photo is not None else []
-    panes += [(fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
-              (fr[key][t_in], f"Anomalous ($t{{=}}{t_in}$)"), (None, "Per-pixel surprise")]
-    for jx, (img, lab) in enumerate(panes):
-        A = fig.add_subplot(top[0, jx])
+    # the trace is as tall as the two image rows together
+    fig = plt.figure(figsize=(7.2, 3.6))
+    outer = fig.add_gridspec(1, 2, width_ratios=(1.0, 0.85), wspace=0.16)
+    # 2x4. Row one: how it was applied, a clean frame, the anomalous frame, and a LATER anomalous
+    # frame. Row two: the per-pixel surprise under each of the two anomalous frames, with the first two
+    # cells blank -- the map belongs under the frame it explains, not in a row of its own.
+    top = outer[0].subgridspec(2, 4, wspace=0.06, hspace=0.10)
+    panes = [(0, 0, photo, "Applying the disturbance"),
+             (0, 1, fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
+             (0, 2, fr[key][t_in], f"Anomalous ($t{{=}}{t_in}$)"),
+             (0, 3, fr[key][t_late], f"Anomalous ($t{{=}}{t_late}$)"),
+             (1, 2, None, None), (1, 3, None, None)]
+    for r_, c_, img, lab in panes:
+        A = fig.add_subplot(top[r_, c_])
         if img is None:
-            A.imshow(sur, cmap="inferno", vmin=np.percentile(sur, 50), vmax=np.percentile(sur, 99))
+            m = sur if c_ == 2 else sur_late
+            A.imshow(m, cmap="inferno", vmin=np.percentile(m, 50), vmax=np.percentile(m, 99))
         else:
             A.imshow(img)
-        A.set_title(lab, fontsize=FS)
+        if lab:
+            A.set_title(lab, fontsize=FS)
         A.set_xticks([]); A.set_yticks([])
-        for sp_ in A.spines.values():                    # every image in the paper carries this border
+        for sp_ in A.spines.values():
             sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
     A = fig.add_subplot(outer[1])
     v = np.asarray(r[chan])
-    A.plot(r["steps"], v, color="tab:purple", lw=1.6)
+    A.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
     A.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
     out = (r["steps"] < w0) | (r["steps"] >= w1)
     A.set_xlim(0, len(o) - 1)
@@ -304,19 +325,19 @@ def ood(paper, dev="cuda"):
     t_peak = int(r["steps"][int(np.argmax(np.where((r["steps"] >= w0) & (r["steps"] < w1), v, -1)))])
     pov = fr[key][t_peak]
     photo = _scene_photo(paper, "leaf-blower.png", shape=pov.shape)
-    fig = plt.figure(figsize=(7.2, 3.9))
-    gb = fig.add_gridspec(2, 2, width_ratios=(1.0, 1.5), wspace=0.24, hspace=0.30)
-    A = fig.add_subplot(gb[0, 0]); A.imshow(pov)
+    fig = plt.figure(figsize=(7.2, 2.9))
+    gb = fig.add_gridspec(2, 2, width_ratios=(1.5, 1.0), wspace=0.22, hspace=0.34)
+    A = fig.add_subplot(gb[1, 1]); A.imshow(pov)
     A.set_xticks([]); A.set_yticks([])
     for sp_ in A.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    A.set_title(f"From the drone, as it is pushed ($t{{=}}{t_peak}$)", fontsize=FS)
-    AP = fig.add_subplot(gb[1, 0]); AP.imshow(photo)
+    A.set_title("Disturbance is not visually detectable", fontsize=FS)
+    AP = fig.add_subplot(gb[0, 1]); AP.imshow(photo)
     AP.set_xticks([]); AP.set_yticks([])
     for sp_ in AP.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-    AP.set_title("How it was applied", fontsize=FS)
-    AV = fig.add_subplot(gb[0, 1])
+    AP.set_title("Disturbance application", fontsize=FS)
+    AV = fig.add_subplot(gb[0, 0])
     for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
         AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
     AV.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0)
@@ -325,8 +346,8 @@ def ood(paper, dev="cuda"):
               labelspacing=0.25)
     AV.tick_params(labelsize=FS - 1.5); AV.grid(alpha=0.25)
     AV.set_xlim(0, len(o) - 1)
-    AE = fig.add_subplot(gb[1, 1], sharex=AV)
-    AE.plot(r["steps"], v, color="tab:purple", lw=1.6)
+    AE = fig.add_subplot(gb[1, 0], sharex=AV)
+    AE.plot(r["steps"], v, color="tab:purple", lw=1.6, label="OOD score")
     AE.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
     AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)
     AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25)
@@ -372,41 +393,10 @@ def curves(paper):
         # i.e. held-out retrieval is at chance, while the probe reaches 2.4-4.6x chance and train and val
         # track each other. Chance differs per factor (6, 10 and 9 buckets), so the mean of the three is
         # plotted against the mean of their chance levels, drawn.
-        if any(t.startswith("val/probe/") for t in tags):
-            facs = sorted({t.split("/")[-1][:-4] for t in tags if t.startswith("val/probe/")
-                           and t.endswith("_acc")})
-            NB = {"facing": 6, "object_in_view": 10, "motion_dominant": 9}
-            chance = float(np.mean([1.0 / NB[f] for f in facs]))
-            acc = {"train": {}, "val": {}}
-            for r in rows:
-                t = r.get("tag") or ""
-                for sp in ("train", "val"):
-                    if t.startswith(f"{sp}/probe/") and t.endswith("_acc"):
-                        acc[sp].setdefault(r.get("step", 0), []).append(r["value"])
-            A = ax[i]
-            for k, c in (("train", "tab:blue"), ("val", "tab:red")):
-                x = sorted(acc[k])
-                A.plot(x, [float(np.mean(acc[k][v])) for v in x], color=c, lw=1.3, label=k)
-            A.axhline(chance, color="k", ls=":", lw=0.9)
-            # THE DEPLOYED CHECKPOINT. The probe peaks early and then drifts down -- ordinary
-            # overfitting on 12k pairs -- and early stopping on val loss means the head that ships is
-            # the best one, not the last. Marking it stops the decline reading as what we deployed.
-            xb = max(acc["val"], key=lambda k: float(np.mean(acc["val"][k])))
-            A.axvline(xb, color="tab:green", lw=0.9, ls="--")
-            A.text(xb, A.get_ylim()[0], " deployed", fontsize=5.5, color="tab:green", ha="left",
-                   va="bottom")
-            A.text(0.98, chance, "chance", ha="right", va="bottom", fontsize=6, color="k",
-                   transform=A.get_yaxis_transform())
-            A.set_title(name, fontsize=8)
-            A.set_xlabel("epoch", fontsize=7); A.set_ylabel("probe accuracy", fontsize=7)
-            A.tick_params(labelsize=6); A.grid(alpha=0.25); A.legend(fontsize=6)
-            A.set_ylim(0.0, None)
-            if fallback_h:
-                span = fallback_h * max(max(acc["train"] or [0]), max(acc["val"] or [0]))
-                mul, unit = (60.0, "min") if span < 0.2 else (1.0, "h")
-                tw = A.twiny(); tw.set_xlim(*[x * fallback_h * mul for x in A.get_xlim()])
-                tw.set_xlabel(f"wall clock ({unit})", fontsize=7); tw.tick_params(labelsize=6)
-            continue
+        # THE REWARD HEAD IS PLOTTED ON ITS LOSS, like the other two. The probe was the honest
+        # headline but it is not a training curve: it peaks and drifts, which reads as a fault. The
+        # contrastive loss shows the thing that actually happened -- train falls and val does not
+        # follow -- and the wall clock is in SECONDS, because 91 s is the number worth seeing.
         pair = None
         for cand in ("loss/total", "loss/contrastive"):
             if f"train/{cand}" in tags and f"val/{cand}" in tags:
@@ -440,10 +430,10 @@ def curves(paper):
             # UNIT PER PANEL. The world model took 45 h and the Reward Model 91 s; one axis in hours makes
             # the third panel read 0.000 to 0.007, which says nothing. Switch to minutes below 12 min.
             span = h * max(max(cur["train"] or [0]), max(cur["val"] or [0]))
-            mul, unit = (60.0, "min") if span < 0.2 else (1.0, "h")
+            mul, unit = (3600.0, "s") if span < 0.05 else (60.0, "min") if span < 0.2 else (1.0, "h")
             tw = A.twiny(); tw.set_xlim(*[x * h * mul for x in A.get_xlim()])
             tw.set_xlabel(f"wall clock ({unit})", fontsize=7); tw.tick_params(labelsize=6)
-    fig.tight_layout(w_pad=1.1)
+    fig.tight_layout(w_pad=0.5, pad=0.4)
     f = os.path.join(paper, "figures", "training-curves.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print(f"  figures/training-curves.png")

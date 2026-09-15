@@ -85,19 +85,19 @@ def main(run: str = RUN) -> int:
     print(f"  chunk {K} | recorded {real.shape} | sampled {pred.shape} "
           f"({len(h)} contexts x {N_DRAW} draws)")
 
-    fig = plt.figure(figsize=(7.1, 2.9))
-    gh = fig.add_gridspec(len(LOOKAHEADS), NA, hspace=0.0, wspace=0.30)
+    fig = plt.figure(figsize=(7.1, 2.5))
+    gh = fig.add_gridspec(len(LOOKAHEADS), NA, hspace=0.0, wspace=0.14,
+                          left=0.075, right=0.995, top=0.92, bottom=0.11)
     for r, k in enumerate(LOOKAHEADS):
         for c in range(NA):
             A_ = fig.add_subplot(gh[r, c])
-            # fore/aft never goes positive in this corpus, so its own range is -1..0 and the shared
-            # -1..1 spent half the panel on empty space
-            x0, x1 = (-1.0, 0.0) if AXES[c].startswith("fore") else (-1.0, 1.0)
+            x0, x1 = -1.0, 1.0
             bins = np.linspace(x0, x1, BINS)
+            last = (r == len(LOOKAHEADS) - 1 and c == NA - 1)
             A_.hist(real[:, k, c], bins=bins, density=True, color="tab:green", alpha=0.45,
-                    label="Truth" if (r == 0 and c == 0) else None)
+                    label="Truth" if last else None)
             A_.hist(pred[:, k, c], bins=bins, density=True, color="tab:red", alpha=0.45,
-                    label="Prediction" if (r == 0 and c == 0) else None)
+                    label="Prediction" if last else None)
             A_.set_yticks([])
             A_.set_xlim(x0, x1)
             A_.tick_params(labelsize=FS - 2.5, labelbottom=(r == len(LOOKAHEADS) - 1))
@@ -108,10 +108,9 @@ def main(run: str = RUN) -> int:
                              fontsize=FS)
             if c == 0:
                 A_.set_ylabel(f"$+${k + 1}", fontsize=FS)
-            if r == 0 and c == 0:
+            if r == len(LOOKAHEADS) - 1 and c == NA - 1:
                 A_.legend(fontsize=FS - 2.0, frameon=False, loc="upper left")
-    fig.supylabel("Lookahead", fontsize=FS)
-    fig.tight_layout(h_pad=0.1, w_pad=0.35)
+    fig.supylabel("Lookahead", fontsize=FS, x=0.012)     # hard against the row labels, not the margin
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", OUT)
     return 0
