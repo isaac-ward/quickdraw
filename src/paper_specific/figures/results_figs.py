@@ -90,7 +90,7 @@ def longhorizon(paper, dev="cuda", n_show=8):
     # FIVE rows per pair: label strip, the two images, the curve panel, and a SPACER -- with hspace=0
     # (which the flush image pair needs) the next pair's step labels otherwise land on this pair's ticks.
     gs = fig.add_gridspec(5 * len(rows), NC, hspace=0.0, wspace=0.0,
-                          height_ratios=[0.34, 1.0, 1.0, 0.95, 0.42] * len(rows))
+                          height_ratios=[0.34, 1.0, 1.0, 0.95, 0.62] * len(rows))
     for r, (pred, true, ks, h, cur) in enumerate(rows):
         for c in range(NC):
             lab = fig.add_subplot(gs[5 * r, c]); lab.axis("off")
@@ -101,8 +101,8 @@ def longhorizon(paper, dev="cuda", n_show=8):
                 A.set_xticks([]); A.set_yticks([])
                 for sp in A.spines.values():                 # the frame outline: black, and the same
                     sp.set_linewidth(2.0); sp.set_color("black")   # weight as the green one in Fig. 4
-                if c == 0:
-                    A.set_ylabel("Predicted" if k == 1 else "Truth", fontsize=13)
+                if c == 0:                                   # 13pt made the two labels touch
+                    A.set_ylabel("Predicted" if k == 1 else "Truth", fontsize=10.5, labelpad=2)
         # THE ERRORS OVER THE WHOLE ROLLOUT, under the pair they belong to and on the same x
         AC = fig.add_subplot(gs[5 * r + 3, :])
         x = np.arange(1, h + 1)
@@ -110,14 +110,14 @@ def longhorizon(paper, dev="cuda", n_show=8):
             AC.plot(x, v, lw=1.3, color=col, label=nm)
         for k in ks:                                          # which steps the frames above came from
             AC.axvline(k + 1, color="0.75", lw=0.6, ls=":")
-        AC.set_xlim(1, h); AC.set_ylim(0, None)
+        AC.set_xlim(1, h); AC.set_ylim(0, 1.0)
         AC.set_ylabel("error", fontsize=12); AC.tick_params(labelsize=10)
         AC.grid(alpha=0.25)
-        AC.legend(fontsize=10, ncol=3, loc="upper right", framealpha=0.85)
-        if r == len(rows) - 1:                                # ticks and the label on the last panel only
-            AC.set_xlabel("open-loop prediction step", fontsize=12)
-        else:
-            AC.tick_params(labelbottom=False)
+        AC.legend(fontsize=10, ncol=3, loc="lower left", framealpha=0.85)
+        # EACH PAIR HAS ITS OWN X AXIS -- the rollouts are different lengths, so they never shared one --
+        # but the NAME of that axis is written once, under the arrow of time, because a label per panel
+        # lands on the next pair's step numbers.
+        AC.tick_params(labelbottom=True)
     # THE ARROW OF TIME, matched to the width of the sequences rather than the whole figure
     fig.canvas.draw()
     first = fig.axes[1].get_position(); last = None
@@ -125,11 +125,13 @@ def longhorizon(paper, dev="cuda", n_show=8):
         pos = A.get_position()
         if abs(pos.y0 - first.y0) < 1e-6:
             last = pos
-    fig.subplots_adjust(bottom=0.055)
+    fig.subplots_adjust(bottom=0.075)
     x0, x1 = first.x0, (last or first).x1
     fig.patches.append(FancyArrowPatch((x0, 0.022), (x1, 0.022), transform=fig.transFigure,
                                        arrowstyle="-|>", mutation_scale=22, lw=1.6, color="#333333"))
     fig.text(x1 + 0.006, 0.022, "$t$", ha="left", va="center", fontsize=15, color="#333333")
+    fig.text(0.5 * (x0 + x1), 0.016, "Open-loop prediction step", ha="center", va="top", fontsize=12,
+             color="#333333")
     f = os.path.join(paper, "figures", "longhorizon.png")
     fig.savefig(f, dpi=DPI_IMG, bbox_inches="tight"); plt.close(fig)
     print(f"  figures/longhorizon.png  {len(rows)} pairs, horizons "
@@ -170,35 +172,31 @@ def _scene_photo(paper, name):
 
 
 def ood(paper, dev="cuda"):
-    """Two blocks, one per anomaly kind, and they are deliberately NOT the same figure.
+    """TWO SEPARATE FIGURES, one per anomaly kind, because they are not the same figure and the author
+    reads them separately: ood-visual.png and ood-dynamical.png.
 
-    (a) The pool noodle is IN THE IMAGE, so frames plus the per-pixel surprise map carry it.
-    (b) The leaf blower is not: two camera frames of it look identical, which is what made the first
-        version of this panel the weakest thing in the paper. The evidence there is the third-person
-        scene (what is physically happening), the RECORDED angular velocity (the array the detector
-        reads), and the detector's own channel with its conformal threshold.
+    Each carries the third-person scene (what was physically done to the drone, from the author's own
+    composite figures), the evidence in the sensor the anomaly actually lives in, and the detector's
+    channel with its conformal threshold. For the noodle that sensor is the camera, so the panel shows
+    frames and the per-pixel surprise map; for the blower it is the IMU, because two camera frames of an
+    invisible disturbance prove nothing.
 
-    Episodes are picked so the reviewed window sits MID-RUN -- with the window at a clip's edge there is
-    no before-and-after to see. Frames within the window are still chosen by peak evidence, since the
-    midpoint of a window is often a moment when the object is edge-on."""
+    Every trace marks WHERE PREDICTION STARTS: the first P frames are context, so there is no prediction
+    before then and the empty stretch at the left is not missing data."""
     from quickdraw.data.ood_windows import kept, window_steps
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analysis"))
     from detect_anomalies_wm import one_step
     from localise_ood_pixels import ensemble, maps_from, pink_mask
     cfg, core, norm, P, key = _model(dev)
-    FS = 8.0
-    fig = plt.figure(figsize=(7.2, 7.4))
-    outer = fig.add_gridspec(2, 1, hspace=0.34, height_ratios=(1.0, 1.05))
+    FS = 8.5
 
-    def pick(split, need_out=4, min_width=3):
-        """The kept episode with the most usable margin either side of its window.
+    def pick(split, need_out=4, min_width=3, prefer="central"):
+        """The kept episode that reads best for a figure.
 
-        MID-RUN IS NOT ALWAYS AVAILABLE, and the data says so: every reviewed noodle window touches an
-        edge of its clip -- the noodle is either already in view at the first predicted step or still
-        there at the last -- so no noodle episode has clean flight on BOTH sides. The leaf blower does
-        (ep4: 5 steps before, 14 after). So rank by the smaller margin first and the total second, which
-        gives the blower a genuinely central window and the noodle the longest clean stretch available,
-        and require a window at least `min_width` steps wide so it is visible at all."""
+        `prefer="end"` wants the disturbance to ARRIVE and stay -- a long clean stretch first, then the
+        window running to the end of the clip -- which is what the noodle needs, since every reviewed
+        noodle window touches an edge anyway and starting inside it shows the anomaly before the baseline.
+        `prefer="central"` wants a window with clean flight either side, which the blower has."""
         eps = load_split_episodes_mm(resolve_data_root(cfg), split, img_size=image_head_sizes(cfg),
                                      cam=image_head_cams(cfg), repo_id="starling-2")
         cands = []
@@ -211,21 +209,27 @@ def ood(paper, dev="cuda"):
             n_aft = len([t for t in outside if t >= w1])
             if not inside or len(outside) < need_out or (w1 - w0) < min_width:
                 continue
-            cands.append((min(n_bef, n_aft), n_bef + n_aft,
-                          abs(0.5 * (w0 + w1) / max(1, len(o)) - 0.5), ep, w0, w1))
+            cands.append(dict(ep=ep, w0=w0, w1=w1, bef=n_bef, aft=n_aft, n=len(o),
+                              ctr=abs(0.5 * (w0 + w1) / max(1, len(o)) - 0.5)))
         assert cands, f"no usable episode in {split}"
-        # WHERE BOTH MARGINS EXIST, CENTRALITY DECIDES -- that is what "mid-run" means, and margin alone
-        # picked a later window (ep10, centre at 0.69) over a dead-central one (ep4, 0.48). Where no
-        # episode has both margins, as for the noodle, fall back to the longest clean stretch.
-        ok = [c for c in cands if c[0] >= 3]
-        mn, tot, ctr, ep, w0, w1 = min(ok, key=lambda c: c[2]) if ok else max(cands, key=lambda c: c[:2])
-        print(f"    {split}: ep{ep} window {w0}-{w1} | margins min {mn} total {tot} | "
-              f"centre offset {ctr:.2f} | {'central' if ok else 'no episode has both margins'}")
-        return eps, (0.0, ep, w0, w1)
+        if prefer == "end":
+            c = max(cands, key=lambda c: (c["bef"], -c["aft"]))    # longest clean run BEFORE the window
+        else:
+            ok = [c for c in cands if min(c["bef"], c["aft"]) >= 3]
+            c = min(ok, key=lambda c: c["ctr"]) if ok else max(cands, key=lambda c: min(c["bef"], c["aft"]))
+        print(f"    {split}: ep{c['ep']} window {c['w0']}-{c['w1']} of {c['n']} | before {c['bef']} "
+              f"after {c['aft']} | prefer={prefer}")
+        return eps, c
 
-    # ---- (a) the visual anomaly ---------------------------------------------------------------------
+    def mark_context(A):
+        A.axvline(P, color="tab:blue", ls="-.", lw=1.0)
+        A.text(P, A.get_ylim()[1], " prediction starts", color="tab:blue", fontsize=FS - 2.0,
+               ha="left", va="top")
+
+    # ================= (a) VISUAL =====================================================================
     split, chan, chan_lab = "eval_ood_noodle", "latent_cos", "latent surprise"
-    eps, (_, ep, w0, w1) = pick(split)
+    eps, c = pick(split, prefer="end")
+    ep, w0, w1 = c["ep"], c["w0"], c["w1"]
     o, a, fr = eps[ep]
     r = one_step(core, norm, o, a, fr[key], key, P, dev)
     inside = [t for t in range(max(P, w0), min(w1, len(o)))]
@@ -235,18 +239,21 @@ def ood(paper, dev="cuda"):
     obs = torch.from_numpy(fr[key][t_in]).float().div(255.0).to(dev)
     mp, _, _ = maps_from(ensemble(core, norm, o, a, fr[key], key, P, t_in, dev, n=32), obs)
     sur = mp["surprise_patch"].cpu().numpy()
-    print(f"    (a) {split} ep{ep}: window {w0}-{w1} of {len(o)} steps, frames {t_out} / {t_in}")
-    gs = outer[0].subgridspec(2, 3, height_ratios=[1.35, 1.0], hspace=0.34, wspace=0.05)
-    for jx, (img, lab) in enumerate(((fr[key][t_out], f"in distribution ($t{{=}}{t_out}$)"),
-                                     (fr[key][t_in], f"anomalous ($t{{=}}{t_in}$)"),
-                                     (None, "per-pixel surprise"))):
-        A = fig.add_subplot(gs[0, jx])
+    photo = _scene_photo(paper, "pool-noodle.png")
+    fig = plt.figure(figsize=(7.2, 3.6))
+    outer = fig.add_gridspec(2, 1, height_ratios=(1.05, 1.0), hspace=0.24)
+    top = outer[0].subgridspec(1, 4 if photo is not None else 3, wspace=0.06)
+    panes = [(photo, "how it was applied")] if photo is not None else []
+    panes += [(fr[key][t_out], f"in distribution ($t{{=}}{t_out}$)"),
+              (fr[key][t_in], f"anomalous ($t{{=}}{t_in}$)"), (None, "per-pixel surprise")]
+    for jx, (img, lab) in enumerate(panes):
+        A = fig.add_subplot(top[0, jx])
         if img is None:
             A.imshow(sur, cmap="inferno", vmin=np.percentile(sur, 50), vmax=np.percentile(sur, 99))
         else:
             A.imshow(img)
-        A.set_title(lab, fontsize=FS - 0.5); A.axis("off")
-    A = fig.add_subplot(gs[1, :])
+        A.set_title(lab, fontsize=FS); A.axis("off")
+    A = fig.add_subplot(outer[1])
     v = np.asarray(r[chan])
     A.plot(r["steps"], v, color="crimson", lw=1.4)
     A.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0, label="reviewed anomaly window")
@@ -254,29 +261,34 @@ def ood(paper, dev="cuda"):
     if out.any():
         A.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
                   label="90% conformal threshold")
-    A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("model step", fontsize=FS)
-    A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25); A.legend(fontsize=FS - 1.5, loc="best")
-    fig.text(0.02, 0.975, "(a) Visual anomaly: a pool noodle enters frame   "
-             f"[episode {ep}]", fontsize=FS + 0.5, weight="bold", ha="left")
+    A.set_xlim(0, len(o) - 1)
+    A.set_ylabel(chan_lab, fontsize=FS); A.set_xlabel("Model step", fontsize=FS)
+    A.tick_params(labelsize=FS - 1.5); A.grid(alpha=0.25); A.legend(fontsize=FS - 1.5, loc="lower left")
+    mark_context(A)
+    f = os.path.join(paper, "figures", "ood-visual.png")
+    fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
+    print("  figures/ood-visual.png")
 
-    # ---- (b) the dynamical anomaly ------------------------------------------------------------------
+    # ================= (b) DYNAMICAL ==================================================================
     split, chan, chan_lab = "eval_ood_leafblower", "angvel_err", "angular velocity error"
-    eps, (_, ep, w0, w1) = pick(split)
+    eps, c = pick(split, prefer="central")
+    ep, w0, w1 = c["ep"], c["w0"], c["w1"]
     o, a, fr = eps[ep]
     r = one_step(core, norm, o, a, fr[key], key, P, dev)
-    print(f"    (b) {split} ep{ep}: window {w0}-{w1} of {len(o)} steps")
     photo = _scene_photo(paper, "leaf-blower.png")
-    gb = outer[1].subgridspec(2, 2, width_ratios=(1.0, 1.55), wspace=0.22, hspace=0.12)
+    fig = plt.figure(figsize=(7.2, 3.3))
+    gb = fig.add_gridspec(2, 2, width_ratios=(1.0, 1.7), wspace=0.20, hspace=0.14)
     if photo is not None:
         A = fig.add_subplot(gb[:, 0]); A.imshow(photo); A.axis("off")
-        A.set_title("the disturbance", fontsize=FS - 0.5)
+        A.set_title("how it was applied", fontsize=FS)
     AV = fig.add_subplot(gb[0, 1])
-    for c, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
-        AV.plot(np.arange(len(o)), o[:, c], lw=1.1, label=lab)
+    for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
+        AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
     AV.axvspan(w0, w1, color="tab:green", alpha=0.16, lw=0)
     AV.set_ylabel("recorded\n$\\omega$ (rad/s)", fontsize=FS)
     AV.legend(fontsize=FS - 2, ncol=3, loc="upper left", frameon=False)
     AV.tick_params(labelsize=FS - 1.5, labelbottom=False); AV.grid(alpha=0.25)
+    AV.set_xlim(0, len(o) - 1)
     AE = fig.add_subplot(gb[1, 1], sharex=AV)
     v = np.asarray(r[chan])
     AE.plot(r["steps"], v, color="crimson", lw=1.4)
@@ -285,13 +297,13 @@ def ood(paper, dev="cuda"):
     if out.any():
         AE.axhline(float(np.quantile(v[out], 0.90)), color="k", ls=":", lw=1.1,
                    label="90% conformal threshold")
-    AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("model step", fontsize=FS)
-    AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25); AE.legend(fontsize=FS - 1.5, loc="upper left")
-    fig.text(0.02, 0.487, "(b) Dynamical anomaly: an off-camera leaf blower pushes the drone   "
-             f"[episode {ep}]", fontsize=FS + 0.5, weight="bold", ha="left")
-    f = os.path.join(paper, "figures", "ood-detection.png")
+    AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Model step", fontsize=FS)
+    AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25)
+    AE.legend(fontsize=FS - 1.5, loc="upper right")      # upper-left is where the context mark labels
+    mark_context(AE)
+    f = os.path.join(paper, "figures", "ood-dynamical.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
-    print("  figures/ood-detection.png")
+    print("  figures/ood-dynamical.png")
 
 
 def curves(paper):

@@ -37,7 +37,7 @@ RUN = "logs/paper_icra_2027/model_backups/train_action_2026_09_14_04_41_17_s2_ah
 OUT = "/app/logs/paper_icra_2027/marginals.png"
 AXES = [a["name"] for a in yaml.safe_load(open("conf/interpret/starling.yaml"))["action_axes"]]
 NA = len(AXES)
-LEADS = (0, 7, 15, 31)        # slots into the 32-step chunk: +1, +8, +16, +32
+LOOKAHEADS = (0, 7, 15, 31)    # slots into the 32-step chunk: +1, +8, +16, +32
 N_CTX, N_DRAW, BINS = 48, 64, 61
 FS = 9.0
 
@@ -82,28 +82,28 @@ def main(run: str = RUN) -> int:
     print(f"  chunk {K} | recorded {real.shape} | sampled {pred.shape} "
           f"({len(h)} contexts x {N_DRAW} draws)")
 
-    fig, ax = plt.subplots(len(LEADS), NA, figsize=(7.1, 5.6), sharex="col")
-    for r, k in enumerate(LEADS):
+    fig, ax = plt.subplots(len(LOOKAHEADS), NA, figsize=(7.1, 2.8), sharex=True)
+    for r, k in enumerate(LOOKAHEADS):
         for c in range(NA):
             A_ = ax[r, c]
-            lo = min(real[:, k, c].min(), pred[:, k, c].min())
-            hi = max(real[:, k, c].max(), pred[:, k, c].max())
-            bins = np.linspace(lo, hi, BINS)
+            # ONE x range for every panel: the stick is bounded at +-1 by construction, so a per-panel
+            # range made panels with a narrow distribution look like panels with a wide one.
+            bins = np.linspace(-1.0, 1.0, BINS)
             A_.hist(real[:, k, c], bins=bins, density=True, color="tab:green", alpha=0.45,
-                    label="recorded" if (r == 0 and c == 0) else None)
+                    label="Truth" if (r == 0 and c == 0) else None)
             A_.hist(pred[:, k, c], bins=bins, density=True, color="tab:red", alpha=0.45,
-                    label="sampled" if (r == 0 and c == 0) else None)
+                    label="Prediction" if (r == 0 and c == 0) else None)
             A_.set_yticks([]); A_.tick_params(labelsize=FS - 2.5)
-            for sp in ("top", "right", "left"):
-                A_.spines[sp].set_visible(False)
+            A_.set_xlim(-1.0, 1.0)
+            for sp in A_.spines.values():                    # every panel in its own box
+                sp.set_visible(True); sp.set_linewidth(0.7); sp.set_color("black")
             if r == 0:
                 A_.set_title(AXES[c], fontsize=FS)
             if c == 0:
-                A_.set_ylabel(f"lead $+${k + 1}", fontsize=FS)
-            if r == len(LEADS) - 1:
-                A_.set_xlabel("stick", fontsize=FS - 1)
-    ax[0, 0].legend(fontsize=FS - 1.5, frameon=False, loc="upper left")
-    fig.tight_layout(h_pad=0.6, w_pad=0.5)
+                A_.set_ylabel(f"$+${k + 1}", fontsize=FS)
+    ax[0, 0].legend(fontsize=FS - 2.0, frameon=False, loc="upper left")
+    fig.supylabel("lookahead", fontsize=FS)
+    fig.tight_layout(h_pad=0.25, w_pad=0.35)
     fig.savefig(OUT, dpi=450, bbox_inches="tight"); plt.close(fig)
     print("  wrote", OUT)
     return 0

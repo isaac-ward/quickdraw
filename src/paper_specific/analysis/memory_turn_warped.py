@@ -100,11 +100,11 @@ def brace_up(fig, xa, xb, y, up_to, x_stem, r=0.010, inset=0.004, **kw):
     xa, xb = xa + inset, xb - inset
     mid = 0.5 * (xa + xb)
     for xe in (xa, xb):
-        pts = [(xe, y - 0.013), (xe, y), (mid, y), (mid, y + 0.010)]
+        pts = [(xe, y - 0.007), (xe, y), (mid, y), (mid, y + 0.005)]
         fig.add_artist(PathPatch(rounded_path(pts, r), fill=False, transform=fig.transFigure, **kw))
-    rise = up_to - (y + 0.010)
-    pts = [(mid, y + 0.010), (mid, y + 0.010 + 0.32 * rise),
-           (x_stem, y + 0.010 + 0.74 * rise), (x_stem, up_to)]
+    rise = up_to - (y + 0.005)
+    pts = [(mid, y + 0.005), (mid, y + 0.005 + 0.32 * rise),
+           (x_stem, y + 0.005 + 0.74 * rise), (x_stem, up_to)]
     fig.add_artist(PathPatch(rounded_path(pts, r * 0.8), fill=False, transform=fig.transFigure, **kw))
 
 
@@ -309,7 +309,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     fig.canvas.draw()
     inv = fig.transFigure.inverted()
     # the brace sits high enough that its two-line label clears the axes below it
-    y_br = AC.get_position().y1 + 0.026
+    y_br = AC.get_position().y1 + 0.040
     for i, ((xa, xb), A, txt) in enumerate(zip(((0.0, t_away), (t_away, t_back), (t_back, t_end)),
                                                im_axes,
                                                ("Looking at\naltered region",
