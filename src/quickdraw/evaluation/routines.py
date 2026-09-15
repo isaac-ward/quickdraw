@@ -1644,6 +1644,7 @@ def eval_steer(cfg, model, norm, ecfg, writer, device, step=0):
             bags, acts, sco = S.plan(m, lang, t_e, ctx, ca, prop, horizon=H, lookahead=look,
                                      n_samples=int(sc["n_samples"]), lam=float(sc.get("lam", 0.3)),
                                      objective=str(sc.get("objective", "level")),
+                                     commit_rule=str(sc.get("commit_rule", "argmax")),
                                      commit=int(sc.get("commit", 0) or 0),
                                      beta_jerk=float(sc.get("beta_jerk", 0.0)), generator=g)
             gains.append(float(sco[-max(1, len(sco) // 8):].mean() - sco[:max(1, len(sco) // 8)].mean()))

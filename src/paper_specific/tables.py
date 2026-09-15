@@ -215,8 +215,11 @@ STEER_RUNS = {
 }
 # ORDER, at the author's ask: the reference first, then the noise floor, then the two learned priors
 # with the deployed one last.
-COLS = [("data", r"Data Retrieval AM$^{\ddagger}$"), ("gauss", "Gaussian AM"),
-        ("pitdelta", r"Learned $\Delta$ AM"), ("prior", r"Learned AM (\textbf{ours})")]
+# "AM" is dropped from every header -- the caption already says the Action Model is the only thing that
+# differs -- and the reference is labelled a CEILING, because it is not a method anyone can deploy: it
+# draws chunks that were actually flown.
+COLS = [("data", r"\makecell{Data Retrieval\\(ceiling)$^{\ddagger}$}"), ("gauss", "Gaussian"),
+        ("pitdelta", r"Learned $\Delta$"), ("prior", r"Learned (\textbf{ours})")]
 # THE BASELINE IS NEVER BOLDED AS THE WINNER. Retrieval is a reference, not a competitor: it is bounded
 # by what the corpus happens to contain, so calling it "best" asserts a target none of the priors could
 # reach by construction. Bolding therefore runs over the generative columns only.
@@ -440,7 +443,8 @@ def steer_table(paper: str) -> str:
          r"and no arm gets more than one context out of fifteen -- a motion primitive absent from the "
          r"data is not reachable by steering, however the candidates are drawn.}",
          r"  \label{tab:planningandcontrol}", r"  \begin{tabular}{l" + "c" * nc + "}", r"    \toprule",
-         r"    Request & " + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
+         r"    \diagbox[width=0.19\textwidth, height=2.1\line]{Request}{Action Model} & "
+         + " & ".join(lab for _, lab in COLS) + r" \\", r"    \midrule",
          r"    \multicolumn{" + str(1 + nc) + r"}{c}{Motion primitives} \\", r"    \midrule"]
     hits_all = {m: [] for m, _ in COLS}
     frac_all = {m: [] for m, _ in COLS}

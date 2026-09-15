@@ -1,6 +1,6 @@
 """figures/dataset.png -- what a training sample IS, in the same visual language as the architecture.
 
-Two sequences, one above the other, six consecutive model steps each. Every step carries the camera
+Two sequences, one above the other, six model steps each, K apart. Every step carries the camera
 frame, the 16-dimensional proprioceptive vector and the 4-dimensional commanded action, in the three
 modality hues the architecture figure uses (vision green, proprioception orange, action blue) and with
 the same colour-map window, so a reader can carry the colours between the two figures.
@@ -112,7 +112,10 @@ def main() -> int:
             ax.add_patch(Rectangle((x, y0), IMG_W, img_h, fill=False, ec=vis, lw=IMG_LW / 2))
             # THE STEP TAG, INSIDE the frame on a translucent plate -- the same design as every other
             # figure in the paper. The y axis is inverted here, so the frame's TOP is the smaller y.
-            ax.text(x + 0.030 * IMG_W, y0 + 0.055 * img_h, f"$+${i + 1}", ha="left", va="top",
+            # THE TAG IS IN MODEL STEPS, SPACED BY K. The columns are not consecutive steps -- they are
+            # K=8 model steps apart (32 raw frames at stride 4, 2.1 s), which is what makes the two
+            # sequences show motion rather than six near-duplicates. Labelling them +1..+6 said otherwise.
+            ax.text(x + 0.030 * IMG_W, y0 + 0.055 * img_h, f"$+${1 + i * K}", ha="left", va="top",
                     fontsize=7.5, color="black",
                     bbox=dict(boxstyle="square,pad=0.14", fc="white", ec="none", alpha=0.74))
         y_s = y0 + img_h + gap

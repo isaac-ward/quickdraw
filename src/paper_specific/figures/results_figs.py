@@ -318,7 +318,7 @@ def ood(paper, dev="cuda"):
     # THE LEGEND COMES OUT OF THE AXES. Four entries will not fit beside the data at 3.4in -- inside
     # the panel it covered the rise that is the whole point of the figure -- so it sits under the trace
     # as a two-column strip and the plot area is left clear.
-    TOP_IN, PAD_IN, TR_IN, BOT_IN, LEG_IN = 0.02, 0.0, 0.78, 0.34, 0.30
+    TOP_IN, PAD_IN, TR_IN, BOT_IN, LEG_IN = 0.34, 0.0, 0.78, 0.34, 0.30
     FIG_H = TOP_IN + 2 * ch_in + PAD_IN + TR_IN + BOT_IN + LEG_IN
     fig = plt.figure(figsize=(FIG_W, FIG_H))
     cw, ch = W / 4.0, ch_in / FIG_H
@@ -327,12 +327,14 @@ def ood(paper, dev="cuda"):
     # Row one: how it was applied, a clean frame, the anomalous frame, and a LATER anomalous frame.
     # Row two: the per-pixel surprise under each, with the first cell blank -- the map belongs under the
     # frame it explains, and the in-distribution map is the control that shows it stays dark.
-    panes = [(0, 0, photo, "Disturbance\nis applied"),
-             (0, 1, fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
-             (0, 2, fr[key][t_in], f"Anomalous ($t{{=}}{t_in}$)"),
-             (0, 3, fr[key][t_late], f"Anomalous ($t{{=}}{t_late}$)"),
-             (1, 1, None, None), (1, 2, None, None), (1, 3, None, None)]
-    for r_, c_, img, lab in panes:
+    # THE STEP OFFSET COMES INSIDE, in +X form, and NOTHING ELSE: the descriptive label stays a title,
+    # at the author's ask. `None` for the scene photo, which is not a step of the rollout.
+    panes = [(0, 0, photo, "Disturbance\nis applied", None),
+             (0, 1, fr[key][t_out], "In distribution", t_out),
+             (0, 2, fr[key][t_in], "Anomalous", t_in),
+             (0, 3, fr[key][t_late], "Anomalous", t_late),
+             (1, 1, None, None, None), (1, 2, None, None, None), (1, 3, None, None, None)]
+    for r_, c_, img, lab, step in panes:
         A = fig.add_axes([L + c_ * cw, y0 if r_ == 0 else y1, cw, ch])
         if img is None:
             m = {1: sur_out, 2: sur, 3: sur_late}[c_]
@@ -340,10 +342,10 @@ def ood(paper, dev="cuda"):
         else:
             A.imshow(img)
         if lab:
-            # INSIDE THE FRAME, top left, on a translucent plate -- the design the author prefers, and it
-            # returns the entire title band to the figure.
-            A.text(0.03, 0.95, lab.replace(" ($t", "\n($t"), transform=A.transAxes, ha="left",
-                   va="top", fontsize=FS - 2.4, color="black", linespacing=1.1,
+            A.set_title(lab, fontsize=FS - 2.2, pad=1.8, linespacing=1.15)
+        if step is not None:
+            A.text(0.03, 0.95, f"$+${step}", transform=A.transAxes, ha="left", va="top",
+                   fontsize=FS - 2.4, color="black",
                    bbox=dict(boxstyle="square,pad=0.16", fc="white", ec="none", alpha=0.74))
         A.set_xticks([]); A.set_yticks([])
         for sp_ in A.spines.values():
@@ -388,7 +390,7 @@ def ood(paper, dev="cuda"):
     WI = 1.06                                          # image width; the plots take whatever is left
     # TOP_IN is not zero even with the captions inside: the rotated two-line "Observed omega (rad/s)" is
     # taller than its own panel, so it overflows both ends of it and the top end needs somewhere to go.
-    TOP_IN, BOT_IN, LEG_IN = 0.10, 0.34, 0.30          # ylabel slack, xlabel+ticks, legend strip
+    TOP_IN, BOT_IN, LEG_IN = 0.30, 0.34, 0.30          # 2-line image title, xlabel+ticks, legend
     hi = WI * ph / pw                                  # one image, and therefore one plot, in inches
     PW = FIG_W - L - GAP - WI - R
     FIG_H = TOP_IN + 2 * hi + BOT_IN + LEG_IN
@@ -402,15 +404,17 @@ def ood(paper, dev="cuda"):
     AI.set_xticks([]); AI.set_yticks([])
     for sp_ in AI.spines.values():
         sp_.set_visible(True); sp_.set_linewidth(0.6); sp_.set_color("black")
-    AI.text(0.03, 0.95, "Disturbance\nis applied", transform=AI.transAxes, ha="left", va="top",
-            fontsize=FS - 2.4, color="black", linespacing=1.1,
-            bbox=dict(boxstyle="square,pad=0.16", fc="white", ec="none", alpha=0.74))
+    AI.set_title("Disturbance\nis applied", fontsize=FS - 2.2, pad=1.8, linespacing=1.15)
     A = fig.add_axes([xi, y_top - 2 * hr, wi_, hr]); A.imshow(pov)
     # THE LABEL BELONGS UNDER THIS ONE: the frame is the whole argument for the dynamical case, and the
     # argument is that there is nothing in it to see. It sits in the band the legend strip occupies on
     # the plot side, which is free out here.
-    A.text(0.03, 0.95, "Disturbance is\nvisually\nundetectable", transform=A.transAxes, ha="left",
-           va="top", fontsize=FS - 2.4, color="black", linespacing=1.1,
+    # the caption stays OUTSIDE, under the frame; only the step offset comes inside
+    A.annotate("Disturbance is visually\nundetectable", xy=(0.5, 0.0), xycoords="axes fraction",
+               ha="center", va="top", fontsize=FS - 2.2, linespacing=1.15,
+               xytext=(0, -3), textcoords="offset points")
+    A.text(0.03, 0.95, f"$+${t_peak}", transform=A.transAxes, ha="left", va="top",
+           fontsize=FS - 2.4, color="black",
            bbox=dict(boxstyle="square,pad=0.16", fc="white", ec="none", alpha=0.74))
     A.set_xticks([]); A.set_yticks([])
     for sp_ in A.spines.values():
