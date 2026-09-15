@@ -170,11 +170,10 @@ def _scene_photo(paper, name, shape=None):
     cut = rows[0] if rows else int(h * 0.42)
     im = im[2:cut - 2, 2:-2]
     if shape is not None:
-        # A SLIGHT TOP CROP ONLY. Forcing the frames' exact aspect distorted nothing but made the photo
-        # a letterbox; this trims the ceiling, which carries nothing, and leaves the photo's own shape.
+        # CROP THE TOP to the frames' own aspect, so the photo renders at exactly their height without
+        # any image being rescaled or stretched -- the ceiling is what gets cut, and it carries nothing.
         hh, ww = im.shape[:2]
-        want = 1.35 * shape[0] / shape[1]
-        keep = int(min(hh, ww * want))
+        keep = int(min(hh, ww * shape[0] / shape[1]))
         im = im[hh - keep:, :]
     return im
 
@@ -261,8 +260,8 @@ def ood(paper, dev="cuda"):
     t_out = max(cand, key=lambda t: abs(t - t_in)) if cand else P
     sur = best_sur
     photo = _scene_photo(paper, "pool-noodle.png", shape=fr[key][0].shape)
-    fig = plt.figure(figsize=(7.2, 3.6))
-    outer = fig.add_gridspec(2, 1, height_ratios=(1.05, 1.0), hspace=0.24)
+    fig = plt.figure(figsize=(7.2, 2.9))
+    outer = fig.add_gridspec(2, 1, height_ratios=(0.72, 1.0), hspace=0.10)
     top = outer[0].subgridspec(1, 4 if photo is not None else 3, wspace=0.06)
     panes = [(photo, "How it was applied")] if photo is not None else []
     panes += [(fr[key][t_out], f"In distribution ($t{{=}}{t_out}$)"),
@@ -291,40 +290,48 @@ def ood(paper, dev="cuda"):
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print("  figures/ood-visual.png")
 
-    # ================= (b) DYNAMICAL ==================================================================
+    # ================= (b) DYNAMICAL =================================================================
+    # A 2x2: what the drone SAW while it was pushed, the angular velocity it recorded, how the push was
+    # applied, and what the detector made of it. The two plots share an x axis; the two images are
+    # cropped to a common shape and never rescaled anisotropically.
     split, chan, chan_lab = "eval_ood_leafblower", "angvel_err", "$\\omega$ error"
     eps, c = pick(split, prefer="central")
     ep, w0, w1 = c["ep"], c["w0"], c["w1"]
     o, a, fr = eps[ep]
     r = one_step(core, norm, o, a, fr[key], key, P, dev)
-    photo = _scene_photo(paper, "leaf-blower.png", shape=fr[key][0].shape)
-    fig = plt.figure(figsize=(7.2, 3.6))
-    gb = fig.add_gridspec(2, 2, width_ratios=(1.0, 1.7), wspace=0.20, hspace=0.34,
-                          height_ratios=(1.0, 0.8))
-    if photo is not None:
-        A = fig.add_subplot(gb[0, 0]); A.imshow(photo)
-        A.set_xticks([]); A.set_yticks([])
-        for sp_ in A.spines.values():
-            sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
-        A.set_title("How it was applied", fontsize=FS)
+    print(f"    (b) {split} ep{ep}: window {w0}-{w1} of {len(o)} steps")
+    v = np.asarray(r[chan])
+    t_peak = int(r["steps"][int(np.argmax(np.where((r["steps"] >= w0) & (r["steps"] < w1), v, -1)))])
+    pov = fr[key][t_peak]
+    photo = _scene_photo(paper, "leaf-blower.png", shape=pov.shape)
+    fig = plt.figure(figsize=(7.2, 3.9))
+    gb = fig.add_gridspec(2, 2, width_ratios=(1.0, 1.5), wspace=0.24, hspace=0.30)
+    A = fig.add_subplot(gb[0, 0]); A.imshow(pov)
+    A.set_xticks([]); A.set_yticks([])
+    for sp_ in A.spines.values():
+        sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
+    A.set_title(f"From the drone, as it is pushed ($t{{=}}{t_peak}$)", fontsize=FS)
+    AP = fig.add_subplot(gb[1, 0]); AP.imshow(photo)
+    AP.set_xticks([]); AP.set_yticks([])
+    for sp_ in AP.spines.values():
+        sp_.set_visible(True); sp_.set_linewidth(1.2); sp_.set_color("black")
+    AP.set_title("How it was applied", fontsize=FS)
     AV = fig.add_subplot(gb[0, 1])
     for ci, lab in zip(range(10, 13), ("$\\omega_x$", "$\\omega_y$", "$\\omega_z$")):
         AV.plot(np.arange(len(o)), o[:, ci], lw=1.1, label=lab)
     AV.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0)
     AV.set_ylabel("Observed $\\omega$\n(rad/s)", fontsize=FS, labelpad=2)
-    AV.legend(fontsize=FS - 2, ncol=1, loc="lower left", frameon=False, handlelength=1.1,
+    AV.legend(fontsize=FS - 2, ncol=1, loc="lower right", frameon=False, handlelength=1.1,
               labelspacing=0.25)
     AV.tick_params(labelsize=FS - 1.5); AV.grid(alpha=0.25)
     AV.set_xlim(0, len(o) - 1)
-    AE = fig.add_subplot(gb[1, :])
-    v = np.asarray(r[chan])
+    AE = fig.add_subplot(gb[1, 1], sharex=AV)
     AE.plot(r["steps"], v, color="tab:purple", lw=1.6)
     AE.axvspan(w0, w1, color="#c62828", alpha=0.20, lw=0, label="Anomaly window")
-    out = (r["steps"] < w0) | (r["steps"] >= w1)
     AE.set_ylabel(chan_lab, fontsize=FS); AE.set_xlabel("Prediction step", fontsize=FS)
     AE.tick_params(labelsize=FS - 1.5); AE.grid(alpha=0.25)
     mark_context(AE)
-    AE.legend(fontsize=FS - 1.5, loc="upper left", ncol=1)
+    AE.legend(fontsize=FS - 1.5, loc="upper right", ncol=1)
     f = os.path.join(paper, "figures", "ood-dynamical.png")
     fig.savefig(f, dpi=DPI, bbox_inches="tight"); plt.close(fig)
     print("  figures/ood-dynamical.png")

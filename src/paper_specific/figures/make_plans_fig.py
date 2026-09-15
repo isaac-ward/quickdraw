@@ -29,11 +29,21 @@ import numpy as np
 RUN = "/app/logs/eval_steer_2026_09_15_16_33_40_plans8"   # 3 requests x 8 contexts, video on
 OUT = "/app/logs/paper_icra_2027/plans.png"
 IMG_H = 112                # the starling camera; rows below this in the mp4 are the caption bar
-N_SHOW = 6
 FS = 9.5
-# THE CONTACT SHEET, for choosing from: three requests, every context that was planned for each. The
-# final figure keeps a subset -- this iteration shows them all so the illustrative ones can be picked.
-REQS = ["table", "mannequin", "clock"]
+# THE AUTHOR'S SELECTION, round two: (request, episode prefix, the steps to show). Steps are the
+# author's own picks, not an even spacing. Where an episode ran from two different start times the
+# reference is ambiguous, so BOTH are emitted and the next round narrows it.
+KEEP = [
+    ("table", "ep003", (1, 26, 48, 52)),
+    ("table", "ep005", (1, 10, 26, 52)),
+    ("table", "ep005", (1, 10, 18, 26)),
+    ("mannequin", "ep003", (1, 26, 52, 103)),
+    ("mannequin", "ep004", (1, 8, 16, 26)),
+    ("mannequin", "ep006", (1, 52, 82, 103)),
+    ("clock", "ep001", (1, 8, 16, 26)),
+    ("clock", "ep003", (1, 52, 77, 128)),
+    ("clock", "ep005_t0200", (1, 26, 52, 77)),
+]
 
 
 def frames(path):
@@ -50,33 +60,34 @@ def frames(path):
 
 def main() -> int:
     rows = []
-    for req in REQS:
+    for req, prefix, steps in KEEP:
         folder = req.replace(" ", "_")
-        for d in sorted(glob.glob(os.path.join(RUN, "logs", "epoch_*", "eval_steer", "plans", folder,
-                                               "*"))):
+        hits = sorted(glob.glob(os.path.join(RUN, "logs", "epoch_*", "eval_steer", "plans", folder,
+                                             prefix + "*")))
+        assert hits, f"no plan matching {req}/{prefix}"
+        for d in hits:                                   # both start times when the prefix is ambiguous
             fr = frames(os.path.join(d, "image.mp4"))
-            H = len(fr)
-            ks = np.unique(np.linspace(0, H - 1, N_SHOW).round().astype(int))
-            rows.append((req, os.path.basename(d), fr[ks], ks, H))
-    print(f"  {len(rows)} demonstrations over {len(REQS)} requests")
+            ks = [min(int(t) - 1, len(fr) - 1) for t in steps]
+            rows.append((req, os.path.basename(d), fr[ks], steps))
+    print(f"  {len(rows)} rows from {len(KEEP)} selections")
 
     ih, iw = rows[0][2][0].shape[:2]
-    NC = len(rows[0][3])
+    NC = max(len(r[3]) for r in rows)
     fig = plt.figure(figsize=(7.1, 7.1 * (len(rows) * ih * 1.62) / (NC * iw)))
     gs = fig.add_gridspec(2 * len(rows), NC, hspace=0.0, wspace=0.02,
                           height_ratios=[0.52, 1.0] * len(rows))
-    for r, (req, ctx, imgs, ks, H) in enumerate(rows):
+    for r, (req, ctx, imgs, steps) in enumerate(rows):
         lab = fig.add_subplot(gs[2 * r, :]); lab.axis("off")
         lab.text(0.0, 0.16, "\u201c" + req + "\u201d", ha="left", va="bottom", fontsize=FS,
                  style="italic")
         lab.text(1.0, 0.16, ctx, ha="right", va="bottom", fontsize=FS - 2.0, color="0.45")
-        for c in range(NC):
+        for c in range(len(steps)):
             A = fig.add_subplot(gs[2 * r + 1, c])
             A.imshow(imgs[c], interpolation="bilinear")
             A.set_xticks([]); A.set_yticks([])
             for sp in A.spines.values():
                 sp.set_linewidth(1.2); sp.set_color("black")
-            A.set_title(f"$+${ks[c] + 1}", fontsize=FS - 1.5, pad=1.5)
+            A.set_title(f"$+${steps[c]}", fontsize=FS - 1.5, pad=1.5)
     fig.savefig(OUT, dpi=300, bbox_inches="tight"); plt.close(fig)
     print(f"  wrote {OUT}  ({os.path.getsize(OUT) / 1e6:.1f} MB)")
     return 0

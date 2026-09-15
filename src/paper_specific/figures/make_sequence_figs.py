@@ -108,8 +108,9 @@ BLK_LABELS   = False      # draw A/B/C on the three faces so they can be referre
 # one scalar out.
 RM_ON        = True
 RM_TITLE     = "Reward head\n(contrastive)"
-RM_LAT       = "MLP $f_z$"            # the latent branch, fed by the brace, drawn ON TOP
-RM_TXT       = "MiniLM + MLP $f_t$"   # the text branch, fed by the request, drawn BELOW it
+RM_LAT       = "Project to $f_z$"     # the latent branch, fed by the brace, drawn ON TOP
+RM_TXT       = "Project to $f_t$"     # the text branch, drawn BELOW the latent one
+RM_ENC       = "MiniLM"               # ...and its sentence encoder is its OWN block: it is frozen
 RM_COS       = "cosine"
 RM_REQ       = "\u201cGo forward to the ladder\nin the middle of the room\u201d"   # no box, two lines
 RM_REQ_PAD   = 90.0      # clear space between the request and the box it feeds
@@ -1394,8 +1395,11 @@ def draw_box(ax, D, sx):
     bx0, bx1 = D["sub_x0"] + sx, D["sub_x1"] + sx
     ax.add_patch(PathPatch(rounded_polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], CORNER_R),
                            fc=ENC_FC, ec=BOX_EC, lw=ENC_LW, zorder=Z_TOKENIZER))
+    # THE HEADS ARE BOLD, the summariser is not: bold marks the three things the paper trains, and the
+    # summariser is a component inside the first of them.
     ax.text(0.5 * (x0 + x1), D["title_cy"], D["title"], ha="center", va="center",
-            fontsize=BOX_FS, color="black", linespacing=1.3, zorder=Z_TOKENIZER + 4)
+            fontsize=BOX_FS, color="black", linespacing=1.3, zorder=Z_TOKENIZER + 4,
+            fontweight="bold" if "head" in D["title"] else "normal")
     if D.get("glyph"):
         gx1 = x1 - BB_PAD
         dist_glyph(ax, D["glyph"], (gx1 - GLYPH_W, D["title_cy"] - GLYPH_H / 2.0, gx1,
@@ -1821,20 +1825,32 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                                                CORNER_R), fc=ENC_FC, ec=BOX_EC, lw=ENC_LW,
                                zorder=Z_TOKENIZER))
         ax.text(0.5 * (rx0 + rx1), ry0 + RM_PAD * 0.45 + ttl_h / 2, RM_TITLE, ha="center", va="center",
-                fontsize=BOX_FS, linespacing=1.3, zorder=Z_TOKENIZER + 4)
+                fontsize=BOX_FS, linespacing=1.3, zorder=Z_TOKENIZER + 4, fontweight="bold")
         w_cos = text_extent(RM_COS, BB_FS)[0] + 1.7 * RM_PAD
-        w_br = rw - 2 * RM_PAD - RM_COS_GAP - w_cos          # the branches take what the box leaves them
+        # THE BRANCH CELLS MUST FIT THEIR OWN TEXT. The box width is fixed (it matches the two heads), so
+        # what gives is the gap before the cosine -- sizing the cells from the leftover instead clipped
+        # "Project to f_t".
+        w_enc = text_extent(RM_ENC, BB_FS)[0] + 1.3 * RM_PAD
+        w_prj = text_extent(RM_TXT, BB_FS)[0] + 1.3 * RM_PAD
+        w_br = max(text_extent(RM_LAT, BB_FS)[0] + 1.7 * RM_PAD, w_enc + RM_ROW_SEP + w_prj)
+        cos_gap = max(2.2 * ARROW_L, rw - 2 * RM_PAD - w_br - w_cos)
         bx0 = rx0 + RM_PAD
         y_lat = ry0 + RM_PAD + ttl_h + sub_h / 2
         y_txt = y_lat + sub_h + RM_ROW_SEP
-        for yy, lab in ((y_lat, RM_LAT), (y_txt, RM_TXT)):
-            ax.add_patch(PathPatch(rounded_polygon([(bx0, yy - sub_h / 2), (bx0 + w_br, yy - sub_h / 2),
-                                                    (bx0 + w_br, yy + sub_h / 2), (bx0, yy + sub_h / 2)],
+        def _cell(x, y, w, lab):
+            ax.add_patch(PathPatch(rounded_polygon([(x, y - sub_h / 2), (x + w, y - sub_h / 2),
+                                                    (x + w, y + sub_h / 2), (x, y + sub_h / 2)],
                                                    CORNER_R), fc="white", ec=BOX_EC, lw=ENC_LW * 0.6,
                                    zorder=Z_TOKENIZER + 2))
-            ax.text(bx0 + w_br / 2, yy, lab, ha="center", va="center", fontsize=BB_FS,
+            ax.text(x + w / 2, y, lab, ha="center", va="center", fontsize=BB_FS,
                     zorder=Z_TOKENIZER + 3)
-        cx0 = bx0 + w_br + RM_COS_GAP
+        # THE TEXT BRANCH IS TWO BLOCKS: a frozen sentence encoder, then the projection that is trained.
+        _cell(bx0, y_lat, w_br, RM_LAT)
+        _cell(bx0, y_txt, w_enc, RM_ENC)
+        _cell(bx0 + w_enc + RM_ROW_SEP, y_txt, w_prj, RM_TXT)
+        draw_arrow(ax, [(bx0 + w_enc, y_txt), (bx0 + w_enc + RM_ROW_SEP - ARROW_L * 0.7, y_txt)],
+                   Z_TOKENIZER + 2.5, tip=(bx0 + w_enc + RM_ROW_SEP, y_txt), head_dir=(1.0, 0.0))
+        cx0 = bx0 + w_br + cos_gap
         y_cos = 0.5 * (y_lat + y_txt)
         ax.add_patch(PathPatch(rounded_polygon([(cx0, y_cos - sub_h / 2), (cx0 + w_cos, y_cos - sub_h / 2),
                                                 (cx0 + w_cos, y_cos + sub_h / 2), (cx0, y_cos + sub_h / 2)],
@@ -1853,10 +1869,17 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         # ...and the request runs in from the SAME x the brace stem turns at, so the two inputs align
         lines = RM_REQ.split(chr(10))
         tw = max(text_extent(l, BB_FS * 1.5)[0] for l in lines)
-        draw_arrow(ax, [(mid[0], y_txt), (bx0 - ARROW_L, y_txt)], Z_ARROW, tip=(bx0, y_txt),
-                   head_dir=(1.0, 0.0))
-        ax.text(mid[0] - RM_REQ_PAD, y_txt, RM_REQ, ha="right", va="center", fontsize=BB_FS * 2.0,
+        # THE REQUEST IS BRACED, like every other group of things in this figure, and the brace's stem
+        # is the line that carries it into the text branch.
+        _tw, _th = text_extent(RM_REQ, BB_FS * 2.0)
+        _tx1 = mid[0] - RM_REQ_PAD
+        ax.text(_tx1, y_txt, RM_REQ, ha="right", va="center", fontsize=BB_FS * 2.0,
                 style="italic", color=EDGE, linespacing=1.25, zorder=Z_TOKENIZER + 1)
+        rpoly, rmid = brace_between((_tx1 + MIN_SEG, y_txt - _th / 2 - BRACE_T),
+                                    (_tx1 + MIN_SEG, y_txt + _th / 2 + BRACE_T),
+                                    BRACE_M * 0.7, u=(0.0, 1.0), off=(1.0, 0.0))
+        draw_arrow(ax, rpoly, Z_ARROW)
+        draw_arrow(ax, [rmid, (bx0 - ARROW_L, y_txt)], Z_ARROW, tip=(bx0, y_txt), head_dir=(1.0, 0.0))
         draw_arrow(ax, [(cx0 + w_cos, y_cos), (rx1 + 1.2 * ARROW_L, y_cos)], _z_in,
                    tip=(rx1 + 2.2 * ARROW_L, y_cos), head_dir=(1.0, 0.0))
         ax.text(rx1 + 2.6 * ARROW_L, y_cos, RM_OUT, ha="left", va="center", fontsize=BOX_FS * 0.8,
