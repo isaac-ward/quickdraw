@@ -108,31 +108,29 @@ def wm_table() -> str:
 def ah_table() -> str:
     L = [r"\begin{table}[t]", r"  \centering", r"  \footnotesize",
          r"  \setlength{\tabcolsep}{3pt}",
-         r"  \caption{\textbf{Action Model.} The counterpart of Table~\ref{tab:longhorizon} for the other "
-         r"half of what \modelname{} predicts: not what follows from an action, but what action follows "
-         r"from a context. One setting changes per row, best per column in bold. Energy skill is the only "
-         r"column that measures \emph{conditioning}, against a context-blind null, so $0$ is a model that "
-         r"ignores its context; it is given at the first lead time and at the worst. $W_1$ is the distance "
-         r"to the recorded action marginal, i.e.\ whether it flies like the data. Rest AUC asks whether "
-         r"the model can place mass on a stick being held still, which is what the percentile transform "
-         r"buys --- every row here uses it, so the target column distinguishes the percentile of the "
-         r"stick's \emph{value} from the percentile of its \emph{increment}. "
-         r"buys and what a flow cannot do without it. No row wins every column, because the trade is "
-         r"real --- Figure~\ref{fig:marginals} is the same question answered by eye. "
-         r"$^{*}$The configuration \modelname{} deploys: the planner commits $16$ steps of a $32$-step "
-         r"chunk.}",
+         r"  \caption{\textbf{Action Model performance.} Here we enumerate the model's ability to predict "
+         r"what distribution of actions follows from a given context. Both skill columns are \emph{energy "
+         r"skill} against a context-blind null --- the recorded chunks shuffled across contexts, so the "
+         r"null has the right marginal and the wrong context --- scored as "
+         r"$1-\mathrm{ES}/\mathrm{ES}_{\mathrm{null}}$, so $0$ is a model that ignores its context and "
+         r"$1$ is perfect. Skill$_{+1}$ scores the first action of the chunk alone, and "
+         r"Skill$_{\mathrm{chunk}}$ scores all $K$ actions jointly, which is the harder question because "
+         r"it asks one draw to be right about the whole manoeuvre at once. $W_1$ is the distance to the "
+         r"recorded action marginal, i.e.\ whether it flies like the data. Rest AUC asks whether the "
+         r"model can place mass on a zero valued action. Best per column in bold. $^{*}$The "
+         r"configuration \modelname{} uses.}",
          r"  \label{tab:actionhead}",
          # A WRAPPING CONFIGURATION COLUMN: written out in full the labels are too long for one line, and
          # p{} wraps them rather than overflowing the column.
          r"  \begin{tabular}{@{}p{0.40\columnwidth}cccc@{}}", r"    \toprule",
-         r"    & Skill$_{+1}$ & Skill$_{\max}$ & $W_1$ & Rest AUC \\",
+         r"    & Skill$_{+1}$ & Skill$_{\mathrm{chunk}}$ & $W_1$ & Rest AUC \\",
          r"    Configuration & $\uparrow$ & $\uparrow$ & $\downarrow$ & $\uparrow$ \\", r"    \midrule"]
     rows = []
     for run, lab in AH_ROWS:
         d = metrics(os.path.join(LOGS, run))
         if not d:
             continue
-        rows.append((lab, [contains(d, "lead_00/energy_skill"), contains(d, "energy_skill"),
+        rows.append((lab, [contains(d, "lead_00/energy_skill"), contains(d, "energy_skill_vs_blind"),
                            contains(d, "w1_mean"), contains(d, "rest_auc")]))
     best = [None] * 4
     for k, lo in enumerate((False, False, True, False)):    # W1 is the only lower-is-better column
