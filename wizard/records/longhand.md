@@ -606,6 +606,370 @@ No lever survives. The remaining explanations are not knobs — **2.06 h of data
 model** — so the next collection session is worth more than any config change available here, and it
 should target object interactions, where identity has to survive contact and occlusion.
 
+### 8.20 The capacity sweep — and the CONTROL that made it readable (2026-09-14/15)
+
+> **VOID — see §8.24.** Every arm here was read before its codec floor converged. `tok64`'s floor
+> (0.1634) equalled its rollout (0.1627): the codec could not reconstruct a frame it was shown, so
+> the arm measured codec convergence speed, not prediction. Capacity is an OPEN question again.
+> The control's batch-8 ≡ batch-13 finding also needs re-checking at converged floors.
+
+Capacity was the one axis never varied here, and §21.2 had explicitly left it open: `num_tokens=64`
+was killed after 2 evals **for cost, not evidence**, having posted the best codec floor on this
+dataset at the time. So two arms, two different claims about what room was missing:
+
+| arm | change | params | what it claims |
+|---|---|---|---|
+| `bs_tok64` | `num_tokens` 32 → 64 per camera | 11.94M (vs 11.92M) | more **slots** — places for distinct objects |
+| `bs_d256` | `model.d` 128 → 256 | 18.23M | more **dimensions** — what each slot can say |
+
+`tok64` is the clean version of the hypothesis: it doubles the bag while adding essentially **no
+parameters** (32 extra query embeddings × d=128 per camera).
+
+**Both autobatched to 8 against the baseline's 13.** That is a confound shared by both arms and by
+neither baseline — exactly the one that made the window sweep unreadable (batch collapsed 13 → 8 → 4
+and it was only noticed afterwards). So the third arm was a **control**: `bs_batch8ctl`, the baseline
+config with `data.autobatch=false data.batch=8` and nothing else touched.
+
+OL LPIPS on `cam_scene`, at **matched gradient steps** (1778/epoch at batch 8, 1094 at batch 13):
+
+| arm | gstep | OL mean | vs baseline |
+|---|---|---|---|
+| **`bs_batch8ctl`** | 1778 | **0.1167** | **1.0% worse** |
+| `bs_d256` | 1778 / 5334 / 8890 | 0.1460 / 0.1575 / 0.1519 | 26% / 60% / 62% worse |
+| `bs_tok64` | 1778 / 5334 | 0.1627 / 0.1637 | 41% / 66% worse |
+
+The control lands *on* the baseline curve — 1.0% apart, with `@+8` of 0.0608 actually beating the
+interpolated baseline. **Batch 8 is not the cause.** Both capacity axes therefore lost on merit, and
+both were moving the wrong way while the control improved. `d256` blew up at ep3 (train 12.88,
+recovering to 5.52 by ep5) which briefly looked like it might excuse the width axis — but its ep5
+reading, taken post-recovery, is still 62% worse. Both axes closed.
+
+**Run the control.** It cost one GPU for a few hours and converted two uninterpretable arms into a
+clean result. Without it the honest conclusion would have been "capacity may or may not help, batch
+may or may not be why" — which is what the window sweep had to settle for.
+
+### 8.21 THE DIAGNOSIS: this is OVERFITTING, not capacity or architecture
+
+> **PARTLY VOID — see §8.24.** The val/train evidence below (gap 1.09 → 1.69, val turning up at
+> ep9) still stands on its own. What does NOT stand is the supporting argument from the capacity and
+> window arms, and the `tok16` mirror test that appeared to adjudicate it — all read before their
+> codec floors converged.
+
+`bs_stride10`, train vs val vs ratio:
+
+| | ep1 | ep3 | ep5 | ep7 | ep9 |
+|---|---|---|---|---|---|
+| train | 5.71 | 3.78 | 3.03 | 2.53 | 2.52 |
+| val | 6.24 | 4.98 | 4.50 | 4.23 | **4.26** |
+| val/train | 1.09 | 1.32 | 1.48 | 1.67 | **1.69** |
+
+The gap widens monotonically and **val turns UP at ep9** (4.2276 → 4.2575) while train is flat
+(2.5279 → 2.5179). That is overfitting: 56 episodes, 2.06 h, ~22k training timesteps at subsample 10,
+against a 12M-parameter model.
+
+**It retro-explains the entire pile of dead hypotheses** rather than adding a tenth to it. An overfit
+dynamics model memorises plausible scenes instead of generalising transitions, so:
+
+- extra capacity buys more memorisation — **both** axes worse, monotonically
+- a longer attention window buys more still — and `win128`, the *strongest* manipulation, broke
+  **earliest** (§8.17b), which was the most confusing result in the record until now
+- predictions come out **sharp and confidently wrong** rather than blurred — memorised, not averaged
+- best-of-8 gains 2.5% and shrinks with horizon — the failure was never a lack of diversity
+- the codec is fine while the rollout drifts — per-frame reconstruction needs no generalisation
+
+The batch-8 control corroborates the mechanism: it reaches a 1.65 gap by **ep3**, where the batch-13
+baseline was at 1.32 and did not hit 1.65 until ep7. More gradient steps per epoch → faster
+overfitting. The gap is step-driven, not epoch-driven.
+
+**There is no more data to add.** `campaign1-tests` is EMPTY (0 episodes, only `campaign.json`) and
+`campaign2-play` is **3.1 minutes**. Campaigns 8–9 are the held-out eval set and spending them
+destroys the measurement. More data means new recording, not reprocessing.
+
+**What is actually available:** the world model has **no dropout knob at all**. `optim.weight_decay`
+is `1e-4` (very low for this gap). `variations.noise_injection.observations_encoded_pre_fusion`
+exists and is OFF (`scale: 0.0`). So: weight decay, shrinking the model, or latent noise — built as
+`wizard/scripts/blockstack-regularize.sh {wd|tokens|noise}`.
+
+Note on the `noise` mode: `df_scale=0.1` (isotropic context noise) already lost 6–8%. This knob
+injects at a different point, so it is not the same experiment, but the prior is poor.
+
+The mirror test is the cheap one: the capacity axis already has two points going the *wrong* way, so
+if overfitting is the story, going **down** that axis should help. Watch `eval_ae_floor` when doing
+it — fewer tokens also means less room to reconstruct one frame, which would confound the rollout read.
+
+### 8.22 Two more corrections to things that were believed
+
+- **`detach_every` is 32, not 8, on every block-stack arm.** Asserted from memory as 8, which would
+  have meant gradients spanning only 2.7 s against a ~8 s break — a compelling story for a
+  compounding failure, and wrong. At 32 with F=64/subsample 10 gradients span **10.7 s**, already
+  past the break. BPTT truncation is a much weaker lever here than it looked. (`vl128.yaml` does
+  record that `detach_every: 8` was tried and **froze** the model.)
+- **`metrics.jsonl`'s `step` field is the EPOCH INDEX, not the gradient step.** It reads 1,3,5,7,9
+  for evals every 2 epochs. A comparison table was built reading it as steps before this was
+  noticed. `wizard/scripts/olcmp.py` now applies batches-per-epoch by hand and prints both columns,
+  with the trap in its docstring.
+
+### 8.23 The self-kill bug, fifth occurrence — now actually fixed
+
+`pkill -f <pattern>` matching the calling shell was fixed once by reading `/proc/<pid>/cmdline`
+instead. It came back anyway: the kill loop was inside a `bash -c` whose **own command line
+contained the literal text `experiment=bs_tok64`** (in the `case` pattern), so it matched itself and
+died mid-script, before the launch that was supposed to follow. Four earlier occurrences silently
+skipped later steps; this one left a GPU idle and no control running.
+
+The durable guard is a **type check, not a pattern refinement**: require `/proc/<pid>/exe` to resolve
+to `*python*`, which a bash shell can never satisfy.
+
+```bash
+for p in $(pgrep -f "quickdr[a]w.train_world_model"); do
+  case "$(readlink /proc/$p/exe)" in *python*) : ;; *) continue ;; esac   # never a shell
+  tr '\0' '\n' < "/proc/$p/cmdline" | grep -qx "experiment=$TARGET" && kill "$p"
+done
+```
+
+Also: `bs_tok64` ignored SIGTERM for the full 240 s and needed SIGKILL. Always verify death with
+`kill -0` in a loop; never assume `kill` worked.
+
+Third related trap: a bare `run_summary` launch fails the **5-point assertion** (`trying_detail` is
+required). Cost one relaunch when the summary was written inline rather than via the script.
+
+### 8.24 THE READING ERROR THAT INVALIDATED §8.20 AND §8.21 (2026-09-15)
+
+**Open-loop LPIPS is only comparable across arms whose CODEC FLOOR has converged.** It was read at
+ep1-ep5 on six arms whose floors had not. Everything §8.20 concluded about capacity, and the
+"mirror test" that appeared to confirm §8.21, measured codec convergence speed and not dynamics.
+
+`eval_ae_floor/cam_scene/lpips_mean` is a per-frame encode->decode of the TRUE frames: the best the
+rollout could possibly score. Pulled next to the rollout number it destroys the sweep:
+
+| run | ep | gstep | OL | floor | OL-floor | OL/floor |
+|---|---|---|---|---|---|---|
+| `bs_stride10` | 1→9 | 1094→9846 | 0.1191→0.0930 | 0.0752→**0.0305** | 0.044→0.063 | 1.58→3.05 |
+| `bs_batch8ctl` | 1 / 3 | 1778 / 5334 | 0.1167 / 0.0978 | 0.0484 / 0.0363 | 0.068 / 0.062 | 2.41 / 2.69 |
+| `bs_wd01` | 1 / 3 | 1778 / 5334 | 0.1250 / 0.0930 | 0.0525 / 0.0306 | 0.073 / 0.062 | 2.38 / 3.04 |
+| `bs_tok16` | 1 | 1778 | 0.1399 | 0.0686 | 0.071 | 2.04 |
+| `bs_tok64` | 1 / 3 | 1778 / 5334 | 0.1627 / 0.1637 | **0.1634 / 0.1732** | −0.001 / −0.010 | **1.00 / 0.95** |
+| `bs_d256` | 1 / 3 | 1778 / 5334 | 0.1460 / 0.1575 | 0.0653 / **0.1582** | 0.081 / −0.001 | 2.24 / **1.00** |
+
+**`bs_tok64`'s floor was 0.1634 against a rollout of 0.1627.** Its codec could not reconstruct a
+frame it was *shown*. The rollout sat exactly at the codec ceiling, so the arm carried no
+information about prediction at all. `d256` reached the same degenerate state by ep3.
+
+What died with it:
+
+- **§8.20 is void.** "Capacity closed on both axes, with a control" was the cleanest-looking result
+  in this record. Both arms were killed while their codecs were still converging, and a bigger
+  bag/width converges *slower*. Capacity is once again an OPEN question.
+- **The §8.21 mirror test is void.** `tok16` looked 20% worse, but its floor is 0.0686 against the
+  control's 0.0484. Nothing was learned about binding-vs-overfitting from it.
+- **`bs_wd01`'s apparent ep3 win is void.** OL 0.0930 beats the control's 0.0978 by 4.9%, but its
+  floor is 16% better (0.0306 vs 0.0363) — the codec improved more than the rollout, so relative to
+  what its own codec can express it got *worse*.
+
+**The ratio does not rescue it.** When the floor is high there is little headroom for the rollout to
+be worse, so `OL/floor` → 1 mechanically. `tok64`'s 1.00 is a ceiling effect, not good dynamics. The
+baseline's own ratio climbs 1.58 → 3.05 purely because its codec improves faster than its rollout;
+the ratio therefore tracks codec convergence stage too, and is not a normalisation.
+
+**Rules going forward:**
+
+1. Never quote OL LPIPS without the codec floor next to it. `olcmp.py` must print both.
+2. An arm is not readable until its floor has plateaued. On the baseline that is ~ep7 (0.0313 →
+   0.0305), i.e. ~7600 gradient steps — far beyond the ep1-ep3 where six arms were judged.
+3. A floor at or above the rollout number means the arm is degenerate: report it as "codec did not
+   converge", never as a dynamics result.
+4. Matched gradient steps is necessary but NOT sufficient. Two arms at the same step with different
+   floors are not comparable.
+
+This is the same failure as §8.18's "look at the pictures" and the `latent_cos` correction: a number
+was read without checking what it was capable of meaning. The difference is that this one produced
+confident, well-tabulated, internally-consistent conclusions across two sections before it was
+caught — which is what made it durable.
+
+### 8.25 THE INVARIANT: `OL - floor` is pinned at ~0.063 and nothing has moved it
+
+Once the codec floor is subtracted, every arm in this sweep produces the same number:
+
+| run | ep | OL | floor | **OL − floor** |
+|---|---|---|---|---|
+| `bs_stride10` | 5 / 7 / 9 | 0.0980 / 0.0946 / 0.0930 | 0.0340 / 0.0313 / 0.0305 | **0.0640 / 0.0633 / 0.0625** |
+| `bs_wd01` | 3 / 5 / 7 | 0.0930 / 0.0963 / 0.0910 | 0.0306 / 0.0317 / 0.0280 | **0.0624 / 0.0646 / 0.0631** |
+| `bs_tok16` | 5 | 0.1014 | 0.0324 | 0.0690 |
+| `bs_batch8ctl` | 1 / 3 | 0.1167 / 0.0978 | 0.0484 / 0.0363 | 0.0682 / 0.0615 |
+
+On the baseline it RISES to ~0.063 and stops: 0.0439 → 0.0599 → 0.0640 → 0.0633 → 0.0625. The codec
+keeps improving (0.0752 → 0.0305) and the rollout improves in lockstep, leaving the dynamics
+contribution fixed.
+
+**Every OL LPIPS improvement measured across this entire branch was the codec getting better.** This
+is the floor-corrected version of §8.24: that section established the comparisons were invalid, this
+one says what the valid comparison actually shows.
+
+`bs_wd01` is the clean illustration. Its ep7 OL of 0.0910 is nominally below the baseline's 0.0930
+plateau and would have been reported as the first real win — but its floor is also lower (0.0280 vs
+0.0305) and `OL − floor` is 0.0631 vs 0.0625, i.e. identical. Weight decay bought a better CODEC,
+not better prediction. Its trajectory also bounces 0.0930 → 0.0963 → 0.0910, noise around a flat
+line, and ep3 alone looked like a 5.7% win.
+
+**Thirteen arms, one invariant number.** Nothing has moved it: weight decay (1e-4 → 1e-2), capacity
+in BOTH directions (16 / 32 / 64 tokens, d 128 / 256), the attention window (32 / 64 / 128), loss
+reweighting (L1, LPIPS, DINOv3 per-patch cosine, first-order derivative), `p_tf_dynamics`,
+`df_scale`, `detach_every`, `action_aggregate`, temporal subsampling.
+
+That pattern is what a STRUCTURAL limit looks like, not a tuning problem. Nothing in this
+architecture binds a token to an object: the bag is undifferentiated, so "which block is which" must
+be re-derived diffusely at every one of ~30 rollout steps, and the per-step cost of doing that is
+~0.063 LPIPS regardless of codec quality or weight norm. It also explains the one fact that has
+held since §8.15 — the codec holds identity perfectly on true frames while the rollout loses it. The
+codec never has to CARRY identity through a step.
+
+**Read `OL − floor`, not `OL`.** Both plateau, but only the difference isolates the dynamics. A
+change that improves the codec moves OL and means nothing for the failure being chased.
+
+Two routes remain, and neither is another knob:
+- **object binding**, needing an unsupervised formulation (§8.13 ruled out slot attention for lack
+  of object trajectory labels — the question is whether a binding loss is possible without them)
+- **more data** — 2.06 h is very small for a video world model, and §8.21 confirmed there is nothing
+  left to reprocess, so this means recording
+
+### 8.26 The binding probe: there is NO object binding to sharpen (2026-09-15)
+
+§8.25 said the failure looks structural, and the standing suspicion was that nothing binds a token
+to an object. Before building an unsupervised binding loss, measure whether there is any binding to
+sharpen. `src/quickdraw/_oneoff_binding_probe.py` — checkpoint-only, runs alongside live arms.
+
+**Method.** Ablate one image token at a time (replace it with its own temporal mean — in
+distribution, unlike zeroing), decode, and take `|Δimage|`. That gives each token a spatial
+FOOTPRINT over 24 frames / 8 s of val episode 0, on `bs_stride10` ep9 (floor converged, 0.0305).
+
+| measure | value | reference |
+|---|---|---|
+| concentration (energy in top 5% of pixels) | **0.498** (min 0.291, max 0.656; 32/32 above 0.25) | uniform = 0.050 |
+| overlap (mean pairwise IoU of top-10% masks) | 0.373 | 0 disjoint, 1 identical |
+| centroid drift over 8 s | 7.89 px | scene's own moving content 10.24 px → **0.77×** |
+| **inter-token spread at a fixed instant** | **8.33 px** | image diagonal 160 px → **0.052** |
+| drift decomposition | **common-mode 6.20** vs individual 4.89 | — |
+| pairwise-distance corr, frame 0 vs t | 0.433 (0.805 → 0.400) | 1.0 = rigid pan |
+
+**Verdict: NOT BOUND.** Tokens are sharply localised — 10× more concentrated than uniform, every one
+of the 32 — but they are localised to *the same region* (all footprint centroids within ~8 px on a
+160 px diagonal) and their motion is mostly **common-mode**: the whole bag slides toward wherever
+the action is. There is no spatial division of labour for a binding loss to sharpen.
+
+**This was got wrong first.** Concentration 0.498 plus drift 0.77× content read as "CONTENT-BOUND:
+emergent binding is present, a binding loss has something to sharpen" — and that was nearly
+reported as a green light to build one. It is an artifact: if the DECODER is content dependent, then
+ablating ANY token produces a footprint near the current action, so every token appears to follow
+content while owning nothing. The two checks that actually discriminate are **inter-token spread at
+a fixed instant** and the **common-mode / individual drift split**, and neither was in the first
+version of the probe. Both are now in it, and its verdict logic requires them.
+
+The general lesson, third time in this record after `latent_cos` and §8.24: a localisation measure
+that never asks "localised to DIFFERENT places?" cannot distinguish binding from a content-dependent
+readout. Measure the division of labour, not the localisation.
+
+**What it means for the plan.** This closes the more attractive of the two routes left in §8.25. A
+binding *loss* needs an existing weak division of labour to sharpen; there is none, so binding here
+is an architecture change (slots with competition, or an explicit per-object latent), not a
+regulariser — and §8.13 already ruled out slot attention for lack of object trajectory labels. It
+also independently corroborates §8.25: with nothing tying a token to an object, identity must be
+re-derived diffusely at every one of ~30 rollout steps, which is exactly a fixed per-step cost that
+no amount of weight decay, capacity or window tuning would move.
+
+That leaves **more data** as the one route not yet closed, and it needs recording, not reprocessing.
+
+### 8.27 Fewer tokens: a transient gain that REVERTED — not a fix (2026-09-16)
+
+> **HEADLINE RETRACTED, see §8.28.** This section was first written as "FEWER TOKENS FIXES IT" on
+> four monotone points and two filmstrips. `tok16` ep13 then reverted to 0.0640, the baseline
+> plateau, and the operator — watching the actual videos — reported `tok16` "still has weird
+> glitching disappearing blocks, so this wasn't solved." Both are right and the claim was wrong.
+> The numbers below are accurate; the conclusion drawn from them was not.
+
+Halving the image tokens, 32 -> 16 per camera, produced a four-point improvement against the §8.25
+invariant that then gave itself back. `bs_tok16`, identical to the baseline but `num_tokens: 16` on both image heads,
+batch pinned to 8.
+
+| `OL − floor` | ep5 | ep7 | ep9 | ep11 |
+|---|---|---|---|---|
+| `bs_stride10` (32 tok) | 0.0640 | 0.0633 | 0.0625 | — |
+| `bs_tok16` | 0.0690 | **0.0590** | **0.0582** | **0.0566** | ep13: **0.0640** |
+
+Monotone after its floor converged at ep5, reaching ~10% below the baseline plateau — and then at
+ep13 returning to 0.0640, which IS the baseline plateau. The gain was transient.
+The gain concentrates at the mid horizon, which is exactly where identity was failing:
+
+| `@+412` (13.7 s) | | `@+824` (27.5 s) | `@+1651` (55 s) |
+|---|---|---|---|
+| `bs_stride10` ep9 | 0.0810 | 0.0896 | 0.0872 |
+| `bs_tok16` ep11 | **0.0595** (−27%) | 0.0739 | 0.0955 (no gain) |
+| `bs_tok16` ep13 | 0.0792 (−2%, gone) | 0.0850 | 0.0980 |
+
+**AND THE FILMSTRIPS AGREE.** This is the first time in this branch a metric and the pictures have
+pointed the same way, and §8.18 says the pictures decide.
+
+- **Episode 0.** Baseline: 3 blocks at +1, then by **+1180 and +1415 the table is essentially
+  empty** — blocks reduced to faint smudges. `tok16`: three saturated, distinctly coloured blocks in
+  **all eight frames** across the full 55 s.
+- **Episode 1.** Baseline: drops to a **single red block on an empty table at +708**, 1–2 faded
+  blocks elsewhere. `tok16`: 2–3 blocks throughout; red is lost mid-rollout and +472/+708 soften,
+  but blue and green persist the whole way.
+
+Dramatic on ep0, moderate on ep1. Where blocks survive the colours stay correct — no swapping.
+Positions still diverge from ground truth, but that is unavoidable open-loop over 55 s and was never
+the complaint.
+
+**Why this is the opposite of the intuition, and why §8.20 pointed the wrong way.** The capacity
+sweep went UP first (64 tokens, d 256) and both arms looked catastrophic — but §8.24 showed they were
+killed with unconverged codecs and measured nothing. The axis was right; the direction and the
+reading were both wrong. With `tok16` at 0.0566 and the 32-token baseline at 0.0625, the dose curve
+now reads: fewer image tokens, lower dynamics error.
+
+It also fits §8.26. There is no object binding: all 32 footprints cluster in one region and drift
+together, so identity is re-derived diffusely at every rollout step. FEWER tokens means less to
+re-derive, and less opportunity for the re-derivation to disagree with itself — which predicts
+exactly the observed shape, a gain at short and mid horizons that washes out by 55 s.
+
+`bs_tok8` launched as the dose extension (ep3: `OL − floor` 0.0655 against `tok16`'s 0.0675 at the
+same epoch, `@+412` already 0.0582). Its codec converged FASTER than `tok16`'s (floor 0.0409 at ep1
+vs 0.0686), so the starvation risk did not bite.
+
+**Open:** where the curve turns. 8 may beat 16, or 8 may starve the codec enough to lose the rollout
+gain. And the 55 s horizon has not improved at any token count, so whatever fails at long range is a
+separate problem from the one just fixed.
+
+### 8.28 WHY §8.27 WAS CALLED WRONG, AND WHAT THE VIDEOS SAY (2026-09-16)
+
+Three independent things had to be believed at once for §8.27's headline, and the fourth point plus
+the operator's own viewing killed it.
+
+**1. The metric reverted.** `bs_tok16` `OL − floor`: 0.0690, 0.0590, 0.0582, 0.0566, then **0.0640**
+at ep13 — the baseline plateau. `@+412` went 0.0595 -> **0.0792** against the baseline's 0.0810,
+i.e. the 27% mid-horizon gain evaporated in one eval. This is the SAME shape as `bs_wd01` ep3
+(0.0624, looked like a 5.7% win, reverted at ep5). The only difference is that `tok16` sustained it
+for four points instead of one, which is exactly what made it convincing.
+
+**2. The operator watched the videos and disagreed.** Verbatim: `tok16` "still has weird glitching
+disappearing blocks, so this wasn't solved." The filmstrips in §8.27 are 8 sampled frames out of
+1651; the MP4 rollouts show the frames in between. **Glitching between sampled frames is invisible
+to a filmstrip by construction.** §8.18 said "look at the pictures" — the sharper rule is look at
+the MOTION, because the failure is temporal and a filmstrip cannot show it.
+
+**3. The operator's read on the dose curve differs from the metric's.** They judge `tok8` "a little
+better than tok16". At matched epoch 3, `OL − floor` is 0.0655 (tok8) vs 0.0675 (tok16) and `@+412`
+is 0.0582 vs 0.0970 — so the videos and the numbers agree that 8 is at least not worse, on the
+early evidence available before the instance came down.
+
+**What the token axis actually shows, stated conservatively.** Every converged `OL − floor` across
+every arm on this dataset falls in **0.057–0.069**. `tok16` wandered to the bottom of that band for
+four evals and came back. Nothing has broken the band. §8.25's invariant stands.
+
+**The error to not repeat.** Four monotone points, a 27% gain on the horizon where the failure
+lives, and two corroborating filmstrips still was not enough — because the rule that had already
+been earned twice (`wd01` ep3, and §8.24's whole floor problem) is that a trend on this dataset is
+not a trend until it survives a point that could have broken it. The right response to four good
+points was to keep the arm running and say nothing, not to write the headline.
+
 ### 8.19 An operational lesson: eval products fill the disk
 
 `eval:ae_floor` died at `win64` ep5 with `OSError: No space left on device` — 287/290 GB. Eval
@@ -638,6 +1002,27 @@ products on a schedule.
 
 ## 9. Still open
 
+- [ ] **The identity/persistence failure is NOT fixed** (§8.27 retracted, §8.28). `tok16` gave a
+      four-point improvement that reverted to the baseline plateau at ep13, and the operator
+      watching the MP4s reports it "still has weird glitching disappearing blocks". `tok8` looks
+      mildly better than `tok16` to the eye and marginally better at matched epoch 3, but had only
+      2 eval points when the instance came down. RESUME HERE: run `tok8` to ep13+ and compare
+      against `tok16`, on the VIDEOS, not filmstrips.
+- [ ] **Judge these rollouts on the MP4s, not the filmstrips.** 8 sampled frames out of 1651
+      cannot show glitching between samples, which is what the operator sees and what the
+      filmstrips missed (§8.28).
+- [ ] The 55 s horizon (`@+1651`) has not improved at ANY token count. Whatever fails at long
+      range is a separate problem from the one §8.27 fixed.
+- [ ] ~~The identity/persistence failure is unresolved~~, hypothesis was OVERFITTING
+      (§8.21), not capacity (§8.20, closed on both axes with a control), not the attention window
+      (§8.17b, falsified twice), and not any of the nine in §8.16. Open arms: `bs_wd01`
+      (`weight_decay` 1e-2) and the batch-8 control as its matched reference.
+- [ ] If regularisation bends the val/train gap but not OL LPIPS, then overfitting is real but not
+      the *cause* of colour swapping, and the next question is object binding — nothing in this
+      architecture ties one token to one object. §8.13 ruled slot attention out for lack of object
+      trajectory labels; revisit whether an unsupervised binding loss is possible without them.
+- [ ] Recording more block-stack data is the only way to attack the gap from the data side (§8.21).
+      2.06 h is small for a video world model.
 - [ ] Should `campaign4-rgb` / `campaign6-combos` / `campaign7-precision` be pooled (current
       behaviour, one distribution) or should the model condition on campaign? The label is
       already carried in `task`, so this is a training-side choice, not a re-processing one.
@@ -656,3 +1041,29 @@ provenance to the shared builder. Split confirmed at 90/10 longest-first, landin
 both val episodes ~9–10 min. `tests/test_longhand_split.py` 8/8. Two smoke builds green
 end-to-end (4 splits, obs_dim 17, action_dim 5, campaign labels intact); full 4-camera build
 complete and verified: bit-exact vectors and a strict frame-alignment minimum at shift 0.
+
+**2026-09-14/15** — Window sweep killed (§8.17b: falsified on filmstrips *and* on compute-matched
+LPIPS, with the stronger manipulation breaking earliest). Reopened capacity per §21.2 with two arms
+on two axes, `num_tokens 64` and `d 256` — both autobatched to 8 against the baseline's 13, so
+`bs_batch8ctl` was launched as a batch-8 control. The control came in **1.0% off the baseline** at
+matched gradient steps, which closed both capacity axes on merit (§8.20) instead of leaving them
+confounded the way the window sweep was.
+
+That negative result plus the baseline's own loss curve produced the first unifying diagnosis in the
+record: **overfitting** (§8.21). val/train widens 1.09 → 1.69 across ep1–9 and val turns up at ep9
+while train is flat. It accounts for capacity hurting on both axes, the longer window hurting more,
+sharp-and-wrong predictions, and best-of-k buying nothing — i.e. it explains the nine dead
+hypotheses rather than joining them. Confirmed no data is available to add: `campaign1-tests` is
+empty, `campaign2-play` is 3.1 min, campaigns 8–9 are the eval set.
+
+Built `wizard/scripts/blockstack-regularize.sh` (`wd`/`tokens`/`noise`) and `wizard/scripts/olcmp.py`
+(OL LPIPS at matched gradient steps). Launched `bs_wd01` (`weight_decay` 1e-4 → 1e-2) against the
+control. Two corrections worth keeping: `detach_every` is **32** on every block-stack arm, not 8 as
+asserted from memory (§8.22), and `metrics.jsonl`'s `step` is the **epoch index**, not the gradient
+step — a comparison table was built on that error before it was caught.
+
+Housekeeping: deleted `/home/isaac/data/lego_assemblies` (58 GB) after verifying recoverability by
+actually downloading from `swoosh-data/lego_assemblies` with the token — 444 local mp4s against 444
+on HF. 41 GB of it (`_quickdraw_frames`, a `*_h288` decode cache) was never uploaded and would need
+regenerating. Disk 41 → 82 GB free. The self-kill bug recurred a fifth time and is now guarded by an
+exe type check rather than a better pattern (§8.23).
