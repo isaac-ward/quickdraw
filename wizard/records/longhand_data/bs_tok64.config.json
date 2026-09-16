@@ -1,0 +1,453 @@
+{
+  "model": {
+    "name": "mm_flow",
+    "size": null,
+    "d": 128,
+    "depth": 4,
+    "heads": 8,
+    "window": 32,
+    "relative_position": false,
+    "relative_scale": null,
+    "mlp_ratio": 4.0,
+    "rope_theta": 10000.0,
+    "action_dim": 5,
+    "lambda_flow": 1.0,
+    "lambda_consistency": 1.0,
+    "p_tf_start": 1.0,
+    "p_tf_end": 0.0,
+    "p_tf_warmup_epochs": 1,
+    "action_squash": "none",
+    "action_fourier_freqs": 0,
+    "latent_norm": "layernorm",
+    "p_tf_batch_granular": false,
+    "p_tf_dynamics": 1.0,
+    "dynamics_detach_encoder": false,
+    "recon_frac": 1.0,
+    "detach_every": 32,
+    "grad_checkpoint": false,
+    "compile_rollout": true,
+    "diffusion": {
+      "shortcut": false,
+      "sampling_steps": 6,
+      "predict": "residual",
+      "stochastic_eval": true,
+      "time_sampling": "uniform",
+      "flow_hidden": 128,
+      "concat_action_embedding": true,
+      "flow_arch": "transformer",
+      "flow_arch_depth": 2,
+      "flow_arch_heads": 4
+    },
+    "action_head": {
+      "enabled": false,
+      "weight": 1.0,
+      "chunk": 1,
+      "shortcut": false,
+      "detach_gradient": false
+    },
+    "modalities": [
+      {
+        "name": "proprio",
+        "kind": "vector",
+        "dim": 17,
+        "weight": 1.0,
+        "decode_kind": "flow",
+        "decode_param": "x0",
+        "decode_arch": "mlp"
+      },
+      {
+        "name": "cam_scene",
+        "kind": "image",
+        "cam": "scene_right",
+        "weight": 1.0,
+        "img_size": [
+          96,
+          128
+        ],
+        "ae_bottleneck": 6,
+        "pretrained": false,
+        "num_tokens": 64,
+        "encode_arch": "conv",
+        "encode_base": 32,
+        "decode_kind": "mse",
+        "decode_arch": "up",
+        "decode_base": 64,
+        "decode_param": "x0",
+        "patch": 16,
+        "ae_depth": 4,
+        "decode_chunk_train": 64,
+        "visual_l1": 3.0,
+        "visual_l2": 0.0,
+        "visual_lpips": 1.0,
+        "visual_lpips_net": "vgg",
+        "visual_frames": 128,
+        "latent_loss_weight": 10
+      },
+      {
+        "name": "cam_wrist",
+        "kind": "image",
+        "cam": "gripper_right_top",
+        "weight": 1.0,
+        "img_size": [
+          96,
+          128
+        ],
+        "ae_bottleneck": 6,
+        "pretrained": false,
+        "num_tokens": 64,
+        "encode_arch": "conv",
+        "encode_base": 32,
+        "decode_kind": "mse",
+        "decode_arch": "up",
+        "decode_base": 64,
+        "decode_param": "x0",
+        "patch": 16,
+        "ae_depth": 4,
+        "decode_chunk_train": 64,
+        "visual_l1": 3.0,
+        "visual_l2": 0.0,
+        "visual_lpips": 1.0,
+        "visual_lpips_net": "vgg",
+        "visual_frames": 128,
+        "latent_loss_weight": 10
+      }
+    ]
+  },
+  "data": {
+    "root": "logs/recording_2026_09_10_10_04_45_longhand",
+    "hf_repo": null,
+    "repo_id": "block_stack",
+    "cam": "fpv",
+    "obs_keep": null,
+    "P": 8,
+    "F": 64,
+    "window_stride": 1,
+    "subsample": 10,
+    "action_aggregate": "mean",
+    "batch": 8,
+    "autobatch": true,
+    "autobatch_reserve_gb": 4,
+    "autobatch_max": 512,
+    "autobatch_base": 16,
+    "workers": 16,
+    "fast_gpu": true,
+    "n_plot_trajectories": 4,
+    "fpv_fov": 100,
+    "composite_grid": 4,
+    "action_smooth_window": 18,
+    "action_sampler": "ornstein_uhlenbeck",
+    "splits": {
+      "train": {
+        "n_traj": 256,
+        "steps": 256,
+        "seed": 0,
+        "coloring": "hsv",
+        "env": {}
+      },
+      "val": {
+        "n_traj": 64,
+        "steps": 256,
+        "seed": 1,
+        "coloring": "hsv",
+        "env": {}
+      },
+      "eval_ood_horizon": {
+        "n_traj": 64,
+        "steps": 1024,
+        "seed": 2,
+        "coloring": "hsv",
+        "env": {}
+      },
+      "eval_ood_visual": {
+        "n_traj": 64,
+        "steps": 256,
+        "seed": 3,
+        "coloring": "circles",
+        "env": {}
+      },
+      "eval_ood_geometric": {
+        "n_traj": 64,
+        "steps": 256,
+        "seed": 4,
+        "coloring": "hsv",
+        "env": {
+          "R": 1.1,
+          "r": 0.08
+        }
+      },
+      "eval_ood_dynamics": {
+        "n_traj": 64,
+        "steps": 256,
+        "seed": 5,
+        "coloring": "hsv",
+        "env": {
+          "gamma": 0.5,
+          "mass": 2.0
+        }
+      }
+    },
+    "subsample_all_phases": false
+  },
+  "optim": {
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "lr_warmup_steps": 300
+  },
+  "trainer": {
+    "max_epochs": 50,
+    "precision": "bf16-mixed",
+    "save_top_k": -1,
+    "checkpoint_monitor": "val/metric/cam_scene/mse",
+    "checkpoint_mode": null,
+    "check_val_every_n_epoch": 2,
+    "accumulate_grad_batches": 1,
+    "grad_diag_every": 25
+  },
+  "environments": {
+    "name": "recorded",
+    "obs_dim": 17,
+    "action_dim": 5,
+    "dt": 0.0333333,
+    "position_idx": [
+      0,
+      1,
+      2
+    ],
+    "preview_fps": 30
+  },
+  "logging": {
+    "project": "quickdraw",
+    "group": "base"
+  },
+  "eval": {
+    "action_dist_window": 4,
+    "action_dist_episodes": 64,
+    "horizon": 2048,
+    "closed_loop_steps": [
+      1,
+      16
+    ],
+    "closed_loop_horizon": 256,
+    "n_episodes": 64,
+    "manifold_max_steps": 1024,
+    "ae_floor_episodes": 2,
+    "decode_chunk": 64,
+    "n_plot": 2,
+    "denoising_filmstrip_steps": 8,
+    "denoising_filmstrip_images": 4,
+    "denoising_filmstrip_seeds": 4,
+    "denoising_filmstrip_horizons": [
+      1,
+      8,
+      16,
+      32,
+      64
+    ],
+    "denoising_seed": null,
+    "denoising_max_steps": null,
+    "during_train": {
+      "every_epochs": 2,
+      "at_epochs": [
+        5,
+        15
+      ],
+      "evals": {
+        "ood_horizon": true,
+        "ood_visual": false,
+        "ood_geometric": false,
+        "ood_dynamics": false,
+        "control": true,
+        "denoising_multistep": true,
+        "denoising_aggregate": true,
+        "denoising_filmstrip": true,
+        "ae_floor": true,
+        "manifold": true,
+        "interpret": false,
+        "action_distribution": true
+      }
+    }
+  },
+  "control": {
+    "horizon": 64,
+    "chunk": 8,
+    "num_samples": 128,
+    "noise_sigma": 2.0,
+    "lambda_": 0.3,
+    "mean_decay": 1.0,
+    "tol": 0.3,
+    "settle_steps": 45,
+    "max_steps": 1000,
+    "beta_ctrl": 0.02,
+    "beta_vel": 0.0,
+    "r_settle": 0.5,
+    "n_episodes": 8,
+    "n_goals": 5,
+    "reuse_render": true,
+    "reward_override": null
+  },
+  "interpret": {
+    "n_clips": 1024,
+    "n_captions": 16,
+    "point": "per_step",
+    "clip_len": 30,
+    "batch": 32,
+    "vlm_frames": 6,
+    "seed": 0,
+    "imaginations": true,
+    "umap_sup_weights": [
+      0.1,
+      0.3,
+      0.9
+    ],
+    "vlm": {
+      "model": "gpt-4o",
+      "max_workers": 8
+    },
+    "factors": {
+      "color": {
+        "source": "vlm",
+        "buckets": [
+          "cyan",
+          "blue",
+          "pink",
+          "red",
+          "orange",
+          "yellow",
+          "green"
+        ],
+        "colors": {
+          "cyan": "#00ffff",
+          "blue": "#0000ff",
+          "pink": "#ff69b4",
+          "red": "#ff0000",
+          "orange": "#ffa500",
+          "yellow": "#ffff00",
+          "green": "#228b22"
+        },
+        "analytic": {
+          "kind": "hue_at_position",
+          "hue_centers": {
+            "red": 0.0,
+            "orange": 0.09,
+            "yellow": 0.17,
+            "green": 0.34,
+            "cyan": 0.5,
+            "blue": 0.67,
+            "pink": 0.87
+          }
+        }
+      },
+      "positioning": {
+        "source": "analytic",
+        "buckets": [
+          "top",
+          "middle",
+          "bottom"
+        ],
+        "colors": {
+          "top": "#d62728",
+          "middle": "#7f7f7f",
+          "bottom": "#1f77b4"
+        },
+        "analytic": {
+          "kind": "z_band",
+          "frac": 0.1
+        }
+      }
+    },
+    "prompt": "You are labeling a short first-person video clip (about half a second) recorded by an agent moving on the\ninside surface of a colorful torus world. The surface is painted with bands of color around a wheel:\ncyan, blue, purple, pink, red, orange, yellow, light green, green. The frames may be LOW-RESOLUTION or BLURRY \u2014\njudge the dominant HUE, not fine texture. Report the color of the surface the agent is STANDING ON: look ONLY at\nthe immediate foreground floor at the BOTTOM-CENTER of the frame (ignore the walls, the far distance, and any\ncolors elsewhere in the view). Choose the single closest match from the listed colors; if it is between two,\npick the more dominant / more saturated one. In \"reasoning\", FIRST briefly describe what you see on the\nbottom-center floor (a few words), THEN commit to the color. Also give a self_reported_confidence in [0,1]\n(lower it when the frames are blurry or ambiguous). Return ONLY the structured fields.\n",
+    "caption_prompt": "ALSO write exactly {n} short, natural-language captions, each describing THIS specific clip in a DIFFERENT\nway, as if telling someone what the agent is seeing and doing. Take into account the color of the surface it\nis standing on and where it sits on the ring vertically (near the top, around the middle, or near the bottom),\nand mention any motion you can see (climbing, descending, drifting left or right, fast or slow). Vary the\nwording, word order, and level of detail across the {n} captions \u2014 some terse (\"red floor, near the top\"),\nsome fuller (\"moving along a bright red band high up on the ring, drifting to the left\"). Do NOT number them\nor reuse a fixed template; make them read like distinct human descriptions of the same moment. If any \"Known\nexact facts\" are given (e.g. the vertical position on the ring), treat them as ground truth and make EVERY\ncaption consistent with them \u2014 the frames can be misleading about position, so trust the stated facts there.\n"
+  },
+  "reward": {
+    "interpret_run": "logs/eval_interpret_2026_07_08_04_07_28_interpret_r3diff_v4",
+    "factors": [
+      "color",
+      "positioning"
+    ],
+    "factor": "color",
+    "soft_targets": false,
+    "caption_tau": 0.1,
+    "embed_dim": 128,
+    "hidden": 256,
+    "epochs": 300,
+    "report_every": 10,
+    "lr": 0.001,
+    "batch": 512,
+    "temperature": 0.07,
+    "weight_decay": 0.01,
+    "dropout": 0.1,
+    "latent_noise": 0.1,
+    "early_stop_patience": 8,
+    "val_frac": 0.15,
+    "seed": 0,
+    "text_model": "sentence-transformers/paraphrase-MiniLM-L3-v2",
+    "paraphrases": [
+      "{c}",
+      "the {c} band",
+      "a {c} surface",
+      "the {c} floor"
+    ]
+  },
+  "language": {
+    "request": "red",
+    "head": null,
+    "interpret_run": null,
+    "interpret_plots": [
+      {
+        "method": "lda",
+        "factor": "color",
+        "dims": [
+          2,
+          3
+        ]
+      },
+      {
+        "method": "lda",
+        "factor": "positioning",
+        "dims": [
+          2,
+          3
+        ]
+      }
+    ],
+    "hull_frac": 0.8,
+    "per_request_joint_plots": false,
+    "overrides": {
+      "n_episodes": 4,
+      "n_plot": 4,
+      "max_steps": 500,
+      "lambda_": 0.05
+    }
+  },
+  "seed": 0,
+  "experiment": "bs_tok64",
+  "checkpoint": null,
+  "variations": {
+    "noise_injection": {
+      "std": 0.0,
+      "observations_encoded_pre_fusion": {
+        "scale": 0.0,
+        "granularity": "timestep"
+      }
+    },
+    "physical_loss": {
+      "weight": 0.0,
+      "continuity": 0.0,
+      "warmup_epochs": 10
+    },
+    "contraction": {
+      "weight": 0.0,
+      "target": 1.02,
+      "power_iters": 2,
+      "n_sample_steps": 4
+    }
+  },
+  "run_summary": {
+    "problem": "On block-stack the blocks CHANGE COLOUR and merge over an open-loop rollout -- sharp, confident and wrong rather than blurred or faded. The model knows a block is there and not which block. Identity is demonstrably present at the start and lost in transit: a per frame encode decode of the true frames keeps colours correct for a whole clip, and at zero to four seconds the rollout matches that codec ceiling exactly, then it compounds away by about eight seconds.",
+    "tried": "Nine hypotheses measured and killed on checkpoints. Loss reweighting between LPIPS, a DINOv3 per patch cosine and a first order derivative term. Mode collapse, ruled out because eight draws spread to 2.8 times their own step motion. Scoring away diversity, ruled out because best of eight gains 2.5 percent at twenty one seconds and the gain shrinks with horizon. Codec capacity, ruled out because reconstruction error is 0.29 times the patch own variation on dynamic patches against 2.48 on still ones. Off manifold decode, ruled out because rolled frames are 0.90 to 1.01 times as sharp as real. Identity being a low variance latent direction, ruled out because a recolour moves the latent 2.3 times more per pixel than a reposition. The flow never having learned identity, ruled out by the zero to four second match. And p_tf_dynamics, df_scale and the attention window all ran as real arms and all lost, the window falsified twice with the stronger manipulation breaking earliest.",
+    "trying": "Give the token bag more room, on two different axes, and see whether identity survives the transit.",
+    "trying_detail": "num_tokens 64 on both image heads, against the baseline 32. This gives the bag more SLOTS, so distinct objects have distinct places to live. It doubles n_state from 65 to about 129 so spatial attention roughly quadruples; record 21.2 saw 2339 batches per epoch against 1254 on a comparable change, so expect the batch to fall from the baseline 13 and read results at matched gradient steps rather than matched epochs.",
+    "rationale": "Nothing in this architecture binds one token to one object. The bag is undifferentiated, so which block is which must be carried diffusely across all of it and re derived at every one of about thirty rollout steps, from 32 tokens per camera covering an arm, a table and several individually identifiable blocks. That predicts the exact shape observed: the codec is fine because all its tokens serve a single frame, while the rollout degrades because each step re derives the scene from a bag at its limit. Capacity is also the one dimension never varied here, and it is a documented open question rather than a new idea: record section 21.2 records that num_tokens 64 was killed after two evals with the best codec floor of any run on that dataset, stopped for cost and not for evidence, with the explicit note that retrying it is an open question.",
+    "allow_duplicate": false
+  }
+}
