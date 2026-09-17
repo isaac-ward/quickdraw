@@ -1,0 +1,32 @@
+# =============================================================================================
+# vl128_phys — vl128 (NARROW flow head + L1/LPIPS at parity) + physics-aware proprio, for owm-iss.
+# Select `model=vl128_phys`. This is `vl_phys` corrected for record §23: the owm-iss collapses were
+# `flow_hidden=512` (which vl_phys carried on the CLI). vl128 sets flow_hidden=128 (the fix) so this
+# config needs NO flow_hidden flag — do not pass one.
+#
+# Deltas from vl_phys: inherits vl128 not vl64 (=> diffusion.flow_hidden=128, the collapse fix, baked in),
+# and image visual_l1 3.0 not 1.0 (§23.5 parity — fixes the magenta/oversaturation cast). proprio arm
+# unchanged (ego-13, prior:physics, llw 0). Everything else is vl128 verbatim.
+#
+# RUN IT WITH (CLI):
+#   data.subsample=16   (owm-iss-derived; native motion is far below the codec floor — see this session)
+#   data.F=64   model.action_dim=6   environments=recorded (+dynamics_prior +quat_idx +rate_clamp)
+#   data.autobatch=false data.batch=26   (§23.6: the narrow head makes autobatch pick a larger, silent batch)
+#   DO NOT pass model.diffusion.flow_hidden (128 comes from vl128; 512 is the collapse).
+# Set visual_l1: 1.0 here to reproduce the more-proven st_fh128 recipe exactly.
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+modalities:
+  # physics-aware proprio (ego-13). prior:physics => env supplies the dynamics fn; round-trip illegal => llw 0.
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp,
+     prior: physics, latent_loss_weight: 0}
+  # vl128 image arm verbatim: bespoke UP decoder + L1(3.0)+LPIPS(1.0) at parity, narrow flow head from vl128.
+  - {name: image, kind: image, weight: 1.0, img_size: 128, pretrained: false,
+     num_tokens: 32, encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64, decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}

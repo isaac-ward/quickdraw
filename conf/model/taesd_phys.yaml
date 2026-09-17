@@ -1,0 +1,31 @@
+# =============================================================================================
+# taesd_phys — FROZEN TAESD image codec + physics-aware proprio, for owm-iss (coop). Select `model=taesd_phys`.
+#
+# WHY. The bespoke conv codec collapses to the dataset-MEAN frame on owm-iss FPV (ae_floor ~12 dB, motion_ratio
+# ~0.013 — the DreamerV3 runs hit the same ~11 dB). Raw TAESD reconstructs these frames at ~31 dB at the SAME
+# 1024-float budget, so the codec floor stops being the blocker. TAESD is FROZEN (excluded from AdamW); only the
+# Perceiver adapters + the dynamics train. The dynamics are UNCHANGED — they still predict the 8x128 token bag;
+# TAESD.encode -> down-adapter fills that bag, up-adapter -> TAESD.decode reads it back.
+#
+# Inherits bsp32mse (transformer flow denoiser, compile_rollout, action_head off) and changes ONLY:
+#   - the image modality -> frozen TAESD (pretrained), num_tokens 8 (8*128 == TAESD@128 latent 4*16*16 = 1024; NEVER pad)
+#   - latent_norm: affine  (REQUIRED for a frozen pretrained latent — calibrates its fixed moments; layernorm is for bespoke)
+#   - recon_frac: 1.0      (more decode supervision; the only autoregressive gradient reaches dynamics via the decoder)
+#   - proprio -> ego-13 with prior:physics (round-trip is ILLEGAL in prior mode, so latent_loss_weight MUST be 0)
+# =============================================================================================
+defaults:
+  - bsp32mse
+  - _self_
+
+latent_norm: affine        # frozen TAESD latent -> affine (layernorm would recenter a latent that is already calibrated)
+recon_frac: 1.0
+
+modalities:
+  # physics-aware proprio (ego-13). prior:physics => the env supplies the dynamics fn; round-trip anchor is illegal here => llw 0.
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp,
+     prior: physics, latent_loss_weight: 0}
+  # frozen TAESD image codec bridged to the 8x128 token bag by learned Perceiver adapters (encode_arch/decode_arch ignored under pretrained).
+  - {name: image, kind: image, weight: 1.0, img_size: 128, num_tokens: 8, patch: 16, ae_depth: 4,
+     decode_kind: mse, decode_param: x0, encode_arch: conv, decode_arch: unet, encode_base: 32, decode_base: 32,
+     pretrained: true, pretrained_name: madebyollin/taesd, pretrained_init: true, freeze: true, adapter: {depth: 2},
+     latent_loss_weight: 1.0}

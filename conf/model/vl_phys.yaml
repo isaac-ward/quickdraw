@@ -1,0 +1,32 @@
+# =============================================================================================
+# vl_phys — vl64 (bespoke UP decoder + L1+LPIPS visual loss) + physics-aware proprio, for owm-iss.
+# Select `model=vl_phys`. Inherits vl64; changes ONLY the proprio modality to the ego-13 physics arm.
+#
+# The image arm is vl64 verbatim (bespoke conv encoder, decode_arch: up @64, num_tokens 32, L1 1.0 + LPIPS-VGG
+# 1.0, latent_loss_weight 10 DO-NOT-MOVE). proprio keeps plain MSE (VisualLoss is image-only) and adds
+# prior:physics (round-trip illegal in prior mode => latent_loss_weight MUST be 0).
+#
+# RUN IT WITH (CLI, per vl64/up64 headers):
+#   data.subsample=16   (DERIVED for owm-iss: image motion is far below the codec floor; 16 = 1.25 Hz is the
+#                        best practical image SNR. robocasa used 5. see the measurement in this session.)
+#   data.F=64   model.action_dim=6   environments=recorded (+dynamics_prior +quat_idx +rate_clamp)
+#   model.diffusion.flow_hidden=512   (every vl64 number used it)
+#   p_tf_dynamics stays 1.0 (record §21: the dose curve is a CLEAN NEGATIVE; 1.0 is the only stable point)
+# WATCH latent_cos: vl64 collapsed at eval 12 (latent_cos -> negative) after a non-finite step. It also GHOSTS
+#   (spatially-wrong-but-sharp) and its ROLLOUT is worse than pure-MSE (LPIPS is blind to displacement). READ FRAMES.
+# =============================================================================================
+defaults:
+  - vl64
+  - _self_
+
+modalities:
+  # physics-aware proprio (ego-13). prior:physics => env supplies the dynamics fn; round-trip illegal => llw 0.
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp,
+     prior: physics, latent_loss_weight: 0}
+  # vl64 image arm, verbatim: bespoke UP decoder + L1+LPIPS visual loss.
+  - {name: image, kind: image, weight: 1.0, img_size: 128, pretrained: false,
+     num_tokens: 32, encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64, decode_param: x0, patch: 16, ae_depth: 4,
+     decode_chunk_train: 64,
+     visual_l1: 1.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}

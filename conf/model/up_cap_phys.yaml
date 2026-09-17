@@ -1,0 +1,27 @@
+# =============================================================================================
+# up_cap_phys — bespoke UP decoder with PUSHED codec capacity + physics-aware proprio, owm-iss (coop).
+# Select `model=up_cap_phys`. The counterpart to taesd_phys: keep the bespoke (no-pretrained) premise but throw
+# capacity at the codec collapse instead of swapping in TAESD.
+#
+# Inherits up64 (decode_arch: up, decode_base 64, recon_frac 1.0, p_tf_warmup 1). Pushes the image codec on every axis:
+#   num_tokens   32 -> 64   (finer latent addressing; 64*128 = 8192 floats = 6x compression at 128px, vs 12x)
+#   ae_bottleneck 8 -> 16   (16x16 conv-pyramid bottleneck; less spatial compression = the single biggest codec-floor
+#                            lever on robocasa, BUT it lost every rollout metric there and needs a firmer anchor)
+#   encode_base  32 -> 64   (bigger conv encoder — never swept before, plausibly under-capacity on owm-iss frames)
+#   latent_loss_weight 10 -> 20  (round-trip anchor scaled up to hold the bigger codec against dynamics drag)
+# decode_base stays 64 (param-matched up head). WATCH: per the record, ae_bottleneck 16 raised the codec floor then
+# COLLAPSED the rollout — so track ae_floor (should rise) AGAINST ood_horizon/motion (may fall).
+# =============================================================================================
+defaults:
+  - up64
+  - _self_
+
+modalities:
+  # physics-aware proprio (ego-13). prior:physics => env supplies the dynamics fn; round-trip illegal in prior mode => llw 0.
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp,
+     prior: physics, latent_loss_weight: 0}
+  # bespoke UP decoder, capacity pushed on tokens / bottleneck / encoder width.
+  - {name: image, kind: image, weight: 1.0, img_size: 128, pretrained: false,
+     num_tokens: 64, encode_arch: conv, encode_base: 64,
+     decode_kind: mse, decode_arch: up, decode_base: 64, decode_param: x0, patch: 16, ae_depth: 4,
+     ae_bottleneck: 16, decode_chunk_train: 64, latent_loss_weight: 20}

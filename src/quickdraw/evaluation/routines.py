@@ -27,6 +27,32 @@ from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_
 from .products import emit_openloop
 
 
+def _window_eps(eps, P, H, cfg):
+    """Slice each selected episode to a single (P+H+1)-frame window per `eval.window`:
+      start (default) — first P+H+1 frames (bit-identical to the old behaviour: downstream [:P]/[P:P+H] slices);
+      random          — a seeded per-episode offset ANYWHERE in the run, so evals sample orbit->dock, not just
+                        the orbit start (the dock is the last ~H steps and was never in the window);
+      end             — the final window (the docking approach -> contact).
+    Seed is FIXED (eval.window_seed, default 1234) so the windows are stable across epochs (metrics comparable)
+    but vary across episodes. eps[i] = (obs, act, frame_dict)."""
+    mode = str((cfg.eval.get("window", "start") if hasattr(cfg.eval, "get") else "start") or "start")
+    if mode == "start":
+        return eps
+    W = P + H + 1
+    rng = np.random.default_rng(int(cfg.eval.get("window_seed", 1234)))
+    out = []
+    for o, a, fr in eps:
+        L = len(o)
+        if L <= W:
+            s0 = 0
+        elif mode == "end":
+            s0 = L - W
+        else:  # random
+            s0 = int(rng.integers(0, L - W + 1))
+        out.append((o[s0:s0 + W], a[s0:s0 + W], {h: fr[h][s0:s0 + W] for h in fr}))
+    return out
+
+
 def _is_mm(model):
     return hasattr(getattr(model, "_orig_mod", model), "layout")
 
@@ -196,6 +222,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
                                                       [len(o) for o, _, _ in eps], P,
                                                       n_ep_override=cfg.eval.get("horizon_n_episodes"))
     eps = eps[:n_ep]
+    eps = _window_eps(eps, P, H, cfg)   # eval.window: start(default)|random|end — slice each ep to a P+H window (so evals can land on the DOCK, not just the orbit start)
     n_plot = min(int(cfg.eval.get("n_plot", 2) or 2), n_ep)   # per-episode visuals; SAME episode indices (0..n_plot-1) across all modes
     env = make_env(cfg.environments.get("name", "torus_world"), cfg.environments, 1, "cpu")
     pos, pos_explicit = _pos_idx(cfg, env=env)                              # world-xyz obs dims (#11; env hook / config)
