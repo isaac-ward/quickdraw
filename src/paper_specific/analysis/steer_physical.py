@@ -41,6 +41,43 @@ WANTS = {"rotate left": ("yaw", +1), "rotate right": ("yaw", -1),
          "strafe right": ("lateral", +1), "strafe left": ("lateral", -1)}
 
 
+MOTION_REQUESTS = tuple(WANTS)                  # the 8 with an exact physical readout
+# THE OPPOSING REQUEST ON EACH AXIS, which is what makes a negative class available at all: "rotate left"
+# and "rotate right" name the same axis with opposite signs, so a context asked for one is a negative for
+# the other.
+OPPOSING = {q: next(p for p in WANTS if p != q and WANTS[p][0] == WANTS[q][0]) for q in WANTS}
+REST_FRAC = 0.05                                # a request counts as met past 5% of a pilot's own motion
+
+
+def weighted_accuracy(hit_rate: float, false_positive_rate: float) -> float:
+    """Balanced accuracy in percent: the mean of the true-positive and true-negative rates, so the
+    no-skill value is 50 under ANY class imbalance. One definition, used for both blocks of the steering
+    table and for the selection-rule sweep -- it lived in two places and the sign of the negative class
+    is subtle enough that the first version returned exactly 50.0 for every arm (summed over an opposing
+    pair, tpr_q + 1 - tpr_q' cancels to 1 identically)."""
+    return 100.0 * 0.5 * (hit_rate + 1.0 - false_positive_rate)
+
+
+def motion_weighted_accuracy(phys: dict, pilot: dict) -> float | None:
+    """Mean weighted accuracy over the 8 motion primitives for ONE arm.
+
+    `phys` is {request: (mean, n, per-context values)} as tables._phys returns it, storing motion*sgn for
+    the request it was asked under. So for the OPPOSING request, motion in THIS request's direction past
+    the threshold is a stored value below -threshold -- not above +threshold, which is that request's own
+    hit rate and cancels to 0.5 when summed over the pair."""
+    import numpy as np
+    w = []
+    for q in MOTION_REQUESTS:
+        thr = REST_FRAC * pilot[WANTS[q][0]]
+        pos, neg = phys.get(q), phys.get(OPPOSING[q])
+        if not pos or not neg:
+            continue
+        tpr = float(np.mean([v > thr for v in pos[2]]))
+        fpr = float(np.mean([v < -thr for v in neg[2]]))
+        w.append(weighted_accuracy(tpr, fpr))
+    return float(np.mean(w)) if w else None
+
+
 def yaw_of(q):                                  # (T,4) qx,qy,qz,qw -> (T,) radians
     x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     return np.arctan2(2 * (w * z + x * y), 1.0 - 2 * (y * y + z * z))

@@ -130,8 +130,14 @@ def ah_table() -> str:
         d = metrics(os.path.join(LOGS, run))
         if not d:
             continue
+        # BOTH REDUCTIONS ARE EXPLICIT, because both patterns match many tags and the old silent v[-1]
+        # published a single slice under an aggregate heading: rest AUC was dimension 15 alone, and W_1
+        # was whichever lead was logged last -- +8 on the chunk-8 rows against +32 on the chunk-32 ones,
+        # in the same column. rest_auc is per-dim at lead 0, so its mean is over the action dimensions;
+        # w1_mean is per-lead, so its mean is over the leads.
         rows.append((lab, [contains(d, "lead_00/energy_skill"), contains(d, "energy_skill_vs_blind"),
-                           contains(d, "w1_mean"), contains(d, "rest_auc")]))
+                           contains(d, "w1_mean", reduce="mean"),
+                           contains(d, "rest_auc", reduce="mean")]))
     best = [None] * 4
     for k, lo in enumerate((False, False, True, False)):    # W1 is the only lower-is-better column
         vs = [r[1][k] for r in rows if r[1][k] is not None]
@@ -372,35 +378,22 @@ def avg_locations(vl):
 
 
 def wacc_motion(ph):
-    """{arm: weighted accuracy} over MOTION_ROWS. The negative class is the OPPOSING request on the same
-    axis. _phys stores motion*sgn for the request it was asked under, so for the opposing request a
-    false positive -- motion in THIS request's direction past the threshold -- is a stored value below
-    -threshold."""
+    """{arm: weighted accuracy} over the 8 primitives. The metric itself lives in steer_physical beside
+    WANTS, which is what defines the opposing pairs; scratch/_selresults.py imports the same one."""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
-    from steer_physical import WANTS
-    opp = {q: next(p for p in MOTION_ROWS if p != q and WANTS[p][0] == WANTS[q][0]) for q in MOTION_ROWS}
-    out = {}
-    for m, _ in COLS:
-        w = []
-        for q in MOTION_ROWS:
-            thr = 0.05 * PILOT[WANTS[q][0]]
-            pos, neg = ph[m].get(q), ph[m].get(opp[q])
-            if not pos or not neg:
-                continue
-            tpr = float(np.mean([v > thr for v in pos[2]]))
-            fpr = float(np.mean([v < -thr for v in neg[2]]))
-            w.append(0.5 * (tpr + 1.0 - fpr))
-        out[m] = 100.0 * float(np.mean(w)) if w else None
-    return out
+    from steer_physical import motion_weighted_accuracy
+    return {m: motion_weighted_accuracy(ph[m], PILOT) for m, _ in COLS}
 
 
 def wacc_locations(vl):
     """{arm: weighted accuracy} over LOC_ROWS, from the VLM hit and base rates."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
+    from steer_physical import weighted_accuracy
     out = {}
     for m, _ in COLS:
-        w = [0.5 * (v[0] + 1.0 - v[1]) for v in (vl.get(m, {}).get(q) for q in LOC_ROWS)
+        w = [weighted_accuracy(v[0], v[1]) for v in (vl.get(m, {}).get(q) for q in LOC_ROWS)
              if v and np.isfinite(v[1])]
-        out[m] = 100.0 * float(np.mean(w)) if w else None
+        out[m] = float(np.mean(w)) if w else None
     return out
 
 
