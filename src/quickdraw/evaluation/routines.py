@@ -166,6 +166,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     # model configured without that modality was asked to decode a head it does not have. Every run to
     # date declares proprio, so the assumption was invisible rather than absent; ordering is preserved
     # (proprio first) so this is a no-op for all of them.
+    from .timing import Timer
+    tm = Timer()                       # every model gets this, ours and external alike -- no opt-in
     has_pro = any(n == "proprio" for n, _ in m.layout)
     heads = (["proprio"] if has_pro else []) + img_heads
     was = m.training
@@ -240,8 +242,9 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         segs, bag_out = {h: [] for h in heads}, None
         for r0 in range(0, rows, cap):
             sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
-            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc, norm=norm,
-                                 return_bag=want_bag)
+            with tm.phase("rollout"):
+                o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc,
+                                     norm=norm, return_bag=want_bag)
             for h in heads:
                 segs[h].append(o_c[h])
             if want_bag and "_bag" in o_c:
@@ -309,7 +312,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         images = {}
         for head in img_heads:
             ipred = out[head].clamp(0, 1)
-            ic = image_curves(ipred, itrue[head][:, :Hm])
+            with tm.phase("metrics"):
+                ic = image_curves(ipred, itrue[head][:, :Hm])
             ic.update(lat or {})            # latent_motion_ratio / latent_cos ride the head's curve dict, so they
             #                                 reach the SAME panel + the same @+x scalar readouts as motion_ratio
             images[head] = {"icurves": ic,
@@ -345,6 +349,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         lat = latent_pass(Hm, bag) if open_loop else None      # open-loop only (see latent_pass)
         summary.update(score_and_emit(out, f"{tag}/{name}", desc, Hm, lat=lat))
 
+    tm.emit(writer, tag, step, horizon=H, n_ep=n_ep, n_heads=max(1, len(img_heads)))
+    _plog(writer, f"[{tag} @ep{step}] timing: {tm.summary()}")
     if was:
         m.train()
     prog(100, f"done in {time.perf_counter() - t0:.1f}s")
@@ -1779,13 +1785,16 @@ def eval_steer(cfg, model, norm, ecfg, writer, device, step=0):
     return {"eval_steer_requests": float(len(rows))}
 
 
+from .timing import eval_timing as _eval_timing          # fixed-workload benchmark, model-agnostic
+
 REGISTRY = {"steer": eval_steer, "ood_horizon": eval_ood_horizon,
             "held_out_splits": eval_held_out_splits, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
             "control": eval_control, "denoising_multistep": eval_denoising_multistep,
             "denoising_aggregate": eval_denoising_aggregate, "denoising_filmstrip": eval_denoising_filmstrip,
             "ae_floor": eval_ae_floor, "manifold": eval_manifold,
-            "interpret": eval_interpret, "action_distribution": eval_action_distribution}
+            "interpret": eval_interpret, "action_distribution": eval_action_distribution,
+            "timing": _eval_timing}
 
 
 def _quiver_round_data(swarm, grow=10, collapse=5):
