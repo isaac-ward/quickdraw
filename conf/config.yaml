@@ -73,6 +73,8 @@ variations:
   physical_loss:   { weight: 0.0, continuity: 0.0, warmup_epochs: 10 }  # weight: on-surface+tangent; continuity:
   #                  kinematic v=dp/dt; warmup_epochs: ramp the physical weight 0->1 over N epochs (schedules/)
   contraction:     { weight: 0.0, target: 1.02, power_iters: 2, n_sample_steps: 4 }  # hinge on sigma_max(one-step J)
+  latent_straightness: { weight: 0.0 }             # curvature penalty 1-cos(dz_t,dz_{t+1}) on the ROLLED latent
+  #                  (LSAR/flow only) -- attacks random-walk rollout drift (record s18). 0 -> off (bit-identical).
 
 # REQUIRED before any training run (train.py asserts all 5 are set): a 5-point experiment note,
 # written to <run_dir>/auto_run_summary.txt and printed to the logs (so it's in the wandb console).
