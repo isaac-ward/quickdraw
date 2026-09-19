@@ -48,7 +48,14 @@ def run_standalone(cfg, routines, label: str | None = None):
         except Exception as e:
             print(f"[standalone] could not re-apply CLI model overrides ({type(e).__name__}: {e})")
     model = build_model(cfg).to(device)
-    load_checkpoint(model, cfg.checkpoint)  # .ckpt file or train run dir (-> best.ckpt)
+    # AN EXTERNAL ADAPTER CARRIES ITS OWN WEIGHTS (or none). There is no checkpoint in our format to
+    # restore, and the saved-config adoption above already no-ops because there is no logs/config.json
+    # at the end of `cfg.checkpoint`.
+    if getattr(model, "is_external", False):
+        print(f"[standalone] external model {type(model).__name__}: heads={list(model.heads)} "
+              f"img_size={model.img_size} action_mode={model.action_mode} — skipping load_checkpoint")
+    else:
+        load_checkpoint(model, cfg.checkpoint)  # .ckpt file or train run dir (-> best.ckpt)
     model.eval()
     run_dir = make_run_dir(f"eval_{label}", cfg.experiment)
 
@@ -66,7 +73,15 @@ def run_standalone(cfg, routines, label: str | None = None):
                          lambda m: print(m, flush=True), name=env_name)
     summary = {}
     for name in routines:
-        summary.update(REGISTRY[name](cfg, model, norm, ecfg, writer, device, 0))
+        # A ROUTINE A MODEL CANNOT SERVE IS SKIPPED, LOUDLY AND BY NAME. The adapters raise
+        # NotImplementedError from the capability they lack (`latents`, or an action bridge they have no
+        # input for), which is better than a table row that looks comparable and is not. Only that
+        # exception is caught: a genuine failure inside a supported routine still stops the run.
+        try:
+            summary.update(REGISTRY[name](cfg, model, norm, ecfg, writer, device, 0))
+        except NotImplementedError as e:
+            print(f"[standalone] SKIPPED {name}: {e}", flush=True)
+            summary[f"{name}/skipped"] = 1.0
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     writer.finalize()

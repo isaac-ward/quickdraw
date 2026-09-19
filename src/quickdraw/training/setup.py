@@ -204,6 +204,14 @@ def build_model(cfg):
     m = cfg.model
     name = str(m.get("name", "base"))
 
+    # AN EXTERNAL MODEL SHORT-CIRCUITS EVERYTHING BELOW. It is an nn.Module with the same `layout` and
+    # `imagine_eval` the routines use, so nothing downstream knows the difference -- but it is not built
+    # from modality specs and has no checkpoint in our format. The modality list in its config is still
+    # read, by the DATA side, to decide which camera to load and at what size.
+    from ..models.external import EXTERNAL
+    if name in EXTERNAL:
+        return EXTERNAL[name](cfg)
+
     specs = _modality_specs(cfg)
     # THE HEADS ARE WHATEVER THE CONFIG DECLARES -- but a feature that is ABOUT proprio cannot run without
     # it, and must say so by name. This is checked here, before any environment/physics config is read,
