@@ -56,6 +56,10 @@ class ModalitySpec:
     #                           per level, zero-init output. This is Stable Diffusion's multi-resolution
     #                           cross-attention pattern; see models/decoders.py:LevelCrossAttn for the caveat
     #                           that SD injects TEXT into a DENOISER, not a decoder re-reading its own latent.
+    decode_down_inject: bool = False   # decode_arch=up + decode_kind=flow ONLY. Feature 2 on the DOWN/analysis
+    #                           path (a denoiser conditions its down blocks too; SD U-Net pattern). zero-init.
+    decode_down_xattn_max_res: int = 0  # decode_arch=up + decode_kind=flow ONLY. Feature 3 on the DOWN path,
+    #                           resolution-gated exactly like decode_xattn_max_res. zero-init output.
     decode_out_act: str = "none"   # decode_arch=up ONLY. "none" (default, bit-identical to every historical
     #                           run) | "sigmoid" -> bound the decoder output to (0,1) BY CONSTRUCTION.
     #                           WHY IT EXISTS (2026-09-03). `out_conv` is a bare nn.Conv2d, so the output is
@@ -412,19 +416,24 @@ class ImageModality(Modality):
             self.decode_head = ImageUNetFlowHead(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
                                                  chunk=_chunk, param=param, shortcut=sc, no_noise=no_noise)
         elif self.decode_arch == "up":
-            # UP-ONLY decoder (models/decoders.py): no analysis path, query-grid readout. DECODER ONLY -- it
-            # has no mechanism to denoise an image, so it cannot serve decode_kind=flow.
-            if not no_noise:
-                raise ValueError(
-                    "decode_arch='up' is a DECODER (tokens->image) and cannot serve decode_kind='flow', which "
-                    "needs a denoiser with an analysis path over its own noised input. Use decode_arch='unet' "
-                    "for flow, or decode_kind='mse' for 'up'. See models/decoders.py.")
-            from .decoders import TokenGridDecoder
-            self.decode_head = TokenGridDecoder(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
-                                                chunk=_chunk,
-                                                inject=bool(getattr(spec, "decode_inject", False)),
-                                                xattn_max_res=int(getattr(spec, "decode_xattn_max_res", 0) or 0),
-                                                out_act=self.decode_out_act)
+            # The UP backend serves BOTH kinds (models/decoders/): up-mse = TokenGridDecoder (no analysis
+            # path, query-grid readout); up-flow = UpFlowDecoder (the SAME backend + a mimics-up analysis
+            # path, all contributions zero-init so it starts == up-mse). `unet-mse` is unreachable from an
+            # `up` config by construction. See design/up_flow_decoder.md.
+            _base = int(getattr(spec, "decode_base", 32))
+            _inj = bool(getattr(spec, "decode_inject", False))
+            _xa = int(getattr(spec, "decode_xattn_max_res", 0) or 0)
+            if no_noise:
+                from .decoders import TokenGridDecoder
+                self.decode_head = TokenGridDecoder(self.ae.cfg, base=_base, chunk=_chunk,
+                                                    inject=_inj, xattn_max_res=_xa, out_act=self.decode_out_act)
+            else:
+                from .decoders import UpFlowDecoder
+                self.decode_head = UpFlowDecoder(
+                    self.ae.cfg, base=_base, chunk=_chunk, param=param, shortcut=sc, inject=_inj, xattn_max_res=_xa,
+                    down_inject=bool(getattr(spec, "decode_down_inject", False)),
+                    down_xattn_max_res=int(getattr(spec, "decode_down_xattn_max_res", 0) or 0),
+                    out_act=self.decode_out_act)
         elif self.decode_arch == "vit":
             self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc,
                                              no_noise=no_noise, chunk=_chunk)
@@ -451,7 +460,7 @@ class ImageModality(Modality):
         latent = int(spec.num_tokens) * int(d)
         head = self.decode_head
         if self.decode_arch == "up":
-            gh, gw = head.readout.grid_hw
+            gh, gw = head.back.readout.grid_hw     # readout lives on the shared UpBackend (up-mse and up-flow)
             cap, how = gh * gw * d, f"query grid {gh}x{gw} = {gh * gw} cells x d{d}"
             over = "OVER the cap -- cross-attention still SELECTS from a richer menu, so this buys choice, not bandwidth"
         elif self.decode_arch == "unet":
