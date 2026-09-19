@@ -162,7 +162,12 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     tag = str(tag or "eval_ood_horizon")
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
-    heads = ["proprio"] + img_heads
+    # THE HEAD LIST IS THE MODEL'S, NOT A LITERAL. This used to prepend "proprio" unconditionally, so a
+    # model configured without that modality was asked to decode a head it does not have. Every run to
+    # date declares proprio, so the assumption was invisible rather than absent; ordering is preserved
+    # (proprio first) so this is a no-op for all of them.
+    has_pro = any(n == "proprio" for n, _ in m.layout)
+    heads = (["proprio"] if has_pro else []) + img_heads
     was = m.training
     m.eval()
     t0 = time.perf_counter()
@@ -214,18 +219,19 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         Hm = this mode's horizon (open_loop uses the full H; closed-loop uses min(H, eval.closed_loop_horizon))."""
         every = min(int(every), Hm)
         n_seg = -(-Hm // every)                                             # ceil(Hm/every)
-        C = {"proprio": []}
+        C = {"proprio": []} if has_pro else {}
         C.update({h: [] for h in img_heads})
         A = []
         for o, a, fr in eps:                                                # (episode, segment) row order
             for s in range(n_seg):
                 st = s * every
-                C["proprio"].append(norm.norm_obs(torch.from_numpy(o[st:st + P])))
+                if has_pro:
+                    C["proprio"].append(norm.norm_obs(torch.from_numpy(o[st:st + P])))
                 for h in img_heads:
                     C[h].append(torch.from_numpy(fr[h][st:st + P]))          # per-head frames, not one shared array
                 idx = _np.clip(_np.arange(st, st + P + every - 1), 0, len(a) - 1)   # last seg: pad+clamp (tail discarded)
                 A.append(norm.norm_act(torch.from_numpy(a[idx])))
-        ctx = {"proprio": torch.stack(C["proprio"]).float().to(device)}
+        ctx = {"proprio": torch.stack(C["proprio"]).float().to(device)} if has_pro else {}
         for h in img_heads:
             ctx[h] = torch.stack(C[h]).float().div(255.0).to(device)
         acts = torch.stack(A).float().to(device)                           # (n_ep*n_seg, P+every-1, act_dim)
@@ -269,10 +275,12 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
                 _plog(writer, f"[{tag} @ep{step}] latent curves SKIPPED: imagine_eval returned no "
                               f"`_bag` (return_bag path). The decoded-image products are unaffected.")
                 return {}
-            gt = {"proprio": norm.norm_obs(p_true[:, :Hm])}
+            gt = {"proprio": norm.norm_obs(p_true[:, :Hm])} if has_pro else {}
             for h in img_heads:
                 gt[h] = itrue[h][:, :Hm]
-            anc = m.rel_anchor({"proprio": pro0}) if getattr(m, "_rel_on", lambda: False)() else None
+            # the anchor is a PROPRIO position, so it cannot exist without that head
+            anc = (m.rel_anchor({"proprio": pro0})
+                   if has_pro and getattr(m, "_rel_on", lambda: False)() else None)
             with torch.autocast(device_type=(device if isinstance(device, str) else device.type),
                                 dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
                 z_gt = m.encode_state(gt, anc)
@@ -286,12 +294,18 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         """Score (image_curves per head + proprio_curves) + emit (emit_openloop) a completed rollout under the
         `subroutine` tag (e.g. eval_ood_horizon/open_loop). Head nesting rides under it via product_tag. `Hm`
         is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H)."""
-        pred = out["proprio"]
-        p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
-        pt = p_true[:, :Hm]                                                    # GT future sliced to this mode's horizon
-        per_step = proprio_curves(pred, norm.norm_obs(pt), p_hat, pt, env,
-                                  pos_slice=(pos if pos_explicit else None))    # position-L2 pointwise iff explicit
-        curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}
+        # THE PROPRIO BLOCK IS SKIPPED WHOLESALE without that head. The error curves, the trajectory
+        # plots and the xyz overlays are all derived from proprio, so an image-only model emits its
+        # per-head image readouts (the loop below) and nothing else. Computed BEFORE the image loop, as
+        # it always was, so the order of writer calls is unchanged for every model that has proprio.
+        curves = p_hat = pt = None
+        if has_pro:
+            pred = out["proprio"]
+            p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
+            pt = p_true[:, :Hm]                                                # GT future sliced to this mode's horizon
+            per_step = proprio_curves(pred, norm.norm_obs(pt), p_hat, pt, env,
+                                      pos_slice=(pos if pos_explicit else None))  # position-L2 pointwise iff explicit
+            curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}
         images = {}
         for head in img_heads:
             ipred = out[head].clamp(0, 1)
@@ -302,6 +316,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
                             "full_true": _np.stack([eps[i][2][head][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                             "ipred": ipred[:n_plot].cpu().numpy()}
             emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
+        if not has_pro:
+            return {}                       # image readouts are already emitted; the rest is proprio
         emit_openloop(writer, subroutine, step, env=env, R=getattr(ecfg, "R", None), r=getattr(ecfg, "r", None),
                       coloring="hsv", fps=fps, P=P, smooth_window=int(cfg.data.action_smooth_window), description=desc,
                       ctx_xyz=ctx_obs[:, :, pos],

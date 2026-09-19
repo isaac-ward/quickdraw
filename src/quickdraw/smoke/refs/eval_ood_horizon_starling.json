@@ -1,0 +1,9 @@
+{
+ "note": "eval_ood_horizon on the deployed flow checkpoint, +model.diffusion.stochastic_eval=false. DETERMINISM IS THE POINT: with the default stochastic_eval=true this eval's own run-to-run spread is 4.2e-3, which is LARGER than a real change would move it, so the gate has to pin the sampling off. Pinned, two runs of identical code agree to 0.0e0.",
+ "cmd": "scratch/_regress_eval.sh",
+ "metrics": {
+  "eval_ood_horizon/open_loop/proprio/pointwise_error": 1.257809758,
+  "eval_ood_horizon/closed_loop_1_steps/proprio/pointwise_error": 0.419143766,
+  "eval_ood_horizon/closed_loop_16_steps/proprio/pointwise_error": 0.753652692
+ }
+}

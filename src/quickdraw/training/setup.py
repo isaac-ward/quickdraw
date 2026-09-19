@@ -205,6 +205,18 @@ def build_model(cfg):
     name = str(m.get("name", "base"))
 
     specs = _modality_specs(cfg)
+    # THE HEADS ARE WHATEVER THE CONFIG DECLARES -- but a feature that is ABOUT proprio cannot run without
+    # it, and must say so by name. This is checked here, before any environment/physics config is read,
+    # because reaching the physics constructor first fails on `Missing key quat_idx` and sends the reader
+    # hunting through the env schema for a problem that is in the modality list.
+    if specs is not None and _proprio_prior_mode(cfg) != "none" \
+            and not any(getattr(sp, "name", None) == "proprio" for sp in specs):
+        raise ValueError(
+            "a proprio dynamics prior was requested (model.modalities.<proprio>.prior, or the legacy "
+            "environments.dynamics_prior=true) but model.modalities declares no `proprio` entry: "
+            f"heads are {[getattr(sp, 'name', '?') for sp in specs]}. The physics prior integrates "
+            "position and velocity, so it is meaningless without a proprio head -- either add the "
+            "modality or turn the prior off.")
     if specs is not None:
         from ..models.multimodal import MultiModalFlow, MultiModalDSAR, MultiModalLSAR
         compile_rollout = bool(m.get("compile_rollout", False))
