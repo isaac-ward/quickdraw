@@ -38,6 +38,8 @@ class ExternalWorldModel(nn.Module, ABC):
     img_size: tuple[int, int] = (112, 192)   # (H, W) the model natively runs at
     action_mode: str = "per_step"        # per_step | chunk | text | none
     action_chunk: int = 1                # frames per action, when action_mode == "chunk"
+    text_style: str = "table"            # table | prose, when action_mode == "text" (see `_actions`)
+    prompt_phases: int = 4               # spans a prose prompt is split into (prose only)
     is_external: bool = True             # run_standalone reads this to skip load_checkpoint
 
     def __init__(self, cfg=None):
@@ -105,9 +107,28 @@ class ExternalWorldModel(nn.Module, ABC):
                 raise NotImplementedError(
                     f"{type(self).__name__} needs `norm` to denormalize actions before describing them; "
                     f"the caller did not pass one.")
-            from ..evaluation.interpret import build_action_text
+            from ..evaluation.interpret import build_action_prose, build_action_text
             raw = norm.denorm_act(actions).float().cpu().numpy()      # (N, T, act_dim) in stick units
-            return [build_action_text(raw[i], self.action_axes()) for i in range(raw.shape[0])]
+            ax = self.action_axes()
+            if self.text_style == "table":
+                # the VLM format: every number, named. Right when the reader can already see the clip.
+                return [build_action_text(raw[i], ax) for i in range(raw.shape[0])]
+            if self.text_style == "prose":
+                # the GENERATOR format: a sentence. A video model's text encoder was trained on scene
+                # descriptions, and under classifier-free guidance an out-of-distribution prompt embedding
+                # is not ignored, it is pushed toward -- so a grid of floats is worse than no numbers.
+                it = (self.cfg or {}) and self.cfg.get("interpret", None) or {}
+                scene, subj = str(it.get("scene_prompt", "") or ""), str(it.get("prose_subject", "") or "The view")
+                # `lead` context actions precede the first PREDICTED step, so window step g is raw index
+                # lead+g. A chunked adapter asks for the window it is about to generate; everything else
+                # just uses the list, which describes the whole rollout.
+                lead = raw.shape[1] - horizon
+
+                def render(i, lo, hi, _p=self.prompt_phases):
+                    return build_action_prose(raw[i, lead + lo:lead + hi], ax, scene=scene, subject=subj,
+                                              max_phases=_p)
+                return TextActions([render(i, 0, horizon) for i in range(raw.shape[0])], render)
+            raise ValueError(f"unknown text_style={self.text_style!r}; expected 'table' or 'prose'")
         if self.action_mode == "none":
             raise NotImplementedError(
                 f"{type(self).__name__} takes no action input (action_mode='none'), so an "
@@ -172,6 +193,21 @@ class ExternalWorldModel(nn.Module, ABC):
             assert v.ndim == 5 and v.shape[-1] == 3, (
                 f"{what}[{h}]: expected (N,P,h,w,3) channels-LAST, got {tuple(v.shape)}")
             yield h, v
+
+
+class TextActions(list):
+    """The per-episode prompts, as a plain `list[str]` -- plus `window(i, lo, hi)` for an adapter that
+    generates the rollout in CHUNKS and should prompt each chunk with the actions belonging to it.
+
+    A list subclass rather than a new type on purpose: every existing adapter indexes and slices this
+    exactly as before, and only the ones that need windows have to know windows exist."""
+
+    def __init__(self, whole, render):
+        super().__init__(whole)
+        self._render = render
+
+    def window(self, i: int, lo: int, hi: int) -> str:
+        return self._render(i, lo, hi)
 
 
 EXTERNAL: dict = {}

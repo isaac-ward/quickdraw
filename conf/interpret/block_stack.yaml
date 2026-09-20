@@ -29,11 +29,23 @@
 # frame can only mean receding from the camera. The u fit is weak (R2 0.33) -- +y reads as "leftward" on
 # the best available estimate, not on a confident one. If a block-stack Cosmos row ever turns on getting
 # left/right right, re-measure it against the second scene camera before trusting this line.
+# THE SCENE, for the prose prompt form (evaluation/interpret.build_action_prose, which is what an external
+# VIDEO GENERATOR is given -- see models/external.py `_actions`). The axes below say what MOVES; these two
+# say what is in frame and what the moving thing is called. A generator conditioned only on motion words
+# has been told nothing about the workspace it is supposed to be drawing.
+scene_prompt: "A fixed camera looks down at a robotic arm on a workbench with coloured blocks."
+prose_subject: "The arm"
+
+# WORDED IN THE THIRD PERSON because both consumers read better that way: the VLM legend becomes
+# "move_x: + is moves away from the camera" and the prose prompt becomes "The arm moves away from the
+# camera". `neutral` is where a stick RESTS -- 0 for the four rate axes, and 0.85 for the gripper, which
+# lives in [0, 1] and is held closed for most of an episode. Measured from zero it would clear any
+# threshold in every span and crowd out the axes that are actually moving.
 action_axes:
-  - {name: move_x,  positive: move the gripper away from the camera, negative: move the gripper toward the camera}
-  - {name: move_y,  positive: move the gripper left across the bench, negative: move the gripper right across the bench}
-  - {name: height,  positive: raise the gripper,                     negative: lower the gripper}
-  - {name: yaw,     positive: rotate the gripper counter-clockwise seen from above, negative: rotate the gripper clockwise seen from above}
-  - {name: gripper, positive: squeeze the gripper closed,            negative: let the gripper open}
+  - {name: move_x,  positive: moves away from the camera,     negative: moves toward the camera}
+  - {name: move_y,  positive: moves left across the bench,    negative: moves right across the bench}
+  - {name: height,  positive: rises,                          negative: lowers}
+  - {name: yaw,     positive: rotates counter-clockwise seen from above, negative: rotates clockwise seen from above}
+  - {name: gripper, positive: closes its gripper,             negative: opens its gripper, neutral: 0.85}
 
 factors: {}

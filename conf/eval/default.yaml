@@ -25,7 +25,14 @@ horizon: 2048              # long-horizon / ood rollout length (capped by episod
 # the in-distribution baseline from the same invocation, on the same metric code, so the OOD and memory
 # figures are comparable to the headline numbers by construction rather than by argument.
 splits: []
-horizon_split: val         # which split eval_ood_horizon reads when it is called on its own
+horizon_split: val         # which split eval_ood_horizon reads when it is called on its own. ANY split
+#                            directory in the dataset works, not just `val` -- block-stack ships
+#                            `eval_purple_play` (5 eps) and `eval_purple_stack` (6 eps), which are the
+#                            interesting held-out targets and load with no code change:
+#                              eval.horizon_split=eval_purple_stack
+#                            They stay OPT-IN and `val` stays the default ON PURPOSE. Those two splits are
+#                            the out-of-distribution test for models trained on block-stack; promoting
+#                            either to the default val would quietly spend that, for every model, forever.
 horizon_n_episodes: null   # null -> 8 with an image head, a DECODE cap sized for val's ~1785-step
 #                             episodes. The OOD/memory clips are ~31 model steps, so 12 scores every
 #                             episode in those splits instead of discarding a fifth of a 10-episode one.

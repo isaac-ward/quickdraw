@@ -205,6 +205,54 @@ def build_action_text(actions: np.ndarray, axes: list) -> str:
     return (f"Commanded stick inputs over this clip, each in [-1, 1] ({legend}):\n{head}\n{rows}")
 
 
+
+def build_action_prose(actions: np.ndarray, axes: list, scene: str = "", subject: str = "The view",
+                       max_phases: int = 3, thresh: float = 0.2) -> str:
+    """The same commanded actions as build_action_text, written as a SENTENCE instead of a table.
+
+    WHY BOTH EXIST. build_action_text is for a VLM being asked to LABEL a clip it can already see -- there
+    a table is the honest format, because the numbers are the evidence. A video GENERATOR is the opposite
+    problem: its text encoder (T5, here) was trained on scene descriptions, so a grid of floats is an
+    out-of-distribution embedding, and under classifier-free guidance an out-of-distribution embedding is
+    not neutral -- it is actively pushed toward. Prose is the in-distribution way to say the same thing.
+
+    WHAT IT LOSES, and this is not a small thing: magnitude, and any motion that cancels. The clip is
+    split into at most `max_phases` equal spans, each span's per-axis mean is taken, and any axis whose
+    mean clears `thresh` contributes its own words from `action_axes`. Direction and order survive; the
+    rest does not, and a stick that swings +1 then -1 inside ONE span averages to nothing and is reported
+    as stillness. That is the argument for calling this per CHUNK rather than once per rollout, which is
+    what the chunked adapters do -- a span should be a few seconds, not a few minutes.
+
+    AN AXIS IS MEASURED FROM ITS OWN NEUTRAL, not from zero. `action_axes` entries may carry
+    `neutral: <float>` (default 0.0) for a stick that does not rest at zero -- block-stack's gripper is
+    in [0, 1] and sits near 0.85, so against zero it would clear any threshold in every span and crowd
+    out the axes that are actually moving.
+
+    `scene` is the environment's one-line description of what is in frame and `subject` names the thing
+    that moves -- both from conf/interpret/<env>.yaml (`scene_prompt`, `prose_subject`). Without them the
+    model is told what MOVES and nothing about WHAT is moving, which for a video generator is most of the
+    prompt.
+    """
+    a = np.asarray(actions, dtype=np.float32)
+    n = len(axes)
+    assert a.shape[-1] % n == 0, f"action width {a.shape[-1]} is not a multiple of {n} declared axes"
+    a = a.reshape(a.shape[0], a.shape[-1] // n, n).mean(axis=1)      # fold concat sub-steps, keep sign
+    k = max(1, min(int(max_phases), len(a)))
+    spans = np.array_split(np.arange(len(a)), k)
+    neutral = np.array([float(ax.get("neutral", 0.0)) for ax in axes], dtype=np.float32)
+
+    phrases = []
+    for sp in spans:
+        m = a[sp].mean(0) - neutral
+        said = [axes[j]["positive"] if m[j] > 0 else axes[j]["negative"]
+                for j in np.argsort(-np.abs(m)) if abs(m[j]) >= thresh]
+        phrases.append(" and ".join(said[:2]) if said else "holds still")
+    # collapse a repeated phrase rather than saying the same thing three times
+    seq = [ph for i, ph in enumerate(phrases) if i == 0 or ph != phrases[i - 1]]
+    motion = seq[0] if len(seq) == 1 else ", then ".join(seq)
+    return f"{scene.strip()} {subject.strip()} {motion}.".strip()
+
+
 # ------------------------- analytic labels (exact, from the imagined proprio) -------------------------
 def analytic_scalar(kind: str, pro_phys: np.ndarray, R: float, dims=None, fc: dict | None = None) -> float:
     """One scalar per clip for an analytic factor; `bucketize` turns a set of them into labels.
