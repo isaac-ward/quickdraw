@@ -1,0 +1,20 @@
+# =============================================================================================
+# Cosmos on `data=block_stack`. Select with `model=cosmos_blockstack interpret=block_stack`.
+#
+# The only difference from conf/model/cosmos.yaml is the frame size: block-stack ships 144x192, and
+# Cosmos runs there natively because both divide by 16 (144/16 = 9, 192/16 = 12) -- so, as on starling,
+# nothing is resampled in either direction. The adapter takes the size from the modality below; set
+# `external.height`/`external.width` only to deliberately run somewhere else.
+#
+#   python -m quickdraw.eval_ood_horizon model=cosmos_blockstack interpret=block_stack \
+#       data=block_stack environments=recorded data.subsample=8 data.action_aggregate=concat
+#
+# data.P=8 with Predict2's 4x temporal VAE gives Cosmos 5 of the 8 context frames (see
+# models/external_cosmos.py). data.P=9 gives it all 9 and costs one frame of dataset window.
+# =============================================================================================
+defaults:
+  - cosmos
+  - _self_
+
+modalities:
+  - {name: image, kind: image, weight: 1.0, img_size: [144, 192], ae_bottleneck: 9, pretrained: false}

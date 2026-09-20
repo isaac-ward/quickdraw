@@ -62,7 +62,7 @@ class CosmosVideo2World(ExternalWorldModel):
 
     DEFAULTS = dict(model_id="nvidia/Cosmos-Predict2-2B-Video2World", pipeline="predict2",
                     num_frames=93, num_inference_steps=35, guidance_scale=7.0, fps=16,
-                    height=112, width=192, batch=1, seed=0, negative_prompt="")
+                    height=None, width=None, batch=1, seed=0, negative_prompt="")
 
     def __init__(self, cfg=None):
         super().__init__(cfg)
@@ -77,11 +77,17 @@ class CosmosVideo2World(ExternalWorldModel):
         self.batch = int(g("batch"))                  # episodes per pipeline call
         self.seed = int(g("seed"))
         self.negative = str(g("negative_prompt") or "") or None
-        self.img_size = (int(g("height")), int(g("width")))
-        if cfg is not None:
-            hs = [m for m in (cfg.model.get("modalities", None) or []) if str(m.get("kind", "")) == "image"]
-            if hs:
-                self.heads = tuple(str(m["name"]) for m in hs)
+        hs = [] if cfg is None else [m for m in (cfg.model.get("modalities", None) or [])
+                                     if str(m.get("kind", "")) == "image"]
+        if hs:
+            self.heads = tuple(str(m["name"]) for m in hs)
+        # RESOLUTION FOLLOWS THE DATA unless it is overridden. The model config's image modality already
+        # states the frame size the dataset is decoded at, and running Cosmos anywhere else means the ABC
+        # resamples -- fine, but a choice, so it should be one someone made. external.height/width are the
+        # override, and they move together.
+        hw = (hs[0].get("img_size", None) if hs else None) or self.img_size
+        hw = (int(hw), int(hw)) if isinstance(hw, int) else (int(hw[0]), int(hw[1]))
+        self.img_size = (int(g("height") or hw[0]), int(g("width") or hw[1]))
         assert self.pipeline in PIPELINES, f"external.pipeline must be one of {sorted(PIPELINES)}"
         assert self.img_size[0] % 16 == 0 and self.img_size[1] % 16 == 0, (
             f"Cosmos requires height and width divisible by 16; got {self.img_size}")

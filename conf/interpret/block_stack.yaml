@@ -1,0 +1,39 @@
+# ACTION AXES ONLY, for `data=block_stack`. Select with `interpret=block_stack`.
+#
+# WHAT THIS FILE IS FOR, AND WHAT IT IS NOT. `action_axes` is the one thing in an interpret config that
+# the EXTERNAL-MODEL text bridge needs (models/external.py `_actions`, action_mode="text"): it is how a
+# recorded stick becomes a sentence a video model can be prompted with. Everything else an interpret
+# config carries -- `factors`, the VLM prompts, the segmentation schema -- is absent here, so
+# eval_interpret and train_reward_model will fail on this file BY DESIGN. Write those when block-stack
+# actually gets an interpretability run; do not stub them, because a stubbed factor silently labels one
+# environment's data with another's categories (that is the whole argument in interpret/unset.yaml).
+#
+# THE SIGNS ARE MEASURED, NOT READ OFF THE NAMES. Correlating action[t] against the observation delta
+# over all 43 train episodes (scratch calibration, 2026-09-20) gives r = +0.94 on every diagonal:
+#
+#     move_x -> d ee_x  +0.944     height -> d ee_z  +0.942
+#     move_y -> d ee_y  +0.939     yaw    -> d(atan2 of the rot6 first column)  +0.947
+#     gripper -> d gripper_open  -0.167   (obs dim 9 is 1 = OPEN, the action is 1 = SQUEEZE)
+#
+# rot6 (obs 3:9) is COLUMN-major -- [c0|c1] is orthonormal to 1e-4, [r0|r1] is not -- so world yaw is
+# atan2(rot6_1, rot6_0), and a POSITIVE yaw stick turns the gripper counter-clockwise seen from above.
+#
+# HOW THAT LOOKS IN THE CAMERA, which is what the wording below actually has to convey. `scene_left` is
+# FIXED, so the background never moves and a global image shift is identically zero; the arm was located
+# instead as the centroid of frame-to-frame change and regressed on ee_xyz (val ep0, 18k frames):
+#
+#     centroid v (px DOWN per 100 mm):  d/d ee_x -11.45   d/d ee_y  -1.73   d/d ee_z -16.93   R2 0.90
+#     centroid u (px RIGHT per 100 mm): d/d ee_x  -3.73   d/d ee_y  -6.61   d/d ee_z  +2.81   R2 0.33
+#
+# The v fit is strong and its x-coefficient is a PARTIAL effect at fixed height, so +x rising in the
+# frame can only mean receding from the camera. The u fit is weak (R2 0.33) -- +y reads as "leftward" on
+# the best available estimate, not on a confident one. If a block-stack Cosmos row ever turns on getting
+# left/right right, re-measure it against the second scene camera before trusting this line.
+action_axes:
+  - {name: move_x,  positive: move the gripper away from the camera, negative: move the gripper toward the camera}
+  - {name: move_y,  positive: move the gripper left across the bench, negative: move the gripper right across the bench}
+  - {name: height,  positive: raise the gripper,                     negative: lower the gripper}
+  - {name: yaw,     positive: rotate the gripper counter-clockwise seen from above, negative: rotate the gripper clockwise seen from above}
+  - {name: gripper, positive: squeeze the gripper closed,            negative: let the gripper open}
+
+factors: {}
