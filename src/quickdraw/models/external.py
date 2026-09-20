@@ -70,15 +70,50 @@ class ExternalWorldModel(nn.Module, ABC):
         return self.latents(obs, act)
 
     # ---- action conditioning: the bridge between our per-step sticks and whatever the model eats -------
-    def _actions(self, actions: Tensor, horizon: int):
+    def action_axes(self):
+        """[{name, positive, negative}] from conf/interpret/<env>.yaml -- the environment's own words for
+        its sticks, which is what turns a number into a sentence. Same source the VLM labelling uses."""
+        ax = (self.cfg or {}) and self.cfg.get("interpret", None)
+        ax = ax and ax.get("action_axes", None)
+        if not ax:
+            raise NotImplementedError(
+                f"{type(self).__name__} conditions on text (action_mode='text'), which needs the "
+                f"environment's action_axes to name the sticks -- pass `interpret=<env>` on the CLI "
+                f"(e.g. interpret=starling), the same flag eval_steer and eval_interpret take.")
+        from omegaconf import OmegaConf
+        return OmegaConf.to_container(ax, resolve=True) if not isinstance(ax, list) else ax
+
+    def _actions(self, actions: Tensor, horizon: int, norm=None):
+        """Our per-step normalized sticks -> whatever this model eats. The returned object is passed
+        straight to `_rollout`, so its type is the adapter's business: a tensor for per_step/chunk, a
+        list of strings for text."""
         if self.action_mode == "per_step":
             return actions
+        if self.action_mode == "chunk":
+            # fold k per-step commands into one, the same mean-fold build_action_text and our own
+            # action_aggregate=concat use. Requires the chunk to divide the sequence evenly.
+            k = int(self.action_chunk)
+            n, t, a = actions.shape
+            assert t % k == 0, (f"action_chunk={k} does not divide the {t}-step action sequence; "
+                                f"pick a chunk that divides P-1+horizon")
+            return actions.reshape(n, t // k, k, a).mean(2)
+        if self.action_mode == "text":
+            # THE ACTIONS BECOME A SENTENCE, using the same function that captions clips for the VLM
+            # labelling. They arrive NORMALIZED, so they are denormalized first -- a caption describing
+            # standardized units would be describing nothing the pilot ever did.
+            if norm is None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} needs `norm` to denormalize actions before describing them; "
+                    f"the caller did not pass one.")
+            from ..evaluation.interpret import build_action_text
+            raw = norm.denorm_act(actions).float().cpu().numpy()      # (N, T, act_dim) in stick units
+            return [build_action_text(raw[i], self.action_axes()) for i in range(raw.shape[0])]
         if self.action_mode == "none":
             raise NotImplementedError(
                 f"{type(self).__name__} takes no action input (action_mode='none'), so an "
                 f"action-conditioned rollout is not defined for it. ood_horizon scores a prediction of "
                 f"THIS recorded future, which requires the actions that produced it.")
-        raise NotImplementedError(f"action_mode={self.action_mode!r} has no bridge yet (see Phase 4)")
+        raise ValueError(f"unknown action_mode={self.action_mode!r}")
 
     # ---- resampling, so LPIPS is always computed at OUR frame size ------------------------------------
     @staticmethod
@@ -109,7 +144,7 @@ class ExternalWorldModel(nn.Module, ABC):
             f"actions has {actions.shape[1]} steps; P={p} and horizon={horizon} require {p - 1 + horizon}")
         native = {h: self._resize(v, self.img_size) for h, v in native.items()}
 
-        out = self._rollout(native, self._actions(actions, horizon), horizon, want)
+        out = self._rollout(native, self._actions(actions, horizon, norm=norm), horizon, want)
 
         assert isinstance(out, dict), f"_rollout must return a dict, got {type(out).__name__}"
         ours = next(iter(ctx_obs.values())).shape[-3:-1]                 # OUR frame size, from the context

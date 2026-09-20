@@ -36,3 +36,21 @@ class RepeatLastFrame(ExternalWorldModel):
     def _rollout(self, ctx: dict[str, Tensor], actions, horizon: int, heads) -> dict[str, Tensor]:
         # ctx[h] is (N,P,h,w,3); take the last context frame and hold it for the whole horizon.
         return {h: ctx[h][:, -1:].expand(-1, horizon, -1, -1, -1).contiguous() for h in heads}
+
+
+@register("stub_text")
+class RepeatLastFrameFromText(RepeatLastFrame):
+    """The text bridge, end to end, on a model whose behaviour is known.
+
+    Identical to RepeatLastFrame except that it declares action_mode='text', so the harness renders the
+    recorded actions into the environment's own words before handing them over. It prints the caption it
+    was given and then ignores it -- the point is to read what a text-conditioned model would actually
+    receive, before one exists to receive it.
+    """
+    action_mode = "text"
+
+    def _rollout(self, ctx, actions, horizon: int, heads):
+        first = actions[0] if isinstance(actions, list) else str(actions)
+        print(f"[stub_text] conditioned on {len(actions) if isinstance(actions, list) else 1} caption(s); "
+              f"the first reads:\n{first}", flush=True)
+        return super()._rollout(ctx, actions, horizon, heads)
