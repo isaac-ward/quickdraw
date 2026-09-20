@@ -92,3 +92,7 @@ run_summary:
 hydra:
   job:
     chdir: false
+
+# External (non-quickdraw) models: knobs for models/external adapters. Empty by default -- every adapter
+# supplies its own defaults, and these only override them.
+external: {}

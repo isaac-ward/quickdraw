@@ -1,0 +1,17 @@
+# =============================================================================================
+# NVIDIA Cosmos Video2World as an external world model. `name: cosmos` routes build_model to
+# models/external.EXTERNAL["cosmos"]; the modality list below is read by the DATA side, to decide which
+# camera to load and at what size.
+#
+# The adapter's own knobs live under the top-level `external:` group (see models/external_cosmos.py for
+# what each one costs). Everything has a default, so override only what you want to move:
+#   +external.num_inference_steps=10                     faster, rougher
+#   +external.height=704 +external.width=1280            its TRAINED resolution; the ABC resamples back
+#   +external.pipeline=cosmos1 +external.model_id=nvidia/Cosmos-1.0-Diffusion-7B-Video2World \
+#     +external.num_frames=121 +external.fps=30          the older, larger family
+#   +external.num_frames=93 +external.batch=1            clip length per call, episodes per call
+# =============================================================================================
+name: cosmos
+d: 128
+modalities:
+  - {name: image, kind: image, weight: 1.0, img_size: [112, 192], ae_bottleneck: 7, pretrained: false}

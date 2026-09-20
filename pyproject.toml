@@ -37,6 +37,28 @@ dependencies = [
   "opencv-python-headless",
 ]
 
+[project.optional-dependencies]
+# --- NVIDIA Cosmos as an external world model (models/external_cosmos.py). NOT part of the default
+#     install: nothing in quickdraw needs these unless you run `model=cosmos`, and the container already
+#     ships diffusers/transformers/accelerate, so in practice this group is the guardrail and its deps.
+#
+#     Install with `uv pip install -e ".[cosmos]"` -- and DO read these two pins before touching them:
+#       cosmos-guardrail declares transformers>=5, which would drag the container off 4.57 and away from
+#       the diffusers 0.35 the Cosmos pipelines live in. It runs fine on 4.57, so it is installed
+#       --no-deps and its real deps are listed here by hand.
+#       nltk<3.10 because 3.10's pathsec refuses to open a symlink, and every file in the HF hub cache
+#       IS a symlink -- the guardrail's blocklist corpus included.
+cosmos = [
+  "diffusers>=0.35",
+  "accelerate",
+  "better-profanity",
+  "nltk<3.10",
+  "peft",
+  "retinaface-py",
+  "scikit-image",
+  "sentencepiece",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
