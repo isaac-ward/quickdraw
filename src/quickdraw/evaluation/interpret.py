@@ -207,31 +207,30 @@ def build_action_text(actions: np.ndarray, axes: list) -> str:
 
 
 def build_action_prose(actions: np.ndarray, axes: list, scene: str = "", subject: str = "The view",
-                       max_phases: int = 3, thresh: float = 0.2) -> str:
-    """The same commanded actions as build_action_text, written as a SENTENCE instead of a table.
+                       max_phases: int = 4, thresh: float = 0.2) -> str:
+    """The commanded actions as a SENTENCE, for conditioning a video generator (build_action_text is the
+    table form, for a VLM that can already see the clip).
 
-    WHY BOTH EXIST. build_action_text is for a VLM being asked to LABEL a clip it can already see -- there
-    a table is the honest format, because the numbers are the evidence. A video GENERATOR is the opposite
-    problem: its text encoder (T5, here) was trained on scene descriptions, so a grid of floats is an
-    out-of-distribution embedding, and under classifier-free guidance an out-of-distribution embedding is
-    not neutral -- it is actively pushed toward. Prose is the in-distribution way to say the same thing.
+    WHY THIS IS NOT JUST A LIST OF DIRECTIONS. An axis whose value is a STATE rather than a rate -- a
+    gripper -- averages to nothing useful: reporting its per-phase mean produced "opens its gripper, then
+    opens its gripper and lowers, then opens its gripper and rises", one fact repeated three times, while
+    the thing that actually happened (a cube was grasped, lifted and placed) was never said at all. A
+    grasp is an EVENT, and the manipulation is the whole content of the clip.
 
-    WHAT IT LOSES, and this is not a small thing: magnitude, and any motion that cancels. The clip is
-    split into at most `max_phases` equal spans, each span's per-axis mean is taken, and any axis whose
-    mean clears `thresh` contributes its own words from `action_axes`. Direction and order survive; the
-    rest does not, and a stick that swings +1 then -1 inside ONE span averages to nothing and is reported
-    as stillness. That is the argument for calling this per CHUNK rather than once per rollout, which is
-    what the chunked adapters do -- a span should be a few seconds, not a few minutes.
+    So an axis may declare `role: gripper` in `action_axes`, and it is then read as a transition:
+      open -> closed   "closes its gripper on the cube"
+      closed -> open   "opens its gripper and releases the cube"
+      closed throughout, while moving   "... while holding the cube", said ONCE per hold and not
+                                        repeated on every phase it spans
+    Everything else is a rate axis and keeps the direction-of-mean treatment, two per phase, ranked by
+    distance from its own `neutral`.
 
-    AN AXIS IS MEASURED FROM ITS OWN NEUTRAL, not from zero. `action_axes` entries may carry
-    `neutral: <float>` (default 0.0) for a stick that does not rest at zero -- block-stack's gripper is
-    in [0, 1] and sits near 0.85, so against zero it would clear any threshold in every span and crowd
-    out the axes that are actually moving.
+    WHAT IT STILL CANNOT SAY: WHICH cube. The dataset records the arm (ee pose, joints, gripper) and not
+    the objects, so there are no cube poses to read; naming one from the future frames would be feeding
+    the model the answer. "the cube" is the honest limit until object state exists.
 
-    `scene` is the environment's one-line description of what is in frame and `subject` names the thing
-    that moves -- both from conf/interpret/<env>.yaml (`scene_prompt`, `prose_subject`). Without them the
-    model is told what MOVES and nothing about WHAT is moving, which for a video generator is most of the
-    prompt.
+    Magnitude and sub-phase reversals are lost either way -- a stick that swings +1 then -1 inside one
+    span averages to nothing, which is the argument for calling this per CHUNK rather than per rollout.
     """
     a = np.asarray(actions, dtype=np.float32)
     n = len(axes)
@@ -241,13 +240,30 @@ def build_action_prose(actions: np.ndarray, axes: list, scene: str = "", subject
     spans = np.array_split(np.arange(len(a)), k)
     neutral = np.array([float(ax.get("neutral", 0.0)) for ax in axes], dtype=np.float32)
 
-    phrases = []
+    gi = next((j for j, ax in enumerate(axes) if str(ax.get("role", "")) == "gripper"), None)
+    shut = None if gi is None else a[:, gi] > float(axes[gi].get("closed_above", 0.5))
+
+    phrases, held_said = [], False
     for sp in spans:
         m = a[sp].mean(0) - neutral
-        said = [axes[j]["positive"] if m[j] > 0 else axes[j]["negative"]
-                for j in np.argsort(-np.abs(m)) if abs(m[j]) >= thresh]
-        phrases.append(" and ".join(said[:2]) if said else "holds still")
-    # collapse a repeated phrase rather than saying the same thing three times
+        rate = [j for j in np.argsort(-np.abs(m)) if j != gi and abs(m[j]) >= thresh]
+        moved = [axes[j]["positive"] if m[j] > 0 else axes[j]["negative"] for j in rate[:2]]
+
+        grip, holding = [], ""
+        if shut is not None:
+            a0, a1 = bool(shut[sp[0]]), bool(shut[sp[-1]])
+            if not a0 and a1:
+                grip = ["closes its gripper on the cube"]
+            elif a0 and not a1:
+                grip = ["opens its gripper and releases the cube"]
+            elif a1 and shut[sp].mean() > 0.5 and moved and not held_said:
+                holding = " while holding the cube"       # once per hold; a 5 s grasp spans ~2 phases
+            held_said = a1 and (held_said or bool(holding) or bool(grip))
+            if not a1:
+                held_said = False
+        said = grip + ([" and ".join(moved)] if moved else [])
+        phrases.append((", ".join(said) + holding) if said else "holds still")
+
     seq = [ph for i, ph in enumerate(phrases) if i == 0 or ph != phrases[i - 1]]
     motion = seq[0] if len(seq) == 1 else ", then ".join(seq)
     return f"{scene.strip()} {subject.strip()} {motion}.".strip()

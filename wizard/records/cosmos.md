@@ -231,6 +231,34 @@ Two episodes is the whole block-stack val split, so the fix is not more compute 
 saw any of this data, so every split is equally out of distribution for it. That reservation applies to
 models trained here, not to an external one.
 
+## Finding 7 — the prompt described stick directions, not the task
+
+Reading a real prompt against the footage showed two things wrong, both mine.
+
+The SCENE half asserted a configuration: "stands at the right edge of the table", "sit on the tabletop".
+Neither survives ten seconds of an episode -- the arm moves and the cubes get stacked on each other. It
+now describes only what is always true, and states the task: the arm "picks up coloured cubes, lifts
+them and stacks them on top of each other".
+
+The ACTION half never mentioned the manipulation at all. The gripper was averaged like a rate axis, so
+a state got reported once per phase -- "opens its gripper, then opens its gripper and lowers, then opens
+its gripper and rises" -- while the grasp, the lift and the place were never said. An axis can now
+declare `role: gripper` and is read as TRANSITIONS:
+
+    closes its gripper on the cube, lowers, then moves left across the bench and rotates
+    counter-clockwise seen from above, then opens its gripper and releases the cube, rises
+
+"while holding the cube" is said once per hold rather than on every phase it spans.
+
+MEASURED, not assumed: the gripper channel is not noisy. 80 grasps over 9096 steps (10 min), mean hold
+5.03 s, one grasp every 7.6 s. A median filter only destroys real grasps (80 -> 52 at 1.4 s), so there
+is no debounce.
+
+WHAT IT STILL CANNOT SAY IS WHICH CUBE. block-stack records the arm -- ee pose, rot6, gripper, joints --
+and no object poses, so there is nothing to read; naming a cube off the future frames would be handing
+the model the answer. "the cube" is the honest limit. The model can see the cubes in its context frames;
+what it cannot infer is the intent, and that is what the prompt is for.
+
 ## Experiments (run log)
 
 | date | what | config | result |
@@ -247,7 +275,7 @@ models trained here, not to an external one.
 | 09-21 | negative-prompt A/B, stride 8 | 720x960, H=200, 3 arms | KILLED at 24 min — same reason: the negative's motion clauses interact with motion-per-frame, so it has to be run at the stride we will use |
 | 09-21 | stride-2 smoke | 720x960, H=176, 2 eps, fps auto 15 | the scene, stable, 11.7 s — Finding 6 |
 | 09-21 | seed repeat | same, `+external.seed=1` | noise floor: LPIPS 0.024, motion_ratio 0.640 |
-| 09-21 | **val ablation, stride 2** | 720x960, H=8192 (9.1 min) + cl_16, 94 calls/ep. GPU0 scene prompt only, GPU1 scene + negative | RUNNING (~19 h) |
+| 09-21 | val ablation, stride 2 | 720x960, H=8192 + cl_16 | KILLED at 2 min — the prompt described stick directions and never said a cube was picked up (Finding 7) |
 | 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | no knee; 720x960 LPIPS @+64 **0.218** — Finding 1b |
 
 ## Costs, for planning

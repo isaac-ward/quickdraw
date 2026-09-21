@@ -76,6 +76,10 @@ action_axes:
   - {name: move_y,  positive: moves left across the bench,    negative: moves right across the bench}
   - {name: height,  positive: rises,                          negative: lowers}
   - {name: yaw,     positive: rotates counter-clockwise seen from above, negative: rotates clockwise seen from above}
-  - {name: gripper, positive: closes its gripper,             negative: opens its gripper, neutral: 0.85}
+  # role: gripper marks this as a STATE, not a rate -- build_action_prose reads its TRANSITIONS as grasp
+  # and release events instead of averaging it. The action is 1 = squeeze and is bimodal (mean 0.51,
+  # std 0.42, values at the rails), so 0.5 separates held from empty cleanly.
+  - {name: gripper, positive: closes its gripper,             negative: opens its gripper, neutral: 0.85,
+     role: gripper, closed_above: 0.5}
 
 factors: {}
