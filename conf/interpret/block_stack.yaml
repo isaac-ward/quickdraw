@@ -45,12 +45,13 @@
 # instability ... disappearing or morphing objects" -- so they are the model's known failure modes, not
 # something our setup induced. Stating the arm COUNT is a legitimate "key objects" description and the
 # cheapest thing to try against it; the matching negative preset is `scene_stable`.
-scene_prompt: "A fixed camera in a laboratory looks down at a wooden table from about 45
-  degrees above it. A black robotic arm
-  with a two-finger gripper stands at the right edge of the table. Three coloured cubes -- green, blue and
-  red -- sit on the tabletop. Behind the table is a plain grey wall, with chairs and a tiled floor visible
-  at the edges of the frame. There is exactly one robotic arm, and it keeps the same shape throughout; no
-  other arm, machine or person ever enters the frame. The camera is bolted down and never moves."
+scene_prompt: "A fixed camera in a laboratory looks down at a wooden table from about 45 degrees above
+  it. A black robotic arm with a two-finger gripper reaches over the table: it picks up coloured cubes,
+  lifts them clear of the surface, carries them and stacks them on top of one another, so the cubes move
+  and do not stay where they start. Three cubes are in the scene -- green, blue and red. Behind the table
+  is a plain grey wall, with chairs and a tiled floor visible at the edges of the frame. There is exactly
+  one robotic arm, and it keeps the same shape throughout; no other arm, machine or person ever enters
+  the frame. The camera is bolted down and never moves."
 # WHAT MUST NOT APPEAR. Same scene, stated in the negative -- classifier-free guidance pushes the
 # sampler away from this. The first half is NVIDIA's own text from the Predict2 card MINUS "static with
 # no motion", "shaky footage", "jerky movements" and "low frame rate": those punish stillness, and this
