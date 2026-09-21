@@ -1,10 +1,16 @@
 # =============================================================================================
 # Cosmos on `data=block_stack`. Select with `model=cosmos_blockstack interpret=block_stack`.
 #
-# The only difference from conf/model/cosmos.yaml is the frame size: block-stack ships 144x192, and
-# Cosmos runs there natively because both divide by 16 (144/16 = 9, 192/16 = 12) -- so, as on starling,
-# nothing is resampled in either direction. The adapter takes the size from the modality below; set
-# `external.height`/`external.width` only to deliberately run somewhere else.
+# Two sizes, and they are not the same size. `modalities.img_size` is what the DATA is decoded at and
+# what every metric is computed at: 144x192, as block-stack ships. `render_size` is what COSMOS runs at:
+# 720x960, exactly 5x, so identical aspect and both axes divisible by 16, and the ABC's resample back for
+# LPIPS is pure scaling. This is the MEASURED default -- see wizard/records/cosmos.md Finding 1b:
+#
+#     resolution   LPIPS @+1   @+64    SSIM @+64   motion_ratio @+1
+#     144x192        0.477    0.839      0.198          4.10          <- saturated noise
+#     720x960        0.041    0.218      0.730          1.35
+#
+# Override with `+external.height=... +external.width=...`; move both together.
 #
 #   python -m quickdraw.eval_ood_horizon model=cosmos_blockstack interpret=block_stack \
 #       data=block_stack environments=recorded data.subsample=8 data.action_aggregate=concat
@@ -15,6 +21,8 @@
 defaults:
   - cosmos
   - _self_
+
+render_size: [720, 960]
 
 modalities:
   - {name: image, kind: image, weight: 1.0, img_size: [144, 192], ae_bottleneck: 9, pretrained: false}

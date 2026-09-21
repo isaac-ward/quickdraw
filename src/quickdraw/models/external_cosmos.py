@@ -89,11 +89,17 @@ class CosmosVideo2World(ExternalWorldModel):
                                      if str(m.get("kind", "")) == "image"]
         if hs:
             self.heads = tuple(str(m["name"]) for m in hs)
-        # RESOLUTION FOLLOWS THE DATA unless it is overridden. The model config's image modality already
-        # states the frame size the dataset is decoded at, and running Cosmos anywhere else means the ABC
-        # resamples -- fine, but a choice, so it should be one someone made. external.height/width are the
-        # override, and they move together.
-        hw = (hs[0].get("img_size", None) if hs else None) or self.img_size
+        # RESOLUTION IS NOT THE DATA'S RESOLUTION, and that is the single most consequential line in this
+        # file. Measured on block-stack (wizard/records/cosmos.md, Finding 1b): running Cosmos at the frame
+        # size our dataset is decoded at produces saturated noise, because the VAE compresses space 8x and
+        # a 144x192 frame leaves the whole gripper inside two latent cells -- off-manifold for a model
+        # trained at 704x1280. Quality was still climbing at 25x the pixels with no plateau in sight.
+        #
+        # So the order is: external.height/width (an explicit CLI choice) > model.render_size (the
+        # validated default, aspect-matched to the data so the ABC's resample is pure scaling) > the
+        # modality size (the last resort, and a bad one).
+        rs = (cfg.model.get("render_size", None) if cfg is not None else None)
+        hw = rs or (hs[0].get("img_size", None) if hs else None) or self.img_size
         hw = (int(hw), int(hw)) if isinstance(hw, int) else (int(hw[0]), int(hw[1]))
         self.img_size = (int(g("height") or hw[0]), int(g("width") or hw[1]))
         assert self.pipeline in PIPELINES, f"external.pipeline must be one of {sorted(PIPELINES)}"

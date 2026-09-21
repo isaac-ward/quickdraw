@@ -13,5 +13,14 @@
 # =============================================================================================
 name: cosmos
 d: 128
+
+# WHAT COSMOS RENDERS AT, which is deliberately NOT what the data is decoded at. 672x1152 is exactly 6x
+# starling's 112x192 -- identical aspect, both axes divisible by 16 -- so the ABC's resample back to
+# 112x192 for the metrics is pure scaling with no distortion. The size comes from the block-stack ladder
+# (wizard/records/cosmos.md Finding 1b), where 25x the pixels was still improving and native size was
+# unusable noise; it is EXTRAPOLATED to starling, not measured there. Override with
+# `+external.height=... +external.width=...`, and move both together.
+render_size: [672, 1152]
+
 modalities:
   - {name: image, kind: image, weight: 1.0, img_size: [112, 192], ae_bottleneck: 7, pretrained: false}

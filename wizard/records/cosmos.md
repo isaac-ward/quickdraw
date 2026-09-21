@@ -81,6 +81,12 @@ DRIFTS (the viewpoint swings at +46/+55) even though scene_left is bolted down. 
 plausible video of this scene rather than continuing this particular episode under these particular
 commands.
 
+**This is now the default.** `model.render_size` is what Cosmos runs at (720x960 for block-stack, an
+extrapolated 672x1152 for starling — both an exact integer multiple of the data size, so identical aspect
+and both axes %16); `modalities.img_size` stays what the data is decoded at and what every metric is
+computed at. Order of precedence: `external.height/width` (explicit CLI) > `model.render_size` > the
+modality size. Nothing runs at native size by accident any more.
+
 ## Finding 2 — the frame rate is NOT the story (hypothesis, tested, rejected)
 
 Our steps are 8 frames of 30 Hz footage apart = 3.75 Hz; the pipeline defaults to fps=16. 16/3.75 = 4.3,
