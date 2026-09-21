@@ -200,6 +200,37 @@ call's sub-batch, and `rollout_regrounded` translates that to the global (episod
 it knows `r0` and the row layout. Step ranges are absolute, so a cl_16 run reads +1..+16, +17..+32, ...
 rather than thirteen segments all claiming +1..+16. A model that takes actions as numbers logs nothing.
 
+## Finding 6 — stride 2 works, and the noise floor says what the numbers can and cannot show
+
+At `data.subsample=2` (15 Hz fed, fps 15 declared, 6.2 s clips, 720x960) the prediction is finally a
+picture of the actual episode: the table, all three cubes in their right places holding their colours,
+one arm, a stable viewpoint, through 11.7 s of pure open-loop rollout. Read at MATCHED SECONDS, which is
+the only fair way across strides:
+
+| footage | stride 8 | stride 2 |
+|---|---|---|
+| 2.13 s | @+8 LPIPS 0.199 | @+32 LPIPS **0.187** |
+| 4.27 s | @+16 LPIPS 0.226 | @+64 LPIPS **0.140** |
+| 11.7 s | — | @+176 LPIPS 0.355 |
+
+THE NOISE FLOOR, from two runs identical but for the seed (H=176, 2 eps):
+
+| metric | mean abs diff between seeds | worst lead |
+|---|---|---|
+| LPIPS | **0.024** | 0.059 |
+| SSIM | **0.033** | 0.096 |
+| motion_ratio | **0.640** | 1.306 |
+
+So at 2 episodes a LPIPS gap under ~0.05 means nothing, and **motion_ratio is not usable as a
+discriminator at all** — the same config gave 1.507 and 0.201 at +64. Every earlier reading of
+motion_ratio at 720x960 (the "camera drift" inference included) is therefore unsupported; the 4-6x
+values at 144x192 were consistent across many runs and survive, but nothing at working resolution does.
+
+Two episodes is the whole block-stack val split, so the fix is not more compute at this split. Note that
+`eval_purple_play` (5 eps) and `eval_purple_stack` (6 eps) cost NOTHING to spend on Cosmos — it never
+saw any of this data, so every split is equally out of distribution for it. That reservation applies to
+models trained here, not to an external one.
+
 ## Experiments (run log)
 
 | date | what | config | result |
@@ -214,7 +245,9 @@ rather than thirteen segments all claiming +1..+16. A model that takes actions a
 | 09-21 | products smoke | 144x192 H=64 2 eps | mp4s + filmstrips emit; output is visibly noise |
 | 09-21 | val, 720x960, stride 8 | block-stack, H=2048 + cl_16 | KILLED at 52 min — superseded by stride 2 |
 | 09-21 | negative-prompt A/B, stride 8 | 720x960, H=200, 3 arms | KILLED at 24 min — same reason: the negative's motion clauses interact with motion-per-frame, so it has to be run at the stride we will use |
-| 09-21 | stride-2 smoke | 720x960, H=176, 2 eps, fps auto 15 | RUNNING |
+| 09-21 | stride-2 smoke | 720x960, H=176, 2 eps, fps auto 15 | the scene, stable, 11.7 s — Finding 6 |
+| 09-21 | seed repeat | same, `+external.seed=1` | noise floor: LPIPS 0.024, motion_ratio 0.640 |
+| 09-21 | **val ablation, stride 2** | 720x960, H=8192 (9.1 min) + cl_16, 94 calls/ep. GPU0 scene prompt only, GPU1 scene + negative | RUNNING (~19 h) |
 | 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | no knee; 720x960 LPIPS @+64 **0.218** — Finding 1b |
 
 ## Costs, for planning
