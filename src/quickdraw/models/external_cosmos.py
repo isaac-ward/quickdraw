@@ -94,7 +94,7 @@ class CosmosVideo2World(ExternalWorldModel):
     text_style = "prose"          # a T5-conditioned generator, not a VLM reading a table -- see _actions
 
     DEFAULTS = dict(model_id="nvidia/Cosmos-Predict2-2B-Video2World", pipeline="predict2",
-                    num_frames=93, num_inference_steps=35, guidance_scale=7.0, fps=16,
+                    num_frames=93, num_inference_steps=35, guidance_scale=7.0, fps=None,
                     negative_prompt="none",
                     height=None, width=None, batch=1, seed=0,
                     prompt_style="prose", prompt_phases=4, allow_small_render=False)
@@ -109,7 +109,16 @@ class CosmosVideo2World(ExternalWorldModel):
         self.num_frames = int(g("num_frames"))        # frames per pipeline call, context included
         self.steps = int(g("num_inference_steps"))
         self.guidance = float(g("guidance_scale"))
-        self.fps = int(g("fps"))
+        # FPS IS DERIVED FROM THE DATA, not defaulted to the model's 16. It is not a label: it rescales
+        # the transformer's temporal rotary embedding (`seq / fps * base_fps`, base_fps=24), so it is
+        # literally the model's belief about how far apart consecutive frames are. Declaring 16 while
+        # handing it 3.75 Hz frames tells it they are 4.3x closer together in time than they are.
+        #
+        # The honest number is the rate we actually feed: dataset fps / data.subsample. Getting CLOSE to
+        # 16 is the data side's job (`data.subsample=2` on 30 Hz footage gives 15 Hz, and a 93-frame clip
+        # then spans 5.87 s against the 5.8 s the model was built for) -- but whatever stride is chosen,
+        # what we DECLARE now matches what we SEND. Override with external.fps to test that claim.
+        self.fps = int(g("fps") or _data_fps(cfg) or 16)
         self.batch = int(g("batch"))                  # episodes per pipeline call
         self.seed = int(g("seed"))
         # a preset name, or literal text for anything else
@@ -232,6 +241,26 @@ class CosmosVideo2World(ExternalWorldModel):
 
         y = torch.stack([torch.stack(g[:horizon], 0) for g in gen], 0)    # (N,horizon,3,H,W)
         return {head: y.permute(0, 1, 3, 4, 2).to(frames.device, frames.dtype)}
+
+
+def _data_fps(cfg) -> int | None:
+    """The rate we actually hand the model: the dataset's own fps divided by `data.subsample`. Read from
+    the dataset's summary.json, the same source env_cfg uses to derive dt. None if it cannot be read, and
+    the caller falls back to the model's native 16 (with the mismatch that implies)."""
+    if cfg is None:
+        return None
+    try:
+        import json
+        import os
+        from ..training.setup import resolve_data_root
+        fps = json.load(open(os.path.join(resolve_data_root(cfg), "summary.json"))).get("fps")
+        k = int(cfg.data.get("subsample", 1) or 1)
+        return max(1, round(float(fps) / k)) if fps else None
+    except Exception as ex:                                        # noqa: BLE001
+        print(f"[cosmos] could not derive fps from the dataset ({type(ex).__name__}); using the model's "
+              f"native 16, which is WRONG unless your steps really are 1/16 s apart. Set external.fps.",
+              flush=True)
+        return None
 
 
 def _patch_guardrail(sc):

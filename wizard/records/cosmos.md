@@ -161,20 +161,25 @@ Two gaps, and the second is structural:
    footage that is **23.5 seconds of real time** presented to the model as one 5-second clip — 4.7x more
    action than the format is designed to hold. It cannot depict 23.5 s in 5 s; it compresses or ignores.
 
-   The clean fix is to stop asking. Run Cosmos at the SOURCE frame rate (one generated frame = one 30 Hz
-   frame, 88 frames = 2.9 s, comfortably in distribution) and decimate every 8th frame to get our steps.
-   It costs 8x the calls for the same horizon:
+   The fix is to stop asking, by choosing the STRIDE so our frames land near the model's own spacing.
+   30 Hz does not divide by 16, so 15 Hz -- `data.subsample=2` -- is the closest this footage gets:
 
-   | scheme | s per clip | H=128, 2 eps | H=2048, 2 eps |
-   |---|---|---|---|
-   | current: 1 generated frame = 1 of our steps | 23.5 s | 4 calls, 0.4 h | 48 calls, 4.9 h |
-   | native rate + decimate | 2.9 s | 24 calls, 2.5 h | 374 calls, 38.5 h |
+   | data.subsample | we feed | declared fps | 5 ctx frames | 93-frame clip | vs the 5.8 s design |
+   |---|---|---|---|---|---|
+   | 8 (what we ran) | 3.75 Hz | 4 | 1.33 s | 23.3 s | 4.0x |
+   | 4 | 7.5 Hz | 8 | 0.67 s | 11.6 s | 2.0x |
+   | **2** | **15 Hz** | **15** | **0.33 s** | **6.2 s** | **1.1x** |
+   | 1 | 30 Hz | 30 | 0.17 s | 3.1 s | 0.5x |
 
-   So it is affordable at H=128 and not at full horizon. Worth one H=128 head-to-head against the
-   current scheme before deciding whether the long-horizon number is worth 38 h.
+   Stride 2 is the sweet spot and it beats the obvious "run at native 30 Hz" on both axes: closer to the
+   design point (1.1x vs 0.5x) and half the cost. For the same WALL-CLOCK horizon it is 4x the calls:
+   34 s of footage goes 0.4 h -> 1.2 h, the full 9.1 min goes 4.9 h -> 19.4 h. The catch is that step
+   counts stop being comparable across models -- our +128 at stride 8 is Cosmos's +512 at stride 2, both
+   34 s -- so the comparison has to be made at matched SECONDS.
 
-   Note this is NOT the fps knob, which was tested and does nothing (Finding 2). fps is a conditioning
-   scalar; this changes what a frame IS.
+   FPS IS NOW DERIVED, not defaulted. The adapter reads the dataset's own fps from summary.json (the same
+   source env_cfg uses for dt), divides by data.subsample, and declares that. Whatever stride is chosen,
+   what we tell the model now matches what we send it; `external.fps` overrides to test that claim.
 
 ## Bug fixed — an image-only model got no visual products at all
 
