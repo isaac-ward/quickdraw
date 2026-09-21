@@ -259,6 +259,37 @@ and no object poses, so there is nothing to read; naming a cube off the future f
 the model the answer. "the cube" is the honest limit. The model can see the cubes in its context frames;
 what it cannot infer is the intent, and that is what the prompt is for.
 
+## Finding 8 — the VLM can name the cube, and names the wrong one. Tried, measured, dropped.
+
+`label_clip` was given exactly what Cosmos gets and nothing more: the 8 ground-truth CONTEXT frames plus
+`build_action_text` (the full stick table, gripper included) from t=0 to the end of the chunk. No future
+frames, so nothing leaks -- it is re-expressing information the model already has. It answered fluently:
+
+    [chunk 1] objects=['green'] confident=True
+      "The robot arm moves toward the green cube, lowers, and closes its gripper, picking it up. It then
+       carries the green cube left across the table and places it next to the blue cube."
+
+Checked against colour-segmented cube centroids rather than against my eyes (288x384, x = right):
+
+    green  (243,175)  (242,176)  1px   (241,176)  1px   (242,176)  2px
+    blue   (299,182)  (300,181)  1px   (288,195) 18px   (304,170) 29px
+    red    (334,196)  (275,200) 58px   (276,211) 11px   (276,200) 12px
+    marks:       +0        +88              +176             +264
+
+Green moves ONE PIXEL across the whole window -- it is the only cube that never moves -- and the VLM
+named it as the one picked up and carried. Red, which moved 58 px, went unmentioned. Chunks 2 and 3 name
+red while blue is the mover. Wrong cube three times out of three, `confident: true` three times out of
+three. That is strictly worse than saying "the cube": the generator would be instructed to move a cube
+that stays still. Dropped.
+
+The failure is reasonable -- integrating 88 steps of joystick into a trajectory and binding it to objects
+in a 45-degree view is hard, and it fell back on generic block-stacking narration. The route that could
+work does not need a VLM for the hard part: cube pixel positions from colour segmentation on the context
+frames (works, above), the gripper path by integrating the sticks (exact, and non-leaky -- PROCESSING.md
+gives the integrator rule), then nearest-cube at grasp time. The weak link is projecting world mm to
+pixels: the fit is R2 0.90 vertical but 0.33 HORIZONTAL, and horizontal is the axis that separates the
+cubes. Not attempted.
+
 ## Experiments (run log)
 
 | date | what | config | result |
@@ -276,6 +307,8 @@ what it cannot infer is the intent, and that is what the prompt is for.
 | 09-21 | stride-2 smoke | 720x960, H=176, 2 eps, fps auto 15 | the scene, stable, 11.7 s — Finding 6 |
 | 09-21 | seed repeat | same, `+external.seed=1` | noise floor: LPIPS 0.024, motion_ratio 0.640 |
 | 09-21 | val ablation, stride 2 | 720x960, H=8192 + cl_16 | KILLED at 2 min — the prompt described stick directions and never said a cube was picked up (Finding 7) |
+| 09-21 | VLM object attribution | gpt-4o, context frames + stick table | wrong cube 3/3, confident 3/3 — Finding 8, dropped |
+| 09-21 | **val ablation, stride 2, v2** | 720x960, H=8192 (9.1 min) + cl_16, 94 calls/ep, grasp-event prompts. GPU0 scene only, GPU1 scene + negative | RUNNING (~19 h) |
 | 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | no knee; 720x960 LPIPS @+64 **0.218** — Finding 1b |
 
 ## Costs, for planning
