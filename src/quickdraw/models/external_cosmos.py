@@ -58,44 +58,6 @@ from .external import ExternalWorldModel, register
 PIPELINES = {"predict2": "Cosmos2VideoToWorldPipeline", "cosmos1": "CosmosVideoToWorldPipeline"}
 MIN_PIXELS = 432 * 576      # the smallest render that produced a picture of the scene -- see __init__
 
-# THE NEGATIVE PROMPT, which the model card's own example always passes and we were passing None for.
-# `doc` is that example verbatim. Read the clauses: "static with no motion" and "low frame rate" are in
-# there, and under classifier-free guidance a negative is something the sampler is pushed AWAY from -- so
-# the documented default actively discourages stillness. That is right for the cinematic b-roll these
-# models are demoed on and wrong for a bench where the arm is often parked, which is exactly the
-# direction our measured failures point (motion_ratio 4-6x at small render, camera drift at 720x960).
-# `fixed_camera` is the same list with the four motion-suppressing clauses removed and nothing added.
-# Which one wins is an experiment, not a preference -- see wizard/records/cosmos.md.
-NEGATIVE = {
-    "none": None,
-    "doc": ("The video captures a series of frames showing ugly scenes, static with no motion, motion "
-            "blur, over-saturation, shaky footage, low resolution, grainy texture, pixelated images, "
-            "poorly lit areas, underexposed and overexposed scenes, poor color balance, washed out "
-            "colors, choppy sequences, jerky movements, low frame rate, artifacting, color banding, "
-            "unnatural transitions, outdated special effects, fake elements, unconvincing visuals, "
-            "poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of "
-            "poor quality."),
-    # dropped: "static with no motion", "shaky footage", "jerky movements", "low frame rate"
-    # fixed_camera, plus the three artifacts actually observed at 720x960: a second arm sliding in from
-    # the edge, the arm's geometry morphing between frames, and the viewpoint drifting. NVIDIA's own
-    # Limitations section names all three, so this is aimed at known behaviour rather than a guess.
-    "scene_stable": (
-        "The video captures a series of frames showing ugly scenes, motion blur, over-saturation, low "
-        "resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed "
-        "scenes, poor color balance, washed out colors, choppy sequences, artifacting, color banding, "
-        "unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly "
-        "edited content, jump cuts, visual noise, and flickering. The video also shows duplicate robotic "
-        "arms, a second arm entering from the edge of the frame, extra grippers, arms that morph or "
-        "change shape between frames, objects that appear from nowhere or dissolve, and a camera that "
-        "pans, zooms or drifts. Overall, the video is of poor quality."),
-    "fixed_camera": ("The video captures a series of frames showing ugly scenes, motion blur, "
-                     "over-saturation, low resolution, grainy texture, pixelated images, poorly lit "
-                     "areas, underexposed and overexposed scenes, poor color balance, washed out "
-                     "colors, choppy sequences, artifacting, color banding, unnatural transitions, "
-                     "outdated special effects, fake elements, unconvincing visuals, poorly edited "
-                     "content, jump cuts, visual noise, and flickering. Overall, the video is of poor "
-                     "quality."),
-}
 
 
 @register("cosmos")
@@ -107,10 +69,9 @@ class CosmosVideo2World(ExternalWorldModel):
 
     DEFAULTS = dict(model_id="nvidia/Cosmos-Predict2-2B-Video2World", pipeline="predict2",
                     num_frames=93, num_inference_steps=35, guidance_scale=7.0, fps=None,
-                    negative_prompt="none",
+                    negative_prompt=None,
                     height=None, width=None, batch=1, seed=0,
                     prompt_style="prose", prompt_phases=4, allow_small_render=False)
-    # negative_prompt defaults to "none" (see NEGATIVE); keep it out of DEFAULTS so the preset table owns it
 
     def __init__(self, cfg=None):
         super().__init__(cfg)
@@ -133,9 +94,13 @@ class CosmosVideo2World(ExternalWorldModel):
         self.fps = int(g("fps") or _data_fps(cfg) or 16)
         self.batch = int(g("batch"))                  # episodes per pipeline call
         self.seed = int(g("seed"))
-        # a preset name, or literal text for anything else
-        neg = str(g("negative_prompt") or "none")
-        self.negative = NEGATIVE[neg] if neg in NEGATIVE else neg
+        # ONE POSITIVE PROMPT AND ONE NEGATIVE PROMPT, both in conf/interpret/<env>.yaml beside each
+        # other, because both are descriptions of the same scene -- what is there, and what must not
+        # appear. `external.negative_prompt` overrides with literal text; "" disables it.
+        it = (cfg.get("interpret", None) if cfg is not None else None) or {}
+        neg = g("negative_prompt")
+        neg = str(it.get("negative_prompt", "") or "") if neg is None else str(neg)
+        self.negative = neg or None
         self.text_style = str(g("prompt_style"))
         self.prompt_phases = int(g("prompt_phases"))
         hs = [] if cfg is None else [m for m in (cfg.model.get("modalities", None) or [])

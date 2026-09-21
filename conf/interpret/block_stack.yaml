@@ -51,6 +51,19 @@ scene_prompt: "A fixed camera in a laboratory looks down at a wooden table from 
   red -- sit on the tabletop. Behind the table is a plain grey wall, with chairs and a tiled floor visible
   at the edges of the frame. There is exactly one robotic arm, and it keeps the same shape throughout; no
   other arm, machine or person ever enters the frame. The camera is bolted down and never moves."
+# WHAT MUST NOT APPEAR. Same scene, stated in the negative -- classifier-free guidance pushes the
+# sampler away from this. The first half is NVIDIA's own text from the Predict2 card MINUS "static with
+# no motion", "shaky footage", "jerky movements" and "low frame rate": those punish stillness, and this
+# arm is parked for much of an episode. The second half names the three artifacts actually observed at
+# 720x960 -- a second arm sliding in from the edge, the arm's shape morphing, the viewpoint drifting.
+negative_prompt: "The video captures a series of frames showing ugly scenes, motion blur,
+  over-saturation, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and
+  overexposed scenes, poor color balance, washed out colors, choppy sequences, artifacting, color
+  banding, unnatural transitions, fake elements, unconvincing visuals, jump cuts, visual noise, and
+  flickering. The video also shows duplicate robotic arms, a second arm entering from the edge of the
+  frame, extra grippers, arms that morph or change shape between frames, objects that appear from
+  nowhere or dissolve, and a camera that pans, zooms or drifts. Overall, the video is of poor quality."
+
 prose_subject: "The arm"
 
 # WORDED IN THE THIRD PERSON because both consumers read better that way: the VLM legend becomes
