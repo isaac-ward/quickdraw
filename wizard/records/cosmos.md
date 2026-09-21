@@ -54,9 +54,32 @@ at 144x192 the output is saturated psychedelic noise from step 1.
 
 Cost: 590 s per 88-frame call at 704x1280 vs 8.6 s at 144x192 — **56x**.
 
-CAVEAT ON THAT ROW: 144x192 is 3:4 and 704x1280 is 0.55, so the ABC bilinearly STRETCHED the context going
-in and squashed the output coming back. The comparison confounds "more pixels" with "distorted". An
-aspect-preserving ladder (288x384, 432x576, 720x960 — all 3:4, all %16) is running to separate them.
+CAVEAT ON THAT ROW, now resolved: 144x192 is 3:4 and 704x1280 is 0.55, so the ABC bilinearly STRETCHED the
+context going in and squashed the output coming back — that row confounded "more pixels" with "distorted".
+It was the pixels. See Finding 1b.
+
+## Finding 1b — the aspect-preserving ladder: no knee below 720x960, cost is 34x
+
+All 3:4 like the data, all divisible by 16, open-loop, H=64, 2 eps, prose prompts (2026-09-21):
+
+| resolution | px vs native | LPIPS @+1 | @+16 | @+64 | SSIM @+64 | motion_ratio @+1 | rollout (2 calls) |
+|---|---|---|---|---|---|---|---|
+| 144x192 | 1x    | 0.477 | 0.697 | 0.839 | 0.198 | 4.10 | 21.9 s |
+| 288x384 | 4x    | 0.497 | 0.747 | 0.776 | 0.224 | 7.32 | 57.8 s |
+| 432x576 | 9x    | 0.208 | 0.463 | 0.521 | 0.387 | 4.67 | 150.1 s |
+| 720x960 | 25x   | **0.041** | **0.226** | **0.218** | **0.730** | **1.35** | 742.9 s |
+
+Nothing happens until 432x576 and it is still improving at 720x960 — there is no plateau in range, so
+"use the biggest you can afford" is the honest rule. Cost is close to linear in pixels (25x pixels ->
+34x time), which makes the trade easy to price. 432x576 is the cheap usable point (LPIPS @+64 0.52 at
+1/5 the cost); 720x960 is the one to quote.
+
+The 720x960 filmstrip is the first one worth looking at: the table, the three blocks and their colours
+and positions are all correct and stable, and an arm is present and moving. What it gets WRONG is
+instructive and invisible to LPIPS alone — it hallucinates extra arms and grippers, and the camera
+DRIFTS (the viewpoint swings at +46/+55) even though scene_left is bolted down. It is generating a
+plausible video of this scene rather than continuing this particular episode under these particular
+commands.
 
 ## Finding 2 — the frame rate is NOT the story (hypothesis, tested, rejected)
 
@@ -124,18 +147,28 @@ the same mistake: the `continue` when there is no obs to render skipped the imag
 | 09-20 | fps sweep | 144x192 H=128 2 eps, fps 16/8/4/2 | no effect — Finding 2 |
 | 09-20 | native resolution | 704x1280 H=128 2 eps | LPIPS @+128 **0.266** — Finding 1 |
 | 09-21 | products smoke | 144x192 H=64 2 eps | mp4s + filmstrips emit; output is visibly noise |
-| 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | RUNNING |
+| 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | no knee; 720x960 LPIPS @+64 **0.218** — Finding 1b |
 
 ## Costs, for planning
 
-Per 88-frame pipeline call, Predict2-2B, batch 1, 35 steps: 8.6 s at 144x192, 590 s at 704x1280.
-A full default val (2 eps) is 24 calls/ep open-loop at H=2048, 16 calls/ep for cl_16, and **512 calls/ep for
-cl_1** — cl_1 was ~90% of the 70-minute 144x192 val and is simply off the table at high resolution (~84 h).
-Recommendation for any real number: open-loop at full horizon plus `closed_loop_steps=[16]`.
+Per 88-frame pipeline call, Predict2-2B, batch 1, 35 steps: 11 s at 144x192, 29 s at 288x384, 75 s at
+432x576, 371 s at 720x960, 590 s at 704x1280.
+
+A full val (2 eps) is 24 calls/ep open-loop at H=2048 plus 16 calls/ep for cl_16 = **80 calls**; cl_1 adds
+512 calls/ep and is off the table above native size (it was ~90% of the 70-minute 144x192 val, and would be
+~84 h at 720x960). So, open-loop at full horizon + `closed_loop_steps=[16]`:
+
+| resolution | full val (2 eps) |
+|---|---|
+| 432x576 | ~1.7 h |
+| 720x960 | ~8.2 h |
 
 ## Open
 
-- Where is the resolution knee? (the ladder answers this)
+- There is no resolution knee below 720x960 (Finding 1b); is there one above? 1088x1440 (3:4, %16) would
+  cost ~2.3x again. Worth one H=64 probe before committing to a long run.
+- The camera drift at 720x960 is the sharpest failure and no current metric names it. A fixed-camera
+  dataset makes it measurable: background-only optical flow should be ~0 and is not.
 - `provides_latents`: what counts as "the latent" for Cosmos — tokenizer latent or diffusion intermediate?
   Until that is decided, `eval_manifold` and `eval_interpret` are skipped by name, which is correct but
   leaves two columns empty.
