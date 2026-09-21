@@ -87,7 +87,7 @@ and both axes %16); `modalities.img_size` stays what the data is decoded at and 
 computed at. Order of precedence: `external.height/width` (explicit CLI) > `model.render_size` > the
 modality size. Nothing runs at native size by accident any more.
 
-## Finding 2 — the frame rate is NOT the story (hypothesis, tested, rejected)
+## Finding 2 — RETRACTED: the fps sweep was run at the broken resolution and proves nothing
 
 Our steps are 8 frames of 30 Hz footage apart = 3.75 Hz; the pipeline defaults to fps=16. 16/3.75 = 4.3,
 which matched the measured motion_ratio of ~4 almost exactly. It was a coincidence. Sweeping the declared
@@ -97,6 +97,17 @@ fps over {16, 8, 4, 2} at 144x192 moved nothing:
 |---|---|---|---|---|
 | LPIPS @+128 | 0.758 | 0.765 | 0.757 | 0.729 |
 | motion_ratio @+1 | 4.09 | 6.04 | 6.47 | 5.67 |
+
+**That sweep was run at 144x192, where the output is noise whatever you do (Finding 1/1b), so it
+separates nothing.** "No effect" was the resolution failure swamping the variable, not evidence that fps
+is inert. Worse, reading the code shows fps is NOT a passive conditioning scalar — it rescales the
+temporal ROTARY POSITION EMBEDDING directly (`transformer_cosmos.py`, `base_fps = 24`):
+
+    emb_t = torch.outer(seq[:pe_size[0]] / fps * self.base_fps, temporal_freqs)
+
+so the declared fps sets how far apart the model believes consecutive latent frames are. Our steps are
+8 frames of 30 Hz footage = 3.75 Hz, and we declare 16, i.e. we tell it the frames are 4.3x closer
+together in time than they are. The principled value is 4 (nearest int to 3.75). REDO AT 720x960.
 
 ## Finding 3 — context granularity is a real handicap, and it is quantised
 
@@ -226,6 +237,8 @@ A full val (2 eps) is 24 calls/ep open-loop at H=2048 plus 16 calls/ep for cl_16
 - Enrich `scene_prompt` per Finding 5.1 — HELD until the negative-prompt A/B finishes, because editing
   the interpret config mid-sweep would give the later arms a different prompt and confound it.
 - H=128 head-to-head: current scheme vs native-rate-and-decimate (Finding 5.2).
+- Redo the fps sweep at 720x960 (Finding 2 is retracted). fps=4 is the principled value; the question is
+  whether matching the temporal RoPE to our real step rate beats staying at the trained 16.
 - `nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned` takes NUMERIC per-step actions ("end-effector
   displacement and gripper width"), 640x480 at 4 fps — block-stack's semantics at our step rate, and an
   apples-to-apples row the text bridge can never be. Runtime is the cosmos-predict2 monorepo, not
