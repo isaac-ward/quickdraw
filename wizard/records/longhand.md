@@ -970,6 +970,69 @@ been earned twice (`wd01` ep3, and §8.24's whole floor problem) is that a trend
 not a trend until it survives a point that could have broken it. The right response to four good
 points was to keep the arm running and say nothing, not to write the headline.
 
+### 8.29 THE "MUNGEY" IS THE DECODE MEAN, NOT THE DYNAMICS — and stochastic decode dissolves it (2026-09-21)
+
+**A confound to retire first.** The stochastic-decode eval that reported `cam_scene lpips_mean = 0.2098`
+(read as "sampling is much worse than the deterministic 0.094 — sharp-but-wrong from a drifted latent,
+§19.3") was **invalid**. `eval_checkpoint` never set the process-global data config, so it ran at the
+default `subsample=1`/`action_aggregate=sum` instead of the trained `10`/`mean`: val episodes were 10× longer,
+`H` clamped to 2048 (not 1651), and the mean averaged over horizon buckets out to `@+2048` that do not exist
+in the real regime. Fixed by centralising the four data globals into `dataset.apply_data_globals(cfg)` and
+routing every data-loading entrypoint through it (`9f89bbf`, `399426a`; smoke `quickdraw.smoke.data_globals`).
+This was one instance of a class — `push_model._example_context` was shipping `example_context.npz` at
+subsample-1 too; the pushed cards/videos/metrics were unaffected (they come from the run's own logged products).
+
+**The clean redo** (up-flow ep31, both via the fixed `eval_checkpoint`, subsample=10, H=1651, ood_horizon):
+
+| open_loop lpips_mean | deterministic | stochastic | Δ |
+|---|---|---|---|
+| cam_scene | **0.0936** | 0.0918 | −0.002 (neutral) |
+| cam_wrist | 0.3624 | **0.2702** | **−0.092** (better, strongest @+8..+64) |
+
+The deterministic `0.0936` reproduces the training log's `~0.094` — so the fixed entrypoint now matches the
+training eval, which is the point of it. And the earlier "sampling is doomed" headline is **withdrawn**:
+at the correct regime stochastic decode is neutral on the scene cam and materially better on the close-up
+wrist cam.
+
+**The mechanism, and why it matters more than the number.** The flow decode head is a generative model of
+`p(frame | latent)`. `flow.py:_sample` has exactly two modes (`:203`): deterministic sets `eps = zeros` and
+predicts x0 → the **conditional MEAN** of that distribution; stochastic sets `eps = randn` → a single **SAMPLE**
+from it. Where the conditional is multimodal — which cube is which colour, a block's exact pose — the mean is
+a blend of all the plausible answers, and a blend of valid block configurations is not a valid block
+configuration: it is the **"mungey half-block"**. That munge was never the dynamics; it is what averaging a
+multimodal decoder always produces (Mathieu 2015). A sample instead lands ON the data manifold — a specific,
+coherent, sharp set of blocks. The operator's own words on the redo: *"every prediction is a valid set of
+blocks, no mungey half-blocks; temporally inconsistent, but spatially it looks good."*
+
+The temporal inconsistency has the same one-line cause: the noise is drawn with shape `lead + event_shape`
+where `lead` **includes the time axis**, so every frame gets an INDEPENDENT `eps` draw. Consecutive frames are
+therefore independent samples of their per-frame conditional — the sampled degrees of freedom (which valid
+config, exact placement) jitter frame-to-frame even when the underlying latent moves smoothly. The mean is
+temporally smooth precisely because it has no noise to differ on. So the two artefacts are one tradeoff:
+**mean = temporally smooth, spatially blurred; sample = spatially valid, temporally flickering.**
+
+**This finally separates the two ceilings cleanly.** The "mungey" appearance was Ceiling A — the decode MEAN
+blurring a multimodal codec, a decode-side property (which is also why the `ae_floor` render of TRUE frames
+looked mungey: it, too, is a mean decode). It is NOT the identity/drift failure. The *bouncing* is what is
+left once the munge is removed, and that is the real Ceiling B: the latent random-walks (§8.25's invariant),
+so the per-frame conditional keeps re-centring, and independent per-frame noise then resamples inside it.
+
+**Why deterministic stays the default.** (1) The checkpoint monitor is `val/metric/cam_scene/mse` and the
+mean is the L2-optimal point estimate by construction — stochastic will lose on MSE/PSNR even when it wins on
+LPIPS and to the eye. (2) The mean is a reproducible committed prediction (`flow.py:192`); a fresh-noise
+sample changes every run, which breaks A/B comparability and golden tests. (3) For a world model a rollout
+whose block identities jitter frame-to-frame is arguably worse for downstream control than a stable-but-soft
+one. So the canonical scored number should remain the mean; stochastic is the right choice for VISUALS and,
+per the wrist result, for perceptual (LPIPS) reporting — flag it, do not silently swap it.
+
+**The lever this opens.** The flicker is caused by independent per-frame noise, not by anything in the
+dynamics. Sharing (or optical-flow-warping) a single `eps` across the rollout, or making each frame's noise
+autoregressive on the last, should give samples that are sharp AND temporally coherent — the video-diffusion
+"fixed/warped noise" trick. That is a decode-side change with no retrain (the sampler already exists) and is
+the obvious next thing to try on the visuals. It does not touch the latent random-walk, so it will not move
+`OL − floor`; it attacks how the walk is *rendered*, which is the half of the problem this section shows was
+never dynamics at all.
+
 ### 8.19 An operational lesson: eval products fill the disk
 
 `eval:ae_floor` died at `win64` ep5 with `OSError: No space left on device` — 287/290 GB. Eval
@@ -1011,6 +1074,12 @@ products on a schedule.
 - [ ] **Judge these rollouts on the MP4s, not the filmstrips.** 8 sampled frames out of 1651
       cannot show glitching between samples, which is what the operator sees and what the
       filmstrips missed (§8.28).
+- [ ] **The munge was the decode MEAN, not the dynamics (§8.29).** Stochastic decode gives
+      spatially-valid blocks (no half-blocks) but flickers, because noise is drawn independently
+      per frame. NEXT: share/warp one `eps` across the rollout (or make it autoregressive) for
+      sharp AND temporally-coherent samples — decode-side, no retrain, does NOT move `OL − floor`.
+      Keep deterministic as the scored default (L2-optimal, reproducible); use stochastic for
+      visuals/LPIPS and flag it.
 - [ ] The 55 s horizon (`@+1651`) has not improved at ANY token count. Whatever fails at long
       range is a separate problem from the one §8.27 fixed.
 - [ ] ~~The identity/persistence failure is unresolved~~, hypothesis was OVERFITTING
