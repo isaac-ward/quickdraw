@@ -160,7 +160,9 @@ class CosmosVideo2World(ExternalWorldModel):
                 # nothing about the 88 this call generates -- and a stick that reverses inside the span
                 # averages away entirely. `window` re-renders from the actions belonging to these frames;
                 # an adapter given a plain list (a stub, say) still gets the whole-rollout string.
-                g0 = len(gen[lo])
+                g0 = len(gen[lo])                  # every episode advances in lockstep: same clip
+                assert all(len(gen[i]) == g0 for i in range(lo, hi)), \
+                    "episodes are out of step, so one prompt window cannot describe the whole batch"
                 chunk = [prompts.window(i, g0, min(g0 + self.num_frames - c, horizon))
                          if hasattr(prompts, "window") else prompts[i] for i in range(lo, hi)]
                 out = pipe(video=list(cond), prompt=chunk,

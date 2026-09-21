@@ -320,17 +320,21 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
                             "full_true": _np.stack([eps[i][2][head][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                             "ipred": ipred[:n_plot].cpu().numpy()}
             emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
-        if not has_pro:
-            return {}                       # image readouts are already emitted; the rest is proprio
+        # EMITTED FOR EVERY MODEL, proprio or not. `emit_openloop` skips each proprio product whose input
+        # is None and still writes the image rollouts and filmstrips -- which for an image-only model are
+        # the entire visual record, and the reason the external wrapper exists at all.
         emit_openloop(writer, subroutine, step, env=env, R=getattr(ecfg, "R", None), r=getattr(ecfg, "r", None),
                       coloring="hsv", fps=fps, P=P, smooth_window=int(cfg.data.action_smooth_window), description=desc,
                       ctx_xyz=ctx_obs[:, :, pos],
-                      p_true_xyz=pt[:n_plot][:, :, pos].cpu().numpy(), p_hat_xyz=p_hat[:n_plot][:, :, pos].cpu().numpy(),
+                      p_true_xyz=pt[:n_plot][:, :, pos].cpu().numpy() if has_pro else None,
+                      p_hat_xyz=p_hat[:n_plot][:, :, pos].cpu().numpy() if has_pro else None,
                       actions=[eps[i][1][:P + Hm].astype(_np.float32) for i in range(n_plot)],
                       curves=curves, n_plot=n_plot, images=(images or None),
-                      obs_true=_np.concatenate([ctx_obs, pt[:n_plot].cpu().numpy()], axis=1),
-                      obs_pred=p_hat[:n_plot].cpu().numpy(), pos_explicit=pos_explicit,
+                      obs_true=_np.concatenate([ctx_obs, pt[:n_plot].cpu().numpy()], axis=1) if has_pro else None,
+                      obs_pred=p_hat[:n_plot].cpu().numpy() if has_pro else None, pos_explicit=pos_explicit,
                       title_fn=lambda i: f"{subroutine} #{i} H={Hm}", log=lambda msg: prog(50, msg))
+        if not has_pro:
+            return {}                       # the image products are emitted; the SCALAR here is proprio
         return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
 
     modes = _modes               # from ood_horizon_shapes above -- ONE definition, shared with probe_eval

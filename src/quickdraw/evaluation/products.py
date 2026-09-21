@@ -88,7 +88,12 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
       "ipred": (N,H,s,s,3)}}; obs_true (N,P+H,obs_dim)/obs_pred (N,H,obs_dim) full observation vectors
       (only the fallback reads them). title_fn(i) -> a plot title (default '<routine> #i')."""
     title_fn = title_fn or (lambda i: f"{routine} #{i}")
-    log_error_curves(writer, routine, curves, step, head="proprio")        # proprio averaged curves + scalars
+    # EVERY PROPRIO PRODUCT IS OPTIONAL. An image-only model (an external video model, say) has no proprio
+    # prediction at all, and passes curves/p_*_xyz/obs_pred as None. That must cost it the proprio error
+    # curves, the trajectory plots and the obs filmstrip -- and NOTHING ELSE. The image rollouts and
+    # filmstrips are the whole reason such a model is being evaluated.
+    if curves is not None:
+        log_error_curves(writer, routine, curves, step, head="proprio")    # proprio averaged curves + scalars
     for head, d in (images or {}).items():                                 # per image head, mirrored (PSNR split top)
         # psnr owns the TOP panel (dB units); lpips + motion_ratio share the BOTTOM panel (neither is bounded
         # [0,1] nor higher-is-better). psnr_frozen used to share the top panel and was removed 2026-08-18 --
@@ -105,10 +110,11 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
                          colors={"psnr": "red", "lpips": "purple",
                                  "motion_ratio": "green",
                                  "latent_motion_ratio": "olive", "latent_cos": "brown"})
-    rich = wants_diagnostics(env)
+    has_pro = p_hat_xyz is not None and p_true_xyz is not None
+    rich = wants_diagnostics(env) and has_pro
     # Generic (geometry-free) proprio TRAJECTORY plots for a non-torus env — only when position_idx is EXPLICIT
     # (config/env hook, not the [0,1,2] guess) and 3D. torus keeps its richer atlas via log_torus_paths.
-    plot_traj = bool(pos_explicit) and np.asarray(p_hat_xyz).shape[-1] == 3
+    plot_traj = has_pro and bool(pos_explicit) and np.asarray(p_hat_xyz).shape[-1] == 3
     for i in range(n_plot):
         if log is not None:
             log(f"episode {i + 1}/{n_plot} visuals")
@@ -132,21 +138,24 @@ def emit_openloop(writer, routine, step, *, env, R, r, coloring, fps, P, smooth_
                 except Exception as _te:
                     if log is not None:
                         log(f"episode {i}: proprio trajectory plot failed ({type(_te).__name__}: {_te}); continuing")
+            # NOTE the absence of a `continue` here, which is not an accident: the obs filmstrip is the
+            # LAST proprio product, and the image-head loop that follows it is the one thing an image-only
+            # model does have. Skipping ahead used to take the rollout mp4s down with it.
             if obs_true is None or obs_pred is None:
-                if log is not None:
-                    log(f"episode {i}: no diagnostic scene and no obs for the render_obs fallback — skipped")
-                continue
-            try:
-                t = env.render_obs(torch.as_tensor(np.asarray(obs_true[i]), dtype=torch.float32)
-                                   ).cpu().numpy().astype(np.float32) / 255.0
-                p = env.render_obs(torch.as_tensor(np.asarray(obs_pred[i]), dtype=torch.float32)
-                                   ).cpu().numpy().astype(np.float32) / 255.0
-            except NotImplementedError:                                    # e.g. RecordedEnv: no renderer —
-                if log is not None:                                        # image-head filmstrips still emit below
-                    log(f"episode {i}: env has no render_obs — obs filmstrip skipped")
+                if log is not None and i == 0:
+                    log("no obs prediction — the render_obs filmstrip is skipped; image heads still emit")
             else:
-                log_image_head(writer, routine, "obs", i, t, p, step, fps, context_len=P,
-                               title=f"obs #{i} pred(top)/GT(bottom)")
+                try:
+                    t = env.render_obs(torch.as_tensor(np.asarray(obs_true[i]), dtype=torch.float32)
+                                       ).cpu().numpy().astype(np.float32) / 255.0
+                    p = env.render_obs(torch.as_tensor(np.asarray(obs_pred[i]), dtype=torch.float32)
+                                       ).cpu().numpy().astype(np.float32) / 255.0
+                except NotImplementedError:                                # e.g. RecordedEnv: no renderer —
+                    if log is not None:                                    # image-head filmstrips still emit below
+                        log(f"episode {i}: env has no render_obs — obs filmstrip skipped")
+                else:
+                    log_image_head(writer, routine, "obs", i, t, p, step, fps, context_len=P,
+                                   title=f"obs #{i} pred(top)/GT(bottom)")
         for head, d in (images or {}).items():
             log_image_head(writer, routine, head, i, d["full_true"][i], d["ipred"][i], step, fps,
                            context_len=P, title=f"{head} #{i} pred(top)/GT(bottom)")
