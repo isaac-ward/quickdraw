@@ -39,7 +39,8 @@
 # any specific actions or motions", under 300 words -- because the generic one-liner it replaces used 14
 # words of a 300-word budget and named none of the objects. The last clause is deliberate: the measured
 # failure at 720x960 is that the viewpoint drifts, and scene_left is bolted to the bench.
-scene_prompt: "A fixed overhead camera in a laboratory looks down at a wooden table. A black robotic arm
+scene_prompt: "A fixed camera in a laboratory looks down at a wooden table from about 45
+  degrees above it. A black robotic arm
   with a two-finger gripper stands at the right edge of the table. Three coloured cubes -- green, blue and
   red -- sit on the tabletop. Behind the table is a plain grey wall, with chairs and a tiled floor visible
   at the edges of the frame. The camera is bolted down and never moves."
