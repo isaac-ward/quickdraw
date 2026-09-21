@@ -55,10 +55,8 @@ def run_standalone(cfg, routines, label: str | None = None):
     writer = make_writer(run_dir, cfg, job_type=f"eval_{label}")
     # match the trained rate: a checkpoint trained at data.subsample=5 MUST be evaluated at 5, or the
     # rollout is being asked for a timestep it never saw (the saved config carries the value)
-    from ..data.dataset import set_action_aggregate, set_obs_keep, set_subsample
-    set_subsample(int(cfg.data.get("subsample", 1) or 1))
-    set_action_aggregate(str(cfg.data.get("action_aggregate", "sum")))   # beside the stride: same one-shot rule
-    set_obs_keep(cfg.data.get("obs_keep", None))   # process-wide obs subset (adopted from the saved cfg above)
+    from ..data.dataset import apply_data_globals
+    apply_data_globals(cfg)   # subsample / action_aggregate / obs_keep (+ all_phases, inert for eval)
     norm, ecfg = normalizer(cfg), env_cfg(cfg)
     # WorldEnv contract self-report (environments/base.py): one ✓/✗ line at eval start (additive, log-only)
     env_name = cfg.environments.get("name", "torus_world")

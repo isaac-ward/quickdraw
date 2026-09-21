@@ -177,6 +177,23 @@ def get_obs_keep():
     return _OBS_KEEP
 
 
+def apply_data_globals(cfg) -> None:
+    """Set ALL FOUR process-wide data globals from a resolved config, in ONE call, BEFORE any data load.
+
+    subsample / action_aggregate / subsample_all_phases / obs_keep are process-globals: each must be set
+    from the config or the load silently runs at a DEFAULT (subsample=1, action_aggregate='sum', ...). Setting
+    them piecemeal per-entrypoint is exactly how eval_checkpoint shipped a subsample-1 eval against a
+    subsample-10 run. Route every data-loading entrypoint through this ONE call so a new (or edited) entrypoint
+    cannot partially forget. (subsample_all_phases is train-only in the loader, so setting it in an eval
+    process is inert -- see _subsample_episodes.)
+    """
+    d = cfg.get("data", {}) or {}
+    set_subsample(int(d.get("subsample", 1) or 1))
+    set_action_aggregate(str(d.get("action_aggregate", "sum")))
+    set_subsample_all_phases(bool(d.get("subsample_all_phases", False)))
+    set_obs_keep(d.get("obs_keep", None))
+
+
 def _apply_obs_keep(obs_all):
     """Slice loaded obs to the process-wide _OBS_KEEP subset (no-op if None). Sets the used-flag so a later
     set_obs_keep with a different value raises rather than silently desyncing."""

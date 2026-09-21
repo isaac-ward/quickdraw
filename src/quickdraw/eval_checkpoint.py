@@ -49,15 +49,11 @@ def main(cfg):
     from .training.setup import build_model, env_cfg, load_checkpoint, normalizer
 
     # PROCESS-GLOBAL data config, set BEFORE any data load (normalizer + the routines both load episodes).
-    # These are the SAME four the training entrypoint sets (train_world_model.py). Missing them was a real bug:
-    # the eval defaulted to subsample=1 and action_aggregate="sum", so it evaluated a totally different rollout
-    # regime than the run was trained on (10x finer stride -> H clamps to 2048 not the episode, ~10x slower
-    # video, mis-scaled summed actions). MUST run before build_model/normalizer/REGISTRY.
-    from .data.dataset import set_action_aggregate, set_obs_keep, set_subsample, set_subsample_all_phases
-    set_subsample(int(rcfg.data.get("subsample", 1) or 1))
-    set_action_aggregate(str(rcfg.data.get("action_aggregate", "sum")))
-    set_subsample_all_phases(bool(rcfg.data.get("subsample_all_phases", False)))
-    set_obs_keep(rcfg.data.get("obs_keep", None))
+    # Missing this was a real bug: the eval defaulted to subsample=1 and action_aggregate="sum", so it
+    # evaluated a totally different rollout regime than the run was trained on (10x finer stride -> H clamps
+    # to 2048 not the episode, ~10x slower video, mis-scaled summed actions). One call, same as training.
+    from .data.dataset import apply_data_globals
+    apply_data_globals(rcfg)
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(rcfg).to(dev).eval()
