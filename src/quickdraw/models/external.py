@@ -48,6 +48,11 @@ class ExternalWorldModel(nn.Module, ABC):
         # `modalities` exists so routines that probe `m.modalities.values()` for an image size fall
         # through to their own default instead of raising AttributeError.
         self.modalities: dict = {}
+        # WHAT THE MODEL WAS ACTUALLY TOLD. For a text-conditioned model the prompt IS the action channel,
+        # and it is rendered on the fly -- so without this it is unrecoverable from the rollout it
+        # produced. Adapters append (episode, lo, hi, text) per generated window; the eval routine drains
+        # this next to the filmstrips and clears it. Empty for every model that takes actions as numbers.
+        self.prompt_log: list[tuple[int, int, int, str]] = []
 
     @property
     def layout(self):

@@ -135,6 +135,14 @@ Every Cosmos run before 2026-09-21 produced scalars and nothing to look at. Intr
 heads-configurable change; fixed by making each proprio product optional on its own input. A second copy of
 the same mistake: the `continue` when there is no obs to render skipped the image-head loop after it.
 
+## The prompts are logged next to the rollout
+
+`<mode>/prompts_<i>.txt`, one per plotted episode, one block per generated chunk, in the order the model
+saw them. For a text-conditioned model the prompt IS the action channel and it is rendered at run time,
+so without this it is unrecoverable from the mp4 it produced. `writer.text` (local only, like
+`writer.array`); adapters append to `ExternalWorldModel.prompt_log` and the routine drains it. A model
+that takes actions as numbers leaves it empty and nothing is written.
+
 ## Experiments (run log)
 
 | date | what | config | result |
@@ -147,6 +155,7 @@ the same mistake: the `continue` when there is no obs to render skipped the imag
 | 09-20 | fps sweep | 144x192 H=128 2 eps, fps 16/8/4/2 | no effect — Finding 2 |
 | 09-20 | native resolution | 704x1280 H=128 2 eps | LPIPS @+128 **0.266** — Finding 1 |
 | 09-21 | products smoke | 144x192 H=64 2 eps | mp4s + filmstrips emit; output is visibly noise |
+| 09-21 | **val, 720x960** | block-stack, H=2048 open-loop + cl_16, prose | RUNNING (~8 h) |
 | 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | no knee; 720x960 LPIPS @+64 **0.218** — Finding 1b |
 
 ## Costs, for planning

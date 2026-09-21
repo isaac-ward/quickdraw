@@ -24,7 +24,7 @@ import torch
 
 from .conditional import blind_null, energy_score, energy_skill, rank_calibration, rest_skill
 from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_curves, proprio_curves
-from .products import emit_openloop
+from .products import emit_openloop, product_tag
 
 
 def _is_mm(model):
@@ -32,6 +32,35 @@ def _is_mm(model):
 
 
 _POS_IDX_WARNED = [False]
+
+
+def _emit_prompt_log(writer, model, subroutine, n_plot, step):
+    """`<subroutine>/prompts_<i>.txt` — what a text-conditioned model was actually told, in order.
+
+    For an external video model the prompt IS the action channel, and it is rendered at run time from the
+    recorded future actions, so it survives nowhere else: the mp4 next to this file cannot be read back
+    into the words that produced it. Models that take actions as numbers leave `prompt_log` empty and
+    nothing is written.
+
+    The log is DRAINED here. A closed-loop mode calls imagine_eval once per re-grounded segment, so what
+    accumulates between drains is every window of that mode, in order — which is what the file should say.
+    """
+    log = getattr(model, "prompt_log", None)
+    if not log:
+        return
+    for i in range(n_plot):
+        rows = [(lo, hi, t) for ep, lo, hi, t in log if ep == i]
+        if not rows:
+            continue
+        body = "\n\n".join(f"[{k + 1}] predicted steps +{lo + 1}..+{hi}\n{t}"
+                             for k, (lo, hi, t) in enumerate(rows))
+        writer.text(product_tag(subroutine, "prompts", i=i),
+                    f"# {subroutine} — episode {i}\n"
+                    f"# {len(rows)} prompt window(s), one per generated chunk, in the order the model saw\n"
+                    f"# them. Rendered from the RECORDED future actions by build_action_prose; the numbers\n"
+                    f"# are ground truth, the wording comes from conf/interpret/<env>.yaml action_axes.\n\n"
+                    f"{body}\n", step)
+    log.clear()
 
 
 def _pos_idx(cfg, env=None):
@@ -333,6 +362,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
                       obs_true=_np.concatenate([ctx_obs, pt[:n_plot].cpu().numpy()], axis=1) if has_pro else None,
                       obs_pred=p_hat[:n_plot].cpu().numpy() if has_pro else None, pos_explicit=pos_explicit,
                       title_fn=lambda i: f"{subroutine} #{i} H={Hm}", log=lambda msg: prog(50, msg))
+        _emit_prompt_log(writer, m, subroutine, n_plot, step)
         if not has_pro:
             return {}                       # the image products are emitted; the SCALAR here is proprio
         return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}

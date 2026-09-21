@@ -163,8 +163,10 @@ class CosmosVideo2World(ExternalWorldModel):
                 g0 = len(gen[lo])                  # every episode advances in lockstep: same clip
                 assert all(len(gen[i]) == g0 for i in range(lo, hi)), \
                     "episodes are out of step, so one prompt window cannot describe the whole batch"
-                chunk = [prompts.window(i, g0, min(g0 + self.num_frames - c, horizon))
-                         if hasattr(prompts, "window") else prompts[i] for i in range(lo, hi)]
+                g1 = min(g0 + self.num_frames - c, horizon)
+                chunk = [prompts.window(i, g0, g1) if hasattr(prompts, "window") else prompts[i]
+                         for i in range(lo, hi)]
+                self.prompt_log += [(i, g0, g1, chunk[i - lo]) for i in range(lo, hi)]
                 out = pipe(video=list(cond), prompt=chunk,
                            negative_prompt=None if self.negative is None else [self.negative] * (hi - lo),
                            height=self.img_size[0], width=self.img_size[1], num_frames=self.num_frames,
