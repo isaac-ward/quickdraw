@@ -143,11 +143,14 @@ the same mistake: the `continue` when there is no obs to render skipped the imag
 
 ## The prompts are logged next to the rollout
 
-`<mode>/prompts_<i>.txt`, one per plotted episode, one block per generated chunk, in the order the model
-saw them. For a text-conditioned model the prompt IS the action channel and it is rendered at run time,
+`<mode>/action/prompts_<i>.txt`, one per plotted episode, one block per generated chunk, in the order the
+model saw them — nested under `action/` the same way the pixels are nested under `image/`, because the
+prompt IS the action channel for these models. For a text-conditioned model the prompt IS the action channel and it is rendered at run time,
 so without this it is unrecoverable from the mp4 it produced. `writer.text` (local only, like
-`writer.array`); adapters append to `ExternalWorldModel.prompt_log` and the routine drains it. A model
-that takes actions as numbers leaves it empty and nothing is written.
+`writer.array`); adapters append to `ExternalWorldModel.prompt_log` indexed by their position in the
+call's sub-batch, and `rollout_regrounded` translates that to the global (episode, segment) row — only
+it knows `r0` and the row layout. Step ranges are absolute, so a cl_16 run reads +1..+16, +17..+32, ...
+rather than thirteen segments all claiming +1..+16. A model that takes actions as numbers logs nothing.
 
 ## Experiments (run log)
 

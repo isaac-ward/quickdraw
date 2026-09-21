@@ -34,33 +34,41 @@ def _is_mm(model):
 _POS_IDX_WARNED = [False]
 
 
-def _emit_prompt_log(writer, model, subroutine, n_plot, step):
-    """`<subroutine>/prompts_<i>.txt` — what a text-conditioned model was actually told, in order.
+def _emit_prompt_log(writer, prompts, subroutine, n_plot, step):
+    """`<subroutine>/action/prompts_<i>.txt` — what a text-conditioned model was actually told, in order.
 
-    For an external video model the prompt IS the action channel, and it is rendered at run time from the
-    recorded future actions, so it survives nowhere else: the mp4 next to this file cannot be read back
-    into the words that produced it. Models that take actions as numbers leave `prompt_log` empty and
-    nothing is written.
+    Nested under `action/` the same way the pixels are nested under `image/`: the products directory is
+    organised by WHAT THE CHANNEL IS, and for these models the prompt is the action channel, not a note
+    about it.
 
-    The log is DRAINED here. A closed-loop mode calls imagine_eval once per re-grounded segment, so what
-    accumulates between drains is every window of that mode, in order — which is what the file should say.
+    For an external video model the prompt is rendered at run time from the recorded future actions, so
+    it survives nowhere else — the mp4 beside this file cannot be read back into the words that produced
+    it. Models that take actions as numbers log nothing and no file is written.
+
+    `prompts` comes from rollout_regrounded, already re-indexed to GLOBAL rows. Rows are
+    (episode, segment), so a closed-loop mode contributes n_seg entries per episode and the step ranges
+    below are made ABSOLUTE by adding the segment's own offset — otherwise every segment of a cl_16 run
+    would claim to cover steps +1..+16.
     """
-    log = getattr(model, "prompt_log", None)
-    if not log:
+    rows, n_seg, every = prompts.get("rows") or [], prompts.get("n_seg", 1), prompts.get("every", 0)
+    if not rows:
         return
     for i in range(n_plot):
-        rows = [(lo, hi, t) for ep, lo, hi, t in log if ep == i]
-        if not rows:
+        got = []
+        for s in range(n_seg):
+            r = i * n_seg + s
+            got += [(s * every + lo, s * every + hi, t) for rr, lo, hi, t in rows if rr == r]
+        if not got:
             continue
         body = "\n\n".join(f"[{k + 1}] predicted steps +{lo + 1}..+{hi}\n{t}"
-                             for k, (lo, hi, t) in enumerate(rows))
-        writer.text(product_tag(subroutine, "prompts", i=i),
+                             for k, (lo, hi, t) in enumerate(got))
+        writer.text(product_tag(subroutine, "prompts", i=i, head="action"),
                     f"# {subroutine} — episode {i}\n"
-                    f"# {len(rows)} prompt window(s), one per generated chunk, in the order the model saw\n"
-                    f"# them. Rendered from the RECORDED future actions by build_action_prose; the numbers\n"
-                    f"# are ground truth, the wording comes from conf/interpret/<env>.yaml action_axes.\n\n"
+                    f"# {len(got)} prompt window(s), in the order the model saw them"
+                    + (f", across {n_seg} re-grounded segments of {every} steps" if n_seg > 1 else "") + ".\n"
+                    f"# Rendered from the RECORDED future actions by build_action_prose; the numbers are\n"
+                    f"# ground truth, the wording comes from conf/interpret/<env>.yaml action_axes.\n\n"
                     f"{body}\n", step)
-    log.clear()
 
 
 def _pos_idx(cfg, env=None):
@@ -241,6 +249,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     itrue = {h: torch.stack([torch.from_numpy(fr[h][P:P + H]) for _, _, fr in eps]).float().div(255.0).to(device)
              for h in img_heads}
 
+    # What a text-conditioned model was told, filled by rollout_regrounded and drained by score_and_emit.
+    # Shared state rather than a return value so the rollout's signature is unchanged for every other model.
+    prompts: dict = {}
+
     def rollout_regrounded(every, Hm, want_bag=False):
         """Hm-step predicted obs (dict per head, (n_ep,Hm,...)), re-grounding on GT every `every` steps. Segment
         the horizon into ceil(Hm/every) chunks; segment s uses GT context obs[s*every:s*every+P] and actions
@@ -269,11 +281,19 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         rows = n_ep * n_seg
         cap = max(n_ep, 64)                                                 # per-call batch cap (open_loop: rows=n_ep -> ONE call)
         segs, bag_out = {h: [] for h in heads}, None
+        prompts.clear(); prompts.update(rows=[], n_seg=n_seg, every=every, Hm=Hm)
         for r0 in range(0, rows, cap):
             sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
             with tm.phase("rollout"):
                 o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc,
                                      norm=norm, return_bag=want_bag)
+            # A TEXT-CONDITIONED ADAPTER LOGGED WHAT IT WAS TOLD, indexed by its position in THIS call's
+            # sub-batch. Translate to the global row here, because only this loop knows r0 -- and the row
+            # is (episode, segment), which only this function knows how to decompose.
+            pl = getattr(m, "prompt_log", None)
+            if pl:
+                prompts["rows"] += [(r0 + i, lo, hi, t) for i, lo, hi, t in pl]
+                pl.clear()
             for h in heads:
                 segs[h].append(o_c[h])
             if want_bag and "_bag" in o_c:
@@ -362,7 +382,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
                       obs_true=_np.concatenate([ctx_obs, pt[:n_plot].cpu().numpy()], axis=1) if has_pro else None,
                       obs_pred=p_hat[:n_plot].cpu().numpy() if has_pro else None, pos_explicit=pos_explicit,
                       title_fn=lambda i: f"{subroutine} #{i} H={Hm}", log=lambda msg: prog(50, msg))
-        _emit_prompt_log(writer, m, subroutine, n_plot, step)
+        _emit_prompt_log(writer, prompts, subroutine, n_plot, step)
         if not has_pro:
             return {}                       # the image products are emitted; the SCALAR here is proprio
         return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}

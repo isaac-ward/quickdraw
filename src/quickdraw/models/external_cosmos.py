@@ -89,19 +89,12 @@ class CosmosVideo2World(ExternalWorldModel):
                                      if str(m.get("kind", "")) == "image"]
         if hs:
             self.heads = tuple(str(m["name"]) for m in hs)
-        # RESOLUTION IS NOT THE DATA'S RESOLUTION, and that is the single most consequential line in this
-        # file. Measured on block-stack (wizard/records/cosmos.md, Finding 1b): running Cosmos at the frame
-        # size our dataset is decoded at produces saturated noise, because the VAE compresses space 8x and
-        # a 144x192 frame leaves the whole gripper inside two latent cells -- off-manifold for a model
-        # trained at 704x1280. Quality was still climbing at 25x the pixels with no plateau in sight.
-        #
-        # So the order is: external.height/width (an explicit CLI choice) > model.render_size (the
-        # validated default, aspect-matched to the data so the ABC's resample is pure scaling) > the
-        # modality size (the last resort, and a bad one).
-        rs = (cfg.model.get("render_size", None) if cfg is not None else None)
-        hw = rs or (hs[0].get("img_size", None) if hs else None) or self.img_size
-        hw = (int(hw), int(hw)) if isinstance(hw, int) else (int(hw[0]), int(hw[1]))
-        self.img_size = (int(g("height") or hw[0]), int(g("width") or hw[1]))
+        # The ABC has already applied `model.render_size`; external.height/width is the explicit CLI
+        # override on top of it. RESOLUTION IS THE SINGLE MOST CONSEQUENTIAL SETTING HERE -- measured on
+        # block-stack (wizard/records/cosmos.md, Finding 1b), running at the size the dataset is decoded
+        # at produces saturated noise, because the VAE compresses space 8x and a 144x192 frame leaves the
+        # whole gripper inside two latent cells. Quality was still climbing at 25x the pixels.
+        self.img_size = (int(g("height") or self.img_size[0]), int(g("width") or self.img_size[1]))
         assert self.pipeline in PIPELINES, f"external.pipeline must be one of {sorted(PIPELINES)}"
         assert self.img_size[0] % 16 == 0 and self.img_size[1] % 16 == 0, (
             f"Cosmos requires height and width divisible by 16; got {self.img_size}")

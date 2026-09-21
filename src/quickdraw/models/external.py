@@ -45,6 +45,20 @@ class ExternalWorldModel(nn.Module, ABC):
     def __init__(self, cfg=None):
         super().__init__()
         self.cfg = cfg
+        # `model.render_size` — WHAT THIS MODEL GENERATES AT, which is not what the data is decoded at and
+        # not what the metrics are computed at. The parallel is `environments.render_size` (what the SIM
+        # renders at before the cache downsamples it): in both cases a producer has its own resolution and
+        # ours is the target. `imagine_eval` resamples between the two, so the only rule is that the
+        # aspect should match the data's or the resample distorts.
+        #
+        # It lives HERE and not in an adapter because every external model has a resolution it was trained
+        # at, and running one at our frame size because that is what the dataset happens to ship is how
+        # Cosmos spent a day producing saturated noise (wizard/records/cosmos.md, Finding 1b). It is an
+        # EXTERNAL-model field: no quickdraw model has one, because our decoder's output shape IS
+        # `modalities.img_size` — changing it is an architecture change, not a config knob.
+        rs = cfg.model.get("render_size", None) if cfg is not None else None
+        if rs is not None:
+            self.img_size = (int(rs), int(rs)) if isinstance(rs, int) else (int(rs[0]), int(rs[1]))
         # `modalities` exists so routines that probe `m.modalities.values()` for an image size fall
         # through to their own default instead of raising AttributeError.
         self.modalities: dict = {}
