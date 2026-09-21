@@ -212,7 +212,9 @@ rather than thirteen segments all claiming +1..+16. A model that takes actions a
 | 09-20 | fps sweep | 144x192 H=128 2 eps, fps 16/8/4/2 | no effect — Finding 2 |
 | 09-20 | native resolution | 704x1280 H=128 2 eps | LPIPS @+128 **0.266** — Finding 1 |
 | 09-21 | products smoke | 144x192 H=64 2 eps | mp4s + filmstrips emit; output is visibly noise |
-| 09-21 | **val, 720x960** | block-stack, H=2048 open-loop + cl_16, prose | RUNNING (~8 h) |
+| 09-21 | val, 720x960, stride 8 | block-stack, H=2048 + cl_16 | KILLED at 52 min — superseded by stride 2 |
+| 09-21 | negative-prompt A/B, stride 8 | 720x960, H=200, 3 arms | KILLED at 24 min — same reason: the negative's motion clauses interact with motion-per-frame, so it has to be run at the stride we will use |
+| 09-21 | stride-2 smoke | 720x960, H=176, 2 eps, fps auto 15 | RUNNING |
 | 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | no knee; 720x960 LPIPS @+64 **0.218** — Finding 1b |
 
 ## Costs, for planning
@@ -239,8 +241,8 @@ A full val (2 eps) is 24 calls/ep open-loop at H=2048 plus 16 calls/ep for cl_16
   Until that is decided, `eval_manifold` and `eval_interpret` are skipped by name, which is correct but
   leaves two columns empty.
 - Redo the prompt-format A/B (Finding 4) at a working resolution.
-- Enrich `scene_prompt` per Finding 5.1 — HELD until the negative-prompt A/B finishes, because editing
-  the interpret config mid-sweep would give the later arms a different prompt and confound it.
+- ~~Enrich `scene_prompt`~~ DONE 09-21: 14 words -> 71, naming the three cubes, the wall, the chairs and
+  the floor, and ending "The camera is bolted down and never moves" against the measured drift.
 - H=128 head-to-head: current scheme vs native-rate-and-decimate (Finding 5.2).
 - Redo the fps sweep at 720x960 (Finding 2 is retracted). fps=4 is the principled value; the question is
   whether matching the temporal RoPE to our real step rate beats staying at the trained 16.

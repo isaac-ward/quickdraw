@@ -33,17 +33,16 @@
 # VIDEO GENERATOR is given -- see models/external.py `_actions`). The axes below say what MOVES; these two
 # say what is in frame and what the moving thing is called. A generator conditioned only on motion words
 # has been told nothing about the workspace it is supposed to be drawing.
-# NOT YET THE ENRICHED VERSION -- see wizard/records/cosmos.md Finding 5.1. The card asks for scene,
-# KEY OBJECTS and BACKGROUND in under 300 words and this is 14 of them; the replacement below names the
-# three cubes, the wall and floor, and states that the camera is fixed (a direct instruction against the
-# measured drift). It is held back only until the negative-prompt A/B finishes, because changing this
-# file mid-sweep would hand the later arms a different prompt:
-#
-#   "A fixed overhead camera in a laboratory looks down at a wooden table. A black robotic arm with a
-#    two-finger gripper stands at the right edge of the table. Three coloured cubes -- green, blue and
-#    red -- sit on the tabletop. Behind the table is a plain grey wall, with chairs and a tiled floor
-#    visible at the edges of the frame. The camera is bolted down and never moves."
-scene_prompt: "A fixed camera looks down at a robotic arm on a workbench with coloured blocks."
+# THE SCENE, for the prose prompt form (evaluation/interpret.build_action_prose, which is what an
+# external VIDEO GENERATOR is given). The action_axes below say what MOVES; this says what is in frame.
+# Written to the Cosmos card's spec -- "a scene description, key objects or characters, background, and
+# any specific actions or motions", under 300 words -- because the generic one-liner it replaces used 14
+# words of a 300-word budget and named none of the objects. The last clause is deliberate: the measured
+# failure at 720x960 is that the viewpoint drifts, and scene_left is bolted to the bench.
+scene_prompt: "A fixed overhead camera in a laboratory looks down at a wooden table. A black robotic arm
+  with a two-finger gripper stands at the right edge of the table. Three coloured cubes -- green, blue and
+  red -- sit on the tabletop. Behind the table is a plain grey wall, with chairs and a tiled floor visible
+  at the edges of the frame. The camera is bolted down and never moves."
 prose_subject: "The arm"
 
 # WORDED IN THE THIRD PERSON because both consumers read better that way: the VLM legend becomes
