@@ -133,6 +133,38 @@ The axis wordings are MEASURED, not read off the names — see `conf/interpret/b
 correlation table (r = +0.94 on every diagonal), the rot6 column-major determination, and the weak (R2 0.33)
 horizontal camera fit that "left" for +y rests on.
 
+## Finding 5 — our prompts against the card's spec: too thin, and describing 4.7x too much time
+
+The card asks for "fewer than 300 words ... a scene description, key objects or characters, background,
+and any specific actions or motions to be depicted **within the 5-second duration**". Its own example is
+~100 words. Ours (block-stack val ep0, 24 windows) run **20-53 words, mean 37**.
+
+Two gaps, and the second is structural:
+
+1. CONTENT. We give the scene and the motion. We do not name the key objects (three cubes: green, blue,
+   red) or describe the background (grey wall, chairs, tiled floor) — both explicitly requested. There is
+   room: we are using an eighth of the budget. Enriching `scene_prompt` is free and should also carry
+   "the camera never moves", which is a direct instruction against the measured drift.
+
+2. DURATION, which no amount of wording fixes. One chunk is 88 predicted steps, and at stride 8 on 30 Hz
+   footage that is **23.5 seconds of real time** presented to the model as one 5-second clip — 4.7x more
+   action than the format is designed to hold. It cannot depict 23.5 s in 5 s; it compresses or ignores.
+
+   The clean fix is to stop asking. Run Cosmos at the SOURCE frame rate (one generated frame = one 30 Hz
+   frame, 88 frames = 2.9 s, comfortably in distribution) and decimate every 8th frame to get our steps.
+   It costs 8x the calls for the same horizon:
+
+   | scheme | s per clip | H=128, 2 eps | H=2048, 2 eps |
+   |---|---|---|---|
+   | current: 1 generated frame = 1 of our steps | 23.5 s | 4 calls, 0.4 h | 48 calls, 4.9 h |
+   | native rate + decimate | 2.9 s | 24 calls, 2.5 h | 374 calls, 38.5 h |
+
+   So it is affordable at H=128 and not at full horizon. Worth one H=128 head-to-head against the
+   current scheme before deciding whether the long-horizon number is worth 38 h.
+
+   Note this is NOT the fps knob, which was tested and does nothing (Finding 2). fps is a conditioning
+   scalar; this changes what a frame IS.
+
 ## Bug fixed — an image-only model got no visual products at all
 
 `score_and_emit` returned `{}` as soon as a model had no proprio head, and that early return sat BEFORE
@@ -191,5 +223,12 @@ A full val (2 eps) is 24 calls/ep open-loop at H=2048 plus 16 calls/ep for cl_16
   Until that is decided, `eval_manifold` and `eval_interpret` are skipped by name, which is correct but
   leaves two columns empty.
 - Redo the prompt-format A/B (Finding 4) at a working resolution.
+- Enrich `scene_prompt` per Finding 5.1 — HELD until the negative-prompt A/B finishes, because editing
+  the interpret config mid-sweep would give the later arms a different prompt and confound it.
+- H=128 head-to-head: current scheme vs native-rate-and-decimate (Finding 5.2).
+- `nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned` takes NUMERIC per-step actions ("end-effector
+  displacement and gripper width"), 640x480 at 4 fps — block-stack's semantics at our step rate, and an
+  apples-to-apples row the text bridge can never be. Runtime is the cosmos-predict2 monorepo, not
+  diffusers (a raw .pt + tokenizer .pth, no model_index.json), so it costs the NVIDIA stack we avoided.
 - `eval_purple_play` / `eval_purple_stack` (5 and 6 held-out eps) load with no code change via
   `eval.horizon_split=`. Deliberately NOT the default: they are the OOD test for anything trained here.
