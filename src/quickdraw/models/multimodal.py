@@ -528,12 +528,16 @@ class MultiModalSequenceModel(nn.Module):
         carries the observation, compounding error in data space (the defining DSAR property)."""
         return bag
 
-    def _rollout_step(self, s_win: Tensor, a_win: Tensor, bm, prev_bag: Tensor) -> Tensor:
+    def _rollout_step(self, s_win: Tensor, a_win: Tensor, bm, prev_bag: Tensor, levels=None) -> Tensor:
         """One rollout advance as backbone(+readout): (s_win (B,W,n_state,d), a_win (B,W,2), bm, prev_bag
         (B,n_state,d)) -> next state bag (B,n_state,d). This is the unit wrapped by torch.compile (mode="default")
         when compile_rollout is on. Bit-identical to the inline eager body; factored out so the compiled and eager
-        paths run the SAME code (detach/teacher-forcing/carry stay OUTSIDE, in the Python loop, per detach-segment)."""
-        h_last = self.backbone(self._to_input(s_win, a_win), temporal_block_mask=bm)[:, -1]
+        paths run the SAME code (detach/teacher-forcing/carry stay OUTSIDE, in the Python loop, per detach-segment).
+
+        `levels` (DF rollout, None -> clean/level-0, bit-identical): the per-timestep noise level to tag the fed
+        context with, so `_add_level_emb` conditions the backbone on it. Only the eager path is passed a non-None
+        level (compile is disabled when df_rollout_level>0)."""
+        h_last = self.backbone(self._to_input(s_win, a_win, levels=levels), temporal_block_mask=bm)[:, -1]
         return self.readout(h_last, prev_bag, a_win[:, -1])
 
     def _compiled_step(self):
@@ -584,16 +588,19 @@ class MultiModalSequenceModel(nn.Module):
         """Rollout from a PRE-ENCODED context (list of P bags). Lets callers encode the context once and
         roll many action variants from it (MPPI: encode the image context once, share across K candidates).
         use_cache: temporal KV-cache path (inference only) — see `_rollout_cached`."""
-        if use_cache:
+        roll_lv = getattr(self, "df_rollout_level", 0.0)   # DF rollout: hold the fed-back past at this level ε
+        if use_cache and roll_lv == 0.0:
             assert p_tf == 0.0 and tf_future is None, "KV-cache rollout is inference-only (no teacher forcing)"
             return self._rollout_cached(list(bag_buf), actions, horizon)
+        # DF rollout (roll_lv>0) needs a per-step noised past, which neither the KV-cache nor the compiled step
+        # path implements -> force the eager path for both (below).
         W = self.window
         bag_buf = list(bag_buf)
         P0 = len(bag_buf)          # return_feeds: bag_buf[P0+k] is what the step predicting frame k+1 STOOD ON
         B = bag_buf[0].shape[0]
         # Compiled per-step path is opt-in AND only for the steady AR regime (p_tf==0, training). Teacher-forcing
         # (p_tf>0, warmup) is a data-dependent branch -> stays eager; the graph captures the p_tf==0 step only.
-        compiled = self.compile_rollout and p_tf == 0.0 and self.training
+        compiled = self.compile_rollout and p_tf == 0.0 and self.training and roll_lv == 0.0
         step_fn = self._compiled_step() if compiled else self._rollout_step
         preds = []
         for h in range(horizon):
@@ -606,19 +613,25 @@ class MultiModalSequenceModel(nn.Module):
                 s_win = F.pad(s_win, (0, 0, 0, 0, pad, 0))          # pad the TIME axis at front
                 a_win = F.pad(a_win, (0, 0, pad, 0))
             bm = pad_block_mask(W, pad, s_win.device)               # temporal causal + drop padded steps
-            if compiled:
+            lv = None
+            if roll_lv > 0.0:                                       # DF: present the fed-back past at level ε
+                lv = s_win.new_full(s_win.shape[:-2] + (1,), roll_lv)   # (B,W,1) constant per-timestep level
+                s_win = (1.0 - lv.unsqueeze(-2)) * s_win + lv.unsqueeze(-2) * torch.randn_like(s_win)
+                if self.latent_norm:
+                    s_win = _ln(s_win)                             # renormalize (matches the df training noising)
+            if compiled:                                           # roll_lv==0 here -> lv is None, bit-identical
                 s_pred = step_fn(s_win, a_win, bm, bag_buf[-1])     # backbone+readout as one fused compiled step
             elif self.grad_checkpoint and self.training:
                 # recompute this step's backbone forward during backward instead of storing its activations
                 # -> AR memory ∝ detach_every, not F (design/accelerations.md Exp 6). bm (a BlockMask, not a
                 # tensor) is bound as a default arg so the backward-time recompute uses THIS step's mask.
-                x = self._to_input(s_win, a_win)                    # (B,W,n_input,d)
+                x = self._to_input(s_win, a_win, levels=lv)         # (B,W,n_input,d)
                 h_last = torch.utils.checkpoint.checkpoint(
                     lambda x_, _bm=bm: self.backbone(x_, temporal_block_mask=_bm)[:, -1],
                     x, use_reentrant=False)                         # (B,n_input,d)
                 s_pred = self.readout(h_last, bag_buf[-1], a_win[:, -1])   # (B,n_state,d)
             else:
-                s_pred = self._rollout_step(s_win, a_win, bm, bag_buf[-1])  # (B,n_state,d)
+                s_pred = self._rollout_step(s_win, a_win, bm, bag_buf[-1], levels=lv)  # (B,n_state,d)
             preds.append(s_pred)                                   # raw prediction -> loss/decode
             carried = self.carry_transform(s_pred)                 # data-space re-encode for DSAR; identity else
             if tf_future is not None and p_tf > 0.0:
@@ -923,7 +936,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
                  concat_action_embedding: bool = True,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
-                 df_scale: float = 0.0, df_granularity: str = "timestep",
+                 df_scale: float = 0.0, df_granularity: str = "timestep", df_rollout_level: float = 0.0,
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
                  action_head_chunk: int = 1,
@@ -958,6 +971,16 @@ class MultiModalFlow(MultiModalSequenceModel):
         import math as _math
         self.df_scale = float(df_scale)
         self.df_granularity = str(df_granularity)
+        # Diffusion-Forcing ROLLOUT level (Chen 2024): at every rollout step, hold the fed-back past at this
+        # small noise level ε and tell the backbone (via the level embedding), so the model treats its own
+        # imperfect prediction as a familiar level-ε observation and denoises back toward the manifold instead
+        # of amplifying it. Applies in EVERY rollout (training decode-rollout AND eval) so the two regimes
+        # match. 0.0 -> clean rollout, bit-identical to today. Requires df_scale>0 (the level embedding must be
+        # trained), and should be <= df_scale (stay within the range the model was trained to denoise).
+        self.df_rollout_level = float(df_rollout_level)
+        if self.df_rollout_level > 0.0 and self.df_scale <= 0.0:
+            raise ValueError("df_rollout_level>0 needs df_scale>0: the level embedding is only trained when "
+                             "diffusion forcing is on. Set model.df_scale (e.g. 0.3) alongside df_rollout_level.")
         if self.df_scale > 0.0:
             if self.df_granularity != "timestep":
                 raise NotImplementedError(f"diffusion_forcing granularity={self.df_granularity!r} not implemented "

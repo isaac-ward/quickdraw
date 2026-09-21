@@ -251,6 +251,7 @@ def build_model(cfg):
         oeg = (lambda k, v: oe.get(k, v)) if hasattr(oe, "get") else (lambda k, v: getattr(oe, k, v))
         df_scale = float(oeg("scale", 0.0) or 0.0)
         df_granularity = str(oeg("granularity", "timestep"))
+        df_rollout_level = float(oeg("rollout_level", 0.0) or 0.0)   # DF rollout: hold the fed-back past at this ε
         if df_scale > 0.0 and name not in ("mm_flow", "flow"):
             raise ValueError(f"variations.noise_injection.observations_encoded_pre_fusion (diffusion forcing) "
                              f"requires a flow model (model.name in mm_flow/flow); got {name!r}.")
@@ -359,6 +360,7 @@ def build_model(cfg):
                                        lambda_flow=m.get("lambda_flow", 1.0),
                                        lambda_consistency=m.get("lambda_consistency", 1.0),
                                        df_scale=df_scale, df_granularity=df_granularity,
+                                       df_rollout_level=df_rollout_level,
                                        action_head_enabled=bool(ahg("enabled", False)),
                                        action_head_weight=float(ahg("weight", 1.0)),
                                        action_head_shortcut=bool(ahg("shortcut", True)),
