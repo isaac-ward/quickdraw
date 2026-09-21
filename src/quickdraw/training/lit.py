@@ -234,7 +234,11 @@ class LitWorldModel(L.LightningModule):
                 self.log("schedules/physical_loss_ramp", self._physical_ramp())
         if tag == "val":
             with torch.no_grad():
-                dec = m.to_obs(src, anchor=anchor)            # decode (mse) / 1-step sample (flow) — val metrics only; de-relativized -> ABSOLUTE
+                # commit=True: score the DETERMINISTIC mean even under decode_stochastic. The checkpoint monitor
+                # is an MSE, and MSE of a stochastic SAMPLE is bias^2+variance -> it would train the sharpness
+                # away and select on noise (same argument the codec anchor makes, multimodal.py:405-406). So
+                # checkpoint selection stays on the mean; the eval routines (logs/epoch_*) still SAMPLE.
+                dec = m.to_obs(src, anchor=anchor, commit=True)   # val metrics only; de-relativized -> ABSOLUTE
                 # UNIFIED decode/physics: in prior mode the black-box proprio decoder is UNTRAINED (decode/proprio
                 # is the physics chain, no round-trip), so score the DEPLOYED prediction — the physics chain at
                 # p_tf=0 (fully AR) — not dec["proprio"] (audit-F4: the monitor must track what we deploy).

@@ -4,12 +4,15 @@
 # Select with `model=vl128_blockstack_flow`. Everything else is vl128_blockstack_2cam verbatim, so the ONLY
 # variable vs the up-mse baseline is the decode head. See design/up_flow_decoder.md.
 #
-# WHY DETERMINISTIC x0 (decode_stochastic=false). flow.py:59-62 + record §19.3: a deterministic x0 decode is
-# the CONDITIONAL MEAN (~= mse), so this arm tests the one thing that is safe to test in open loop — whether
-# the DENOISING CURRICULUM (predict clean from noised-at-all-tau) shapes a better DETERMINISTIC decoder than
-# plain mse (§19.3 measured flow-x0-deterministic beating mse 16% on frozen latents). It does NOT sample.
-# STOCHASTIC decode (decode_stochastic=true) is the sharper-but-riskier follow-up: §19.3 found sampling
-# "explores around a drifted latent" and LOSES in open-loop rollout. Run that only as a second arm.
+# STOCHASTIC x0 by default (decode_stochastic=true). Record §8.29: the deterministic x0 decode is the
+# CONDITIONAL MEAN of p(frame|latent), and a mean over a multimodal codec is a BLEND of valid block configs
+# = the "mungey half-block". A SAMPLE lands on the data manifold = a coherent, valid, sharp set of blocks.
+# The earlier "sampling loses in open loop" (old §19.3) was a subsample=1 eval_checkpoint CONFOUND; the clean
+# redo at subsample=10 has stochastic NEUTRAL on cam_scene (0.092 vs 0.094 lpips) and BETTER on cam_wrist
+# (0.270 vs 0.362). So sample by default. Checkpoint selection stays on the DETERMINISTIC mean (lit.py forces
+# commit=True on the val metric — MSE-of-a-sample is bias^2+variance), so this changes the eval RENDERS +
+# LPIPS, not the monitor. Residual: samples flicker (independent per-frame noise); shared/warped rollout
+# noise is the temporal-coherence follow-up (§8.29, still open).
 #
 # WARM-START from an up-mse checkpoint's backend (UpFlowDecoder is a superset at init) for a fast, fair A/B.
 #
@@ -29,7 +32,7 @@ modalities:
   - {name: cam_scene, kind: image, cam: scene_right, weight: 1.0,
      img_size: [96, 128], ae_bottleneck: 6, pretrained: false, num_tokens: 32,
      encode_arch: conv, encode_base: 32,
-     decode_kind: flow, decode_arch: up, decode_base: 64, decode_param: x0, decode_stochastic: false,
+     decode_kind: flow, decode_arch: up, decode_base: 64, decode_param: x0, decode_stochastic: true,
      patch: 16, ae_depth: 4, decode_chunk_train: 64,
      visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
      latent_loss_weight: 10}
@@ -37,7 +40,7 @@ modalities:
   - {name: cam_wrist, kind: image, cam: gripper_right_top, weight: 1.0,
      img_size: [96, 128], ae_bottleneck: 6, pretrained: false, num_tokens: 32,
      encode_arch: conv, encode_base: 32,
-     decode_kind: flow, decode_arch: up, decode_base: 64, decode_param: x0, decode_stochastic: false,
+     decode_kind: flow, decode_arch: up, decode_base: 64, decode_param: x0, decode_stochastic: true,
      patch: 16, ae_depth: 4, decode_chunk_train: 64,
      visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
      latent_loss_weight: 10}
