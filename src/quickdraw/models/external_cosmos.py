@@ -56,6 +56,7 @@ from torch import Tensor
 from .external import ExternalWorldModel, register
 
 PIPELINES = {"predict2": "Cosmos2VideoToWorldPipeline", "cosmos1": "CosmosVideoToWorldPipeline"}
+MIN_PIXELS = 432 * 576      # the smallest render that produced a picture of the scene -- see __init__
 
 
 @register("cosmos")
@@ -68,7 +69,7 @@ class CosmosVideo2World(ExternalWorldModel):
     DEFAULTS = dict(model_id="nvidia/Cosmos-Predict2-2B-Video2World", pipeline="predict2",
                     num_frames=93, num_inference_steps=35, guidance_scale=7.0, fps=16,
                     height=None, width=None, batch=1, seed=0, negative_prompt="",
-                    prompt_style="prose", prompt_phases=4)
+                    prompt_style="prose", prompt_phases=4, allow_small_render=False)
 
     def __init__(self, cfg=None):
         super().__init__(cfg)
@@ -98,6 +99,24 @@ class CosmosVideo2World(ExternalWorldModel):
         assert self.pipeline in PIPELINES, f"external.pipeline must be one of {sorted(PIPELINES)}"
         assert self.img_size[0] % 16 == 0 and self.img_size[1] % 16 == 0, (
             f"Cosmos requires height and width divisible by 16; got {self.img_size}")
+        # A SMALL RENDER IS A WASTED RUN, so it is refused rather than warned about. Cosmos's VAE
+        # compresses space 8x, so below roughly a quarter-megapixel the objects in frame occupy a couple
+        # of latent cells and the output is saturated noise -- not a rough version of the right answer,
+        # nothing at all. Measured (wizard/records/cosmos.md Finding 1b), open-loop LPIPS @+64:
+        #     144x192  0.839    288x384  0.776    432x576  0.521    720x960  0.218
+        # The floor is 432x576's pixel count: the first size that produced an image of the actual scene.
+        # It exists because "just make the probe cheap" is exactly how hours get spent generating
+        # rainbow static, and the only honest way to make a Cosmos run cheap is FEWER STEPS or a SHORTER
+        # HORIZON, never a smaller frame.
+        px = self.img_size[0] * self.img_size[1]
+        if px < MIN_PIXELS and not bool(g("allow_small_render")):
+            raise ValueError(
+                f"Cosmos was asked to render at {self.img_size[0]}x{self.img_size[1]} ({px/1e3:.0f}k px), "
+                f"below the {MIN_PIXELS/1e3:.0f}k floor where it produces saturated noise rather than "
+                f"the scene (wizard/records/cosmos.md, Finding 1b). Leave `model.render_size` alone "
+                f"(720x960 on block-stack), or make the run cheap with `eval.horizon=...` / "
+                f"`+external.num_inference_steps=...` instead. To measure the failure ITSELF, pass "
+                f"`+external.allow_small_render=true`.")
         self._pipe = None
 
     # ---- the pipeline, loaded on first use ------------------------------------------------------------
