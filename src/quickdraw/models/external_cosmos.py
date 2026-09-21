@@ -76,6 +76,18 @@ NEGATIVE = {
             "poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of "
             "poor quality."),
     # dropped: "static with no motion", "shaky footage", "jerky movements", "low frame rate"
+    # fixed_camera, plus the three artifacts actually observed at 720x960: a second arm sliding in from
+    # the edge, the arm's geometry morphing between frames, and the viewpoint drifting. NVIDIA's own
+    # Limitations section names all three, so this is aimed at known behaviour rather than a guess.
+    "scene_stable": (
+        "The video captures a series of frames showing ugly scenes, motion blur, over-saturation, low "
+        "resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed "
+        "scenes, poor color balance, washed out colors, choppy sequences, artifacting, color banding, "
+        "unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly "
+        "edited content, jump cuts, visual noise, and flickering. The video also shows duplicate robotic "
+        "arms, a second arm entering from the edge of the frame, extra grippers, arms that morph or "
+        "change shape between frames, objects that appear from nowhere or dissolve, and a camera that "
+        "pans, zooms or drifts. Overall, the video is of poor quality."),
     "fixed_camera": ("The video captures a series of frames showing ugly scenes, motion blur, "
                      "over-saturation, low resolution, grainy texture, pixelated images, poorly lit "
                      "areas, underexposed and overexposed scenes, poor color balance, washed out "

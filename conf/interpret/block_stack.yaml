@@ -37,13 +37,20 @@
 # external VIDEO GENERATOR is given). The action_axes below say what MOVES; this says what is in frame.
 # Written to the Cosmos card's spec -- "a scene description, key objects or characters, background, and
 # any specific actions or motions", under 300 words -- because the generic one-liner it replaces used 14
-# words of a 300-word budget and named none of the objects. The last clause is deliberate: the measured
-# failure at 720x960 is that the viewpoint drifts, and scene_left is bolted to the bench.
+# words of a 300-word budget and named none of the objects.
+#
+# THE LAST TWO SENTENCES ARE AIMED AT MEASURED FAILURES, not decoration. At 720x960 Cosmos drifts the
+# viewpoint (scene_left is bolted down), mutates the arm's geometry, and grows extra arms in from the
+# edges of the frame. All three are in NVIDIA's own Limitations section -- "camera and object motion
+# instability ... disappearing or morphing objects" -- so they are the model's known failure modes, not
+# something our setup induced. Stating the arm COUNT is a legitimate "key objects" description and the
+# cheapest thing to try against it; the matching negative preset is `scene_stable`.
 scene_prompt: "A fixed camera in a laboratory looks down at a wooden table from about 45
   degrees above it. A black robotic arm
   with a two-finger gripper stands at the right edge of the table. Three coloured cubes -- green, blue and
   red -- sit on the tabletop. Behind the table is a plain grey wall, with chairs and a tiled floor visible
-  at the edges of the frame. The camera is bolted down and never moves."
+  at the edges of the frame. There is exactly one robotic arm, and it keeps the same shape throughout; no
+  other arm, machine or person ever enters the frame. The camera is bolted down and never moves."
 prose_subject: "The arm"
 
 # WORDED IN THE THIRD PERSON because both consumers read better that way: the VLM legend becomes
