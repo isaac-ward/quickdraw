@@ -42,11 +42,31 @@ all `codec/roundtrip_*` as one `roundtrip` term): `dynamics/latent`, `decode`, `
 *for an arm built on that baseline*. (For reference: straight03 = 3 + `latent_straightness` = 4; DF = 3 + 0 = 3,
 since diffusion forcing adds no loss term.)
 
+**Explicit terms (ungrouped), for the record:**
+- **Baseline `bs_ss10_2cam` (6):** `dynamics/latent`, `decode/proprio`, `decode/cam_scene`, `decode/cam_wrist`,
+  `codec/roundtrip_cam_scene`, `codec/roundtrip_cam_wrist`. (No `codec/roundtrip_proprio` — proprio
+  `latent_loss_weight=0`. No `decode/*_shortcut` — x0 decode, shortcut off. No `derivative/*` — weight 0. No
+  `dynamics/latent_shortcut` — dynamics shortcut off.)
+- **straight03 (7):** baseline + `variations/latent_straightness`.
+- **DF (6):** baseline (diffusion forcing noises the context + adds a level embedding, but scores through the
+  existing `dynamics/latent` — no new term).
+- **(a) overshoot (7):** baseline + `dynamics/latent_overshoot` (or `+len(k)` if logged per horizon).
+- **(b) moment/MMD (7):** baseline + `variations/trajectory_mmd` (or `+2` if `Δ‖z‖` and `‖z‖` logged separately).
+- **(c) latent GAN (8):** baseline + `dynamics/adv_generator` + `discriminator`.
+
 ### (a) Latent overshooting (PlaNet, arXiv 1811.04551) — lowest risk, do first
 
 Roll `k` steps in latent space feeding own predictions and match the rolled `ẑ_{t+k}` to the TRUE `z_{t+k}` with
 `flow.loss` (reuses the existing flow — no new network). Constrains multi-step *marginals*: not the full joint,
 but far more than per-step.
+
+**Why this is NOT already captured by `dynamics/latent`.** At our default `p_tf_dynamics=1` the training rollout
+(`rollout_train` → `_rollout`) is teacher-forced: every step predicts from the TRUE context window, so it yields
+a bank of **1-step-from-truth** predictions, not a compounding trajectory. `dynamics/latent` (1-step, latent) AND
+the `decode/*` recon (1-step, pixel) are therefore both trained 1-step-from-truth — nothing at p_tf=1 rolls its
+own prediction forward. Overshoot is the missing piece: it rolls k OWN steps and supervises the compounded
+`ẑ_{t+k}` directly in LATENT space (the decode recon, even when p_tf<1, supervises the rollout only through the
+decoder, which can mask latent drift). Genuinely a new term, not a re-logging of the flow loss.
 
 - **How many steps (`k`)?** The overshoot horizon = how far you roll before matching to truth. Start modest and
   sweep: `k ∈ {4, 8, 16}`. You can supervise a single horizon (`k=16`) or a few (dense, `{4,8,16}`). Larger k =
