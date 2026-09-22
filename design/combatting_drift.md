@@ -55,8 +55,10 @@ since diffusion forcing adds no loss term.)
 - **straight03 (7):** baseline + `variations/latent_straightness`.
 - **DF (6):** baseline (diffusion forcing noises the context + adds a level embedding, but scores through the
   existing `dynamics/latent` — no new term).
-- **(a) overshoot (6):** GENERALIZES `dynamics/latent` over depths — same 6 terms (no new named term); a
-  separate `dynamics/latent_overshoot` key is optional, for logging the deep part only.
+- **(a) overshoot (7):** baseline + `dynamics/latent_overshoot`. Conceptually it's the depth-generalization of
+  `dynamics/latent` (clean anchor = the depth-1 case), but the SHIPPED implementation keeps the clean anchor as
+  `dynamics/latent` and logs the deep feeds-conditioned correction as a separate `dynamics/latent_overshoot`
+  key (clearer + reuses the p_tf=0 rollout's `feeds`). Grouped-count: 4.
 - **(b) moment/MMD (7):** baseline + `variations/trajectory_mmd` (or `+2` if `Δ‖z‖` and `‖z‖` logged separately).
 - **(c) latent GAN (8):** baseline + `dynamics/adv_generator` + `discriminator`.
 
@@ -87,9 +89,10 @@ p_tf=0, so the deep own-drifted contexts (`feeds`) are already computed and the 
 them — but only in PIXEL space, through the decoder (which can absorb latent error). The LATENT dynamics loss is
 kept clean (`p_tf_dynamics=1.0`), so nothing supervises those deep contexts DIRECTLY in latent space. Overshoot
 is exactly that missing direct-latent term. And because the deep contexts are already produced by the p_tf=0
-recon rollout, overshoot **reuses `feeds`** (request `return_feeds=True`) rather than running a new rollout — so
-it's **near-free (~straight03's 1.1h/epoch, not DF's 2.9h**; the 2.9h is DF's per-step noised-past overhead,
-which overshoot does not have).
+recon rollout, overshoot **reuses `feeds`** (request `return_feeds=True`) rather than running a new rollout, and
+it is COMPATIBLE with `compile_rollout` (the bs recipe's setting) because it only adds a PARALLEL loss-term
+backbone pass — the compiled rollout is untouched. So it keeps the compiled ~1.1h rollout and adds one eager
+parallel pass -> **~1.3-1.5h/epoch, NOT DF's 2.9h** (DF is eager because it noises the rollout itself).
 
 **Relation to `p_tf_dynamics`, precisely (why 0.8 failing doesn't doom this).** Same raw material (the p_tf=0
 own-contexts); the difference is what supervises the latent loss: `p_tf_dynamics=1.0` = clean only (today);
@@ -173,11 +176,11 @@ truncation, independent of the locked recon `detach_every=32`).
 1. `p_tf_dynamics != 1.0` (`<1` or `None`) → raise. Overshoot needs the depth-1 CLEAN anchor; `p_tf_dynamics<1`
    already drifts the whole dynamics loss (no clean anchor) and is the stochastic twin. Mutually exclusive.
 2. non-flow model (`name ∉ {mm_flow, flow}`) → raise (needs the flow + `_rollout_from`).
-3. `compile_rollout=True` → raise (extra own-rollout not supported by the single captured p_tf=0 compiled step —
-   same reason DF forces eager). NOTE: `compile_rollout` is OFF by default (`mm_flow.yaml: false`), so the bs
-   runs are ALREADY eager and this guard costs nothing in the current regime; it only bites if someone turned
-   compile on for speed. (Overshoot is latent-only — the rollout is latent→latent, no decode — so it is cheaper
-   than the recon rollout per step.)
+3. `compile_rollout` — **COMPATIBLE, no guard.** Unlike DF (which noises the ROLLOUT per step and so forces
+   eager), overshoot does NOT modify the rollout: it reuses the (compiled) rollout's `feeds` and adds a PARALLEL
+   loss-term backbone pass, exactly like the existing anchor pass. The bs recipe runs `compile_rollout=True`
+   (that's why straight03 is 1.1h compiled and DF is 2.9h eager); overshoot KEEPS the compiled rollout and just
+   adds one eager parallel pass. (Overshoot is latent-only — no decode.)
 4. `df_rollout_level > 0` → raise for v1 (two different fed-back-past modifications, untested interaction;
    `df_scale>0` training-noise-only is fine).
 5. prior mode (`dynamics_prior` set / `_proprio_prior != "none"`) → raise (proprio dynamics is chained physics,

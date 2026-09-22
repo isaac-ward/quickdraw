@@ -289,6 +289,32 @@ def build_model(cfg):
                              f"(model.name in mm_lsar/lsar); got {name!r}. DSAR is grounded by its data-space "
                              f"re-encode and Flow by its reconstruction, so neither takes a collapse strategy. "
                              f"Remove the collapse override or switch to mm_lsar.")
+        # LATENT OVERSHOOT (design/combatting_drift.md): a direct deep-drift latent correction ADDED to the clean
+        # 1-step anchor. Reuses the p_tf=0 recon rollout's feeds. Off (weight 0) -> bit-identical.
+        _overshoot_w = float(m.get("overshoot_weight", 0.0) or 0.0)
+        _overshoot_md = m.get("overshoot_max_depth", None)
+        _overshoot_md = None if _overshoot_md is None else int(_overshoot_md)
+        if _overshoot_w > 0.0:
+            if name not in ("mm_flow", "flow"):
+                raise ValueError(f"model.overshoot_weight>0 (latent overshoot) is a Flow-only lever (needs the flow "
+                                 f"+ the p_tf=0 rollout feeds); got model.name={name!r}. See design/combatting_drift.md.")
+            if not (_p_tf_dyn is not None and float(_p_tf_dyn) == 1.0):
+                raise ValueError(f"model.overshoot_weight>0 requires model.p_tf_dynamics=1.0 (the CLEAN 1-step "
+                                 f"anchor overshoot adds its deep terms on top of); got p_tf_dynamics={_p_tf_dyn!r}. "
+                                 f"overshoot is the deterministic, anchored replacement for p_tf_dynamics<1 -- pick "
+                                 f"one, not both. See design/combatting_drift.md.")
+            # NB: overshoot is COMPATIBLE with compile_rollout. Unlike DF (which noises the ROLLOUT per step and so
+            # forces eager), overshoot does NOT modify the rollout -- it reuses the (compiled) rollout's `feeds`
+            # and adds a PARALLEL loss-term backbone pass, exactly like the existing anchor pass. So it keeps the
+            # compiled rollout (~straight03's 1.1h) plus one extra eager parallel pass (~1.3-1.5h), not DF's 2.9h.
+            if df_scale > 0.0 or df_rollout_level > 0.0:
+                raise ValueError("model.overshoot_weight>0 is mutually exclusive with diffusion forcing "
+                                 "(variations.noise_injection.observations_encoded_pre_fusion.scale/rollout_level>0) "
+                                 "for now: both modify the dynamics context (own-drift vs injected noise) and the "
+                                 "interaction is untested. Run them as separate arms.")
+            _F = int(cfg.data.get("F", 0) or 0)
+            if _overshoot_md is not None and not (1 <= _overshoot_md <= max(1, _F - 1)):
+                raise ValueError(f"model.overshoot_max_depth must be in [1, F-1] (F=data.F={_F}); got {_overshoot_md}.")
         _ah = m.get("action_head", {}) or {}
         _ah_on = bool(_ah.get("enabled", False) if hasattr(_ah, "get") else getattr(_ah, "enabled", False))
         if _ah_on and name not in ("mm_flow", "flow"):
@@ -369,7 +395,8 @@ def build_model(cfg):
                                        dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)),
                                        # default 1.0 (always-clean) so an old config adopted by
                                        # run_standalone rebuilds the behaviour it TRAINED under.
-                                       p_tf_dynamics=_p_tf_dyn)
+                                       p_tf_dynamics=_p_tf_dyn,
+                                       overshoot_weight=_overshoot_w, overshoot_max_depth=_overshoot_md)
         raise ValueError(f"unknown model.name: {name!r}")
 
 

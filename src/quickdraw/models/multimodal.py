@@ -940,7 +940,8 @@ class MultiModalFlow(MultiModalSequenceModel):
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
                  action_head_shortcut: bool = True, action_head_detach_gradient: bool = False,
                  action_head_chunk: int = 1,
-                 dynamics_detach_encoder: bool = False, p_tf_dynamics: float | None = 1.0, **kw):
+                 dynamics_detach_encoder: bool = False, p_tf_dynamics: float | None = 1.0,
+                 overshoot_weight: float = 0.0, overshoot_max_depth: int | None = None, **kw):
         super().__init__(specs, d=d, depth=depth, heads=heads, window=window, mlp_ratio=mlp_ratio,
                          rope_theta=rope_theta, action_dim=action_dim, grad_checkpoint=grad_checkpoint,
                          compile_rollout=compile_rollout, latent_norm=latent_norm,
@@ -1015,6 +1016,13 @@ class MultiModalFlow(MultiModalSequenceModel):
         #          in the model). Replaces the old `dynamics_follows_p_tf` bool: false == 1.0, true == None.
         # design/flow.md, record section 18.
         self.p_tf_dynamics = None if p_tf_dynamics is None else float(p_tf_dynamics)
+        # LATENT OVERSHOOT (design/combatting_drift.md): a DIRECT latent correction term added ON TOP of the clean
+        # 1-step anchor (dynamics/latent, which stays teacher-forced -> requires p_tf_dynamics==1). It reuses the
+        # p_tf=0 recon rollout's own-drifted `feeds` (DETACHED) and scores flow.loss(cond(own_context), true_next -
+        # own_context) at up to overshoot_max_depth future positions. weight 0 -> off, bit-identical. See guards in
+        # training/setup.py (flow-only; p_tf_dynamics==1; not with compile_rollout / diffusion forcing).
+        self.overshoot_weight = float(overshoot_weight or 0.0)
+        self.overshoot_max_depth = None if overshoot_max_depth is None else int(overshoot_max_depth)
         # ACTION CHUNK: how many consecutive POST-SUBSAMPLE actions the prior predicts JOINTLY. 1 reproduces
         # every run before 2026-09-10 bit-for-bit. K>1 widens the flow's TARGET to K*action_dim -- one flow over
         # the concatenated chunk, which is a genuine joint (the MLP velocity of each component sees all
@@ -1089,9 +1097,28 @@ class MultiModalFlow(MultiModalSequenceModel):
         # onto the true trajectory. Absolute mode never referenced the context and is unchanged.
         target = (z[:, 1:] - s_ref).detach() if self.predict_residual else z[:, 1:].detach()  # off CLEAN z
         l_flow, l_cons = self.flow.loss(h_state, target, time_sampling=self.time_sampling)
-        raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function
+        raw, w = {"dynamics/latent": l_flow}, {"dynamics/latent": self.lambda_flow}   # the transition function (ANCHOR)
         if l_cons is not None:
             raw["dynamics/latent_shortcut"], w["dynamics/latent_shortcut"] = l_cons, self.lambda_consistency
+        # LATENT OVERSHOOT (design/combatting_drift.md): ADD a direct latent correction from the model's OWN
+        # drifted contexts (the p_tf=0 recon rollout's `feeds`), on TOP of the clean anchor above. feeds[j] is the
+        # context that predicted future frame j+1 (a j-deep own rollout at p_tf=0); its target is the true next.
+        # DETACHED -> trains the flow to correct a drifted context without backprop through the rollout that made
+        # it (pure-forward / DAgger). ONLY the drifted (feed) positions, capped at overshoot_max_depth. weight 0
+        # -> this block is skipped -> bit-identical.
+        if self.overshoot_weight > 0.0 and self.training and feeds is not None:
+            F_ = feeds.shape[1]
+            if L - F_ >= 1 and F_ >= 2:
+                off0 = L - F_                                    # first FUTURE context position (feeds[0] sits here)
+                n_over = F_ - 1 if self.overshoot_max_depth is None else min(int(self.overshoot_max_depth), F_ - 1)
+                s_o = feeds[:, :n_over].detach()                 # own-drifted contexts (no DF noise, no keep_true)
+                tgt_o = (z[:, off0 + 1:off0 + 1 + n_over] - s_o).detach() if self.predict_residual \
+                    else z[:, off0 + 1:off0 + 1 + n_over].detach()
+                a_o = act_seq[:, off0:off0 + n_over]
+                h_o = self._cond(self.backbone(self._to_input(s_o, a_o)), a_o)
+                l_over, _ = self.flow.loss(h_o, tgt_o, time_sampling=self.time_sampling)
+                raw["dynamics/latent_overshoot"] = l_over
+                w["dynamics/latent_overshoot"] = self.overshoot_weight
         if self.action_head_enabled:
             # action-flow PRIOR: predict the next action (or the next `action_head_chunk` actions, jointly)
             # from the PREVIOUS-step pooled context h[t-1] -- leak-free, h[t-1] never attended to what it

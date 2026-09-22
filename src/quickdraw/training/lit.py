@@ -139,6 +139,7 @@ class LitWorldModel(L.LightningModule):
         feeds = None
         _q = getattr(m, "p_tf_dynamics", 1.0)          # probability the dynamics loss uses TRUTH
         want_feeds = (_q is None) or (float(_q) < 1.0)  # None -> follows p_tf; <1 -> partial mixing
+        want_feeds = want_feeds or (float(getattr(m, "overshoot_weight", 0.0) or 0.0) > 0.0)  # overshoot reuses feeds
         # PHASE MARKERS (record_function is a no-op unless a torch.profiler is active). Added 2026-08-25:
         # NOTHING in this repo had ever measured the training step's phase breakdown -- every "X is N% of the
         # step" number, in design docs and audits alike, was inferred from epoch totals. These make one
