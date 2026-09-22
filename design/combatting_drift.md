@@ -95,10 +95,30 @@ the only place the model sees, and is corrected on, its own compounding drift in
   `overshoot_detach_every` (int). All 0/None → off, bit-identical.
 - **Loss terms TOTAL: 3** — it GENERALIZES `dynamics/latent` over depths, so no new named term (becomes 4 only
   if you choose to log the deep-depth part as a separate `*_overshoot` key).
+- **Relation to `p_tf<1` (why it's safe, and why it's not the same).** `p_tf<1` REPLACES the context mix at
+  every position with a Bernoulli own/true draw — near steps included — which is why `p_tf→0` blows up /
+  mean-collapses and `p_tf=0.8` only gave shallow, rare drift. Overshoot instead keeps the clean depth-1
+  true-context term (the **always-on anchor**, `w_1=1`, = today's loss) fixed and ADDS a deterministic,
+  controlled-depth deep term. So it reaches reliable deep-drift exposure WITHOUT entering the unstable pure-AR
+  regime. "Anchor" = the loss that works never leaves the sum.
+- **Implementation (reuses existing machinery, no new module, no loop change):**
+
+      # MultiModalFlow.__init__: overshoot_depths=(1,)  overshoot_weight=0.0  overshoot_detach_every=1
+      z = encode_state(obs, anchor)                          # true latents (already computed)
+      L = flow.loss(cond_true_t, z[:,1:] - z[:,:-1])         # depth-1 anchor (w_1=1) == CURRENT loss, unchanged
+      if overshoot_weight > 0 and training:
+          for k in [d for d in overshoot_depths if d > 1]:
+              drifted = _rollout_from(true_window, actions, steps=k-1,     # own-fed (p_tf=0), OWN truncation
+                                      p_tf=0.0, detach_every=overshoot_detach_every)
+              L += overshoot_weight * flow.loss(cond(drifted, a_k), z[:,k:] - drifted)  # 1-step correction
+
+  `_rollout_from` / `rollout_train(return_feeds=True)` ALREADY do own-fed rollouts with a `detach_every` and
+  return what each step stood on; `flow.loss` is the same primitive as the anchor. So it's a loop over depths
+  adding `flow.loss` on reused tensors — no new network, no manual-optimization surgery (unlike the GAN).
 - **Runs to validate:** 2–3 arms to ep13 — a small `(k, weight)` sweep vs the straight03/DF references, read
-  `OL − floor` and `motion_ratio`. Cheap in code, slower per-epoch (extra rollout in the loss).
-- **Blast radius: MEDIUM.** Core dynamics loss (`multimodal.py`), but reuses tensors `rollout_train` already
-  computes + the existing `flow.loss`; no new modules, no training-loop change. Must leave the 1-step loss intact.
+  `OL − floor` and `motion_ratio`. Cheap in code, slower per-epoch (extra own-rollout in the loss).
+- **Blast radius: MEDIUM.** One function in `multimodal.py`; reuses `rollout_train`'s tensors + the existing
+  `flow.loss`; no new modules, no training-loop change. `overshoot_weight=0` / `depths=(1,)` is bit-identical.
 
 ### (b) Trajectory moment / MMD matching — cheap, isolated, non-adversarial
 
