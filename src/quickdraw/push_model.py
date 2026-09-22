@@ -158,13 +158,15 @@ def _example_context(cfg, n_eps: int = 4, steps: int = 96) -> dict | None:
     Without this the quickstart cannot run for anyone lacking the dataset -- which for the robocasa model
     is everyone outside this project. A card whose example does not run is worse than no card.
     """
-    from .data.dataset import apply_data_globals, load_split_episodes_mm
+    from .data.dataset import DataConfig, load_split_episodes_mm
     from .training.setup import image_head_cams, image_head_sizes, resolve_data_root
     cams = image_head_cams(cfg)
     if not cams:
         return None
-    apply_data_globals(cfg)   # load the quickstart windows at the TRAINED rate/aggregation, not subsample=1/sum
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
+    # dcfg (2026-09-21): the quickstart windows load at the TRAINED rate/aggregation via an explicit DataConfig
+    # (was a module-global apply_data_globals). Without it this shipped example_context.npz at subsample=1/sum.
+    eps = load_split_episodes_mm(resolve_data_root(cfg), "val", dcfg=DataConfig.from_cfg(cfg),
+                                 img_size=image_head_sizes(cfg),
                                  cam=cams, repo_id=str(cfg.data.get("repo_id", "torus")))
     eps = eps[:n_eps]
     n = min(steps, min(len(o) for o, _, _ in eps))

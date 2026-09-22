@@ -33,7 +33,7 @@ import hydra
 import numpy as np
 import torch
 
-from .data.dataset import load_split_episodes_mm
+from .data.dataset import DataConfig, load_split_episodes_mm
 from .training.setup import build_model, env_cfg, load_checkpoint, normalizer, resolve_data_root
 
 H_REPORT = [1, 8, 16, 32, 64]
@@ -74,7 +74,8 @@ def main(cfg):
     _CAMK = str(cfg.data.get("cam", "fpv"))
 
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+                                 cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"),
+                                 dcfg=DataConfig.from_cfg(cfg))  # dcfg (2026-09-21): loaders take the data config explicitly now, no module globals
     rng = np.random.RandomState(0)
     slices = [(ei, t) for ei in range(len(eps)) for t in range(P, len(eps[ei][0]) - H - 1)]
     rng.shuffle(slices)

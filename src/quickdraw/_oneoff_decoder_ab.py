@@ -41,7 +41,7 @@ import torch
 import torch.nn.functional as Fn
 from omegaconf import OmegaConf
 
-from quickdraw.data.dataset import load_split_episodes_mm
+from quickdraw.data.dataset import DataConfig, load_split_episodes_mm
 from quickdraw.evaluation.openloop import _lpips_net
 from quickdraw.models.decoders import TokenGridDecoder
 from quickdraw.models.flow import ImageUNetFlowHead
@@ -70,7 +70,8 @@ norm = normalizer(cfg)
 # name the key once rather than indexing position 2 as if there were only ever one view.
 _CAMK = str(cfg.data.get("cam", "fpv"))
 ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=ae_cfg.img_size,
-                           cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+                           cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"),
+                           dcfg=DataConfig.from_cfg(cfg))  # dcfg (2026-09-21): loaders take the data config explicitly now, no module globals
 P = int(cfg.data.P)
 rng = np.random.default_rng(0)
 

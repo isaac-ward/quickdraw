@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from ..data.dataset import load_split_episodes, resize_frames_area
+from ..data.dataset import DataConfig, load_split_episodes, resize_frames_area
 from ..environments.base import ROLE_STYLE, SceneOverlay, log_env_capabilities
 from ..environments.registry import make_env
 from ..environments.robocasa_utils import OBS_LAYOUT, obs_slices
@@ -44,7 +44,7 @@ def main() -> int:
     check("reward -> (B,)", tuple(env.reward().shape) == (2,))
 
     # THE check that matters: every obs dim inside the range the DATASET actually contains.
-    eps = load_split_episodes(DATA, "val", repo_id=REPO)
+    eps = load_split_episodes(DATA, "val", repo_id=REPO, dcfg=DataConfig(subsample=1))  # dcfg (2026-09-21): loaders take the data config explicitly now, no module globals
     D = np.concatenate([e for e, _ in eps])
     lo, hi = D.min(0), D.max(0)
     v = o2[0].numpy()

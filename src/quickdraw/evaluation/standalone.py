@@ -55,8 +55,8 @@ def run_standalone(cfg, routines, label: str | None = None):
     writer = make_writer(run_dir, cfg, job_type=f"eval_{label}")
     # match the trained rate: a checkpoint trained at data.subsample=5 MUST be evaluated at 5, or the
     # rollout is being asked for a timestep it never saw (the saved config carries the value)
-    from ..data.dataset import apply_data_globals
-    apply_data_globals(cfg)   # subsample / action_aggregate / obs_keep (+ all_phases, inert for eval)
+    # (2026-09-21) No data-globals to set: normalizer(cfg) + the eval routines build a DataConfig from cfg and
+    # pass it into every loader explicitly, so this eval runs at the trained rate by construction. See DataConfig.
     norm, ecfg = normalizer(cfg), env_cfg(cfg)
     # WorldEnv contract self-report (environments/base.py): one ✓/✗ line at eval start (additive, log-only)
     env_name = cfg.environments.get("name", "torus_world")

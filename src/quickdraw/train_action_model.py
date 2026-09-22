@@ -79,8 +79,9 @@ def main(cfg):
 
     _t = time.perf_counter()
     _startup_log(run_dir, "[startup] loading dataset (GPU-resident windows) + normalizer...")
-    from .data.dataset import apply_data_globals
-    apply_data_globals(cfg)                                        # match the rate + obs layout the WM trained on
+    # (2026-09-21) No data-globals to set: normalizer(cfg) + window_loaders(cfg) build a DataConfig from cfg
+    # and hand it to every loader explicitly, so this matches the rate + obs layout the WM trained on by
+    # construction (was a trio of set_* calls that a new entrypoint could partially forget). See DataConfig.
     norm = normalizer(cfg)
     loaders = window_loaders(cfg, norm)
     _startup_log(run_dir, f"[startup] data ready in {time.perf_counter() - _t:.1f}s: "

@@ -80,7 +80,7 @@ def load_pretrained(repo_or_path: str, device: str | torch.device = "cpu",
         raise FileNotFoundError(f"{path} has no {CONFIG} — without it the weights cannot be given a shape")
     cfg = OmegaConf.load(cfg_path)
 
-    from .data.dataset import Normalizer
+    from .data.dataset import DataConfig, Normalizer
     from .training.setup import build_model
     model = build_model(cfg)
     miss, unexp = model.load_state_dict(_load_weights(path), strict=strict)
@@ -96,7 +96,9 @@ def load_pretrained(repo_or_path: str, device: str | torch.device = "cpu",
             f"{path} has no {STATS}. Without the training normalisation statistics every rollout is "
             f"SILENTLY WRONG rather than visibly broken, so this is a hard error, not a warning.")
     with open(stats_path) as f:
-        norm = Normalizer(json.load(f)).subset_obs()
+        # obs_keep (2026-09-21): subset the stats to the published model's obs layout EXPLICITLY (was the module
+        # global _OBS_KEEP). from_cfg reads it off the repo's own cfg; None = full vector. See dataset.DataConfig.
+        norm = Normalizer(json.load(f)).subset_obs(DataConfig.from_cfg(cfg).obs_keep)
     return model, norm, cfg
 
 

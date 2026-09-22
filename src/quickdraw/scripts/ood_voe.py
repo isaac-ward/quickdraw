@@ -45,9 +45,9 @@ SEED = 0
 def load_model(run_dir, ckpt_arg, device):
     cfg = OmegaConf.create(json.load(open(os.path.join(run_dir, "logs", "config.json"))))
     from quickdraw.training.setup import build_model, load_checkpoint, normalizer, env_cfg
-    from quickdraw.data.dataset import apply_data_globals
+    from quickdraw.data.dataset import DataConfig
     from quickdraw.environments.registry import make_env
-    apply_data_globals(cfg)
+    dcfg = DataConfig.from_cfg(cfg)   # (2026-09-21) explicit data config -> the loader below; was module globals
     model = build_model(cfg).to(device)
     ckpt = run_dir if ckpt_arg in (None, "best") else (
         os.path.join(run_dir, "checkpoints", "last.ckpt") if ckpt_arg == "last" else ckpt_arg)
@@ -315,7 +315,7 @@ def main():
     def load(root):
         # frames come back as a DICT keyed by camera (data/dataset.py). This script is single-camera, so
         # flatten to the (obs, act, frames) triples its helpers expect rather than threading a key through.
-        eps = load_split_episodes_mm(root, "rollout", img_size=img_size, cam="fpv", repo_id="owm")
+        eps = load_split_episodes_mm(root, "rollout", dcfg=dcfg, img_size=img_size, cam="fpv", repo_id="owm")
         return [(o, a, fr["fpv"]) for o, a, fr in eps]
 
     ood, dock_ref = {}, {}

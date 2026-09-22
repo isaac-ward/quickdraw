@@ -16,14 +16,16 @@ import sys
 import hydra
 import numpy as np
 
-from .data.dataset import load_split_episodes, set_obs_keep
+from .data.dataset import DataConfig, load_split_episodes
 from .training.setup import env_cfg, resolve_data_root
 
 
 @hydra.main(config_path="../../conf", config_name="config", version_base=None)
 def main(cfg):
     root = resolve_data_root(cfg)
-    set_obs_keep(cfg.data.get("obs_keep", None))   # check the EFFECTIVE obs (subset), so dims match env/model
+    # dcfg (2026-09-21): the loaders take the data config EXPLICITLY now (was module globals). Built once here
+    # so this check reports the EFFECTIVE obs subset + the trained stride, matching env/model dims. See DataConfig.
+    dcfg = DataConfig.from_cfg(cfg)
     P, F = int(cfg.data.P), int(cfg.data.F)
     need = P + F
     repo = str(cfg.data.get("repo_id", "torus"))
@@ -43,7 +45,7 @@ def main(cfg):
     problems = []
     for split in splits:
         try:
-            eps = load_split_episodes(root, split, repo_id=repo)
+            eps = load_split_episodes(root, split, dcfg=dcfg, repo_id=repo)
         except Exception as ex:   # noqa: BLE001
             problems.append(f"{split}: failed to load ({type(ex).__name__}: {ex})")
             continue

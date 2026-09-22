@@ -144,7 +144,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
     (proprio/trajectory_*, image <head>/filmstrip_i + rollout_i). n_ep=8 with an image head (decode cost)."""
     import numpy as _np
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
     heads = ["proprio"] + img_heads
@@ -159,6 +159,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -320,7 +322,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
     constant across epochs (a cheap "is something training that shouldn't be" detector — #12 §4)."""
     import numpy as _np
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
     was = m.training
@@ -334,6 +336,8 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -459,7 +463,7 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     over many VAL contexts, then project the latent to 3D + 2D with THREE reducers — PCA (linear, global-
     geometry-faithful), UMAP (nonlinear neighborhoods), t-SNE (local clusters) — each under eval_manifold/<method>/.
     The 3D still is a 6-view (fig_points_6view). Data-space (6D proprio) plots dropped — it's just the torus."""
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from .manifold import manifold_predictions, pad_lims, reduce_dims
     m = getattr(model, "_orig_mod", model)
     was = m.training
@@ -467,6 +471,8 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     t0 = time.perf_counter()
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
@@ -518,7 +524,7 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     import numpy as _np
     import torch.nn.functional as F
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from ..models.multimodal import MultiModalFlow
     m = getattr(model, "_orig_mod", model)
     if not isinstance(m, MultiModalFlow):
@@ -540,6 +546,8 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -660,7 +668,7 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     (default: the epoch step; cfg.eval.denoising_seed pins it) fixes the sampled contexts + noise."""
     import numpy as _np
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from ..models.multimodal import MultiModalFlow
     from .manifold import manifold_clouds
     m = getattr(model, "_orig_mod", model)
@@ -679,6 +687,8 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     pos, _ = _pos_idx(cfg); K, P = m.sampling_steps, cfg.data.P
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -746,7 +756,7 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     import numpy as _np
     import torch.nn.functional as F
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from ..models.multimodal import MultiModalFlow
     m = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
@@ -761,6 +771,8 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     hz = sorted({int(h) for h in hz if int(h) >= 1})
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -886,7 +898,7 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
 
     from omegaconf import OmegaConf
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from . import interpret as I
     m = getattr(model, "_orig_mod", model)
     if not _is_mm(model):
@@ -904,6 +916,8 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -1121,7 +1135,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     m = getattr(model, "_orig_mod", model)
     if not getattr(m, "action_head_enabled", False):
         return {}                                                # no action head -> skip
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     was = m.training; m.eval()
     t0 = time.perf_counter()
     def prog(p, w): _plog(writer, f"[eval_action_distribution @ep{step}] {p:3d}% — {w}")
@@ -1144,6 +1158,8 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
         pass
     a_max = getattr(ecfg, "a_max", None)   # torus-only histogram x-limit knob; None -> viz derives it from the data
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))

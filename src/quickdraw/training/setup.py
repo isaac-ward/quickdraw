@@ -8,7 +8,7 @@ import os
 import torch
 
 from ..data.dataset import (
-    MMWindowLoader, Normalizer, TrajectoryDataset,
+    DataConfig, MMWindowLoader, Normalizer, TrajectoryDataset,
     load_split_episodes, load_split_episodes_mm,
 )
 from ..environments.torus_utils import TorusConfig
@@ -418,22 +418,17 @@ def autobatch_find(cfg, device, log=print) -> int:
         FIXED reserve cannot cover it: at 20h/256px it is tens of GB while the knob stays put. Frames only (the
         dominant term, 2.87 of 3.17GB); the ~0.3GB of window/index tensors stays inside the blind reserve."""
         try:
-            from ..data.dataset import get_subsample, load_split_episodes
-            # This estimate rides on the PROCESS-GLOBAL frame stride, because the loader applies it. If the
-            # caller has not called set_subsample() yet, the lengths come back unsubsampled and the estimate is
-            # off by exactly that factor -- measured: 14.18GB instead of 2.83GB at subsample=5, i.e. the
-            # verification harness silently shrank the batch. Over-estimating is the SAFE direction, but say so.
-            _want, _have = int(cfg.data.get("subsample", 1) or 1), get_subsample()
-            if _have != _want:
-                log(f"[autobatch] WARNING: data.subsample={_want} but the process frame stride is {_have} "
-                    f"(set_subsample() not called yet) -- the resident frame-store estimate below is {_want/_have:.0f}x "
-                    f"too LARGE, so the chosen batch will be conservative. Call set_subsample() before sizing.")
+            # dcfg (2026-09-21): the loader takes the data config EXPLICITLY now, so the resident-frame estimate
+            # always sizes at the correct stride. This replaced a process-global frame stride whose whole
+            # failure mode was the caller forgetting to set it -- the estimate then ran unsubsampled and the
+            # old get_subsample()!=cfg warning existed only to detect that. With DataConfig it cannot happen.
+            dcfg = DataConfig.from_cfg(cfg)
             imgs = [sp for sp in specs if getattr(sp, "kind", "vector") == "image"]
             if not imgs:
                 return 0
             n = 0
             for split in ("train", "val"):
-                eps_ = load_split_episodes(resolve_data_root(cfg), split,
+                eps_ = load_split_episodes(resolve_data_root(cfg), split, dcfg=dcfg,
                                            repo_id=cfg.data.get("repo_id", "torus"))
                 n += sum(len(o) for o, _ in eps_)          # subsampling is applied inside the loader
             b = 0
@@ -646,7 +641,8 @@ def autobatch_find(cfg, device, log=print) -> int:
             from .setup import resolve_data_root                                    # noqa: F401 (same module)
             img_heads = [sp.name for sp in specs if getattr(sp, "kind", "vector") == "image"]
             # episode LENGTHS only -- the proprio loader reads no frames, so this is cheap (seconds)
-            ep_lens = [len(o) for o, _ in load_split_episodes(resolve_data_root(cfg), "val",
+            # dcfg (2026-09-21): loader takes the data config explicitly (was module globals) -- see DataConfig
+            ep_lens = [len(o) for o, _ in load_split_episodes(resolve_data_root(cfg), "val", dcfg=DataConfig.from_cfg(cfg),
                                                              repo_id=cfg.data.get("repo_id", "torus"))]
             n_ep, H, _cl_h, modes, calls = ood_horizon_shapes(cfg, bool(img_heads), ep_lens, P)
             dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None
@@ -821,7 +817,9 @@ def effective_action_dim(cfg) -> int:
 
 
 def normalizer(cfg) -> Normalizer:
-    n = Normalizer.from_file(resolve_data_root(cfg)).subset_obs()   # subset via the process-wide set_obs_keep
+    # obs_keep (2026-09-21): passed EXPLICITLY to from_file (was the module global _OBS_KEEP + a .subset_obs()
+    # call). The stats are subset to the same obs layout the loaders apply -- see DataConfig.
+    n = Normalizer.from_file(resolve_data_root(cfg), obs_keep=DataConfig.from_cfg(cfg).obs_keep)
     if str(cfg.data.get("action_aggregate", "sum")) == "concat":    # one step carries `subsample` raw actions
         n = n.tile_act(int(cfg.data.get("subsample", 1) or 1))
     return n
@@ -869,21 +867,23 @@ def window_loaders(cfg, norm: Normalizer):
     head_sizes = image_head_sizes(cfg)
     repo = str(cfg.data.get("repo_id", "torus"))
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dcfg = DataConfig.from_cfg(cfg)   # (2026-09-21) explicit data config -> the loaders; was module globals
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
         if head_cams:
-            eps = load_split_episodes_mm(root, split, img_size=head_sizes, cam=head_cams, repo_id=repo)
+            eps = load_split_episodes_mm(root, split, dcfg=dcfg, img_size=head_sizes, cam=head_cams, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev,
                                             image_head=list(head_cams), stride=stride)
         else:                                                    # proprio-only: (obs, act) pairs, no camera frames
-            eps = load_split_episodes(root, split, repo_id=repo)
+            eps = load_split_episodes(root, split, dcfg=dcfg, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
     return loaders
 
 
 def eval_episodes(cfg, norm: Normalizer, split: str):
-    return TrajectoryDataset(load_split_episodes(resolve_data_root(cfg), split,
+    # dcfg (2026-09-21): loader takes the data config explicitly (was module globals) -- see DataConfig
+    return TrajectoryDataset(load_split_episodes(resolve_data_root(cfg), split, dcfg=DataConfig.from_cfg(cfg),
                                                  repo_id=str(cfg.data.get("repo_id", "torus"))), norm)
 
 

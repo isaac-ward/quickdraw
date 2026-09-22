@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -25,16 +26,19 @@ class Normalizer:
         self.a_std = torch.tensor(stats["action"]["std"])
 
     @classmethod
-    def from_file(cls, root: str) -> "Normalizer":
+    def from_file(cls, root: str, *, obs_keep) -> "Normalizer":
+        # obs_keep is a REQUIRED keyword (2026-09-21, was a module global): the stats MUST be subset to the
+        # same obs layout the loaders apply, or norm/denorm silently mismatch the data. Pass None for the full
+        # vector, or DataConfig.obs_keep. Required-with-no-default so a caller cannot forget it and get the
+        # wrong layout -- see DataConfig for why this stopped being ambient state.
         with open(os.path.join(root, "normalization_stats.json")) as f:
-            return cls(json.load(f))
+            return cls(json.load(f)).subset_obs(obs_keep)
 
-    def subset_obs(self):
-        """Restrict the obs stats to the process-wide _OBS_KEEP subset (set_obs_keep), so norm/denorm match
-        the subset the loaders apply. Single source of truth: no obs_keep is threaded. No-op if unset."""
-        idx = get_obs_keep()
-        if idx is not None:
-            t = torch.as_tensor(idx, dtype=torch.long)
+    def subset_obs(self, obs_keep):
+        """Restrict the obs stats to the `obs_keep` index subset, so norm/denorm match the subset the loaders
+        apply. Takes the indices EXPLICITLY (was a module global) -- None = full vector, no-op."""
+        if obs_keep is not None:
+            t = torch.as_tensor(list(obs_keep), dtype=torch.long)
             self.o_mean, self.o_std = self.o_mean[t], self.o_std[t]
         return self
 
@@ -77,27 +81,6 @@ class Normalizer:
 # call sites. That is deliberate: the catastrophic failure here is a MISSED call site leaving eval at
 # 20 Hz while training runs at 4 Hz -- the metrics would be measuring a different problem and would look
 # like the model failing. One source of truth makes that inconsistency impossible to write.
-_SUBSAMPLE = 1
-_SUBSAMPLE_USED = False
-
-
-def set_subsample(n: int) -> None:
-    """Set the process-wide frame stride. Raises if changed after a load, since a mid-process change would
-    silently mix rates between the training windows and the eval episodes."""
-    global _SUBSAMPLE
-    n = int(n)
-    if n < 1:
-        raise ValueError(f"data.subsample must be >= 1, got {n}")
-    if _SUBSAMPLE_USED and n != _SUBSAMPLE:
-        raise RuntimeError(f"data.subsample changed {_SUBSAMPLE} -> {n} AFTER episodes were already loaded; "
-                           "train and eval would run at different rates. Set it once at startup.")
-    _SUBSAMPLE = n
-
-
-def get_subsample() -> int:
-    return _SUBSAMPLE
-
-
 # HOW the actions of the skipped frames are folded into the kept step's action. `sum` is the historical
 # behaviour and the ONLY correct rule for DELTA actions (robocasa's EEF/rotation deltas compose additively
 # over the skipped frames, so the sum IS the net displacement). It is WRONG for ABSOLUTE commands: starling's
@@ -113,96 +96,63 @@ def get_subsample() -> int:
 #           all -- and it makes one strided step carry a genuine s-action chunk. Widens the action vector,
 #           so training.setup.effective_action_dim derives model action_dim and Normalizer.tile_act tiles
 #           the stats to match.
-_ACTION_AGGREGATE = "sum"
 _AGGREGATES = ("sum", "mean", "last", "first", "concat")
 
 
-def set_action_aggregate(mode: str) -> None:
-    """Set the process-wide action-aggregation rule (data.action_aggregate). Set ONCE at startup, beside
-    set_subsample, and for the same reason: a mid-process change would mix rules between the training
-    windows and the eval episodes, and the metrics would silently measure a different problem."""
-    global _ACTION_AGGREGATE
-    mode = str(mode)
-    if mode not in _AGGREGATES:
-        raise ValueError(f"data.action_aggregate must be one of {_AGGREGATES}, got {mode!r}")
-    if _SUBSAMPLE_USED and mode != _ACTION_AGGREGATE:
-        raise RuntimeError(f"data.action_aggregate changed {_ACTION_AGGREGATE!r} -> {mode!r} AFTER episodes "
-                           "were already loaded; train and eval would use different rules. Set it at startup.")
-    _ACTION_AGGREGATE = mode
+@dataclass(frozen=True)
+class DataConfig:
+    """The four data-loading knobs, carried EXPLICITLY to every loader + the Normalizer. Build once with
+    `DataConfig.from_cfg(cfg)` and thread it down.
 
+    WHY THIS REPLACED MODULE GLOBALS (2026-09-21). subsample / action_aggregate / subsample_all_phases /
+    obs_keep used to be process-level globals, each set once per entrypoint by a `set_*` call. That design
+    has one fatal property: ambient state cannot make "you forgot to set me" a loud error. `eval_checkpoint`
+    simply never called `set_subsample`, so it silently evaluated at the DEFAULT subsample=1 against a
+    subsample-10 run -- a 10x-wrong rollout that produced a plausible wrong number instead of crashing. The
+    fix is to make the config an explicit object that every loader REQUIRES as a keyword-only argument with
+    NO default: a missed config is now an immediate TypeError, never a silent wrong-rate load. There is also
+    no process state left to desync mid-run (the old globals needed a `_USED` guard for exactly that), because
+    every loader reads the object it was handed. Do NOT reintroduce a module-level default for these.
 
-def get_action_aggregate() -> str:
-    return _ACTION_AGGREGATE
-
-
-_SUBSAMPLE_ALL_PHASES = False
-
-
-def set_subsample_all_phases(v: bool) -> None:
-    """data.subsample_all_phases: emit ALL `s` phase offsets of the decimation as separate TRAIN episodes.
-
-    At stride s the decimation keeps frames 0, s, 2s, ... and DISCARDS every other frame ENTIRELY -- and since
-    windows then slide over the DECIMATED sequence, every training window shares phase 0. At s=5 that means
-    80% of the dataset is never seen by anything. Emitting all s phases (0,s,2s.. AND 1,1+s,.. AND ...) gives
-    ~s x the training windows at EXACTLY the same frame rate: same per-step motion (the s=5 delta is 1.35x the
-    codec error floor; record section 13), same real-time horizon, so every number stays comparable to runs
-    without it. Not the same as subsample=1, which changes the RATE -- at 20 Hz the per-step motion is 0.61x
-    the codec floor, i.e. below our own reconstruction error, and a matched real-time horizon needs 4x more
-    autoregressive steps.
-
-    TRAIN ONLY, deliberately: adding phases to VAL would change which episodes the eval routines sample and
-    silently shift every metric, breaking comparability with prior runs. Off = bit-identical.
+    - subsample: frame stride. Keep every s-th frame; s=1 is no decimation.
+    - action_aggregate: how the skipped frames' actions fold into the kept step (see the comment above).
+    - subsample_all_phases: emit all s phase offsets as separate TRAIN episodes -- ~s x the windows at the
+      SAME rate (uses the frames the decimation throws away). TRAIN ONLY (guarded on the '/train' tag in
+      _subsample_episodes): adding phases to VAL would change which episodes eval samples and shift every
+      metric, breaking comparability. So it is inert in an eval-only process even when set.
+    - obs_keep: obs-dim indices to KEEP (None = full vector). Applied INSIDE the loaders AND the Normalizer
+      stats, so no call site can load a different obs layout than training saw.
     """
-    global _SUBSAMPLE_ALL_PHASES
-    _SUBSAMPLE_ALL_PHASES = bool(v)
+    subsample: int = 1
+    action_aggregate: str = "sum"
+    subsample_all_phases: bool = False
+    obs_keep: tuple | None = None
+
+    def __post_init__(self):
+        if int(self.subsample) < 1:
+            raise ValueError(f"data.subsample must be >= 1, got {self.subsample}")
+        if self.action_aggregate not in _AGGREGATES:
+            raise ValueError(f"data.action_aggregate must be one of {_AGGREGATES}, got {self.action_aggregate!r}")
+
+    @classmethod
+    def from_cfg(cls, cfg) -> "DataConfig":
+        """Build from a resolved config's `data` group. THE one place that reads these keys off cfg, so the
+        defaults live in exactly one spot instead of being re-typed (and mis-typed) at every entrypoint."""
+        d = cfg.get("data", {}) or {}
+        ok = d.get("obs_keep", None)
+        return cls(subsample=int(d.get("subsample", 1) or 1),
+                   action_aggregate=str(d.get("action_aggregate", "sum")),
+                   subsample_all_phases=bool(d.get("subsample_all_phases", False)),
+                   obs_keep=None if ok is None else tuple(int(i) for i in ok))
 
 
-_OBS_KEEP = None
-_OBS_KEEP_USED = False
+def _apply_obs_keep(obs_all, obs_keep):
+    """Slice loaded obs to the `obs_keep` index subset (no-op if None). Takes the indices EXPLICITLY as an
+    argument (2026-09-21, was the module global _OBS_KEEP) -- the loader passes DataConfig.obs_keep."""
+    return obs_all if obs_keep is None else obs_all[:, list(obs_keep)]
 
 
-def set_obs_keep(idx) -> None:
-    """Set the process-wide obs-dim subset: a list of indices to KEEP (None = full vector). Mirrors
-    set_subsample -- applied INSIDE both episode loaders AND the Normalizer stats, so NO call site can load a
-    different obs layout than training saw. Raises if changed after a load (would desync train vs eval)."""
-    global _OBS_KEEP
-    idx = None if idx is None else [int(i) for i in idx]
-    if _OBS_KEEP_USED and idx != _OBS_KEEP:
-        raise RuntimeError(f"data.obs_keep changed {_OBS_KEEP} -> {idx} AFTER obs were already loaded; "
-                           "train and eval would see different obs layouts. Set it once at startup.")
-    _OBS_KEEP = idx
-
-
-def get_obs_keep():
-    return _OBS_KEEP
-
-
-def apply_data_globals(cfg) -> None:
-    """Set ALL FOUR process-wide data globals from a resolved config, in ONE call, BEFORE any data load.
-
-    subsample / action_aggregate / subsample_all_phases / obs_keep are process-globals: each must be set
-    from the config or the load silently runs at a DEFAULT (subsample=1, action_aggregate='sum', ...). Setting
-    them piecemeal per-entrypoint is exactly how eval_checkpoint shipped a subsample-1 eval against a
-    subsample-10 run. Route every data-loading entrypoint through this ONE call so a new (or edited) entrypoint
-    cannot partially forget. (subsample_all_phases is train-only in the loader, so setting it in an eval
-    process is inert -- see _subsample_episodes.)
-    """
-    d = cfg.get("data", {}) or {}
-    set_subsample(int(d.get("subsample", 1) or 1))
-    set_action_aggregate(str(d.get("action_aggregate", "sum")))
-    set_subsample_all_phases(bool(d.get("subsample_all_phases", False)))
-    set_obs_keep(d.get("obs_keep", None))
-
-
-def _apply_obs_keep(obs_all):
-    """Slice loaded obs to the process-wide _OBS_KEEP subset (no-op if None). Sets the used-flag so a later
-    set_obs_keep with a different value raises rather than silently desyncing."""
-    global _OBS_KEEP_USED
-    _OBS_KEEP_USED = True
-    return obs_all if _OBS_KEEP is None else obs_all[:, _OBS_KEEP]
-
-
-def _subsample_episodes(eps, tag: str):
+def _subsample_episodes(eps, tag: str, *, dcfg: "DataConfig"):
     """Keep every s-th frame; AGGREGATE the actions that drive each kept transition. act[t] drives
     t -> t+1 (see MultiModalFlow._rollout_step, which reads a_win[:, -1]), so the action for the kept
     step i is the aggregate of act[i*s : (i+1)*s].
@@ -211,17 +161,16 @@ def _subsample_episodes(eps, tag: str):
     frames) but TAKE-LAST for near-binary dims: summing robocasa's gripper/flag dims would turn +-1 into
     +-5 and destroy their semantics. Binary dims are DETECTED (<=2 unique values), not hardcoded, and
     logged -- on this dataset that is the flag at dim 4 and the gripper at dim 11."""
-    global _SUBSAMPLE_USED
-    _SUBSAMPLE_USED = True
-    s, mode = _SUBSAMPLE, _ACTION_AGGREGATE
+    # dcfg carries the stride/aggregation/phases EXPLICITLY (2026-09-21, was module globals) -- see DataConfig.
+    s, mode = dcfg.subsample, dcfg.action_aggregate
     if s <= 1:
         return eps
     acts = np.concatenate([e[1] for e in eps], 0)
     hold = [d for d in range(acts.shape[1]) if len(np.unique(acts[:, d])) <= 2]
     # PHASE OFFSETS: normally just [0] -- frames 1..s-1 of every group are discarded and never seen. With
     # data.subsample_all_phases (TRAIN only) emit all s of them as separate episodes: ~s x the windows at the
-    # SAME rate. See set_subsample_all_phases.
-    all_phases = _SUBSAMPLE_ALL_PHASES and "/train" in tag
+    # SAME rate. See DataConfig.subsample_all_phases.
+    all_phases = dcfg.subsample_all_phases and "/train" in tag
     phases = range(s) if all_phases else (0,)
     out, dropped = [], 0
     for ep in eps:
@@ -258,19 +207,20 @@ def _subsample_episodes(eps, tag: str):
     return out
 
 
-def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
+def load_split_episodes(root: str, split: str, *, dcfg: "DataConfig", repo_id: str = "torus"):
     """Return list of (obs (T,D), act (T,A)) float32 arrays. ISOLATED lerobot read. `repo_id` is the
-    prefix the split was written with (<repo_id>/<split>; torus datasets = "torus"). The obs subset
-    (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
+    prefix the split was written with (<repo_id>/<split>; torus datasets = "torus"). `dcfg` (REQUIRED,
+    keyword-only) carries the stride / aggregation / obs subset -- applied here, INSIDE the loader, so no call
+    site can bypass or forget it (see DataConfig for why this replaced the module globals)."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
-    obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
+    obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32), dcfg.obs_keep)
     act_all = np.stack(hf["action"]).astype(np.float32)
     return _subsample_episodes([(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)],
-                               f"{repo_id}/{split}")
+                               f"{repo_id}/{split}", dcfg=dcfg)
 
 
 def resize_frames_area(x, hw: tuple[int, int]):
@@ -348,7 +298,7 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
     return frames
 
 
-def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_id: str = "torus"):
+def load_split_episodes_mm(root: str, split: str, *, dcfg: "DataConfig", img_size=128, cam="fpv", repo_id: str = "torus"):
     """Like load_split_episodes but ALSO returns per-episode camera frames (area-downsampled, uint8),
     aligned 1:1 with obs steps. Returns one entry per episode:
 
@@ -367,8 +317,9 @@ def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_
     rather than a crash, which is the worst failure mode available. Making it a dict turns every such site
     into an immediate TypeError until it names the head it wants. See design/two_camera_plan.md.
 
-    The chunked video is read in dataset row order (== obs row order), then split by episode_index. The obs
-    subset (set_obs_keep) is applied here, INSIDE the loader, so no call site can bypass it."""
+    The chunked video is read in dataset row order (== obs row order), then split by episode_index. `dcfg`
+    (REQUIRED, keyword-only) carries the stride / aggregation / obs subset -- applied here, INSIDE the loader,
+    so no call site can bypass or forget it (see DataConfig for why this replaced the module globals)."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     if isinstance(cam, str):
@@ -389,7 +340,7 @@ def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
-    obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
+    obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32), dcfg.obs_keep)
     act_all = np.stack(hf["action"]).astype(np.float32)
     per_key = {}
     for k, c, sz in zip(keys, cams, sizes):
@@ -399,7 +350,7 @@ def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_
     return _subsample_episodes(
         [(obs_all[ep_idx == e], act_all[ep_idx == e],
           {k: fr[ep_idx == e] for k, fr in per_key.items()}) for e in np.unique(ep_idx)],
-        f"{repo_id}/{split}+{'+'.join(cams)}")
+        f"{repo_id}/{split}+{'+'.join(cams)}", dcfg=dcfg)
 
 
 class MMWindowLoader:

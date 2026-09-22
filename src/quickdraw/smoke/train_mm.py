@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from quickdraw.data.dataset import MMWindowLoader, Normalizer, load_split_episodes_mm
+from quickdraw.data.dataset import DataConfig, MMWindowLoader, Normalizer, load_split_episodes_mm
 from quickdraw.logging import viz
 from quickdraw.models.modalities import ModalitySpec
 from quickdraw.models.multimodal import MultiModalLSAR
@@ -32,8 +32,9 @@ def main():
     steps = int(sys.argv[2]) if len(sys.argv) > 2 else 2000
     P, Fh, B, d = 8, 24, 16, 256
     print(f"[train_mm] loading VAL episodes (obs+act+FPV128) from {root} ...")
-    eps = load_split_episodes_mm(root, "val", img_size=128, cam={"image": "fpv"})  # key by HEAD name
-    norm = Normalizer.from_file(root)
+    # dcfg / obs_keep (2026-09-21): loader + Normalizer take the data config explicitly now (no module globals)
+    eps = load_split_episodes_mm(root, "val", dcfg=DataConfig(subsample=1), img_size=128, cam={"image": "fpv"})  # key by HEAD name
+    norm = Normalizer.from_file(root, obs_keep=None)
     train_eps, hold = eps[:-4], eps[-4]                         # hold out 1 episode for the rollout viz
     loader = MMWindowLoader(train_eps, P, Fh, norm, batch=B, shuffle=True, device=DEV)
     specs = [ModalitySpec("proprio", "vector", dim=6, weight=1.0),

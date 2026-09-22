@@ -48,13 +48,11 @@ def main(cfg):
     from .logging.writer import make_writer
     from .training.setup import build_model, env_cfg, load_checkpoint, normalizer
 
-    # PROCESS-GLOBAL data config, set BEFORE any data load (normalizer + the routines both load episodes).
-    # Missing this was a real bug: the eval defaulted to subsample=1 and action_aggregate="sum", so it
-    # evaluated a totally different rollout regime than the run was trained on (10x finer stride -> H clamps
-    # to 2048 not the episode, ~10x slower video, mis-scaled summed actions). One call, same as training.
-    from .data.dataset import apply_data_globals
-    apply_data_globals(rcfg)
-
+    # NB (2026-09-21): there is nothing to set up here. The data config (subsample / action_aggregate /
+    # obs_keep) is carried EXPLICITLY into normalizer(rcfg) and every eval routine via DataConfig.from_cfg(rcfg),
+    # so this entrypoint evaluates at the trained rate by construction. This used to require a set_subsample
+    # call that eval_checkpoint forgot -> it silently evaluated at subsample=1 (10x wrong). The explicit,
+    # keyword-only-no-default loader signature is what makes that failure mode impossible now. See DataConfig.
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model(rcfg).to(dev).eval()
     load_checkpoint(model, ckpt)                                         # strips `model.` prefix, strict=False

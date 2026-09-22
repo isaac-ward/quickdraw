@@ -127,10 +127,11 @@ def main(cfg):
     summary_text = _run_summary_text(cfg)   # fail if the run note is missing (present on resume via the
     if not resume:                          # resolved config). A resume is a CONTINUATION, so skip the unique
         _assert_summary_unique(summary_text, cfg)   # run-note gate + the config.resolved.yaml re-write below.
-    # Frame stride etc., set ONCE before anything loads episodes (autobatch below loads data too). Applied
-    # inside the loaders so the training windows and every eval routine cannot end up at different rates.
-    from .data.dataset import apply_data_globals
-    apply_data_globals(cfg)
+    # Data-loading config (subsample / action_aggregate / obs_keep / all_phases) is carried EXPLICITLY as a
+    # DataConfig into every loader now (2026-09-21) -- there is NO process-global to set up here, deliberately.
+    # normalizer / window_loaders below each build it from cfg via DataConfig.from_cfg; a loader cannot be
+    # called without it (keyword-only, no default), which is what makes the old "forgot to set subsample ->
+    # silent subsample=1" bug impossible. Do not reintroduce a set_* call here. See dataset.DataConfig.
     if not data_exists(cfg):
         raise FileNotFoundError(
             "No dataset found. Run `python -m quickdraw.data_generation` first, then pass its run "

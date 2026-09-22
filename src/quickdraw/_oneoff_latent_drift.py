@@ -43,7 +43,7 @@ CKPT, OUT = sys.argv[1], sys.argv[2]
 RUN = os.path.dirname(os.path.dirname(CKPT))
 cfg = OmegaConf.load(os.path.join(RUN, "checkpoints", "config.resolved.yaml"))
 from quickdraw.training.setup import build_model, normalizer, resolve_data_root
-from quickdraw.data.dataset import load_split_episodes_mm
+from quickdraw.data.dataset import DataConfig, load_split_episodes_mm
 from quickdraw.evaluation.openloop import _lpips_net
 
 dev = torch.device("cuda")
@@ -60,7 +60,8 @@ img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr
 # name the key once rather than indexing position 2 as if there were only ever one view.
 _CAMK = str(cfg.data.get("cam", "fpv"))
 eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=img_size,
-                                cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"))
+                                cam=cfg.data.get("cam", "fpv"), repo_id=cfg.data.get("repo_id", "torus"),
+                                dcfg=DataConfig.from_cfg(cfg))  # dcfg (2026-09-21): loaders take the data config explicitly now, no module globals
 P = int(cfg.data.P)
 HZ = [1, 8, 16, 32, 64, 128]
 HMAX = max(HZ)
