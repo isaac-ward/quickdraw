@@ -120,6 +120,50 @@ the only place the model sees, and is corrected on, its own compounding drift in
 - **Blast radius: MEDIUM.** One function in `multimodal.py`; reuses `rollout_train`'s tensors + the existing
   `flow.loss`; no new modules, no training-loop change. `overshoot_weight=0` / `depths=(1,)` is bit-identical.
 
+#### Implementation plan
+
+**Relation to the two teacher-forcing knobs (they are NOT stacked):**
+- `p_tf` (scheduled start→end) governs the RECON (pixel) rollout; overshoot does not touch it.
+- `p_tf_dynamics` (default 1.0) governs the DYNAMICS (latent) loss: `q_dyn = p_tf if p_tf_dynamics is None else
+  p_tf_dynamics`. At 1.0 the latent transition loss is always clean 1-step.
+- The overshoot chain is rolled PURE-OWN (`p_tf=0`), deterministically, to a controlled depth. Rolling it with a
+  Bernoulli true/pred prob would just recreate `p_tf_dynamics<1` (the stochastic, shallow, no-anchor version we
+  ran at 0.8 and that failed). So overshoot is the deterministic, depth-controlled, ANCHORED replacement for
+  `p_tf_dynamics<1` — hence guard (1) below.
+
+**Config (`MultiModalFlow.__init__`, threaded in `setup.py`):** `overshoot_depths: list[int] = [1]` (=[1] bit-
+identical), `overshoot_weight: float = 0.0` (w for k>1; 0=off), `overshoot_detach_every: int = 1` (its own
+truncation, independent of the locked recon `detach_every=32`).
+
+**Incompatibilities — raise at build in `setup.py` (mirror the `df_scale` / `compile_rollout` guards):**
+1. `p_tf_dynamics != 1.0` (`<1` or `None`) → raise. Overshoot needs the depth-1 CLEAN anchor; `p_tf_dynamics<1`
+   already drifts the whole dynamics loss (no clean anchor) and is the stochastic twin. Mutually exclusive.
+2. non-flow model (`name ∉ {mm_flow, flow}`) → raise (needs the flow + `_rollout_from`).
+3. `compile_rollout=True` → raise (extra eager own-rollout in the loss graph; same class as the
+   contraction-vs-compile exclusion).
+4. `df_rollout_level > 0` → raise for v1 (two different fed-back-past modifications, untested interaction;
+   `df_scale>0` training-noise-only is fine).
+5. prior mode (`dynamics_prior` set / `_proprio_prior != "none"`) → raise (proprio dynamics is chained physics,
+   not the flow).
+6. validation: `max(overshoot_depths) ≤ data.F`; `overshoot_weight ≥ 0`; `overshoot_detach_every ≥ 1`;
+   `1 ∈ overshoot_depths`.
+
+**Code changes:**
+- `setup.py`: read the 3 knobs, apply guards (1)-(6), pass into `MultiModalFlow(...)`.
+- `MultiModalFlow.__init__`: store the 3 knobs.
+- `dynamics_loss` (or a `_overshoot_loss` called from the same site): keep the depth-1 term unchanged; for each
+  `k>1` in `overshoot_depths`, roll `k-1` own steps from the true anchor via `_rollout_from(..., p_tf=0.0,
+  detach_every=overshoot_detach_every)`, then `L += overshoot_weight * flow.loss(cond(drifted, a_k),
+  z[:,k:]-drifted)`. Reuses `_rollout_from` / `rollout_train(return_feeds=True)`.
+- Optional: log `dynamics/latent_overshoot` as a separate key (readability only).
+
+**Smoke (`smoke/overshoot.py`):** (i) `overshoot_depths=[1]` OR `overshoot_weight=0` is bit-identical to the
+baseline loss; (ii) `depths=[1,8], weight>0` adds a nonzero term and a gradient to `self.flow`; (iii) each of
+guards (1)-(5) raises; (iv) `overshoot_detach_every` bounds the backprop graph (grad-graph depth check).
+
+**Runs:** 2-3 arms to ep13 — small `(overshoot_depths, overshoot_weight)` sweep (e.g. `[1,8]`/`[1,16]` × w∈{0.1,0.5},
+`overshoot_detach_every=1`) vs the straight03/DF references; read `OL − floor` and `motion_ratio`.
+
 ### (b) Trajectory moment / MMD matching — cheap, isolated, non-adversarial
 
 Roll H steps and match the DISTRIBUTION of trajectory statistics (generated vs real) — specifically the step
