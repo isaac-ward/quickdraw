@@ -139,8 +139,11 @@ truncation, independent of the locked recon `detach_every=32`).
 1. `p_tf_dynamics != 1.0` (`<1` or `None`) → raise. Overshoot needs the depth-1 CLEAN anchor; `p_tf_dynamics<1`
    already drifts the whole dynamics loss (no clean anchor) and is the stochastic twin. Mutually exclusive.
 2. non-flow model (`name ∉ {mm_flow, flow}`) → raise (needs the flow + `_rollout_from`).
-3. `compile_rollout=True` → raise (extra eager own-rollout in the loss graph; same class as the
-   contraction-vs-compile exclusion).
+3. `compile_rollout=True` → raise (extra own-rollout not supported by the single captured p_tf=0 compiled step —
+   same reason DF forces eager). NOTE: `compile_rollout` is OFF by default (`mm_flow.yaml: false`), so the bs
+   runs are ALREADY eager and this guard costs nothing in the current regime; it only bites if someone turned
+   compile on for speed. (Overshoot is latent-only — the rollout is latent→latent, no decode — so it is cheaper
+   than the recon rollout per step.)
 4. `df_rollout_level > 0` → raise for v1 (two different fed-back-past modifications, untested interaction;
    `df_scale>0` training-noise-only is fine).
 5. prior mode (`dynamics_prior` set / `_proprio_prior != "none"`) → raise (proprio dynamics is chained physics,
