@@ -245,7 +245,7 @@ class Modality(nn.Module):
         tok = self._encode(flat)
         return tok.reshape(*lead, self.n_tokens, tok.shape[-1])
 
-    def decode(self, tok: Tensor, *, commit: bool = False) -> Tensor:
+    def decode(self, tok: Tensor, *, commit: bool = False, eps: Tensor | None = None) -> Tensor:
         """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape). mse/x0 -> 1 step; v+shortcut -> K=1; v plain ->
         decode_steps. Same output shape for every kind/arch.
 
@@ -253,9 +253,17 @@ class Modality(nn.Module):
         ROUND-TRIP anchor: it is an MSE against the target at weight 10, and E||x_hat - t||^2 =
         ||E x_hat - t||^2 + Var(x_hat), so scoring a SAMPLE there trains the sampler's variance toward zero --
         i.e. it would optimise away the very sharpness decode_stochastic exists to buy, at 10x the weight of
-        the decode loss. The anchor's job is to measure the codec, which is deterministic by definition."""
+        the decode loss. The anchor's job is to measure the codec, which is deterministic by definition.
+
+        `eps` (2026-09-22): externally-supplied starting noise, shape (prod(lead), *obs_shape) matching the
+        flattened batch. Only the warped-noise diagnostic (eval_warped_noise) uses it, to decode a frame with a
+        specific ∫-noise field; it forces a full-step stochastic sample from that eps. None -> normal path."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
+        if eps is not None and not self.decode_head.no_noise and not commit:
+            obs = self.decode_head.sample(self._decode_cond(flat), steps=self.decode_steps,
+                                          deterministic=False, eps=eps)
+            return obs.reshape(*lead, *obs.shape[1:])
         stoch = bool(getattr(self, "decode_stochastic", False)) and not self.decode_head.no_noise and not commit
         # x0 collapses to ONE step only when committing: the k-loop's renoise is what injects the sampling
         # noise, so a stochastic x0 decode needs the full decode_steps to be a sampler rather than one draw.
