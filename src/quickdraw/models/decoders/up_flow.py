@@ -45,7 +45,8 @@ class UpFlowDecoder(TransportHead):
         return self.back.synthesize(cond, g, r, seed_extra=seed_extra, skips=skips)
 
     def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
-               record_path: bool = False):
+               record_path: bool = False, share_noise_over: int = 1):
         c = self.cfg
         return self._sample(cond, event_shape=(*img_hw(c.img_size), c.channels), lead=cond.shape[:-2],
-                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
+                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path,
+                            share_noise_over=share_noise_over)   # (2026-09-22) time-shared noise render lever

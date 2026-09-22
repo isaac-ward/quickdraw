@@ -144,6 +144,12 @@ class ModalitySpec:
     #                           BOTH metrics -- a sample off a DRIFTED latent is a sharp WRONG frame, so PSNR
     #                           falls while LPIPS may improve. Ignored by decode_kind=mse (no_noise returns
     #                           before eps is ever drawn), so mse stays bit-identical.
+    decode_shared_noise: bool = False  # flow decode + decode_stochastic ONLY (2026-09-22): draw the sampling
+    #                           noise ONCE per episode and SHARE it across the rollout's time axis, instead of
+    #                           iid per frame. The per-frame sample is sharp either way; sharing removes the
+    #                           frame-to-frame SPARKLE (the decode-side flicker) so the rollout is temporally
+    #                           coherent. It does NOT touch the latent random-walk (the dominant flicker), only
+    #                           how that walk is rendered (record §8.29). No-op unless decode_stochastic is on.
     decode_param: str = "v"   # flow decode parameterization: "v" (velocity, integrate ODE — imprecise for images)
     #                           | "x0" (predict the clean obs directly — precise + in-range; use for image decode). See flow.py.
     decode_arch: str = "vit"  # IMAGE decoder architecture. "unet" (conv U-Net; serves BOTH decode_kinds) |
@@ -254,7 +260,13 @@ class Modality(nn.Module):
         # x0 collapses to ONE step only when committing: the k-loop's renoise is what injects the sampling
         # noise, so a stochastic x0 decode needs the full decode_steps to be a sampler rather than one draw.
         steps = 1 if (self.decode_head.shortcut or (self.decode_head.param == "x0" and not stoch)) else self.decode_steps
-        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=not stoch)
+        # decode_shared_noise (2026-09-22): when sampling a ROLLOUT (lead = (..., T)), draw the noise once per
+        # episode and share it across the T frames so the sparkle is temporally coherent (record §8.29). `lead`
+        # flattens time-contiguous (t fastest), so the share factor is exactly lead[-1]=T. Needs a time axis
+        # (len(lead)>=2) and stochastic sampling; otherwise 1 = iid, bit-identical to before.
+        share = int(lead[-1]) if (stoch and getattr(self, "decode_shared_noise", False) and len(lead) >= 2) else 1
+        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=not stoch,
+                                      share_noise_over=share)
         return obs.reshape(*lead, *obs.shape[1:])
 
     def decode_loss(self, tok: Tensor, target: Tensor):
@@ -352,6 +364,7 @@ class VectorModality(Modality):
         self.derivative_weight = float(getattr(spec, "derivative_weight", 0.0) or 0.0)
         self.derivative_strides = tuple(getattr(spec, "derivative_strides", (1,)) or (1,))
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
+        self.decode_shared_noise = bool(getattr(spec, "decode_shared_noise", False))  # (2026-09-22) time-shared decode noise; see decode()
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
         self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
                                      chunk=int(getattr(spec, "decode_chunk_train", 0) or 0),
@@ -393,6 +406,7 @@ class ImageModality(Modality):
         self.derivative_strides = tuple(getattr(spec, "derivative_strides", (1,)) or (1,))
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
+        self.decode_shared_noise = bool(getattr(spec, "decode_shared_noise", False))  # (2026-09-22) time-shared decode noise; see decode()
         # ONE VisualLoss, registered ONCE here as a child of this modality. `recon_loss` below hands the SAME
         # object to both loss sites; registering it under two parents would duplicate the frozen LPIPS weights
         # in every checkpoint.
@@ -533,10 +547,11 @@ class PretrainedImageHead(TransportHead):
             img = (img + 1) / 2                    # [-1,1] -> [0,1] (probe-confirmed TAESD convention)
         return img.permute(0, 2, 3, 1)             # (M, H, W, 3) in [0,1] — obs space
 
-    def sample(self, cond, *, steps, deterministic, eps=None, record_path=False):
+    def sample(self, cond, *, steps, deterministic, eps=None, record_path=False, share_noise_over: int = 1):
         H, W = img_hw(self.img_size)
         return self._sample(cond, event_shape=(H, W, self.channels), lead=cond.shape[:-2],
-                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
+                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path,
+                            share_noise_over=share_noise_over)   # (2026-09-22) time-shared noise render lever
 
 
 class PretrainedImageModality(Modality):
@@ -553,6 +568,7 @@ class PretrainedImageModality(Modality):
         self.decode_kind = "mse"                   # pretrained path = the deterministic no_noise decode
         self.decode_steps = 1
         self.decode_stochastic = False
+        self.decode_shared_noise = False
         H, W = img_hw(spec.img_size)
         if spec.pretrained_init:                   # load the HF weights (the pretrained pixel prior)
             taesd = AutoencoderTiny.from_pretrained(spec.pretrained_name)

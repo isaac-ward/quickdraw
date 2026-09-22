@@ -36,12 +36,17 @@ def main(cfg):
     rcfg = OmegaConf.load(rpath)                                          # rebuild EXACTLY as trained
     OmegaConf.set_struct(rcfg, False)
 
-    if bool(cfg.get("eval_decode_stochastic", False)):                   # the eval-only flag under test
+    # eval_decode_shared_noise implies stochastic (shared noise is only meaningful while sampling).
+    _shared = bool(cfg.get("eval_decode_shared_noise", False))
+    if bool(cfg.get("eval_decode_stochastic", False)) or _shared:        # the eval-only flags under test
         n = sum(1 for mod in rcfg.model.modalities if str(mod.get("kind", "")) == "image")
         for mod in rcfg.model.modalities:
             if str(mod.get("kind", "")) == "image":
                 mod["decode_stochastic"] = True
-        print(f"[eval_ckpt] decode_stochastic=TRUE on {n} image head(s)", flush=True)
+                if _shared:
+                    mod["decode_shared_noise"] = True                    # (2026-09-22) time-coherent decode; §8.29
+        print(f"[eval_ckpt] decode_stochastic=TRUE{' + shared_noise' if _shared else ''} on {n} image head(s)",
+              flush=True)
 
     from .environments.registry import make_env  # noqa: F401 (imported for parity with the train env build)
     from .evaluation.routines import REGISTRY

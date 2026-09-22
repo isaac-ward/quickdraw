@@ -35,7 +35,8 @@ class TokenGridDecoder(TransportHead):
         return self.back.synthesize(cond, g, r)
 
     def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
-               record_path: bool = False):
-        c = self.cfg
+               record_path: bool = False, share_noise_over: int = 1):   # accepted for a uniform decoder API;
+        c = self.cfg                                                     # no_noise -> _sample ignores it (mse)
         return self._sample(cond, event_shape=(*img_hw(c.img_size), c.channels), lead=cond.shape[:-2],
-                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
+                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path,
+                            share_noise_over=share_noise_over)

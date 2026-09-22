@@ -188,9 +188,18 @@ class TransportHead(nn.Module):
 
     # ---- inference: integrate the ODE ----
     def _sample(self, cond: Tensor, *, event_shape, lead, steps: int, deterministic: bool,
-                eps: Tensor | None = None, record_path: bool = False):
+                eps: Tensor | None = None, record_path: bool = False, share_noise_over: int = 1):
         """Euler-integrate dx/dtau = v from tau=1 (x=eps) -> tau=0. eps=0 (deterministic) -> reproducible
-        committed prediction. `event_shape`/`lead` let heads with different target shapes reuse this."""
+        committed prediction. `event_shape`/`lead` let heads with different target shapes reuse this.
+
+        share_noise_over>1 (2026-09-22): draw the sampling noise SHARED across the time axis instead of iid
+        per frame. The leading dim is the FLATTENED (batch*time) and is time-contiguous (Modality.decode does
+        tok.reshape(-1,...) on (B,T,...) so t is the fast index), so drawing per-batch and repeating over
+        `share_noise_over`=T frames makes the sampled sparkle temporally CONSTANT rather than re-randomising
+        each frame. This is the §8.29 shared-noise render lever: it does NOT touch the latent walk (the
+        dominant flicker), only the decode-side sparkle. Applies to BOTH the initial eps and the per-step
+        renoise, so every stochastic draw in the rollout is time-coherent. share_noise_over<=1 -> iid (default,
+        bit-identical to before)."""
         ts = tuple(lead) + (1,) * self.event_dims
         if self.no_noise:                             # mse decode: one deterministic cond->target prediction (x=0, tau=1)
             # Routed through predict() so the formula lives in ONE place. `predict` only uses its second
@@ -198,9 +207,17 @@ class TransportHead(nn.Module):
             # the zeros tensor itself is exactly equivalent to the inline version this replaced.
             out = self.predict(cond, cond.new_zeros(tuple(lead) + tuple(event_shape)))
             return (out, [out]) if record_path else out
+
+        def _noise(shape):
+            # iid, OR (share_noise_over>1) shared across the time axis -- see the docstring.
+            if share_noise_over > 1:
+                base = torch.randn((shape[0] // share_noise_over, *shape[1:]), device=cond.device, dtype=cond.dtype)
+                return base.repeat_interleave(share_noise_over, dim=0)
+            return torch.randn(shape, device=cond.device, dtype=cond.dtype)
+
         if eps is None:
             shp = tuple(lead) + tuple(event_shape)
-            eps = cond.new_zeros(shp) if deterministic else torch.randn(shp, device=cond.device, dtype=cond.dtype)
+            eps = cond.new_zeros(shp) if deterministic else _noise(shp)
         x = eps
         path = [x]
         if self.param == "x0":                        # consistency-style: predict x0, optionally renoise + refine
@@ -211,7 +228,7 @@ class TransportHead(nn.Module):
                     path.append(x0_hat)
                 if k < steps - 1:                     # renoise to a lower level and refine (0 noise if deterministic)
                     tn = 1.0 - (k + 1) / steps
-                    noise = torch.zeros_like(x0_hat) if deterministic else torch.randn_like(x0_hat)
+                    noise = torch.zeros_like(x0_hat) if deterministic else _noise(x0_hat.shape)
                     x = (1.0 - tn) * x0_hat + tn * noise
             return (x0_hat, path) if record_path else x0_hat
         d = cond.new_full(ts, 1.0 / steps) if self.shortcut else None       # step-size conditioning
@@ -313,10 +330,13 @@ class FlowField(TransportHead):
         return self.out(y).reshape(*lead, n, self.dz)
 
     def sample(self, h: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
-               record_path: bool = False):
-        """Preserves the original signature (cond=h, dz-shaped output) so the dynamics call sites are unchanged."""
+               record_path: bool = False, share_noise_over: int = 1):
+        """Preserves the original signature (cond=h, dz-shaped output) so the dynamics call sites are unchanged.
+        share_noise_over is accepted for a uniform TransportHead API; the DYNAMICS flow never sets it (>1 is a
+        decode-render lever, see _sample) so this stays iid, i.e. bit-identical to before."""
         return self._sample(h, event_shape=(self.dz,), lead=h.shape[:-1], steps=steps,
-                            deterministic=deterministic, eps=eps, record_path=record_path)
+                            deterministic=deterministic, eps=eps, record_path=record_path,
+                            share_noise_over=share_noise_over)
 
 
 class ImageFlowHead(TransportHead):
@@ -368,11 +388,12 @@ class ImageFlowHead(TransportHead):
         return self._unpatchify(self.unpatch(self.norm(h)))           # (M, H, W, C)
 
     def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
-               record_path: bool = False):
+               record_path: bool = False, share_noise_over: int = 1):
         from .vision import img_hw
         c = self.cfg
         return self._sample(cond, event_shape=(*img_hw(c.img_size), c.channels), lead=cond.shape[:-2],
-                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
+                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path,
+                            share_noise_over=share_noise_over)   # (2026-09-22) time-shared noise render lever
 
 
 class ImageUNetFlowHead(TransportHead):
@@ -392,8 +413,9 @@ class ImageUNetFlowHead(TransportHead):
         return self.unet.velocity(x, temb, cond, demb)
 
     def sample(self, cond: Tensor, *, steps: int, deterministic: bool, eps: Tensor | None = None,
-               record_path: bool = False):
+               record_path: bool = False, share_noise_over: int = 1):
         from .vision import img_hw
         c = self.cfg
         return self._sample(cond, event_shape=(*img_hw(c.img_size), c.channels), lead=cond.shape[:-2],
-                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
+                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path,
+                            share_noise_over=share_noise_over)   # (2026-09-22) time-shared noise render lever
