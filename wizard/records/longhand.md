@@ -1074,12 +1074,17 @@ products on a schedule.
 - [ ] **Judge these rollouts on the MP4s, not the filmstrips.** 8 sampled frames out of 1651
       cannot show glitching between samples, which is what the operator sees and what the
       filmstrips missed (§8.28).
-- [ ] **The munge was the decode MEAN, not the dynamics (§8.29).** Stochastic decode gives
+- [x] **The munge was the decode MEAN, not the dynamics (§8.29).** Stochastic decode gives
       spatially-valid blocks (no half-blocks) but flickers, because noise is drawn independently
-      per frame. NEXT: share/warp one `eps` across the rollout (or make it autoregressive) for
-      sharp AND temporally-coherent samples — decode-side, no retrain, does NOT move `OL − floor`.
-      Keep deterministic as the scored default (L2-optimal, reproducible); use stochastic for
-      visuals/LPIPS and flag it.
+      per frame. DONE: `decode_shared_noise` (commit afe48d9) shares one draw — initial eps AND
+      every per-step renoise — across the rollout's time axis. Smoke: iid varies 2.19 across time,
+      shared == 0. Eval on up-flow ep31 (subsample 10): shared LPIPS 0.0919 scene / 0.2713 wrist ==
+      the iid 0.0918 / 0.2702 — **LPIPS is per-frame so it cannot see the coherence gain; the
+      difference is only in the MP4** (flicker removed). So: stochastic keeps the sharpness win,
+      shared removes the sparkle at zero metric cost. Deterministic stays the scored default
+      (L2-optimal, reproducible); stochastic+shared is the render default now on vl128_blockstack_flow.
+      OPEN: judge the shared-vs-iid MP4s side by side; try optical-flow-WARPED noise (vs constant)
+      for coherence under large motion. Neither moves `OL − floor` — they render the walk, not fix it.
 - [ ] The 55 s horizon (`@+1651`) has not improved at ANY token count. Whatever fails at long
       range is a separate problem from the one §8.27 fixed.
 - [ ] ~~The identity/persistence failure is unresolved~~, hypothesis was OVERFITTING
