@@ -50,7 +50,8 @@ since diffusion forcing adds no loss term.)
 - **straight03 (7):** baseline + `variations/latent_straightness`.
 - **DF (6):** baseline (diffusion forcing noises the context + adds a level embedding, but scores through the
   existing `dynamics/latent` — no new term).
-- **(a) overshoot (7):** baseline + `dynamics/latent_overshoot` (or `+len(k)` if logged per horizon).
+- **(a) overshoot (6):** GENERALIZES `dynamics/latent` over depths — same 6 terms (no new named term); a
+  separate `dynamics/latent_overshoot` key is optional, for logging the deep part only.
 - **(b) moment/MMD (7):** baseline + `variations/trajectory_mmd` (or `+2` if `Δ‖z‖` and `‖z‖` logged separately).
 - **(c) latent GAN (8):** baseline + `dynamics/adv_generator` + `discriminator`.
 
@@ -60,13 +61,23 @@ Roll `k` steps in latent space feeding own predictions and match the rolled `ẑ
 `flow.loss` (reuses the existing flow — no new network). Constrains multi-step *marginals*: not the full joint,
 but far more than per-step.
 
-**Why this is NOT already captured by `dynamics/latent`.** At our default `p_tf_dynamics=1` the training rollout
-(`rollout_train` → `_rollout`) is teacher-forced: every step predicts from the TRUE context window, so it yields
-a bank of **1-step-from-truth** predictions, not a compounding trajectory. `dynamics/latent` (1-step, latent) AND
-the `decode/*` recon (1-step, pixel) are therefore both trained 1-step-from-truth — nothing at p_tf=1 rolls its
-own prediction forward. Overshoot is the missing piece: it rolls k OWN steps and supervises the compounded
-`ẑ_{t+k}` directly in LATENT space (the decode recon, even when p_tf<1, supervises the rollout only through the
-decoder, which can mask latent drift). Genuinely a new term, not a re-logging of the flow loss.
+**This is the DEPTH-GENERALIZATION of the current `dynamics/latent`, not a separate term.** Today's loss is the
+`k=1` case: at `p_tf_dynamics=1` the rollout is teacher-forced, so `dynamics/latent` is `L_flow` on the TRUE
+1-step context. Generalize it over a SET of rollout depths `D` (default `{1}` = bit-identical to today); for
+`k>1` the only change is that the context is the model's own `k`-step rollout instead of the truth:
+
+    L_dynamics = Σ_{k in D} w_k · E_t L_flow( cond(rollout_own(z_t,a,k−1), a),  z_{t+k} − ẑ_{t+k-1} )
+                 # D={1}        -> current loss, unchanged
+                 # D={1,4,8,16} -> keep the stable 1-step anchor (w_1=1) + weighted deep supervision
+
+So it adds NO new named term — `dynamics/latent` just becomes a sum over depths (a separate `*_overshoot` key is
+only for readability if you want to log the deep part). It is the SAME axis as `p_tf_dynamics` (own-vs-true
+context), made DETERMINISTIC and explicit-depth rather than a Bernoulli mix — and it reuses the existing
+machinery (`rollout_train(return_feeds=True)` already yields what each step stood on; `dynamics_loss` already
+conditions the flow loss on those feeds). Keep depth-1 as the always-on stable anchor; deep depths get
+`overshoot_detach_every` to bound backprop. Why it still matters at p_tf=1: today NOTHING compounds — both
+`dynamics/latent` (1-step latent) and `decode/*` (1-step pixel) are trained from truth — so the deep depths are
+the only place the model sees, and is corrected on, its own compounding drift in latent space.
 
 - **How many steps (`k`)?** The overshoot horizon = how far you roll before matching to truth. Start modest and
   sweep: `k ∈ {4, 8, 16}`. You can supervise a single horizon (`k=16`) or a few (dense, `{4,8,16}`). Larger k =
@@ -82,7 +93,8 @@ decoder, which can mask latent drift). Genuinely a new term, not a re-logging of
   the freeze/mean-collapse attractor).
 - **New config (`MultiModalFlow.__init__`):** `overshoot_k` (int or list), `overshoot_weight` (float),
   `overshoot_detach_every` (int). All 0/None → off, bit-identical.
-- **Loss terms TOTAL: 3 + 1 = 4** (one aggregated `dynamics/latent_overshoot`; `3 + len(k)` if logged per-horizon).
+- **Loss terms TOTAL: 3** — it GENERALIZES `dynamics/latent` over depths, so no new named term (becomes 4 only
+  if you choose to log the deep-depth part as a separate `*_overshoot` key).
 - **Runs to validate:** 2–3 arms to ep13 — a small `(k, weight)` sweep vs the straight03/DF references, read
   `OL − floor` and `motion_ratio`. Cheap in code, slower per-epoch (extra rollout in the loss).
 - **Blast radius: MEDIUM.** Core dynamics loss (`multimodal.py`), but reuses tensors `rollout_train` already
@@ -201,8 +213,9 @@ as fake), can't point-explode (no per-sample target). Alternates G/D steps → m
 
 ## Recommended order
 
-1. **(a) overshoot on a stop-grad deep rollout** — 1 new term (total 4), MEDIUM blast, no adversary, folds in the
-   deep-drift mechanism. The honest first test of "does constraining multi-step marginals move 0.063?".
+1. **(a) overshoot on a stop-grad deep rollout** — GENERALIZES `dynamics/latent` over depths (no new term, total
+   3 grouped), MEDIUM blast, no adversary, folds in the deep-drift mechanism. The honest first test of "does
+   constraining multi-step marginals move 0.063?".
 2. **(b) trajectory-MMD variation** — 1 new term (total 4), LOW blast. Targets the walk's signature directly.
 3. **(c) latent-trajectory GAN** — 2 new terms (total 5) + a network + manual-optimization surgery. Only if (a)/(b)
    plateau. This is the full Self-Forcing fix.
