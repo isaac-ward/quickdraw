@@ -101,6 +101,18 @@ the decoder and did NOT fix drift, so overshoot's whole bet is that a DIRECT lat
 forgiving decoder) is the missing piece — plausible, not guaranteed (freeze attractor / unlearnable far-drift
 correction are the failure modes to watch via `motion_ratio`).
 
+**Why the anchor prevents the `p_tf→0` blow-up (`w_1` = weight on the clean depth-1 term).** `p_tf→0` is a
+SINGLE loss whose context is fully own-fed, so it has two runaway modes with nothing to counteract them:
+(1) FREEZE/mean-collapse — predict a near-constant transition so the latent barely moves, so drift and the
+correction target vanish (trivially low loss, `motion_ratio→0`); (2) BLOW-UP — own predictions feed the context,
+errors compound, gradients explode (the §19 Jacobian mode). Overshoot KEEPS the clean depth-1 term at full
+weight (`w_1=1`) and ADDS the deep terms (`w_{k>1}`, detached) on top — like a residual/skip connection, the
+stable objective never leaves the sum. Freeze is now directly penalized (reproducing the TRUE 1-step transition
+requires real motion, so a constant prediction has HIGH anchor loss); blow-up is damped (a stable full-weight
+base gradient dominates the noisier deep terms, and `overshoot_detach_every` truncates the long-rollout Jacobian
+product). Not a guarantee — if `w_{k>1}` is set too high it can still freeze — but it converts the failure mode
+from "blows up" into "safely does nothing" (lands back at ~baseline), which is the right failure mode to test with.
+
 - **How many steps (`k`)?** The overshoot horizon = how far you roll before matching to truth. Start modest and
   sweep: `k ∈ {4, 8, 16}`. You can supervise a single horizon (`k=16`) or a few (dense, `{4,8,16}`). Larger k =
   deeper drift exposure, but a longer forward AND a harder target (the correction back to truth grows with k).
