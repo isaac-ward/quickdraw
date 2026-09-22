@@ -51,6 +51,7 @@ without it. It screens the prompt and blurs faces in the output.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from .external import ExternalWorldModel, register
@@ -186,6 +187,11 @@ class CosmosVideo2World(ExternalWorldModel):
         # single call does not yet produce c new frames to condition the next one on.
         hist = [list(frames[i, -c:].permute(0, 3, 1, 2).float().cpu()) for i in range(n)]
         gen: list[list[Tensor]] = [[] for _ in range(n)]
+        # TWO RESOLUTIONS, DELIBERATELY. `hist` holds the last `c` frames at RENDER size, because that is
+        # what the next call conditions on; `gen` holds the whole rollout at OUR size, because that is
+        # what gets scored. Keeping the rollout at render size instead is 25x the memory and cost two
+        # 19-hour runs: 2 episodes x 8192 frames at 720x960 is 126 GiB, which is what the OOM asked for.
+        small = self.out_hw or self.img_size
 
         while min(len(g) for g in gen) < horizon:
             for lo in range(0, n, self.batch):
@@ -211,12 +217,19 @@ class CosmosVideo2World(ExternalWorldModel):
                            output_type="pt").frames                # list of (F,3,H,W) in [0,1]
                 for i in range(lo, hi):
                     # the first c frames are the conditioning echoed back; only what follows is prediction
-                    added = list(out[i - lo][c:])
-                    assert added, f"pipeline returned {len(out[i - lo])} frames for a {c}-frame context"
-                    gen[i].extend(added)
-                    hist[i].extend(added)
+                    added = out[i - lo][c:]
+                    assert len(added), f"pipeline returned {len(out[i - lo])} frames for a {c}-frame context"
+                    keep = min(len(added), horizon - len(gen[i]))
+                    if tuple(added.shape[-2:]) != tuple(small):
+                        down = F.interpolate(added[:keep].float(), size=small, mode="bilinear",
+                                             align_corners=False)
+                    else:
+                        down = added[:keep].float()
+                    gen[i].extend(list(down))
+                    hist[i].extend(list(added))
+                    del hist[i][:-c]           # only the tail is ever read; the rest is render-size bulk
 
-        y = torch.stack([torch.stack(g[:horizon], 0) for g in gen], 0)    # (N,horizon,3,H,W)
+        y = torch.stack([torch.stack(g[:horizon], 0) for g in gen], 0)    # (N,horizon,3,h,w) at OUR size
         return {head: y.permute(0, 1, 3, 4, 2).to(frames.device, frames.dtype)}
 
 

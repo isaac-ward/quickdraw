@@ -67,6 +67,10 @@ class ExternalWorldModel(nn.Module, ABC):
         # produced. Adapters append (episode, lo, hi, text) per generated window; the eval routine drains
         # this next to the filmstrips and clears it. Empty for every model that takes actions as numbers.
         self.prompt_log: list[tuple[int, int, int, str]] = []
+        # OUR frame size, set by imagine_eval before each _rollout. An adapter that generates far above
+        # it (Cosmos renders 25x the pixels the metrics use) should downsample each chunk as it goes:
+        # holding a long rollout at render resolution is what a 9-minute horizon cannot afford.
+        self.out_hw: tuple[int, int] | None = None
 
     @property
     def layout(self):
@@ -184,10 +188,11 @@ class ExternalWorldModel(nn.Module, ABC):
             f"actions has {actions.shape[1]} steps; P={p} and horizon={horizon} require {p - 1 + horizon}")
         native = {h: self._resize(v, self.img_size) for h, v in native.items()}
 
+        ours = tuple(int(v) for v in next(iter(ctx_obs.values())).shape[-3:-1])   # OUR frame size
+        self.out_hw = ours          # a chunked adapter may downsample to this as it generates
         out = self._rollout(native, self._actions(actions, horizon, norm=norm), horizon, want)
 
         assert isinstance(out, dict), f"_rollout must return a dict, got {type(out).__name__}"
-        ours = next(iter(ctx_obs.values())).shape[-3:-1]                 # OUR frame size, from the context
         res = {}
         for h in want:
             assert h in out, f"_rollout returned {sorted(out)} but was asked for {h}"
