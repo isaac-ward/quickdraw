@@ -6,12 +6,17 @@ same floor-corrected residual `OL − floor ≈ 0.063` (band 0.057–0.069) and 
 
 ## Root cause (the framing the whole literature converges on)
 
-**Exposure bias / covariate shift.** We train the dynamics loss on CLEAN ground-truth context (teacher forced,
-`p_tf_dynamics=1`), so the v-field is only ever asked to step from *true* latents. At rollout it steps from its
-*own* latents, which it has (mostly) never seen. Correction to an earlier overstatement: our dynamics loss is
-NOT naive mean-seeking MSE — `flow.loss` is `F.mse_loss(v, eps−target)` on the velocity at a random τ, i.e. the
-rectified-flow objective, which is **distributional** (it samples `p(z_{t+1}|z_t,a)`). The gap is narrower and
-sharper than "MSE → mean":
+**Exposure bias / covariate shift — but ONLY on the latent dynamics loss.** Important nuance (the recipe runs
+`p_tf_end=0, p_tf_warmup_epochs=1`, `p_tf_dynamics=1.0`):
+- The **recon (pixel) rollout is at p_tf=0** after epoch 1 — fully own-fed. So the recon loss ALREADY trains on
+  the model's own deep rollout (over F=64), decoded. Drift IS seen — in pixel space, *through the decoder*.
+- The **latent dynamics loss is clean** (`p_tf_dynamics=1.0`): it steps only from TRUE latents, 1-step. It never
+  sees its own drifted latents. This is where exposure bias actually lives.
+
+So the v-field is only ever asked to step from true latents, while the recon signal that DOES see drift reaches
+it only through a decoder that can absorb latent error. Correction to an earlier overstatement: the dynamics
+loss is NOT naive mean-seeking MSE — `flow.loss` is `F.mse_loss(v, eps−target)` on the velocity at a random τ,
+the rectified-flow objective, which is **distributional** (it samples `p(z_{t+1}|z_t,a)`). The gap is narrower:
 
 - Our loss constrains each **one-step conditional**. Every transition is individually plausible.
 - Nothing constrains the **joint trajectory** `p(z_{1:H}|z_0,a_{1:H})`. A chain of individually-plausible steps
@@ -75,9 +80,26 @@ only for readability if you want to log the deep part). It is the SAME axis as `
 context), made DETERMINISTIC and explicit-depth rather than a Bernoulli mix — and it reuses the existing
 machinery (`rollout_train(return_feeds=True)` already yields what each step stood on; `dynamics_loss` already
 conditions the flow loss on those feeds). Keep depth-1 as the always-on stable anchor; deep depths get
-`overshoot_detach_every` to bound backprop. Why it still matters at p_tf=1: today NOTHING compounds — both
-`dynamics/latent` (1-step latent) and `decode/*` (1-step pixel) are trained from truth — so the deep depths are
-the only place the model sees, and is corrected on, its own compounding drift in latent space.
+`overshoot_detach_every` to bound backprop.
+
+**Why it still matters even though the recon rollout is at p_tf=0.** The recon rollout ALREADY runs own-fed at
+p_tf=0, so the deep own-drifted contexts (`feeds`) are already computed and the recon loss already supervises
+them — but only in PIXEL space, through the decoder (which can absorb latent error). The LATENT dynamics loss is
+kept clean (`p_tf_dynamics=1.0`), so nothing supervises those deep contexts DIRECTLY in latent space. Overshoot
+is exactly that missing direct-latent term. And because the deep contexts are already produced by the p_tf=0
+recon rollout, overshoot **reuses `feeds`** (request `return_feeds=True`) rather than running a new rollout — so
+it's **near-free (~straight03's 1.1h/epoch, not DF's 2.9h**; the 2.9h is DF's per-step noised-past overhead,
+which overshoot does not have).
+
+**Relation to `p_tf_dynamics`, precisely (why 0.8 failing doesn't doom this).** Same raw material (the p_tf=0
+own-contexts); the difference is what supervises the latent loss: `p_tf_dynamics=1.0` = clean only (today);
+`=0.8` (ran, FAILED) = 80/20 clean/own mix — shallow (a deep coherent own-context is ~0.2^k ≈ 0) AND no separate
+anchor; `→0` = deep but no anchor → blow-up/mean-collapse. Overshoot = the unexplored **deep AND anchored**
+point, which the single `p_tf_dynamics` scalar cannot express (it trades anchor against depth; overshoot
+decouples them into two weights). RISK, stated honestly: the recon already trains on these deep contexts through
+the decoder and did NOT fix drift, so overshoot's whole bet is that a DIRECT latent target (bypassing the
+forgiving decoder) is the missing piece — plausible, not guaranteed (freeze attractor / unlearnable far-drift
+correction are the failure modes to watch via `motion_ratio`).
 
 - **How many steps (`k`)?** The overshoot horizon = how far you roll before matching to truth. Start modest and
   sweep: `k ∈ {4, 8, 16}`. You can supervise a single horizon (`k=16`) or a few (dense, `{4,8,16}`). Larger k =
