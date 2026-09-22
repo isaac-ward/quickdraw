@@ -137,6 +137,68 @@ but the prerequisite makes it VERY HIGH blast radius and least natural for our r
 
 ---
 
+## Math / pseudocode for the new terms
+
+Shared primitive — our existing rectified-flow loss (`param="v"`), the thing `dynamics/latent` already is:
+
+    L_flow(c, y) = E_{τ~U(0,1), ε~N(0,I)}  || v_θ(x_τ, τ, c) − (ε − y) ||²,   x_τ = (1−τ)·y + τ·ε
+
+`c` = backbone conditioning from context+action; `y` = residual target `z_{t+1} − z_t`. Current 1-step term:
+`L_1 = E_t L_flow(c_t^true, z_{t+1} − z_t)` — TRUE context, so it never compounds (p_tf=1).
+
+Write `enc(·)` for the encoder (true latent `z_t = enc(o_t)`), `step(s, a)` for one flow rollout step producing
+the next latent from state `s` (own-fed), `cond(s, a)` for the backbone conditioning at state `s`.
+
+### (a) Latent overshoot — `dynamics/latent_overshoot`
+
+Roll `k` OWN steps from a true anchor, then score the compounded latent against truth in latent space:
+
+    # anchor at true z_t; roll own predictions forward k steps
+    s = z_t                                        # true window end
+    for j in 1..k:
+        ẑ = step(s, a_{t+j-1})                     # OWN prediction fed forward (this is the compounding)
+        if j % overshoot_detach_every == 0:
+            ẑ = ẑ.detach()                         # truncate backprop; =1 -> pure-forward (DAgger regime)
+        s = slide(s, ẑ)                            # advance the window with the OWN pred
+    L_overshoot = λ_over · E_t [ L_flow( cond(s, a_{t+k-1}),  z_{t+k} − ẑ_{t+k-1} ) ]
+    # target = correction from the DRIFTED own-latent ẑ_{t+k-1} back to the TRUE next z_{t+k}
+
+(Optionally sum over several k, e.g. {4,8,16}.) Contrast with `L_1`: the conditioning `cond(s,·)` is built from
+the model's OWN rolled context, not the true one — that's the whole point.
+
+### (b) Trajectory moment / MMD — `variations/trajectory_mmd`
+
+Roll H own steps → `ẑ_{1:H}`; encode truth → `z_{1:H}`. Form per-step statistics (the walk's signature):
+
+    d̂_t = ‖ẑ_{t+1} − ẑ_t‖,  n̂_t = ‖ẑ_t‖      (generated)
+    d*_t = ‖z_{t+1} − z_t‖,  n*_t = ‖z_t‖      (real)
+
+**Plain moment loss** (match low-order moments):
+
+    L_moment = λ · [ (mean d̂ − mean d*)² + (var d̂ − var d*)²
+                   + (mean n̂ − mean n*)² + (var n̂ − var n*)² ]
+
+**MMD loss** (match whole distributions; RBF kernel k(a,b)=exp(−‖a−b‖²/2σ²); X=generated stat set, Y=real):
+
+    MMD²(X,Y) = mean_{i,i'} k(x_i,x_{i'}) + mean_{j,j'} k(y_j,y_{j'}) − 2·mean_{i,j} k(x_i,y_j)
+    L_mmd = λ · MMD²( {[d̂_t, n̂_t]},  {[d*_t, n*_t]} )
+
+No decoder, no adversary — just statistics of the rolled vs real latent trajectory.
+
+### (c) Latent-trajectory GAN — `dynamics/adv_generator` + `discriminator`
+
+A discriminator `D_φ` over a latent-bag SEQUENCE (small temporal transformer/conv, (H,n_state,d)→scalar).
+Generator = the flow rolling `ẑ_{1:H}` (history stop-grad; gradient enters through the current step). Hinge form:
+
+    ẑ_{1:H} = rollout_own(z_0, a)          # own-fed; deep history detached, see the stop-grad mechanism above
+    z_{1:H} = enc(true frames)
+    L_D = E[ relu(1 − D_φ(z_{1:H})) ] + E[ relu(1 + D_φ(ẑ_{1:H})) ]      # train D (its own optimizer)
+    L_G = − E[ D_φ(ẑ_{1:H}) ]                                            # train the flow to look real
+    L_adv_generator = λ_gan · L_G
+
+`D_φ` is the learned, sequence-level distribution matcher: can't mean-collapse (a mean/frozen trajectory reads
+as fake), can't point-explode (no per-sample target). Alternates G/D steps → manual optimization in `lit.py`.
+
 ## Recommended order
 
 1. **(a) overshoot on a stop-grad deep rollout** — 1 new term (total 4), MEDIUM blast, no adversary, folds in the
