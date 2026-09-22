@@ -37,8 +37,10 @@ current step / the final loss). This is what lets any of the losses below train 
 
 ## The ladder (cheapest → heaviest)
 
-Baseline `bs_ss10_2cam` optimizes **6 loss terms**: `dynamics/latent`, `decode/{proprio,cam_scene,cam_wrist}`,
-`codec/roundtrip_{cam_scene,cam_wrist}`. Totals below are *for an arm built on that baseline*.
+Baseline `bs_ss10_2cam` optimizes **3 loss terms** (counting all per-head `decode/*` as one `decode` term and
+all `codec/roundtrip_*` as one `roundtrip` term): `dynamics/latent`, `decode`, `roundtrip`. Totals below are
+*for an arm built on that baseline*. (For reference: straight03 = 3 + `latent_straightness` = 4; DF = 3 + 0 = 3,
+since diffusion forcing adds no loss term.)
 
 ### (a) Latent overshooting (PlaNet, arXiv 1811.04551) — lowest risk, do first
 
@@ -60,7 +62,7 @@ but far more than per-step.
   the freeze/mean-collapse attractor).
 - **New config (`MultiModalFlow.__init__`):** `overshoot_k` (int or list), `overshoot_weight` (float),
   `overshoot_detach_every` (int). All 0/None → off, bit-identical.
-- **Loss terms TOTAL: 6 + 1 = 7** (one aggregated `dynamics/latent_overshoot`; `6 + len(k)` if logged per-horizon).
+- **Loss terms TOTAL: 3 + 1 = 4** (one aggregated `dynamics/latent_overshoot`; `3 + len(k)` if logged per-horizon).
 - **Runs to validate:** 2–3 arms to ep13 — a small `(k, weight)` sweep vs the straight03/DF references, read
   `OL − floor` and `motion_ratio`. Cheap in code, slower per-epoch (extra rollout in the loss).
 - **Blast radius: MEDIUM.** Core dynamics loss (`multimodal.py`), but reuses tensors `rollout_train` already
@@ -80,7 +82,7 @@ growing norm).
   matching (moment ⊂ MMD in what it constrains), at the cost of a batch of samples + a kernel bandwidth to set.
 - **New config (a `Variation`, sibling of `latent_straightness`):** `variations.trajectory_mmd.weight`, `.stats`
   (`delta_norm|latent_norm`), `.kernel`/`.bandwidth`. Off by default = bit-identical.
-- **Loss terms TOTAL: 6 + 1 = 7** (one aggregated term; `6 + 2` if `Δ‖`-dist and `‖z‖`-dist are logged separately).
+- **Loss terms TOTAL: 3 + 1 = 4** (one aggregated term; `3 + 2` if `Δ‖`-dist and `‖z‖`-dist are logged separately).
 - **Runs:** 1–2 weight arms; watch `motion_ratio` (matching norms can freeze OR inflate).
 - **Blast radius: LOW** *if* the variation hook exposes both the rolled and the true latents. `LatentStraightness`
   already runs on the rolled latent, so this is a near-sibling — but it needs the *true* latent too, which
@@ -100,7 +102,7 @@ critic" lives** — the rollout mechanism is folded into (a); the *critic* is th
 - **New config:** `gan_weight`, D arch/width, D lr, D:G update ratio, warmup, spectral-norm on D.
 - **New module + training-loop change:** a discriminator network, and `lit.py` must switch from automatic to
   **manual optimization** (two optimizers, alternating G/D).
-- **Loss terms TOTAL: 6 + 2 = 8** (`dynamics/adv_generator` + `discriminator`), plus a whole D network on a
+- **Loss terms TOTAL: 3 + 2 = 5** (`dynamics/adv_generator` + `discriminator`), plus a whole D network on a
   second optimizer.
 - **Runs: MANY.** GANs need tuning (lr ratio, weight, warmup, D capacity); expect several arms just to stabilize
   before the effect is even readable.
@@ -110,17 +112,17 @@ critic" lives** — the rollout mechanism is folded into (a); the *critic* is th
 ### (d) DMD (distribution matching distillation) — SKIP
 
 Two score nets (a "real" score from a teacher, a "fake" score tracking the generator) + a KL-matching gradient.
-**Requires a bidirectional/teacher score model we don't have** (we'd have to train one first). Loss terms 6 + 2,
+**Requires a bidirectional/teacher score model we don't have** (we'd have to train one first). Loss terms 3 + 2 = 5,
 but the prerequisite makes it VERY HIGH blast radius and least natural for our regime. Not pursued.
 
 ---
 
 ## Recommended order
 
-1. **(a) overshoot on a stop-grad deep rollout** — 1 new term (total 7), MEDIUM blast, no adversary, folds in the
+1. **(a) overshoot on a stop-grad deep rollout** — 1 new term (total 4), MEDIUM blast, no adversary, folds in the
    deep-drift mechanism. The honest first test of "does constraining multi-step marginals move 0.063?".
-2. **(b) trajectory-MMD variation** — 1 new term (total 7), LOW blast. Targets the walk's signature directly.
-3. **(c) latent-trajectory GAN** — 2 new terms (total 8) + a network + manual-optimization surgery. Only if (a)/(b)
+2. **(b) trajectory-MMD variation** — 1 new term (total 4), LOW blast. Targets the walk's signature directly.
+3. **(c) latent-trajectory GAN** — 2 new terms (total 5) + a network + manual-optimization surgery. Only if (a)/(b)
    plateau. This is the full Self-Forcing fix.
 4. **(d) DMD** — skip.
 
