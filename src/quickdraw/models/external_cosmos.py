@@ -177,10 +177,18 @@ class CosmosVideo2World(ExternalWorldModel):
         n, p = frames.shape[:2]
         prompts = actions if isinstance(actions, list) else [str(actions)] * n
         pipe, c = self.pipe(), self._cond_len(p)
+        per = self.num_frames - c
+        n_call = -(-horizon // per) * -(-n // self.batch)
         if not getattr(self, "_said", False):
             self._said = True
-            print(f"[cosmos] context {c}/{p} frames ({self.num_frames - c} new per call, "
-                  f"{-(-horizon // (self.num_frames - c))} calls for horizon {horizon})", flush=True)
+            print(f"[cosmos] context {c}/{p} frames ({per} new per call, "
+                  f"{-(-horizon // per)} calls for horizon {horizon})", flush=True)
+        # PER-CALL PROGRESS. The eval routine reports once per MODE, which is right for a model whose
+        # rollout is one batched forward pass and useless for one that spends a day inside a single mode:
+        # a 9-minute horizon here is 188 sequential pipeline calls and, without this, 19 hours of silence
+        # after "5% — mode open_loop". Rate and ETA come from measured calls, not from an estimate.
+        import time
+        t_start, done_calls = time.time(), 0
         # PER-EPISODE HISTORY, seeded with the context: the next call always conditions on the last c
         # frames we have, and early on that is still partly ground truth. Keeping the history (rather than
         # only the generated tail) is what makes a short clip length safe -- with c close to num_frames a
@@ -228,6 +236,11 @@ class CosmosVideo2World(ExternalWorldModel):
                     gen[i].extend(list(down))
                     hist[i].extend(list(added))
                     del hist[i][:-c]           # only the tail is ever read; the rest is render-size bulk
+                done_calls += 1
+                el = time.time() - t_start
+                print(f"[cosmos] call {done_calls}/{n_call} — ep {lo}, steps +{g0 + 1}..+{g0 + keep} "
+                      f"| {el / done_calls:.0f}s/call, {el / 3600:.1f}h elapsed, "
+                      f"{(n_call - done_calls) * el / done_calls / 3600:.1f}h left", flush=True)
 
         y = torch.stack([torch.stack(g[:horizon], 0) for g in gen], 0)    # (N,horizon,3,h,w) at OUR size
         return {head: y.permute(0, 1, 3, 4, 2).to(frames.device, frames.dtype)}
