@@ -24,6 +24,10 @@ services:
       - ./pyproject.toml:/app/pyproject.toml:ro   # so `uv lock` inside the container sees YOUR edits, not
       - ./uv.lock:/app/uv.lock                    #   the copy baked at image build (which silently
       #                                             re-resolved against stale deps and cost an hour)
+      - ./oneoffs:/app/oneoffs     # gitignored throwaway diagnostic scripts (NOT in the package). Run as
+      #                              `python oneoffs/<name>.py ...`; use absolute `from quickdraw...` imports.
+      #                              (Takes effect on the next `docker compose up -d` recreate; until then a
+      #                              one-off can be run from any already-mounted dir, e.g. logs/oneoffs/.)
       - ./scratch:/app/scratch     # big downloaded datasets / working data (gitignored). Beside logs/
       #                              rather than inside it because a dataset is not a log. Adding this
       #                              mount needs `docker compose up -d`, which RECREATES the container

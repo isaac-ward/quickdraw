@@ -144,3 +144,4 @@ wizard/scripts/*
 # scratch/ — big downloaded datasets and other working data. Sits beside logs/ rather than inside
 # it because a dataset is not a log. Mounted into the container at /app/scratch (docker-compose.yml).
 scratch/
+/oneoffs/
