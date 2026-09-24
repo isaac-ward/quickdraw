@@ -383,6 +383,7 @@ def build_model(cfg):
                                        # rebuilding it with True doubles the flow's h_dim and the checkpoint
                                        # fails to load with a size mismatch. New runs get True from mm_flow.yaml.
                                        concat_action_embedding=bool(dfg("concat_action_embedding", False)),
+                                       concat_proprio_embedding=bool(m.get("concat_proprio_embedding", False)),
                                        lambda_flow=m.get("lambda_flow", 1.0),
                                        lambda_consistency=m.get("lambda_consistency", 1.0),
                                        df_scale=df_scale, df_granularity=df_granularity,

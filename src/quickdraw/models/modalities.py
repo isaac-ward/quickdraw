@@ -144,6 +144,11 @@ class ModalitySpec:
     #                           BOTH metrics -- a sample off a DRIFTED latent is a sharp WRONG frame, so PSNR
     #                           falls while LPIPS may improve. Ignored by decode_kind=mse (no_noise returns
     #                           before eps is ever drawn), so mse stays bit-identical.
+    decode_condition_on: tuple = ()   # (2026-09-24) extra head names whose token slices are APPENDED to this
+    #                           head's decode conditioning (e.g. [proprio] -> the image renderer sees the cube
+    #                           state directly, not only via backbone attention). Per-head, mirroring the other
+    #                           decode_* fields; the up-decoder reads cond by cross-attention so variable token
+    #                           count is fine. Empty -> bit-identical. See multimodal.to_obs.
     decode_shared_noise: bool = False  # flow decode + decode_stochastic ONLY (2026-09-22): draw the sampling
     #                           noise ONCE per episode and SHARE it across the rollout's time axis, instead of
     #                           iid per frame. The per-frame sample is sharp either way; sharing removes the
@@ -245,7 +250,8 @@ class Modality(nn.Module):
         tok = self._encode(flat)
         return tok.reshape(*lead, self.n_tokens, tok.shape[-1])
 
-    def decode(self, tok: Tensor, *, commit: bool = False, eps: Tensor | None = None) -> Tensor:
+    def decode(self, tok: Tensor, *, commit: bool = False, eps: Tensor | None = None,
+               cond_extra: Tensor | None = None) -> Tensor:
         """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape). mse/x0 -> 1 step; v+shortcut -> K=1; v plain ->
         decode_steps. Same output shape for every kind/arch.
 
@@ -260,9 +266,16 @@ class Modality(nn.Module):
         specific ∫-noise field; it forces a full-step stochastic sample from that eps. None -> normal path."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
+        # decode_condition_on (2026-09-24): APPEND extra conditioning tokens (e.g. the proprio/cube slice) to
+        # this head's own tokens, so the renderer conditions on them directly. The up-decoder reads `cond` by
+        # CROSS-ATTENTION (TokenGridReadout / TokenPool), so a variable token count is fine -- no arch change.
+        # None -> bit-identical.
+        cond = self._decode_cond(flat)
+        if cond_extra is not None:
+            ce = cond_extra.reshape(-1, cond_extra.shape[-2], cond_extra.shape[-1])
+            cond = torch.cat([cond, ce], dim=-2)
         if eps is not None and not self.decode_head.no_noise and not commit:
-            obs = self.decode_head.sample(self._decode_cond(flat), steps=self.decode_steps,
-                                          deterministic=False, eps=eps)
+            obs = self.decode_head.sample(cond, steps=self.decode_steps, deterministic=False, eps=eps)
             return obs.reshape(*lead, *obs.shape[1:])
         stoch = bool(getattr(self, "decode_stochastic", False)) and not self.decode_head.no_noise and not commit
         # x0 collapses to ONE step only when committing: the k-loop's renoise is what injects the sampling
@@ -273,12 +286,15 @@ class Modality(nn.Module):
         # flattens time-contiguous (t fastest), so the share factor is exactly lead[-1]=T. Needs a time axis
         # (len(lead)>=2) and stochastic sampling; otherwise 1 = iid, bit-identical to before.
         share = int(lead[-1]) if (stoch and getattr(self, "decode_shared_noise", False) and len(lead) >= 2) else 1
-        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=not stoch,
-                                      share_noise_over=share)
+        obs = self.decode_head.sample(cond, steps=steps, deterministic=not stoch, share_noise_over=share)
         return obs.reshape(*lead, *obs.shape[1:])
 
-    def decode_loss(self, tok: Tensor, target: Tensor):
+    def decode_loss(self, tok: Tensor, target: Tensor, cond_extra: Tensor | None = None):
         """Per-head decode loss. Returns `(main, shortcut|None, derivative|None)`.
+
+        `cond_extra` (2026-09-24): extra conditioning tokens (decode_condition_on) APPENDED to this head's cond
+        at BOTH the train (here) and inference (decode) sites, so the decoder trains and infers on the same
+        conditioning. None -> bit-identical.
 
         The head scores its clean prediction with `self.recon_loss`, which is the SAME object the roundtrip
         anchor uses -- see recon_loss below. No second decoder forward, which matters because the decoder is
@@ -303,6 +319,9 @@ class Modality(nn.Module):
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         tgt = target.reshape(-1, *target.shape[len(lead):])
         cond = self._decode_cond(flat)
+        if cond_extra is not None:                              # decode_condition_on: append extra cond tokens
+            ce = cond_extra.reshape(-1, cond_extra.shape[-2], cond_extra.shape[-1])
+            cond = torch.cat([cond, ce], dim=-2)
         want_d = float(getattr(self, "derivative_weight", 0.0) or 0.0) > 0.0
         if want_d and not self.decode_head.no_noise:
             raise ValueError(
@@ -373,6 +392,7 @@ class VectorModality(Modality):
         self.derivative_strides = tuple(getattr(spec, "derivative_strides", (1,)) or (1,))
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         self.decode_shared_noise = bool(getattr(spec, "decode_shared_noise", False))  # (2026-09-22) time-shared decode noise; see decode()
+        self.decode_condition_on = tuple(getattr(spec, "decode_condition_on", ()) or ())  # (2026-09-24) extra heads appended to decode cond
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
         self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
                                      chunk=int(getattr(spec, "decode_chunk_train", 0) or 0),
@@ -415,6 +435,7 @@ class ImageModality(Modality):
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
         self.decode_shared_noise = bool(getattr(spec, "decode_shared_noise", False))  # (2026-09-22) time-shared decode noise; see decode()
+        self.decode_condition_on = tuple(getattr(spec, "decode_condition_on", ()) or ())  # (2026-09-24) extra heads appended to decode cond
         # ONE VisualLoss, registered ONCE here as a child of this modality. `recon_loss` below hands the SAME
         # object to both loss sites; registering it under two parents would duplicate the frozen LPIPS weights
         # in every checkpoint.

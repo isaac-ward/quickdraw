@@ -1,0 +1,21 @@
+# vl128_blockstack_2cam_cube_wired — the cube overlay WIRED: give the model DIRECT access to the proprio (state+
+# cube) beyond the weak attention channel. Two features (2026-09-24):
+#   concat_proprio_embedding: broadcast the RAW proprio token into every state token's dynamics conditioning
+#                             (un-cancellable, mirrors concat_action_embedding).
+#   decode_condition_on:[proprio] on each image head: the renderer conditions on the proprio/cube slice directly.
+defaults:
+  - vl128_blockstack_2cam_cube
+  - _self_
+concat_proprio_embedding: true
+modalities:
+  - {name: proprio, kind: vector, dim: 49, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  - {name: cam_scene, kind: image, cam: scene_right, weight: 1.0, decode_condition_on: [proprio],
+     img_size: [96, 128], ae_bottleneck: 6, pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32, decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128, latent_loss_weight: 10}
+  - {name: cam_wrist, kind: image, cam: gripper_right_top, weight: 1.0, decode_condition_on: [proprio],
+     img_size: [96, 128], ae_bottleneck: 6, pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32, decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128, latent_loss_weight: 10}

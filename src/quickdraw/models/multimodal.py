@@ -127,6 +127,15 @@ class MultiModalSequenceModel(nn.Module):
         self.n_state = sum(n for _, n in self.layout)
         self.n_input = self.n_state + 1                       # + action token
         self.d, self.window = d, window
+        # proprio token slice in the bag (for concat_proprio_embedding — the un-cancellable proprio channel into
+        # _cond, mirroring concat_action_embedding). None if there is no proprio head.
+        _po = 0
+        self._proprio_off = None
+        for _nm, _n in self.layout:
+            if _nm == "proprio":
+                self._proprio_off, self._proprio_n = _po, _n; break
+            _po += _n
+        self.concat_proprio_embedding = False                 # Flow subclass opts in (config); base is off
         # RELATIVE POSITION ENCODING (design/collapse.md floor lever): re-express the proprio POSITION channels
         # relative to the window's first step, `p~ = (p - anchor)/s_rel`, so the codec represents a small
         # within-window displacement (~8.6x smaller than absolute) instead of a ±300 value -> lower raw floor.
@@ -327,10 +336,19 @@ class MultiModalSequenceModel(nn.Module):
 
     def to_obs(self, bag: Tensor, heads=None, anchor: Tensor | None = None, commit: bool = False) -> dict[str, Tensor]:
         """`commit=True` -> deterministic decode even under decode_stochastic (see Modality.decode)."""
+        offs, _o = {}, 0
+        for name, n in self.layout:                                  # name -> (offset, n) for decode_condition_on gather
+            offs[name] = (_o, n); _o += n
         out, off = {}, 0
         for name, n in self.layout:
             if heads is None or name in heads:                       # partial decode (e.g. proprio-only long rollouts)
-                out[name] = self.modalities[name].decode(bag[..., off:off + n, :], commit=commit)
+                # decode_condition_on: append the named heads' token slices to this head's decode conditioning
+                # (e.g. image head conditions on the proprio/cube slice directly). Empty -> unchanged.
+                extra = None
+                cond_on = getattr(self.modalities[name], "decode_condition_on", ())
+                if cond_on:
+                    extra = torch.cat([bag[..., offs[c][0]: offs[c][0] + offs[c][1], :] for c in cond_on], dim=-2)
+                out[name] = self.modalities[name].decode(bag[..., off:off + n, :], commit=commit, cond_extra=extra)
             off += n
         if anchor is not None and "proprio" in out:
             out["proprio"] = self.absolutize_proprio(out["proprio"], anchor)   # back to ABSOLUTE (no-op if off)
@@ -355,6 +373,9 @@ class MultiModalSequenceModel(nn.Module):
         # through to_obs, so it never de-relativizes -> its targets must be relativized to match. (roundtrip
         # below goes through to_obs, which DOES de-relativize, so it keeps the ABSOLUTE targets.)
         dtgt = self.relativize(targets, anchor) if anchor is not None else targets
+        offs, _o = {}, 0                                          # name -> (offset,n) for decode_condition_on gather
+        for _nm, _n in self.layout:
+            offs[_nm] = (_o, _n); _o += _n
         out, wts, off = {}, {}, 0
         for name, n in self.layout:
             mod = self.modalities[name]
@@ -366,7 +387,9 @@ class MultiModalSequenceModel(nn.Module):
                 wts["decode/proprio"] = float(mod.weight)
                 off += n
                 continue
-            main, sc, deriv = mod.decode_loss(bag[..., off:off + n, :], dtgt[name])
+            _cond_on = getattr(mod, "decode_condition_on", ())   # decode_condition_on: append named heads' slices
+            _extra = torch.cat([bag[..., offs[c][0]: offs[c][0] + offs[c][1], :] for c in _cond_on], dim=-2) if _cond_on else None
+            main, sc, deriv = mod.decode_loss(bag[..., off:off + n, :], dtgt[name], cond_extra=_extra)
             out[f"decode/{name}"], wts[f"decode/{name}"] = main, float(mod.weight)
             if sc is not None:                                  # flow decoders only
                 out[f"decode/{name}_shortcut"], wts[f"decode/{name}_shortcut"] = sc, float(mod.weight)
@@ -487,8 +510,8 @@ class MultiModalSequenceModel(nn.Module):
         Returns the next state bag (B,*,n_state,d)."""
         raise NotImplementedError
 
-    def _cond(self, h_bag: Tensor, act: Tensor | None = None) -> Tensor:
-        """Backbone output (+ the raw action) -> the per-token conditioning the dynamics consumes.
+    def _cond(self, h_bag: Tensor, act: Tensor | None = None, proprio_raw: Tensor | None = None) -> Tensor:
+        """Backbone output (+ the raw action + optionally the raw proprio) -> per-token conditioning.
 
         Up to three channels per state token, concatenated on the feature axis:
           h_state   h_bag[..., :n_state, :]                   the state slots (always)
@@ -517,10 +540,24 @@ class MultiModalSequenceModel(nn.Module):
             parts.append(h_bag[..., self.n_state : self.n_state + 1, :].expand_as(h_state))
         if getattr(self, "concat_action_embedding", False) and act is not None:
             parts.append(self.act_enc(act).unsqueeze(-2).expand_as(h_state))
+        # concat_proprio_embedding (2026-09-24): broadcast the RAW (pre-backbone) proprio token to every state
+        # token, the direct un-cancellable analogue of concat_action_embedding -- gives the image tokens the
+        # proprio (incl cube) state DIRECTLY when predicting the next latent, instead of only via attention.
+        # proprio_raw is the pre-backbone proprio slice (B,*,n_prop,d), threaded from the call site.
+        if getattr(self, "concat_proprio_embedding", False) and proprio_raw is not None:
+            pr = proprio_raw.mean(dim=-2, keepdim=True) if proprio_raw.shape[-2] > 1 else proprio_raw
+            parts.append(pr.expand_as(h_state))
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
+    def _proprio_slot(self, bag: Tensor):
+        """Pre-backbone proprio token slice (B,*,n_prop,d) from a raw bag, for concat_proprio_embedding. None
+        when off / no proprio head, so `_cond` skips the channel and the width is unchanged."""
+        if not getattr(self, "concat_proprio_embedding", False) or self._proprio_off is None:
+            return None
+        return bag[..., self._proprio_off: self._proprio_off + self._proprio_n, :]
+
     def readout(self, h_bag: Tensor, prev_bag: Tensor, act: Tensor | None = None) -> Tensor:
-        return self.predict_next(self._cond(h_bag, act), prev_bag)
+        return self.predict_next(self._cond(h_bag, act, self._proprio_slot(prev_bag)), prev_bag)
 
     def carry_transform(self, bag: Tensor) -> Tensor:
         """What gets fed back into the rollout. Latent models (LSAR/diffusion) carry the predicted latent
@@ -934,7 +971,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                  sampling_steps: int = 6, shortcut: bool = False, predict: str = "residual",
                  stochastic_eval: bool = True, time_sampling: str = "uniform", flow_hidden: int = 0,
                  flow_arch: str = "mlp", flow_arch_depth: int = 2, flow_arch_heads: int = 4,
-                 concat_action_embedding: bool = True,
+                 concat_action_embedding: bool = True, concat_proprio_embedding: bool = False,
                  lambda_flow: float = 1.0, lambda_consistency: float = 1.0,
                  df_scale: float = 0.0, df_granularity: str = "timestep", df_rollout_level: float = 0.0,
                  action_head_enabled: bool = False, action_head_weight: float = 1.0,
@@ -957,10 +994,14 @@ class MultiModalFlow(MultiModalSequenceModel):
         # concat_action_embedding: give the denoiser the action token's own backbone output on a dedicated
         # channel (see _cond). Doubles the conditioning width, so the FlowField's h_dim doubles with it.
         self.concat_action_embedding = bool(concat_action_embedding)
+        # concat_proprio_embedding (2026-09-24): the proprio analogue -- broadcast the RAW proprio token into
+        # every state token's conditioning (un-cancellable, like the action raw channel). Adds one more d-block
+        # to the conditioning width. Off by default (bit-identical). See _cond.
+        self.concat_proprio_embedding = bool(concat_proprio_embedding)
         # The action slot's backbone output is ALWAYS used now (user, 2026-08-12) -- never sliced off. Not a
         # config knob: computing it and discarding it was the one configuration with no precedent.
         self.use_action_slot = True
-        _hd = d * (1 + int(self.use_action_slot) + int(self.concat_action_embedding))
+        _hd = d * (1 + int(self.use_action_slot) + int(self.concat_action_embedding) + int(self.concat_proprio_embedding))
         self.flow = FlowField(d, h_dim=_hd, hidden=(flow_hidden or d), cond="concat", shortcut=shortcut,
                               arch=flow_arch, n_tokens=self.n_state, depth=flow_arch_depth, heads=flow_arch_heads)
         self.pred_obs_in_loss = True
@@ -1090,7 +1131,7 @@ class MultiModalFlow(MultiModalSequenceModel):
             if self.latent_norm:
                 s = _ln(s)                                       # renormalized back onto the sphere
         h = self.backbone(self._to_input(s, act_seq[:, :L - 1], levels=levels))
-        h_state = self._cond(h, act_seq[:, :L - 1])            # (B,L-1,n_state,d) or 2d if concat_action
+        h_state = self._cond(h, act_seq[:, :L - 1], self._proprio_slot(s_ref))   # raw proprio = CLEAN context slot
         # The residual target is defined RELATIVE TO THE CONTEXT it will be added to (`predict_next` does
         # `next = prev + d`), so it must follow `s_ref`. With dynamics_follows_p_tf off this is byte-for-byte
         # the previous expression; on, it becomes `z[t+1] - what_the_step_stood_on` -- the correction back
@@ -1115,7 +1156,7 @@ class MultiModalFlow(MultiModalSequenceModel):
                 tgt_o = (z[:, off0 + 1:off0 + 1 + n_over] - s_o).detach() if self.predict_residual \
                     else z[:, off0 + 1:off0 + 1 + n_over].detach()
                 a_o = act_seq[:, off0:off0 + n_over]
-                h_o = self._cond(self.backbone(self._to_input(s_o, a_o)), a_o)
+                h_o = self._cond(self.backbone(self._to_input(s_o, a_o)), a_o, self._proprio_slot(s_o))
                 l_over, _ = self.flow.loss(h_o, tgt_o, time_sampling=self.time_sampling)
                 raw["dynamics/latent_overshoot"] = l_over
                 w["dynamics/latent_overshoot"] = self.overshoot_weight
