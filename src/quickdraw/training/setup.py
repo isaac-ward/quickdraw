@@ -846,7 +846,8 @@ def effective_action_dim(cfg) -> int:
 def normalizer(cfg) -> Normalizer:
     # obs_keep (2026-09-21): passed EXPLICITLY to from_file (was the module global _OBS_KEEP + a .subset_obs()
     # call). The stats are subset to the same obs layout the loaders apply -- see DataConfig.
-    n = Normalizer.from_file(resolve_data_root(cfg), obs_keep=DataConfig.from_cfg(cfg).obs_keep)
+    _dc = DataConfig.from_cfg(cfg)
+    n = Normalizer.from_file(resolve_data_root(cfg), obs_keep=_dc.obs_keep, obs_fields=_dc.obs_fields)
     if str(cfg.data.get("action_aggregate", "sum")) == "concat":    # one step carries `subsample` raw actions
         n = n.tile_act(int(cfg.data.get("subsample", 1) or 1))
     return n

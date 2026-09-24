@@ -26,13 +26,27 @@ class Normalizer:
         self.a_std = torch.tensor(stats["action"]["std"])
 
     @classmethod
-    def from_file(cls, root: str, *, obs_keep) -> "Normalizer":
+    def from_file(cls, root: str, *, obs_keep, obs_fields=("observation_vector",)) -> "Normalizer":
         # obs_keep is a REQUIRED keyword (2026-09-21, was a module global): the stats MUST be subset to the
         # same obs layout the loaders apply, or norm/denorm silently mismatch the data. Pass None for the full
         # vector, or DataConfig.obs_keep. Required-with-no-default so a caller cannot forget it and get the
         # wrong layout -- see DataConfig for why this stopped being ambient state.
+        #
+        # obs_fields (2026-09-24): the obs is a CONCATENATION of these stored fields, in order (default just
+        # observation_vector -> bit-identical). Each field carries its OWN mean/std in normalization_stats.json;
+        # we assemble them in the SAME order the loaders concat, then subset by obs_keep POST-CONCAT (obs_keep
+        # indexes the FINAL concatenated vector, matching _read_obs_fields). See DataConfig.obs_fields.
         with open(os.path.join(root, "normalization_stats.json")) as f:
-            return cls(json.load(f)).subset_obs(obs_keep)
+            stats = json.load(f)
+        n = cls(stats)                                      # sets action + the default observation_vector stats
+        means, stds = [], []
+        for fld in obs_fields:
+            if fld not in stats:
+                raise KeyError(f"normalization_stats.json has no stats for obs field {fld!r} (obs_fields={list(obs_fields)}); "
+                               f"available: {[k for k in stats if k != 'action']}")
+            means.append(torch.tensor(stats[fld]["mean"])); stds.append(torch.tensor(stats[fld]["std"]))
+        n.o_mean, n.o_std = torch.cat(means), torch.cat(stds)   # concat in obs_fields order (== observation_vector alone by default)
+        return n.subset_obs(obs_keep)                          # obs_keep POST-concat
 
     def subset_obs(self, obs_keep):
         """Restrict the obs stats to the `obs_keep` index subset, so norm/denorm match the subset the loaders
@@ -121,18 +135,27 @@ class DataConfig:
       _subsample_episodes): adding phases to VAL would change which episodes eval samples and shift every
       metric, breaking comparability. So it is inert in an eval-only process even when set.
     - obs_keep: obs-dim indices to KEEP (None = full vector). Applied INSIDE the loaders AND the Normalizer
-      stats, so no call site can load a different obs layout than training saw.
+      stats POST-CONCAT (indexes the FINAL obs_fields-concatenated vector), so no call site can load a
+      different obs layout than training saw.
+    - obs_fields: ordered list of stored parquet features to READ and CONCATENATE into the obs vector. Default
+      ("observation_vector",) -> bit-identical to before. e.g. ("observation_vector","observation_vector.cube")
+      appends the 32-dim cube state. The loader concats in this order; the Normalizer assembles per-field stats
+      in this SAME order; obs_keep then indexes the concatenated result. Keeps the loader dataset-agnostic --
+      no field is hardcoded. See design + PROCESSING.md for the cube-state layout.
     """
     subsample: int = 1
     action_aggregate: str = "sum"
     subsample_all_phases: bool = False
     obs_keep: tuple | None = None
+    obs_fields: tuple = ("observation_vector",)
 
     def __post_init__(self):
         if int(self.subsample) < 1:
             raise ValueError(f"data.subsample must be >= 1, got {self.subsample}")
         if self.action_aggregate not in _AGGREGATES:
             raise ValueError(f"data.action_aggregate must be one of {_AGGREGATES}, got {self.action_aggregate!r}")
+        if not self.obs_fields:
+            raise ValueError("data.obs_fields must be a non-empty list (default ['observation_vector'])")
 
     @classmethod
     def from_cfg(cls, cfg) -> "DataConfig":
@@ -140,16 +163,36 @@ class DataConfig:
         defaults live in exactly one spot instead of being re-typed (and mis-typed) at every entrypoint."""
         d = cfg.get("data", {}) or {}
         ok = d.get("obs_keep", None)
+        of = d.get("obs_fields", None)
         return cls(subsample=int(d.get("subsample", 1) or 1),
                    action_aggregate=str(d.get("action_aggregate", "sum")),
                    subsample_all_phases=bool(d.get("subsample_all_phases", False)),
-                   obs_keep=None if ok is None else tuple(int(i) for i in ok))
+                   obs_keep=None if ok is None else tuple(int(i) for i in ok),
+                   obs_fields=("observation_vector",) if of is None else tuple(str(f) for f in of))
 
 
 def _apply_obs_keep(obs_all, obs_keep):
     """Slice loaded obs to the `obs_keep` index subset (no-op if None). Takes the indices EXPLICITLY as an
-    argument (2026-09-21, was the module global _OBS_KEEP) -- the loader passes DataConfig.obs_keep."""
+    argument (2026-09-21, was the module global _OBS_KEEP) -- the loader passes DataConfig.obs_keep. Applied
+    POST-CONCAT (indexes the full obs_fields-concatenated vector)."""
     return obs_all if obs_keep is None else obs_all[:, list(obs_keep)]
+
+
+def _read_obs_fields(hf, obs_fields):
+    """Read + CONCATENATE the listed parquet features into one (N, sum_dims) float32 obs matrix, in order
+    (2026-09-24). Default obs_fields=('observation_vector',) reproduces the single-field load exactly. A field
+    is (N,) scalar or (N,D) vector -> reshaped to (N,-1) before concat. Missing field -> a clear error naming
+    what IS available (so a typo/unpushed field fails loudly rather than silently dropping obs). Generic: no
+    field name is special-cased -- see DataConfig.obs_fields."""
+    parts = []
+    for fld in obs_fields:
+        if fld not in hf:
+            avail = [c for c in getattr(hf, "column_names", list(hf)) if "images" not in c]
+            raise KeyError(f"obs field {fld!r} not in the dataset (obs_fields={list(obs_fields)}); available "
+                           f"non-image columns: {avail}")
+        arr = np.stack(hf[fld]).astype(np.float32)
+        parts.append(arr.reshape(arr.shape[0], -1))
+    return np.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
 
 
 def _subsample_episodes(eps, tag: str, *, dcfg: "DataConfig"):
@@ -217,7 +260,7 @@ def load_split_episodes(root: str, split: str, *, dcfg: "DataConfig", repo_id: s
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
-    obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32), dcfg.obs_keep)
+    obs_all = _apply_obs_keep(_read_obs_fields(hf, dcfg.obs_fields), dcfg.obs_keep)   # concat obs_fields, obs_keep POST-concat
     act_all = np.stack(hf["action"]).astype(np.float32)
     return _subsample_episodes([(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)],
                                f"{repo_id}/{split}", dcfg=dcfg)
@@ -340,7 +383,7 @@ def load_split_episodes_mm(root: str, split: str, *, dcfg: "DataConfig", img_siz
     ds = LeRobotDataset(f"{repo_id}/{split}", root=os.path.join(root, split))
     hf = ds.hf_dataset.with_format("numpy")
     ep_idx = np.asarray(hf["episode_index"])
-    obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32), dcfg.obs_keep)
+    obs_all = _apply_obs_keep(_read_obs_fields(hf, dcfg.obs_fields), dcfg.obs_keep)   # concat obs_fields, obs_keep POST-concat
     act_all = np.stack(hf["action"]).astype(np.float32)
     per_key = {}
     for k, c, sz in zip(keys, cams, sizes):
