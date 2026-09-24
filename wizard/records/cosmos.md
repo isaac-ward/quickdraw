@@ -290,6 +290,46 @@ gives the integrator rule), then nearest-cube at grasp time. The weak link is pr
 pixels: the fit is R2 0.90 vertical but 0.33 HORIZONTAL, and horizontal is the axis that separates the
 cubes. Not attempted.
 
+## Finding 9 — the full-horizon result: it collapses, and the collapse is the chaining
+
+Both arms finished (22.5 h each, 220 pipeline calls, stride 2, 720x960, fps 15, full 9.1-minute episode).
+The answer is unambiguous and it is not flattering.
+
+| open-loop lead | seconds | chunk | LPIPS | SSIM |
+|---|---|---|---|---|
+| @+1 | 0.1 | 0 | **0.018** | **0.949** |
+| @+8 | 0.5 | 0.1 | 0.137 | 0.797 |
+| @+32 | 2.1 | 0.4 | 0.292 | 0.692 |
+| @+64 | 4.3 | 0.7 | 0.177 | 0.786 |
+| @+2048 | 136 | 23 | 0.831 | 0.042 |
+| @+4096 | 273 | 47 | 0.846 | 0.023 |
+| @+8192 | 546 | 93 | 0.742 | 0.081 |
+
+SSIM 0.02-0.08 is no relationship to the target at all, and the filmstrip agrees: by chunk 13 the frame
+is salt-and-pepper colour speckle with occasional recognisable fragments, and it never recovers.
+
+THE CAUSE IS THE CHAINING, NOT THE MODEL, and the same run proves it. `closed_loop_16` re-grounds on
+ground truth every 16 steps and never degrades: LPIPS 0.19-0.25 and SSIM 0.72-0.78 FLAT from +8 all the
+way to +256. Same model, same prompts, same resolution -- the only difference is that no chunk ever
+conditions on more than one chunk of its own output. Open-loop feeds pixels back through the VAE encoder
+93 times and the artifacts compound; the error-vs-step curve is a smooth saturating rise (not a cliff)
+with a visible sawtooth at the 88-step chunk boundary, which is what accumulate-and-reset looks like.
+
+`motion_ratio` sits at 3-10x for the whole rollout, consistent with the speckle being treated as motion.
+
+WHAT THIS MEANS FOR A TABLE ROW. Cosmos Video2World is usable here for about one clip -- call it 5
+seconds -- and is not a long-horizon world model for this data at any setting we control. That is a
+legitimate and citable result, and NVIDIA's own Limitations section predicts it ("struggle to generate
+long, high-resolution videos without artifacts"), but it means the honest row is short-horizon
+open-loop plus the closed-loop number, with the collapse stated rather than a single @+8192 figure.
+
+## Finding 10 — the negative prompt helps, consistently and slightly
+
+52 of 64 readouts favour the arm with the negative prompt, and **47 of 48 at leads <= 256**, i.e. before
+the collapse saturates and the comparison stops meaning anything. Individual gaps mostly sit at or just
+above the noise floor (LPIPS 0.024) -- @+8 open-loop is 0.137 vs 0.211, cl_16 @+64 is 0.180 vs 0.261 --
+so no single number is decisive, but a 47/48 sign test is not noise. Keep it on.
+
 ## Experiments (run log)
 
 | date | what | config | result |
@@ -308,7 +348,9 @@ cubes. Not attempted.
 | 09-21 | seed repeat | same, `+external.seed=1` | noise floor: LPIPS 0.024, motion_ratio 0.640 |
 | 09-21 | val ablation, stride 2 | 720x960, H=8192 + cl_16 | KILLED at 2 min — the prompt described stick directions and never said a cube was picked up (Finding 7) |
 | 09-21 | VLM object attribution | gpt-4o, context frames + stick table | wrong cube 3/3, confident 3/3 — Finding 8, dropped |
-| 09-21 | **val ablation, stride 2, v2** | 720x960, H=8192 (9.1 min) + cl_16, 94 calls/ep, grasp-event prompts. GPU0 scene only, GPU1 scene + negative | RUNNING (~19 h) |
+| 09-21 | val ablation, stride 2, v2 | 720x960, H=8192 + cl_16 | OOM at the last line of _rollout: 126 GiB, the whole rollout held at render resolution |
+| 09-22 | memory fix verified | 720x960, H=352, 2 eps | completes, peak 22.6 GB |
+| 09-22 | **val ablation, stride 2, v3** | 720x960, H=8192 (9.1 min) + cl_16, 220 calls, 22.5 h each | Findings 9 and 10 |
 | 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | no knee; 720x960 LPIPS @+64 **0.218** — Finding 1b |
 
 ## Costs, for planning
