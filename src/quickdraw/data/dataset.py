@@ -20,10 +20,14 @@ class Normalizer:
     """Train-only mean/std, applied to every split (so OOD shift stays real)."""
 
     def __init__(self, stats: dict):
-        self.o_mean = torch.tensor(stats["observation_vector"]["mean"])
-        self.o_std = torch.tensor(stats["observation_vector"]["std"])
         self.a_mean = torch.tensor(stats["action"]["mean"])
         self.a_std = torch.tensor(stats["action"]["std"])
+        # Base obs stats: prefer the lerobot-canonical `observation.state`, fall back to the legacy
+        # `observation_vector` name (2026-09-24 rename). from_file OVERRIDES o_mean/o_std from obs_fields
+        # anyway, so this only needs to not crash + serve direct `Normalizer(stats)` callers (pretrained/smokes).
+        base = stats.get("observation.state") or stats.get("observation_vector")
+        if base is not None:
+            self.o_mean = torch.tensor(base["mean"]); self.o_std = torch.tensor(base["std"])
 
     @classmethod
     def from_file(cls, root: str, *, obs_keep, obs_fields=("observation_vector",)) -> "Normalizer":
@@ -184,12 +188,12 @@ def _read_obs_fields(hf, obs_fields):
     is (N,) scalar or (N,D) vector -> reshaped to (N,-1) before concat. Missing field -> a clear error naming
     what IS available (so a typo/unpushed field fails loudly rather than silently dropping obs). Generic: no
     field name is special-cased -- see DataConfig.obs_fields."""
+    cols = list(getattr(hf, "column_names", None) or hf.keys())   # HF Dataset -> .column_names; dict -> .keys()
     parts = []
     for fld in obs_fields:
-        if fld not in hf:
-            avail = [c for c in getattr(hf, "column_names", list(hf)) if "images" not in c]
+        if fld not in cols:
             raise KeyError(f"obs field {fld!r} not in the dataset (obs_fields={list(obs_fields)}); available "
-                           f"non-image columns: {avail}")
+                           f"non-image columns: {[c for c in cols if 'images' not in c]}")
         arr = np.stack(hf[fld]).astype(np.float32)
         parts.append(arr.reshape(arr.shape[0], -1))
     return np.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]

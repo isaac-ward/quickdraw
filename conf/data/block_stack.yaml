@@ -70,6 +70,9 @@ defaults:
 root: null
 hf_repo: isaac-ronald-ward/block-stack
 repo_id: block-stack     # lerobot prefix the splits were WRITTEN with (<repo_id>/<split>)
+obs_fields: [observation.state]   # 2026-09-24: observation_vector was renamed to the lerobot-canonical
+#                                  observation.state on HF. The loader concats data.obs_fields in order; a cube
+#                                  arm overrides this to [observation.state, observation.objects.cube] (-> 49-dim).
 cam: scene_left          # -> videos/observation.images.scene_left. FIXED camera; see the header.
 
 P: 8
