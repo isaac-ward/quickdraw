@@ -334,20 +334,29 @@ class MultiModalSequenceModel(nn.Module):
         bag = torch.cat(toks, dim=-2)
         return _ln(bag) if self.latent_norm else bag
 
+    def _bag_offsets(self) -> dict:
+        """name -> (offset, n_tokens) in the bag. For decode_condition_on gathers (to_obs + recon_losses)."""
+        offs, o = {}, 0
+        for nm, n in self.layout:
+            offs[nm] = (o, n); o += n
+        return offs
+
+    def _gather_cond_extra(self, bag: Tensor, mod, offs: dict) -> Tensor | None:
+        """decode_condition_on: concat the named heads' token slices from `bag` (the extra decode conditioning
+        for `mod`). None when the head declares no extra conditioning. Shared by to_obs + recon_losses so the
+        two sites never drift."""
+        cond_on = getattr(mod, "decode_condition_on", ())
+        if not cond_on:
+            return None
+        return torch.cat([bag[..., offs[c][0]: offs[c][0] + offs[c][1], :] for c in cond_on], dim=-2)
+
     def to_obs(self, bag: Tensor, heads=None, anchor: Tensor | None = None, commit: bool = False) -> dict[str, Tensor]:
         """`commit=True` -> deterministic decode even under decode_stochastic (see Modality.decode)."""
-        offs, _o = {}, 0
-        for name, n in self.layout:                                  # name -> (offset, n) for decode_condition_on gather
-            offs[name] = (_o, n); _o += n
+        offs = self._bag_offsets()
         out, off = {}, 0
         for name, n in self.layout:
             if heads is None or name in heads:                       # partial decode (e.g. proprio-only long rollouts)
-                # decode_condition_on: append the named heads' token slices to this head's decode conditioning
-                # (e.g. image head conditions on the proprio/cube slice directly). Empty -> unchanged.
-                extra = None
-                cond_on = getattr(self.modalities[name], "decode_condition_on", ())
-                if cond_on:
-                    extra = torch.cat([bag[..., offs[c][0]: offs[c][0] + offs[c][1], :] for c in cond_on], dim=-2)
+                extra = self._gather_cond_extra(bag, self.modalities[name], offs)   # decode_condition_on (or None)
                 out[name] = self.modalities[name].decode(bag[..., off:off + n, :], commit=commit, cond_extra=extra)
             off += n
         if anchor is not None and "proprio" in out:
@@ -373,9 +382,7 @@ class MultiModalSequenceModel(nn.Module):
         # through to_obs, so it never de-relativizes -> its targets must be relativized to match. (roundtrip
         # below goes through to_obs, which DOES de-relativize, so it keeps the ABSOLUTE targets.)
         dtgt = self.relativize(targets, anchor) if anchor is not None else targets
-        offs, _o = {}, 0                                          # name -> (offset,n) for decode_condition_on gather
-        for _nm, _n in self.layout:
-            offs[_nm] = (_o, _n); _o += _n
+        offs = self._bag_offsets()                               # for decode_condition_on gather
         out, wts, off = {}, {}, 0
         for name, n in self.layout:
             mod = self.modalities[name]
@@ -387,8 +394,7 @@ class MultiModalSequenceModel(nn.Module):
                 wts["decode/proprio"] = float(mod.weight)
                 off += n
                 continue
-            _cond_on = getattr(mod, "decode_condition_on", ())   # decode_condition_on: append named heads' slices
-            _extra = torch.cat([bag[..., offs[c][0]: offs[c][0] + offs[c][1], :] for c in _cond_on], dim=-2) if _cond_on else None
+            _extra = self._gather_cond_extra(bag, mod, offs)     # decode_condition_on (or None)
             main, sc, deriv = mod.decode_loss(bag[..., off:off + n, :], dtgt[name], cond_extra=_extra)
             out[f"decode/{name}"], wts[f"decode/{name}"] = main, float(mod.weight)
             if sc is not None:                                  # flow decoders only

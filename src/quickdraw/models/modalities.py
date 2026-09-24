@@ -243,6 +243,16 @@ class Modality(nn.Module):
     def _decode_cond(self, flat_tok: Tensor) -> Tensor:   # (M, n_tokens, d) -> conditioning for the decode head
         raise NotImplementedError
 
+    @staticmethod
+    def _append_cond_extra(cond: Tensor, cond_extra: Tensor | None) -> Tensor:
+        """decode_condition_on: append extra conditioning tokens (already lead-flattened at the call site or
+        here) to this head's cond. The up-decoder reads cond by cross-attention, so a variable token count is
+        fine. None -> unchanged. Shared by decode() and decode_loss() so the two sites never drift."""
+        if cond_extra is None:
+            return cond
+        ce = cond_extra.reshape(-1, cond_extra.shape[-2], cond_extra.shape[-1])
+        return torch.cat([cond, ce], dim=-2)
+
     def encode(self, obs: Tensor) -> Tensor:
         """obs (B,[T,]*obs_shape) -> tokens (B,[T,]n_tokens,d)."""
         lead = obs.shape[: obs.ndim - self._obs_ndim]
@@ -270,10 +280,7 @@ class Modality(nn.Module):
         # this head's own tokens, so the renderer conditions on them directly. The up-decoder reads `cond` by
         # CROSS-ATTENTION (TokenGridReadout / TokenPool), so a variable token count is fine -- no arch change.
         # None -> bit-identical.
-        cond = self._decode_cond(flat)
-        if cond_extra is not None:
-            ce = cond_extra.reshape(-1, cond_extra.shape[-2], cond_extra.shape[-1])
-            cond = torch.cat([cond, ce], dim=-2)
+        cond = self._append_cond_extra(self._decode_cond(flat), cond_extra)
         if eps is not None and not self.decode_head.no_noise and not commit:
             obs = self.decode_head.sample(cond, steps=self.decode_steps, deterministic=False, eps=eps)
             return obs.reshape(*lead, *obs.shape[1:])
@@ -318,10 +325,7 @@ class Modality(nn.Module):
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         tgt = target.reshape(-1, *target.shape[len(lead):])
-        cond = self._decode_cond(flat)
-        if cond_extra is not None:                              # decode_condition_on: append extra cond tokens
-            ce = cond_extra.reshape(-1, cond_extra.shape[-2], cond_extra.shape[-1])
-            cond = torch.cat([cond, ce], dim=-2)
+        cond = self._append_cond_extra(self._decode_cond(flat), cond_extra)   # decode_condition_on: extra tokens
         want_d = float(getattr(self, "derivative_weight", 0.0) or 0.0) > 0.0
         if want_d and not self.decode_head.no_noise:
             raise ValueError(
