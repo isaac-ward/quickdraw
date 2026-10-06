@@ -9,7 +9,9 @@ import imageio.v3 as iio
 from quickdraw.logging.viz import save_gif
 
 SRC = "logs/ood/gallery"
-LADDER = [(0.6, 15), (0.55, 15), (0.5, 15), (0.5, 12), (0.5, 10), (0.45, 10), (0.4, 10), (0.4, 8)]
+DITHER = False                              # dither adds visible grain/speckle on flat areas -> off; adaptive 256 is clean
+# RESOLUTION-FIRST: keep frames sharp (half-res looked soft/blocky in slides), trade fps/scale down only to fit budget
+LADDER = [(1.0, 10), (0.9, 10), (0.85, 10), (0.8, 10), (0.75, 8), (0.7, 8), (0.6, 8)]
 
 
 def main():
@@ -23,7 +25,7 @@ def main():
         for ds, fps in LADDER:
             step = max(1, round(30 / fps)); eff = 30 / step
             fr = [cv2.resize(f, (int(f.shape[1] * ds), int(f.shape[0] * ds)), interpolation=cv2.INTER_AREA) for f in v[::step]]
-            save_gif(out, fr, eff, colors=256, dither=True)
+            save_gif(out, fr, eff, colors=256, dither=DITHER)
             sz = os.path.getsize(out)
             chosen = (ds, eff, sz)
             if sz <= budget:
