@@ -8,6 +8,7 @@ squares (visual-OOD). A black arrow at each particle shows its net velocity (all
 
 from __future__ import annotations
 
+import os
 import math
 import textwrap
 import time
@@ -1313,6 +1314,75 @@ def image_rollout_video(true_full, pred_future, context_len, sep_px=2):
     top = np.concatenate([black, pred_future], axis=0)[:T]            # black during context, then predictions
     sep = np.zeros((T, sep_px, W, 3), np.uint8)                       # thin divider (no text)
     return np.concatenate([top, sep, true_full], axis=1)             # vstack: pred on top, GT on bottom
+
+
+def label_panels(panels, titles, *, panel_wh=(512, 384), sep_px=3, bg=(18, 18, 18),
+                 header_px=87, font_px=53, fg=(255, 255, 255)):
+    """N frame streams side by side under a titled header band — the house layout for pred videos/GIFs.
+
+    `panels` is a list of (T,H,W,3) arrays (uint8 or float [0,1]), each CUBIC-upscaled to `panel_wh`;
+    `titles` names each one. Returns (T, header_px + panel_h, N*panel_w + (N-1)*sep_px, 3) uint8, so the
+    2-panel default is 1027x471 and the 4-panel 2057x471.
+
+    panel_wh is the OUTPUT size rather than an upscale factor on purpose: the factor varies with the
+    dataset (a 128x96 source needs x4 to reach 512x384, a 144x192 one x2.67) and what has to stay fixed
+    across figures is the canvas, not the multiplier.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    assert len(panels) == len(titles), f"{len(panels)} panels but {len(titles)} titles"
+    pw, ph = int(panel_wh[0]), int(panel_wh[1])
+    ups = [np.asarray([np.asarray(Image.fromarray(f).resize((pw, ph), Image.BICUBIC))
+                       for f in _img_u8(v)]) for v in panels]
+    T = min(len(v) for v in ups)
+    n = len(ups)
+    W = n * pw + (n - 1) * sep_px
+    out = np.empty((T, header_px + ph, W, 3), np.uint8)
+    out[:] = np.asarray(bg, np.uint8)
+    for k, v in enumerate(ups):
+        x = k * (pw + sep_px)
+        out[:, header_px:, x:x + pw] = v[:T]
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_px)
+    except OSError:                                       # no DejaVu -> PIL's bitmap default, still legible
+        font = ImageFont.load_default()
+    band = Image.new("RGB", (W, header_px), tuple(bg))    # drawn ONCE: the titles never change per frame
+    d = ImageDraw.Draw(band)
+    for k, t in enumerate(titles):
+        x0 = k * (pw + sep_px)
+        bb = d.textbbox((0, 0), str(t), font=font)
+        d.text((x0 + (pw - (bb[2] - bb[0])) // 2, (header_px - (bb[3] + bb[1])) // 2),
+               str(t), font=font, fill=tuple(fg))
+    out[:, :header_px] = np.asarray(band)
+    return out
+
+
+def save_gif(path, frames, fps=15, scale=0.55, max_mb=40.0, log=None):
+    """GIF with a PER-FRAME adaptive 256-colour palette and Floyd-Steinberg dither.
+
+    Per-frame rather than one global palette because these clips change content completely over their
+    length -- a global table built on a clean opening frame has nothing left for a late frame. `scale`
+    downsamples first (0.55 of a 1027x471 canvas is 565x259), which is where almost all the size saving
+    comes from. Raises if the result exceeds `max_mb`, since the whole point of the cap is that the file
+    has to be embeddable.
+    """
+    from PIL import Image
+
+    fr = _img_u8(frames)
+    h, w = fr.shape[1:3]
+    sw, sh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    imgs = [Image.fromarray(f).resize((sw, sh), Image.BICUBIC)
+            .quantize(colors=256, method=Image.MEDIANCUT, dither=Image.FLOYDSTEINBERG) for f in fr]
+    imgs[0].save(path, save_all=True, append_images=imgs[1:], loop=0, disposal=2,
+                 duration=int(round(1000.0 / float(fps))), optimize=True)
+    mb = os.path.getsize(path) / 1e6
+    if log is not None:
+        log(f"[gif] {os.path.basename(path)}  {len(imgs)} frames  {sw}x{sh}  {fps} fps  {mb:.1f} MB")
+    if mb > max_mb:
+        raise RuntimeError(f"{path} is {mb:.1f} MB, over the {max_mb:.0f} MB cap — lower `scale`, "
+                           f"shorten the clip, or drop to {fps // 2} fps")
+    return mb
 
 
 def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,
