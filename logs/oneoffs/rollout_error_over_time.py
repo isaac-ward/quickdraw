@@ -15,7 +15,7 @@ from quickdraw.evaluation.openloop import image_curves
 from quickdraw.training.setup import (build_model, env_cfg, image_head_cams, image_head_sizes,
                                       load_checkpoint, normalizer, resolve_data_root)
 
-HEAD, MAXH, STARTS_PER_EP, OUT = "cam_scene", 1000, 3, "logs/ood/rollout_error"
+HEAD, MAXH, STARTS_PER_EP, OUT = "cam_scene", 1000, 8, "logs/ood/rollout_error"   # 8 starts x 2 val eps = 16 rollouts
 
 
 @torch.no_grad()
@@ -44,7 +44,7 @@ def main():
                                  repo_id=rc.data.get("repo_id", "torus"))
     fr_keys = [k for k in eps[0][2]]
 
-    L1, L2, LP, times, lat_times = [], [], [], [], []
+    L1, L2, LP, PS, times, lat_times = [], [], [], [], [], []
     for o, a, fr in eps:
         Lep = len(o)
         for st in np.linspace(P, max(P, Lep - MAXH - P - 1), STARTS_PER_EP).astype(int):
@@ -55,27 +55,31 @@ def main():
             pred = out[HEAD]
             true = torch.from_numpy(fr[HEAD][st + P:st + P + H]).float().div(255.0)[None].to(dev)
             c = image_curves(pred, true)
-            L1.append(c["l1"]); L2.append(np.sqrt(c["mse"])); LP.append(c.get("lpips", np.full(H, np.nan)))
+            L1.append(c["l1"]); L2.append(np.sqrt(c["mse"])); LP.append(c.get("lpips", np.full(H, np.nan))); PS.append(c["psnr"])
             times.append(dt / H)
             _, dl = rollout(m, norm, o, a, {k: fr[k] for k in fr_keys}, P, int(st), H, dev, ["proprio"])  # latent/dynamics-only
             lat_times.append(dl / H)
             print(f"  start {int(st):4d} H {H} | {dt/H*1e3:.1f} ms/step (img) {dl/H*1e3:.1f} ms/step (dynamics) | end L1 {c['l1'][-1]:.3f}", flush=True)
 
     hm = min(len(x) for x in L1)
-    L1, L2, LP = (np.stack([x[:hm] for x in a]) for a in (L1, L2, LP))
-    steps = np.arange(hm); secs = steps / model_hz
+    L1, L2, LP, PS = (np.stack([x[:hm] for x in a]) for a in (L1, L2, LP, PS))
+    secs = np.arange(hm) / model_hz
     img_ms, dyn_ms = np.mean(times) * 1e3, np.mean(lat_times) * 1e3
     img_hz, dyn_hz = 1e3 / img_ms, 1e3 / dyn_ms
 
-    fig, axs = plt.subplots(1, 3, figsize=(15, 4.6))
-    for ax, data, name, lo in [(axs[0], L1, "L1", True), (axs[1], L2, "L2 (RMSE)", True), (axs[2], LP, "LPIPS", True)]:
+    plt.rcParams.update({"font.family": "DejaVu Sans"})
+    fig, axs = plt.subplots(4, 1, figsize=(7.5, 11), sharex=True)
+    for ax, data, name in [(axs[0], L1, "L1"), (axs[1], L2, "L2 (RMSE)"), (axs[2], LP, "LPIPS"), (axs[3], PS, "PSNR")]:
         mu, sd = np.nanmean(data, 0), np.nanstd(data, 0)
         ax.plot(secs, mu, color="#1f77b4", lw=2); ax.fill_between(secs, mu - sd, mu + sd, color="#1f77b4", alpha=0.22)
-        ax.set_xlabel("open-loop rollout time (s of robot time)"); ax.set_ylabel(name)
-        ax.set_title(f"{name} vs horizon  (bounded)" if lo else name); ax.grid(alpha=0.3); ax.set_ylim(bottom=0)
-    fig.suptitle(f"In-distribution open-loop rollout error (N={L1.shape[0]} starts, up to {hm} steps = {hm/model_hz:.0f}s / "
-                 f"{hm} model-steps) — error plateaus, no blow-up", fontsize=13)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT, "error_over_time.png"), dpi=130); plt.close(fig)
+        ax.set_title(name, fontsize=13); ax.grid(alpha=0.3)
+        ax.set_ylabel("dB" if name == "PSNR" else "")
+        if name != "PSNR":
+            ax.set_ylim(bottom=0)
+    axs[-1].set_xlabel("open-loop rollout time (seconds of robot time)")
+    fig.suptitle("Trajectory averaged open-loop rollout error", fontsize=15, y=0.997)
+    fig.text(0.5, 0.965, f"{L1.shape[0]} rollouts  ·  up to {hm/model_hz:.0f}s ({hm} open-loop steps)", ha="center", fontsize=10, color="#555")
+    fig.tight_layout(rect=(0, 0, 1, 0.96)); fig.savefig(os.path.join(OUT, "error_over_time.png"), dpi=130); plt.close(fig)
 
     rt = {"model_rate_hz": model_hz, "img_rollout_ms_per_step": img_ms, "img_rollout_hz": img_hz,
           "dynamics_only_ms_per_step": dyn_ms, "dynamics_only_hz": dyn_hz,
