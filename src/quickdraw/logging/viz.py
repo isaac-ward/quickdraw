@@ -1358,30 +1358,49 @@ def label_panels(panels, titles, *, panel_wh=(512, 384), sep_px=3, bg=(18, 18, 1
     return out
 
 
-def save_gif(path, frames, fps=15, scale=0.55, max_mb=40.0, log=None):
-    """GIF with a PER-FRAME adaptive 256-colour palette and Floyd-Steinberg dither.
+def save_gif(path, frames, fps=15, scale=1.0, max_mb=40.0, log=None):
+    """GIF with a GENUINELY per-frame 256-colour palette and Floyd-Steinberg dither, via ffmpeg.
 
-    Per-frame rather than one global palette because these clips change content completely over their
-    length -- a global table built on a clean opening frame has nothing left for a late frame. `scale`
-    downsamples first (0.55 of a 1027x471 canvas is 565x259), which is where almost all the size saving
-    comes from. Raises if the result exceeds `max_mb`, since the whole point of the cap is that the file
-    has to be embeddable.
+    PIL is not used for this and the reason is measured: `Image.save(..., optimize=True)` on a list of
+    P-mode images consolidates them, so a 450-frame clip came out with TWO distinct palettes and most
+    frames rendered through another frame's colours. ffmpeg's `palettegen=stats_mode=single` plus
+    `paletteuse=new=1` writes a local colour table per frame, which is what these clips need since their
+    content changes completely over their length.
+
+    WHAT THIS CANNOT FIX, so that nobody re-investigates it later: GIF is 256 colours per frame across
+    the WHOLE canvas, and median-cut allocates them by area, so a smooth gradient gets very few levels --
+    measured at 20 colours in a wall patch that holds 480 in the source. Banding in flat regions is the
+    format, not the encoder. Use the mp4 when the gradients matter.
+
+    `scale` resamples before encoding; prefer building the canvas at its final size (one resample) over
+    upscaling in `label_panels` and shrinking here (two).
     """
-    from PIL import Image
+    import subprocess
+
+    import imageio_ffmpeg
 
     fr = _img_u8(frames)
     h, w = fr.shape[1:3]
-    sw, sh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
-    imgs = [Image.fromarray(f).resize((sw, sh), Image.BICUBIC)
-            .quantize(colors=256, method=Image.MEDIANCUT, dither=Image.FLOYDSTEINBERG) for f in fr]
-    imgs[0].save(path, save_all=True, append_images=imgs[1:], loop=0, disposal=2,
-                 duration=int(round(1000.0 / float(fps))), optimize=True)
+    vf = []
+    if abs(float(scale) - 1.0) > 1e-6:
+        vf.append(f"scale={max(2, int(round(w * scale)))}:{max(2, int(round(h * scale)))}:flags=lanczos")
+    vf.append("split[a][b];[a]palettegen=stats_mode=single:max_colors=256[p];"
+              "[b][p]paletteuse=new=1:dither=floyd_steinberg")
+    proc = subprocess.Popen(
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(float(fps)),
+         "-i", "-", "-vf", ",".join(vf), "-loop", "0", "-y", str(path)], stdin=subprocess.PIPE)
+    for f in fr:
+        proc.stdin.write(np.ascontiguousarray(f, np.uint8).tobytes())
+    proc.stdin.close()
+    if proc.wait() != 0:
+        raise RuntimeError(f"ffmpeg failed writing {path}")
     mb = os.path.getsize(path) / 1e6
     if log is not None:
-        log(f"[gif] {os.path.basename(path)}  {len(imgs)} frames  {sw}x{sh}  {fps} fps  {mb:.1f} MB")
+        log(f"[gif] {os.path.basename(path)}  {len(fr)} frames  {w}x{h}  {fps} fps  {mb:.1f} MB")
     if mb > max_mb:
-        raise RuntimeError(f"{path} is {mb:.1f} MB, over the {max_mb:.0f} MB cap — lower `scale`, "
-                           f"shorten the clip, or drop to {fps // 2} fps")
+        raise RuntimeError(f"{path} is {mb:.1f} MB, over the {max_mb:.0f} MB cap — smaller panels, "
+                           f"a shorter clip, or {int(fps) // 2} fps")
     return mb
 
 
