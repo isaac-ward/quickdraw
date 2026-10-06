@@ -522,6 +522,80 @@ def save_mp4(path, frames, fps, quality=9, playback_fps=None):
     imageio.mimwrite(path, list(frames), fps=max(1e-3, rate), macro_block_size=2, quality=quality)
 
 
+_FONT_CACHE = {}
+
+
+def _title_font(size, bold=True):
+    """A professional anti-aliased TrueType font (DejaVu Sans, ships with matplotlib) at `size` px, cached."""
+    from PIL import ImageFont
+
+    key = (size, bold)
+    if key not in _FONT_CACHE:
+        import matplotlib.font_manager as fm
+
+        path = fm.findfont(fm.FontProperties(family="DejaVu Sans", weight="bold" if bold else "normal"))
+        _FONT_CACHE[key] = ImageFont.truetype(path, size)
+    return _FONT_CACHE[key]
+
+
+def _fit_title_size(titles, max_w, max_h):
+    """Largest font px size at which EVERY title fits within (max_w, max_h) -> one shared, uniform size."""
+    from PIL import Image, ImageDraw
+
+    d = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    for size in range(int(max_h), 7, -1):
+        bbs = [d.textbbox((0, 0), t, font=_title_font(size)) for t in titles]
+        if all(b[2] - b[0] <= max_w and b[3] - b[1] <= max_h for b in bbs):
+            return size
+    return 8
+
+
+def label_panels(panels, titles, *, scale=4, sep=3, header=None, font_size=None,
+                 fg=(255, 255, 255), bg=(18, 18, 18), interp=None):
+    """Compose same-size image panels into one captioned strip for a video frame, with CRISP PROFESSIONAL text.
+    Each panel is upscaled x`scale` FIRST, then its FULL title is drawn (centered, in a header band ABOVE the panel)
+    with an anti-aliased TrueType font (DejaVu Sans Bold) at that high resolution -- sharp, not a tiny caption
+    upscaled into a blur. ONE shared font size across panels (uniform). Use this for every multi-panel video so
+    caption quality is standardized. panels: list of (H,W,3) uint8 (same shape); titles: same-length list of str.
+    Returns a uint8 (H*scale + header, W*scale*n + sep*(n-1), 3) frame."""
+    import cv2
+    from PIL import Image, ImageDraw
+
+    interp = cv2.INTER_CUBIC if interp is None else interp
+    n = len(panels)
+    h, w = panels[0].shape[:2]
+    H, W = h * scale, w * scale
+    hdr = header or max(30, int(0.17 * W))
+    out = np.full((H + hdr, W * n + sep * (n - 1), 3), bg, np.uint8)
+    for k, p in enumerate(panels):
+        x0 = k * (W + sep)
+        out[hdr:hdr + H, x0:x0 + W] = cv2.resize(np.ascontiguousarray(p[..., :3]), (W, H), interpolation=interp)
+    img = Image.fromarray(out)
+    draw = ImageDraw.Draw(img)
+    size = font_size or _fit_title_size(titles, W - 14, int(hdr * 0.62))
+    font = _title_font(size)
+    for k, t in enumerate(titles):
+        x0 = k * (W + sep)
+        b = draw.textbbox((0, 0), t, font=font)
+        draw.text((x0 + (W - (b[2] - b[0])) // 2 - b[0], (hdr - (b[3] - b[1])) // 2 - b[1]), t, font=font, fill=fg)
+    return np.asarray(img)
+
+
+def save_gif(path, frames, fps, loop=0, colors=256, dither=True):
+    """Write frames (list/array of (H,W,3) uint8) to an animated GIF (infinite loop by default). `fps` sets the
+    per-frame duration. Quality: each frame gets its OWN adaptive `colors`-entry palette (median-cut) with optional
+    Floyd-Steinberg `dither` -- this preserves true RGB far better than Pillow's default global/posterized palette
+    (which washes colours out), at the cost of file size (dither raises entropy). disposal=2 so per-frame local
+    palettes render correctly. For Google Slides: each image < 50 MB and < 25 MP; < 5 MB is the responsive ideal."""
+    from PIL import Image
+
+    d = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+    q = [Image.fromarray(np.ascontiguousarray(f[..., :3])).quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=d)
+         for f in frames]
+    q[0].save(path, save_all=True, append_images=q[1:], duration=int(round(1000.0 / max(1e-3, fps))),
+              loop=loop, optimize=False, disposal=2)
+
+
 def stitch_grid_video(paths, out_path, grid, fps):
     """Tile `grid`x`grid` already-rendered mp4s into one composite, frame by frame (streaming, so it
     never holds more than one frame per source in memory). All sources must share resolution; the
