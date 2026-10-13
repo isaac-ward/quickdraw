@@ -353,10 +353,61 @@ so no single number is decisive, but a 47/48 sign test is not noise. Keep it on.
 | 09-22 | **val ablation, stride 2, v3** | 720x960, H=8192 (9.1 min) + cl_16, 220 calls, 22.5 h each | Findings 9 and 10 |
 | 09-21 | aspect ladder | 288x384, 432x576, 720x960 H=64 2 eps | no knee; 720x960 LPIPS @+64 **0.218** — Finding 1b |
 
+## Finding 11 — averaged per-frame error, the headline table
+
+Means over frames, 2 episodes, computed with the repo's own `image_curves` from the raw native-resolution
+frames so the arithmetic matches eval. `closed_loop_16` stops at 17 s because that mode's horizon is 256
+steps.
+
+| arm | mode | frames | sec | L1 | L2 (MSE) | PSNR dB | LPIPS | SSIM |
+|---|---|---|---|---|---|---|---|---|
+| scene only | open_loop | 450 | 30.0 | 0.1418 | 0.0439 | 14.12 | 0.4219 | 0.4421 |
+| scene only | closed_loop_16 | 255 | 17.0 | 0.0698 | 0.0133 | 19.40 | 0.1848 | 0.7404 |
+| **scene + negative** | **open_loop** | **450** | **30.0** | **0.0994** | **0.0325** | **15.25** | **0.3320** | **0.5891** |
+| **scene + negative** | **closed_loop_16** | **255** | **17.0** | **0.0501** | **0.0107** | **20.54** | **0.1495** | **0.7941** |
+
+READ THE OPEN-LOOP ROWS AS MEANS, not as steady state: they average a clean start (LPIPS 0.018 at +1)
+with a degraded tail (well past 0.5 by 30 s). Reproduced by
+`src/paper_specific/analysis/cosmos/errtab.py`.
+
+## Finding 12 — rendering: the GIFs looked flat, and it was not the palette
+
+Measured each suspect rather than guessing. NOT the cause: the palette strategy (per-frame, global and
+diff all land at ~2.1/255 mean error) and the h264 pre-pass (1.40/255, saturation +2.3%, so chroma
+subsampling is not eating the coloured cubes). The two that are:
+
+- UPSCALE BLUR. Per-pixel gradient energy: a raw 192x144 frame scores 4.58, shown at x1.5 3.10, shown at
+  the spec's x2.67 512x384 panels **1.80**. A 2.5x loss of detail, and most of what reads as "flat".
+- GIF BANDING. A smooth wall patch holds **480 distinct colours in the source and 20 in the GIF**: 256
+  colours per frame are allocated by area across the whole canvas, so gradients get almost none. That is
+  the format, not the encoder.
+
+Fixed what can be: `viz.save_gif` now uses ffmpeg `palettegen`/`paletteuse new=1` for a genuinely
+per-frame palette (verified at byte level — 450 frames, 450 local colour tables; PIL's `optimize=True`
+had silently consolidated the shipped GIF to TWO palettes), the GIF canvas is built at its final size in
+one resample instead of up-then-down, and frames come from the raw npz with no h264 step.
+
+What none of it fixes: the frames are natively 144x192 because that is our metric resolution. **Cosmos
+generated at 720x960 and the adapter discards it after downsampling.** A genuinely sharp video needs a
+re-render that keeps the full-res output (~37 GPU-min per episode for 450 frames); the ground-truth panel
+would stay 144x192 either way, which is the dataset's own limit.
+
 ## Costs, for planning
 
-Per 88-frame pipeline call, Predict2-2B, batch 1, 35 steps: 11 s at 144x192, 29 s at 288x384, 75 s at
-432x576, 371 s at 720x960, 590 s at 704x1280.
+MEASURED AT THE SETTINGS WE ACTUALLY USE (720x960, Predict2-2B, batch 1, 35 steps, one H100 NVL):
+
+| | |
+|---|---|
+| one frame of prediction | **4.21 s** (marginal — 88 come out of each call, so one frame cannot be bought alone) |
+| one pipeline call | **370 s** -> 88 frames, the minimum purchase |
+| one minute of predicted video | **1.05 h** (3,786 s) |
+| real-time factor | **63x slower than real time** (our footage is 15 Hz; at the model's native 16 fps it is ~1.12 h/min) |
+| the full 9.1-minute episode | **9.6 h** |
+
+Cross-checked against an independent run: 365.8 vs 370.2 s/call, stable to ~1%.
+
+Per 88-frame call at other resolutions: 11 s at 144x192, 29 s at 288x384, 75 s at 432x576, 590 s at
+704x1280.
 
 A full val (2 eps) is 24 calls/ep open-loop at H=2048 plus 16 calls/ep for cl_16 = **80 calls**; cl_1 adds
 512 calls/ep and is off the table above native size (it was ~90% of the 70-minute 144x192 val, and would be
@@ -388,3 +439,21 @@ A full val (2 eps) is 24 calls/ep open-loop at H=2048 plus 16 calls/ep for cl_16
   diffusers (a raw .pt + tokenizer .pth, no model_index.json), so it costs the NVIDIA stack we avoided.
 - `eval_purple_play` / `eval_purple_stack` (5 and 6 held-out eps) load with no code change via
   `eval.horizon_split=`. Deliberately NOT the default: they are the OOD test for anything trained here.
+
+
+## What is NOT backed up (written 2026-10-13, as this node was being decommissioned)
+
+`logs/` and `scratch/` are both gitignored, so none of the following is in this repo:
+
+- the two 22.5-hour run dirs, ~3.3 GB each —
+  `logs/eval_ood_horizon_2026_09_22_19_16_39_cosmos_val_pos` and `..._38_cosmos_val_posneg`
+- `raw_filmstrip_frames_<ep>.npz` inside them: the ENTIRE rollout at native resolution in float32
+  (8192 x 144 x 192 x 3 per episode, ~1.8 GB each). `writer.array` is local-only by design. These are
+  the input to every number in Findings 11 and 12, and regenerating them costs 22.5 h of GPU per arm.
+- `scratch/gifs_spec/` — the rendered 30-second GIFs and mp4s, 190 MB.
+
+WHAT DOES SURVIVE: every number in this record and in the commit messages; the scripts that produced
+them (`src/paper_specific/analysis/cosmos/`); and, on Weights & Biases under `isaacward/quickdraw`, the
+run summaries plus the uploaded `rollout_*.mp4` and `filmstrip_*.png` for both arms — `writer.video` and
+`writer.figure` go to wandb, `writer.array` and `writer.text` do not. So the videos are recoverable from
+wandb; the raw float frames and the per-chunk prompt logs are not.
