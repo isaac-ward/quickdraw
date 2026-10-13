@@ -441,6 +441,45 @@ A full val (2 eps) is 24 calls/ep open-loop at H=2048 plus 16 calls/ep for cl_16
   `eval.horizon_split=`. Deliberately NOT the default: they are the OOD test for anything trained here.
 
 
+## How to reproduce all of it from nothing
+
+Every INPUT is on the hub and nothing else is needed, so a rebuild is one install and two commands.
+Verified 2026-10-13:
+
+| | |
+|---|---|
+| `isaac-ronald-ward/block-stack` | dataset, **public** — `resolve_data_root` snapshot-downloads it |
+| `isaac-ronald-ward/starling-2` | dataset, **public** |
+| `nvidia/Cosmos-Predict2-2B-Video2World` | model, `gated=auto` — one click per account, then it just works |
+| `nvidia/Cosmos-1.0-Guardrail`, `Qwen/Qwen3Guard-Gen-0.6B` | the guardrail's own weights, pulled automatically |
+
+    # 1. the container additions. NEVER `uv sync` -- it strips umap/sklearn out of this image.
+    uv pip install -e ".[cosmos]"
+    uv pip install --no-deps cosmos_guardrail     # --no-deps: it declares transformers>=5, which would
+    #                                               drag the image off 4.57 and away from diffusers 0.35
+
+    # 2. the two arms. ~22.5 h each, one GPU each, 220 pipeline calls apiece.
+    python -m quickdraw.eval_ood_horizon model=cosmos_blockstack interpret=block_stack \
+        data=block_stack environments=recorded data.subsample=2 data.action_aggregate=concat \
+        eval.horizon=8192 "eval.closed_loop_steps=[16]" \
+        experiment=cosmos_val_pos +external.negative_prompt=""        # scene prompt only
+    python -m quickdraw.eval_ood_horizon model=cosmos_blockstack interpret=block_stack \
+        data=block_stack environments=recorded data.subsample=2 data.action_aggregate=concat \
+        eval.horizon=8192 "eval.closed_loop_steps=[16]" \
+        experiment=cosmos_val_posneg                                   # scene prompt + negative
+
+Then `src/paper_specific/analysis/cosmos/errtab.py` for the Finding 11 table and `spec_gifs.py` for the
+clips, both pointed at the new run dirs.
+
+TWO THINGS THAT ARE NOT FREE, so "just re-run it" is not quite the whole story:
+
+1. **45 GPU-hours.** Both arms are 22.5 h. The numbers are cheap to look up and expensive to rebuild.
+2. **It will not come back bit-identical.** The noise is seeded (`torch.Generator("cpu").manual_seed(seed + i)`
+   per episode), but bf16 matmuls and cuDNN autotune are not deterministic, so expect agreement at the
+   level of the measured same-config spread rather than exact equality: LPIPS mean |diff| 0.024 between
+   seeds, and `motion_ratio` not reproducible enough to be a discriminator at 2 episodes (Finding 6).
+   A rebuilt table should match Finding 11 to ~0.02 LPIPS, not to the fourth decimal.
+
 ## What is NOT backed up (written 2026-10-13, as this node was being decommissioned)
 
 `logs/` and `scratch/` are both gitignored, so none of the following is in this repo:
