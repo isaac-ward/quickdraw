@@ -230,6 +230,38 @@ def build_model(cfg):
                     f"FlexAttention kernel (head_dim=24 fails to compile), but d={m.d}/heads={m.heads} -> "
                     f"head_dim={head_dim}. Pick d/heads giving head_dim in {{16,32,64}} (e.g. d=192/heads=12 -> 16), "
                     f"or disable compile_rollout (eager has no such constraint).")
+        # positional encoding + attention sink (StreamingLLM). Default rope/0 -> bit-identical. The sink pins
+        # the first `attention_sink` timesteps as always-attendable; it REQUIRES pos_encoding='nope' because
+        # under RoPE a query would see the pinned sink at a q-k distance far beyond `window`, untrained
+        # (StreamingLLM re-indexes to avoid this; NoPE sidesteps it). Enforced here, loud.
+        _pos_enc = str(m.get("pos_encoding", "rope"))
+        _sink = int(m.get("attention_sink", 0) or 0)
+        if _pos_enc not in ("rope", "nope"):
+            raise ValueError(f"model.pos_encoding must be 'rope' or 'nope'; got {_pos_enc!r}.")
+        if _sink < 0:
+            raise ValueError(f"model.attention_sink must be >= 0; got {_sink}.")
+        if _sink > 0 and _pos_enc != "nope":
+            raise ValueError(
+                f"model.attention_sink={_sink}>0 requires model.pos_encoding='nope' (got {_pos_enc!r}). Under "
+                f"RoPE a query attends the pinned sink at a q-k distance far larger than the window ever trained "
+                f"on; StreamingLLM re-indexing is not implemented. Set model.pos_encoding=nope.")
+        if _sink > 0 and int(cfg.data.get("P", 0) or 0) and _sink >= int(cfg.data.P):
+            raise ValueError(f"model.attention_sink={_sink} must be < the context length data.P={cfg.data.P}: the "
+                             f"sink pins the first S grounded frames and the sliding window covers the rest, so at "
+                             f"least one non-sink context frame is required (S < P).")
+        # LATENT ROLLOUT LOSS (design/combatting_drift.md): the latent-space twin of the decode rollout loss --
+        # scores the ATTACHED rolled latent vs the true latent directly. Replaces the removed detached one-step
+        # `overshoot`. model.latent_rollout.{weight, metric}. weight 0 -> off, bit-identical.
+        if m.get("overshoot_weight", None) is not None or m.get("overshoot_max_depth", None) is not None:
+            raise ValueError("model.overshoot_weight/overshoot_max_depth were REMOVED (2026-09-30): the detached "
+                             "one-step overshoot scored a fresh correction, not the rolled latent. Use "
+                             "model.latent_rollout.weight (+ .metric=mse|cosine) -- the attached latent twin of the "
+                             "decode rollout loss. See design/combatting_drift.md.")
+        _lr = m.get("latent_rollout", {}) or {}
+        _lr_w = float((_lr.get("weight", 0.0) if hasattr(_lr, "get") else getattr(_lr, "weight", 0.0)) or 0.0)
+        _lr_metric = str((_lr.get("metric", "mse") if hasattr(_lr, "get") else getattr(_lr, "metric", "mse")))
+        if _lr_w > 0.0 and _lr_metric not in ("mse", "cosine"):
+            raise ValueError(f"model.latent_rollout.metric must be 'mse' or 'cosine'; got {_lr_metric!r}.")
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
                       mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=effective_action_dim(cfg),
                       grad_checkpoint=bool(m.get("grad_checkpoint", False)),
@@ -243,7 +275,9 @@ def build_model(cfg):
                       relative_position=bool(m.get("relative_position", False)),
                       position_idx=(cfg.environments.get("position_idx", None) if m.get("relative_position", False) else None),
                       relative_scale=(list(m.get("relative_scale")) if m.get("relative_scale", None) is not None else None),
-                      dynamics_prior=_make_dynamics_prior(cfg))
+                      dynamics_prior=_make_dynamics_prior(cfg),
+                      pos_encoding=_pos_enc, attention_sink=_sink,
+                      latent_rollout_weight=_lr_w, latent_rollout_metric=_lr_metric)
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}
@@ -255,6 +289,11 @@ def build_model(cfg):
         if df_scale > 0.0 and name not in ("mm_flow", "flow"):
             raise ValueError(f"variations.noise_injection.observations_encoded_pre_fusion (diffusion forcing) "
                              f"requires a flow model (model.name in mm_flow/flow); got {name!r}.")
+        if _sink > 0 and df_rollout_level > 0.0:
+            raise ValueError(
+                f"model.attention_sink={_sink}>0 is incompatible with the DF ROLLOUT (df_rollout_level="
+                f"{df_rollout_level}): both restructure the rollout window and whether the pinned sink should be "
+                f"noised is untested. Run them as separate arms.")
         # dynamics_follows_p_tf: meaningful only where the dynamics loss CONDITIONS ON a context it can swap.
         # RAISE rather than silently ignore -- a user who sets this believes they changed the training regime
         # (same rule as the fail-fast block just below). See design/flow.md.
@@ -289,32 +328,6 @@ def build_model(cfg):
                              f"(model.name in mm_lsar/lsar); got {name!r}. DSAR is grounded by its data-space "
                              f"re-encode and Flow by its reconstruction, so neither takes a collapse strategy. "
                              f"Remove the collapse override or switch to mm_lsar.")
-        # LATENT OVERSHOOT (design/combatting_drift.md): a direct deep-drift latent correction ADDED to the clean
-        # 1-step anchor. Reuses the p_tf=0 recon rollout's feeds. Off (weight 0) -> bit-identical.
-        _overshoot_w = float(m.get("overshoot_weight", 0.0) or 0.0)
-        _overshoot_md = m.get("overshoot_max_depth", None)
-        _overshoot_md = None if _overshoot_md is None else int(_overshoot_md)
-        if _overshoot_w > 0.0:
-            if name not in ("mm_flow", "flow"):
-                raise ValueError(f"model.overshoot_weight>0 (latent overshoot) is a Flow-only lever (needs the flow "
-                                 f"+ the p_tf=0 rollout feeds); got model.name={name!r}. See design/combatting_drift.md.")
-            if not (_p_tf_dyn is not None and float(_p_tf_dyn) == 1.0):
-                raise ValueError(f"model.overshoot_weight>0 requires model.p_tf_dynamics=1.0 (the CLEAN 1-step "
-                                 f"anchor overshoot adds its deep terms on top of); got p_tf_dynamics={_p_tf_dyn!r}. "
-                                 f"overshoot is the deterministic, anchored replacement for p_tf_dynamics<1 -- pick "
-                                 f"one, not both. See design/combatting_drift.md.")
-            # NB: overshoot is COMPATIBLE with compile_rollout. Unlike DF (which noises the ROLLOUT per step and so
-            # forces eager), overshoot does NOT modify the rollout -- it reuses the (compiled) rollout's `feeds`
-            # and adds a PARALLEL loss-term backbone pass, exactly like the existing anchor pass. So it keeps the
-            # compiled rollout (~straight03's 1.1h) plus one extra eager parallel pass (~1.3-1.5h), not DF's 2.9h.
-            if df_scale > 0.0 or df_rollout_level > 0.0:
-                raise ValueError("model.overshoot_weight>0 is mutually exclusive with diffusion forcing "
-                                 "(variations.noise_injection.observations_encoded_pre_fusion.scale/rollout_level>0) "
-                                 "for now: both modify the dynamics context (own-drift vs injected noise) and the "
-                                 "interaction is untested. Run them as separate arms.")
-            _F = int(cfg.data.get("F", 0) or 0)
-            if _overshoot_md is not None and not (1 <= _overshoot_md <= max(1, _F - 1)):
-                raise ValueError(f"model.overshoot_max_depth must be in [1, F-1] (F=data.F={_F}); got {_overshoot_md}.")
         _ah = m.get("action_head", {}) or {}
         _ah_on = bool(_ah.get("enabled", False) if hasattr(_ah, "get") else getattr(_ah, "enabled", False))
         if _ah_on and name not in ("mm_flow", "flow"):
@@ -397,7 +410,7 @@ def build_model(cfg):
                                        # default 1.0 (always-clean) so an old config adopted by
                                        # run_standalone rebuilds the behaviour it TRAINED under.
                                        p_tf_dynamics=_p_tf_dyn,
-                                       overshoot_weight=_overshoot_w, overshoot_max_depth=_overshoot_md)
+                                       anchor_init=bool(m.get("anchor_init", False)))
         raise ValueError(f"unknown model.name: {name!r}")
 
 

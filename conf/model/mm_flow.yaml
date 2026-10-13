@@ -164,6 +164,13 @@ p_tf_dynamics: 1.0            # Probability that the DYNAMICS loss conditions on
 #                               Replaces the boolean `dynamics_follows_p_tf` (false == 1.0, true == null),
 #                               which is still accepted and translated loudly for old configs.
 #                               design/flow.md, record section 18.
+latent_rollout:              # LATENT-space twin of the decode rollout loss (design/combatting_drift.md). The decode
+  weight: 0.0                #   loss scores decode(rolled_latent[t]) vs the true FRAME; this scores the SAME attached
+  metric: mse               #   rolled_latent[t] vs the true LATENT directly (projection=identity) -> penalizes the
+#                               rollout DRIFTING off the true latent trajectory (PlaNet latent overshooting). Uses the
+#                               ATTACHED rolled `preds` (real BPTT, same detach_every as decode) -- NOT the removed
+#                               detached one-step `overshoot`, which scored a fresh correction, not the rolled latent.
+#                               weight 0 -> off, bit-identical. metric: mse (PlaNet) | cosine (magnitude-invariant).
 dynamics_detach_encoder: false   # true -> stop-grad the encoded context feeding the DYNAMICS (dynamics/latent) loss:
 #                           the dynamics gradient can't reshape the encoder (trained then only by decode/recon).
 #                           The joint-training equivalent of IWS's frozen AE (anti-collapse). See multimodal.py.

@@ -131,6 +131,9 @@ class ModalitySpec:
     #                           for the TEMPORAL form only, where 72.2% of patches are static and their
     #                           cosine is noise (measured). Detached, so freezing cannot shrink its own
     #                           weight. See design/dino_loss.md section 3.
+    visual_saliency: str = "none"      # "hue" -> up-weight the DECODE pixel loss on cube pixels (saturated non-table);
+    visual_saliency_weight: float = 0.0 #  cube is ~2% of scene pixels so uniform L1 barely defends it. 0/"none" = off.
+    visual_saliency_dilate: int = 2    # grow the cube mask by N px to cover the boundary ring the threshold misses
     visual_frames: int = 128   # visual_lpips>0: score LPIPS on a random subset of this many frames per step
     #                           instead of all B*F (2048 at batch 32 / F 64), which would dominate the step. A
     #                           random subset is an unbiased estimate of the same expectation. 0 -> all frames.
@@ -454,7 +457,10 @@ class ImageModality(Modality):
                                  w_dino_v3=float(getattr(spec, "visual_dino_v3", 0.0) or 0.0),
                                  dino_v3_net=str(getattr(spec, "visual_dino_v3_net", "vits16")),
                                  dino_v3_layer=int(getattr(spec, "visual_dino_v3_layer", -1)),
-                                 dino_v3_patch_weight=str(getattr(spec, "visual_dino_v3_patch_weight", "none")))
+                                 dino_v3_patch_weight=str(getattr(spec, "visual_dino_v3_patch_weight", "none")),
+                                 saliency=str(getattr(spec, "visual_saliency", "none")),
+                                 saliency_weight=float(getattr(spec, "visual_saliency_weight", 0.0) or 0.0),
+                                 saliency_dilate=int(getattr(spec, "visual_saliency_dilate", 2) or 0))
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         # EXPLICIT dispatch with a RAISE on anything unknown. This used to be `if unet ... else vit`, so a
         # typo'd or newly-added decode_arch SILENTLY built the ViT head and the run "tested" nothing at all.

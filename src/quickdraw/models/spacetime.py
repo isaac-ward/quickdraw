@@ -59,12 +59,15 @@ class _SpatialAttention(nn.Module):
 class SpaceTimeBlock(nn.Module):
     """Pre-norm: spatial (within-step, bidirectional) -> temporal (across-step, causal) -> MLP."""
 
-    def __init__(self, dim: int, heads: int, window: int, mlp_ratio: float, rope_theta: float):
+    def __init__(self, dim: int, heads: int, window: int, mlp_ratio: float, rope_theta: float,
+                 pos_encoding: str = "rope", attention_sink: int = 0):
         super().__init__()
         self.s_norm = nn.LayerNorm(dim)
         self.s_attn = _SpatialAttention(dim, heads)
         self.t_norm = nn.LayerNorm(dim)
-        self.t_attn = SelfAttention(dim, heads, window, rope_theta)   # reuse causal+RoPE+FlexAttention
+        # pos_encoding / attention_sink apply to the TEMPORAL attention only (spatial is within-step, no time).
+        self.t_attn = SelfAttention(dim, heads, window, rope_theta,
+                                    pos_encoding=pos_encoding, attention_sink=attention_sink)
         self.m_norm = nn.LayerNorm(dim)
         self.mlp = FeedForward(dim, mlp_ratio)
 
@@ -98,13 +101,14 @@ class SpaceTimeTransformer(nn.Module):
     enabled modalities); a learned per-slot embedding is added once at the input."""
 
     def __init__(self, dim: int, depth: int, heads: int, window: int, mlp_ratio: float,
-                 n_slots: int, rope_theta: float = 10000.0):
+                 n_slots: int, rope_theta: float = 10000.0, pos_encoding: str = "rope", attention_sink: int = 0):
         super().__init__()
         self.window = window
         self.slot_emb = nn.Parameter(torch.zeros(1, 1, n_slots, dim))
         nn.init.trunc_normal_(self.slot_emb, std=0.02)
         self.blocks = nn.ModuleList(
-            [SpaceTimeBlock(dim, heads, window, mlp_ratio, rope_theta) for _ in range(depth)])
+            [SpaceTimeBlock(dim, heads, window, mlp_ratio, rope_theta,
+                            pos_encoding=pos_encoding, attention_sink=attention_sink) for _ in range(depth)])
         self.norm_out = nn.LayerNorm(dim)
 
     def forward(self, x: Tensor, temporal_block_mask=None, attn_eager: bool = False) -> Tensor:

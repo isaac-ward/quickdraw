@@ -225,6 +225,50 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
             out[h] = torch.cat([v[:, s, :min(every, Hm - s * every)] for s in range(n_seg)], dim=1)  # (n_ep,Hm,...)
         return (out, bag_out) if want_bag else out
 
+    def rollout_xstep_ahead(X, Hm):
+        """TARGET-TIME sliding X-steps-ahead forecast (replaces the old segment-and-reset 'closed loop', which
+        averaged horizons 1..X -- a sawtooth, optimistically biased). out[:, j] (n_ep, Hm, ...) is the X-ahead
+        forecast OF future-frame j (== absolute frame P+j): ground on the P GT frames ENDING at frame P+j-X, roll
+        X steps, and decode ONLY the last frame. So out[:, j] and the GT at future-frame j are the SAME world
+        moment -> a perfect model makes them identical. Valid for j in [X-1, Hm-1]; out[:, :X-1] is BLACK (no
+        X-ahead forecast exists yet -> masked from the metric via `valid_from`, rendered black in the filmstrip).
+        decode_last -> 1 decode/start (not X), so cost ~ open-loop. Only a START drop (X-1); no end drop, since
+        Hm <= L-P already bounds the targets inside the episode."""
+        X = min(int(X), Hm)
+        C = {"proprio": []}
+        C.update({h: [] for h in img_heads})
+        A = []
+        for o, a, fr in eps:                                               # rows ordered (episode, target j)
+            for j in range(X - 1, Hm):
+                cs = j - X + 1                                             # context start (abs); P frames end at grounding P+j-X
+                C["proprio"].append(norm.norm_obs(torch.from_numpy(o[cs:cs + P])))
+                for h in img_heads:
+                    C[h].append(torch.from_numpy(fr[h][cs:cs + P]))
+                idx = _np.clip(_np.arange(cs, cs + P + X - 1), 0, len(a) - 1)
+                A.append(norm.norm_act(torch.from_numpy(a[idx])))
+        ctx = {"proprio": torch.stack(C["proprio"]).float().to(device)}
+        for h in img_heads:
+            ctx[h] = torch.stack(C[h]).float().div(255.0).to(device)
+        acts = torch.stack(A).float().to(device)
+        n_j = Hm - (X - 1)                                                 # valid targets per episode
+        rows = n_ep * n_j
+        cap = max(n_ep, 64)
+        segs = {h: [] for h in heads}
+        for r0 in range(0, rows, cap):
+            sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
+            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], X, heads=heads, decode_chunk=dc, norm=norm, decode_last=True)
+            for h in heads:
+                segs[h].append(o_c[h][:, -1])                              # (chunk, ...) the single X-ahead frame
+        out = {}
+        for h in heads:
+            vv = torch.cat(segs[h], 0).reshape(n_ep, n_j, *torch.cat(segs[h], 0).shape[1:])
+            if X > 1:
+                black = torch.zeros(n_ep, X - 1, *vv.shape[2:], device=vv.device, dtype=vv.dtype)
+                out[h] = torch.cat([black, vv], dim=1)                     # (n_ep, Hm, ...) black lead-in + forecasts
+            else:
+                out[h] = vv
+        return out
+
     def latent_pass(Hm, bag):
         """LATENT-space curves for the OPEN-LOOP mode, computed from THE ROLLOUT THAT WAS ALREADY RUN.
 
@@ -256,25 +300,38 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
                           f"the decoded-image products are unaffected")
             return {}
 
-    def score_and_emit(out, subroutine, desc, Hm, lat=None):
+    def score_and_emit(out, subroutine, desc, Hm, lat=None, valid_from=0):
         """Score (image_curves per head + proprio_curves) + emit (emit_openloop) a completed rollout under the
         `subroutine` tag (e.g. eval_ood_horizon/open_loop). Head nesting rides under it via product_tag. `Hm`
-        is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H)."""
+        is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H).
+
+        `valid_from` (sliding X-ahead mode): the first `valid_from` frames carry no valid forecast -> their
+        per-step curve entries are NaN'd (dropped from the nanmean headline + shown as a gap on the error-vs-step
+        plot) and the filmstrip prediction is blacked. 0 for open-loop (everything valid)."""
         pred = out["proprio"]
         p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
         pt = p_true[:, :Hm]                                                    # GT future sliced to this mode's horizon
         per_step = proprio_curves(pred, norm.norm_obs(pt), p_hat, pt, env,
                                   pos_slice=(pos if pos_explicit else None))    # position-L2 pointwise iff explicit
         curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}
+        if valid_from:                                                         # drop the X-ahead lead-in from the metric
+            for k in curves:
+                curves[k][:valid_from] = _np.nan
         images = {}
         for head in img_heads:
             ipred = out[head].clamp(0, 1)
             ic = image_curves(ipred, itrue[head][:, :Hm])
+            if valid_from:
+                for k in ic:
+                    ic[k][:valid_from] = _np.nan                              # lead-in has no X-ahead forecast
             ic.update(lat or {})            # latent_motion_ratio / latent_cos ride the head's curve dict, so they
             #                                 reach the SAME panel + the same @+x scalar readouts as motion_ratio
+            ipred_film = ipred[:n_plot].cpu().numpy()
+            if valid_from:
+                ipred_film[:, :valid_from] = 0.0                              # black lead-in (no X-ahead forecast yet)
             images[head] = {"icurves": ic,
                             "full_true": _np.stack([eps[i][2][head][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
-                            "ipred": ipred[:n_plot].cpu().numpy()}
+                            "ipred": ipred_film}
             emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
         emit_openloop(writer, subroutine, step, env=env, R=getattr(ecfg, "R", None), r=getattr(ecfg, "r", None),
                       coloring="hsv", fps=fps, P=P, smooth_window=int(cfg.data.action_smooth_window), description=desc,
@@ -294,14 +351,21 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0):
         prog(int(5 + 90 * k / len(modes)), f"mode {name} (re-ground every {every} steps, H={Hm})"
              if every < Hm else f"mode {name} (open-loop, no re-grounding, H={Hm})")
         open_loop = every >= Hm
-        out = rollout_regrounded(every, Hm, want_bag=open_loop)
-        out, bag = out if open_loop else (out, None)
-        desc = (f"Open-loop long-horizon rollout: a BLACK agent on the TRUE path and a GREY agent on the model's "
-                f"PREDICTED path, sharing the context then diverging at the fork." if every >= Hm else
-                f"Closed-loop rollout: the GROUND-TRUTH observation is re-injected as context every {every} steps "
-                f"(over a {Hm}-step horizon), so error resets each re-grounding instead of compounding.")
+        if open_loop:
+            out, bag = rollout_regrounded(every, Hm, want_bag=True)
+            valid_from = 0
+            desc = ("Open-loop long-horizon rollout: a BLACK agent on the TRUE path and a GREY agent on the "
+                    "model's PREDICTED path, sharing the context then diverging at the fork.")
+        else:
+            X = int(every)
+            out, bag = rollout_xstep_ahead(X, Hm), None
+            valid_from = X - 1                                  # first X-1 frames have no X-ahead forecast (black)
+            desc = (f"Sliding {X}-step-ahead forecast (target-time aligned): at frame j the prediction is the "
+                    f"{X}-step-ahead forecast OF frame j (grounded {X} steps earlier on GT), so a perfect model "
+                    f"matches GT frame-for-frame. First {valid_from} frames black (no forecast yet); metric is the "
+                    f"uniform {X}-ahead error over valid frames.")
         lat = latent_pass(Hm, bag) if open_loop else None      # open-loop only (see latent_pass)
-        summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm, lat=lat))
+        summary.update(score_and_emit(out, f"eval_ood_horizon/{name}", desc, Hm, lat=lat, valid_from=valid_from))
 
     if was:
         m.train()

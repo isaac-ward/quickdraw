@@ -40,9 +40,11 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 # ----------------------------- masks -----------------------------
-def _sliding_causal_mask_mod(window: int):
+def _sliding_causal_mask_mod(window: int, sink: int = 0):
+    """Causal + sliding-window, plus an ATTENTION SINK: the first `sink` positions stay attendable from
+    every query (StreamingLLM). sink=0 -> the plain sliding-causal mask, bit-identical."""
     def mask_mod(b, h, q_idx, kv_idx):
-        return (kv_idx <= q_idx) & (q_idx - kv_idx < window)
+        return (kv_idx <= q_idx) & ((q_idx - kv_idx < window) | (kv_idx < sink))
 
     return mask_mod
 
@@ -54,11 +56,11 @@ _MASK_CACHE: dict = {}
 _ROPE_CACHE: dict = {}
 
 
-def _block_mask(window: int, T: int, device):
-    key = (window, T, str(device))
+def _block_mask(window: int, T: int, device, sink: int = 0):
+    key = (window, T, str(device), sink)
     bm = _MASK_CACHE.get(key)
     if bm is None:
-        bm = create_block_mask(_sliding_causal_mask_mod(window), B=None, H=None, Q_LEN=T, KV_LEN=T, device=device)
+        bm = create_block_mask(_sliding_causal_mask_mod(window, sink), B=None, H=None, Q_LEN=T, KV_LEN=T, device=device)
         _MASK_CACHE[key] = bm
     return bm
 
@@ -88,18 +90,41 @@ def pad_block_mask(T: int, pad: int, device):
     return bm
 
 
+_SINK_PAD_MASK_CACHE: dict = {}
+
+
+def rollout_sink_block_mask(window: int, sink: int, pad: int, device):
+    """Temporal mask for the AR rollout window when an ATTENTION SINK is active. The fed buffer is laid out
+    [ sink S ][ pad ][ recent (window-pad) ] -> fixed length S+window (one compiled shape). A query attends
+    every SINK column (the pinned grounded start) plus its causal RECENT column; the pad gap is masked.
+    `sink=0` collapses to `[pad][recent]` with mask (kv<=q)&(kv>=pad) -- byte-identical to `pad_block_mask`.
+    NoPE-only by construction (the sink requires pos_encoding='nope'; enforced at build)."""
+    s, p = int(sink), int(pad)
+    key = (window, s, p, str(device))
+    bm = _SINK_PAD_MASK_CACHE.get(key)
+    if bm is None:
+        T = s + window
+        def mask_mod(b, h, q_idx, kv_idx):
+            is_sink = kv_idx < s
+            is_recent = kv_idx >= s + p                       # excludes the [s, s+p) pad gap
+            return (kv_idx <= q_idx) & (is_sink | is_recent)
+        bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=T, KV_LEN=T, device=device)
+        _SINK_PAD_MASK_CACHE[key] = bm
+    return bm
+
+
 _EAGER_MASK_CACHE: dict = {}
 
 
-def eager_sliding_mask(window: int, T: int, device):
+def eager_sliding_mask(window: int, T: int, device, sink: int = 0):
     """Boolean causal + sliding-window mask (T,T), True = attend. For the EAGER sdpa(MATH) attention
     path used only by the contraction penalty (it needs double-backward, which the FlexAttention kernel
-    doesn't support). Same admissible set as `_sliding_causal_mask_mod`. Cached (shape/window/device)."""
-    key = (window, T, str(device))
+    doesn't support). Same admissible set as `_sliding_causal_mask_mod` (sink included). Cached."""
+    key = (window, T, str(device), sink)
     m = _EAGER_MASK_CACHE.get(key)
     if m is None:
         i = torch.arange(T, device=device)
-        m = (i[:, None] >= i[None, :]) & (i[:, None] - i[None, :] < window)
+        m = (i[:, None] >= i[None, :]) & ((i[:, None] - i[None, :] < window) | (i[None, :] < sink))
         _EAGER_MASK_CACHE[key] = m
     return m
 
@@ -133,44 +158,69 @@ class KVRing:
         self.k = None
         self.v = None
 
-    def append(self, k: Tensor, v: Tensor, window: int):   # k,v: (M,H,S,Dh) -> full (M,H,L,Dh), L<=window
+    def append(self, k: Tensor, v: Tensor, window: int, sink: int = 0):   # k,v: (M,H,S,Dh) -> (M,H,L,Dh)
+        """Ring holds the admissible key set of `_sliding_causal_mask_mod(window, sink)`: the LAST `window`
+        steps PLUS the FIRST `sink` steps (pinned, never evicted). sink=0 -> plain last-`window`, bit-identical.
+        Trimming only fires once length exceeds window+sink, at which point every dropped position is provably
+        outside both the window and the sink set (kv>=sink and cur-kv>=window)."""
         self.k = k if self.k is None else torch.cat((self.k, k), dim=2)
         self.v = v if self.v is None else torch.cat((self.v, v), dim=2)
-        if self.k.shape[2] > window:
-            self.k = self.k[:, :, -window:].contiguous()
-            self.v = self.v[:, :, -window:].contiguous()
+        if self.k.shape[2] > window + sink:
+            if sink:
+                self.k = torch.cat((self.k[:, :, :sink], self.k[:, :, -window:]), dim=2).contiguous()
+                self.v = torch.cat((self.v[:, :, :sink], self.v[:, :, -window:]), dim=2).contiguous()
+            else:
+                self.k = self.k[:, :, -window:].contiguous()
+                self.v = self.v[:, :, -window:].contiguous()
         return self.k, self.v
 
 
 # ----------------------------- attention -----------------------------
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, window: int, rope_theta: float):
+    def __init__(self, dim: int, heads: int, window: int, rope_theta: float,
+                 pos_encoding: str = "rope", attention_sink: int = 0):
         super().__init__()
         assert dim % heads == 0
         self.heads = heads
         self.head_dim = dim // heads
         self.window = window
         self.rope_theta = rope_theta
+        # pos_encoding: "rope" (default, bit-identical) | "nope" (no positional encoding -- causal mask only).
+        # NoPE is required for attention_sink>0: with RoPE a query would see the pinned sink at a q-k distance
+        # far larger than `window`, which the model never trained on (StreamingLLM re-indexes to avoid this;
+        # NoPE sidesteps it entirely). The incompatibility is ENFORCED at build (setup.build_model).
+        self.pos_encoding = str(pos_encoding)
+        self.attention_sink = int(attention_sink)
         self.qkv = nn.Linear(dim, 3 * dim)
         self.out = nn.Linear(dim, dim)
+
+    def _maybe_rope(self, q, k, out_dtype, T, positions=None):
+        """RoPE in fp32 on the RAW q,k then cast to `out_dtype` -- byte-for-byte the original rope path.
+        NoPE: no rotation, just cast to out_dtype (the positional signal is dropped entirely)."""
+        if self.pos_encoding != "rope":
+            return q.to(out_dtype), k.to(out_dtype)
+        if positions is None:
+            cos, sin = _rope(T, self.head_dim, self.rope_theta, q.device, torch.float32)
+        else:
+            cos, sin = rope_at(positions, self.head_dim, self.rope_theta, q.device, torch.float32)
+        return apply_rope(q.float(), cos, sin).to(out_dtype), apply_rope(k.float(), cos, sin).to(out_dtype)
 
     def forward(self, x: Tensor, block_mask=None, attn_eager: bool = False) -> Tensor:
         B, T, _ = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, T, Dh)
         # RoPE in fp32 for precision, then cast q,k back to v's dtype so FlexAttention sees one dtype
-        # (under bf16-mixed, LayerNorm keeps x in fp32, which would otherwise promote q,k to fp32).
-        cos, sin = _rope(T, self.head_dim, self.rope_theta, x.device, torch.float32)
-        q = apply_rope(q.float(), cos, sin).to(v.dtype)
-        k = apply_rope(k.float(), cos, sin).to(v.dtype)
+        # (under bf16-mixed, LayerNorm keeps x in fp32, which would otherwise promote q,k to fp32). NoPE skips it.
+        q, k = self._maybe_rope(q, k, v.dtype, T)
+        sink = self.attention_sink
         if attn_eager:  # differentiable backup path (contraction penalty only): plain sdpa(MATH), which
             # supports double-backward / forward-over-reverse. FlexAttention stays the default everywhere.
-            mask = eager_sliding_mask(self.window, T, x.device)
+            mask = eager_sliding_mask(self.window, T, x.device, sink)
             with sdpa_kernel(SDPBackend.MATH):
                 o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         else:
             if block_mask is None:  # default (parallel forward): build the sliding-causal mask for this T
-                block_mask = _block_mask(self.window, T, x.device)
+                block_mask = _block_mask(self.window, T, x.device, sink)
             o = flex_attention(q, k, v, block_mask=block_mask)
         o = o.transpose(1, 2).reshape(B, T, self.heads * self.head_dim)
         return self.out(o)
@@ -187,10 +237,8 @@ class SelfAttention(nn.Module):
         assert S == 1, "cached temporal attention feeds one step at a time (S==1)"
         qkv = self.qkv(x).view(M, S, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]                      # (M,H,S,Dh)
-        cos, sin = rope_at(positions, self.head_dim, self.rope_theta, x.device, torch.float32)
-        q = apply_rope(q.float(), cos, sin).to(v.dtype)
-        k = apply_rope(k.float(), cos, sin).to(v.dtype)
-        K, V = ring.append(k, v, self.window)                # (M,H,L,Dh), L<=window
+        q, k = self._maybe_rope(q, k, v.dtype, S, positions=positions)   # NoPE skips; rope uses GLOBAL positions
+        K, V = ring.append(k, v, self.window, self.attention_sink)       # (M,H,L,Dh), L<=window+sink
         if M <= self._M_CHUNK:
             o = F.scaled_dot_product_attention(q, K, V)
         else:

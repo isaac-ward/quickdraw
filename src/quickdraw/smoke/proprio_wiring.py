@@ -25,12 +25,13 @@ def _cfg(overrides):
 def main():
     torch.manual_seed(0)
     base = ["model=vl128_blockstack_flow"]        # small flow recipe (proprio + 2 img heads), fast to build
-    off = build_model(_cfg(base)).train()
-    # concat_proprio_embedding OFF by default:
+    # concat_proprio_embedding is ON by default in the blockstack recipe (2026-09-30); test the FEATURE by
+    # toggling it explicitly rather than assuming the default.
+    off = build_model(_cfg(base + ["++model.concat_proprio_embedding=false"])).train()
     if getattr(off, "concat_proprio_embedding", False):
-        _fail("concat_proprio_embedding should default OFF")
+        _fail("concat_proprio_embedding=false did not turn it off")
     # flow conditioning width with proprio embedding ON should be exactly +d vs off
-    on = build_model(_cfg(base + ["+model.concat_proprio_embedding=true"])).train()
+    on = build_model(_cfg(base + ["++model.concat_proprio_embedding=true"])).train()
     hd_off = off.flow.velocity_net_in_dim if hasattr(off.flow, "velocity_net_in_dim") else None
     print(f"off concat_proprio={off.concat_proprio_embedding}  on={on.concat_proprio_embedding}  d={off.d}   OK")
 
@@ -49,7 +50,7 @@ def main():
         _fail(f"_cond exercise failed: {type(e).__name__}: {e}")
 
     # decode_condition_on: cam_scene decode conditions on proprio -> gradient reaches the proprio slice
-    w = build_model(_cfg(base + ["+model.concat_proprio_embedding=true"])).train()
+    w = build_model(_cfg(base + ["++model.concat_proprio_embedding=true"])).train()
     # give cam_scene decode_condition_on at runtime
     w.modalities["cam_scene"].decode_condition_on = ("proprio",)
     bag = torch.randn(B, 2, w.n_state, d, requires_grad=True)

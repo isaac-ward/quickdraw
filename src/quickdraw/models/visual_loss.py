@@ -68,7 +68,7 @@ class _Term:
     def weight(self, vl: "VisualLoss") -> float:
         raise NotImplementedError
 
-    def pointwise(self, vl: "VisualLoss", p: Tensor, t: Tensor) -> Tensor | None:
+    def pointwise(self, vl: "VisualLoss", p: Tensor, t: Tensor, w: Tensor | None = None) -> Tensor | None:
         raise NotImplementedError
 
     def difference(self, vl: "VisualLoss", p0: Tensor, p1: Tensor, g0: Tensor, g1: Tensor) -> Tensor | None:
@@ -84,13 +84,28 @@ class _Term:
         raise NotImplementedError
 
 
+def _weighted_mean(err: Tensor, w: Tensor | None) -> Tensor:
+    """Mean of per-element `err`, optionally weighted by a per-pixel map `w=1+K·mask` (M,H,W,1) broadcast
+    over channels. `w is None` -> plain `.mean()`, BIT-IDENTICAL to the unweighted term.
+
+    NOT renormalized (`(w·err).mean()`, not `Σwε/Σw`): with `w=1` off the cube, background error is scored
+    EXACTLY as before (existing signal untouched), and cube error gets K× ADDITIONAL gradient on top. A
+    renormalized mean would instead dilute background error through the denominator, quietly weakening it --
+    the opposite of 'defend the cube without dropping everything else'. The only effect is a mild scale rise
+    (~1 + K·cube_fraction) on this term, which is decode-loss-internal."""
+    if w is None:
+        return err.mean()
+    return (w * err).mean()
+
+
 class L2Term(_Term):
     name = "l2"
     full_sequence = True
 
     def weight(self, vl): return vl.w_l2
 
-    def pointwise(self, vl, p, t): return F.mse_loss(p, t)
+    def pointwise(self, vl, p, t, w=None):
+        return F.mse_loss(p, t) if w is None else _weighted_mean((p - t) ** 2, w)
 
     def difference(self, vl, p0, p1, g0, g1):
         """NO temporal form, deliberately. A temporal difference image is SPARSE -- almost all zero
@@ -106,7 +121,8 @@ class L1Term(_Term):
 
     def weight(self, vl): return vl.w_l1
 
-    def pointwise(self, vl, p, t): return F.l1_loss(p, t)
+    def pointwise(self, vl, p, t, w=None):
+        return F.l1_loss(p, t) if w is None else _weighted_mean((p - t).abs(), w)
 
     def difference(self, vl, p0, p1, g0, g1): return F.l1_loss(p1 - p0, g1 - g0)
 
@@ -128,7 +144,7 @@ class LpipsTerm(_Term):
 
     def weight(self, vl): return vl.w_lpips
 
-    def pointwise(self, vl, p, t): return vl._lpips_term(p, t)
+    def pointwise(self, vl, p, t, w=None): return vl._lpips_term(p, t)   # feature-space: no per-pixel weight
 
     def difference(self, vl, p0, p1, g0, g1):
         fp0, fp1 = vl._layer_features(vl._sanitise(p0)), vl._layer_features(vl._sanitise(p1))
@@ -156,7 +172,7 @@ class DinoV3Term(_Term):
         from .dino_loss import get_net, patch_tokens
         return patch_tokens(get_net(vl.dino_v3_net, x.device), x, vl.dino_v3_layer)
 
-    def pointwise(self, vl, p, t):
+    def pointwise(self, vl, p, t, w=None):         # feature-space: no per-pixel weight
         from .dino_loss import patch_cosine
         p, t = vl._subsample(p, t)                 # the same frame budget LPIPS gets
         fp, fg = self._tok(vl, vl._sanitise(p)), self._tok(vl, t.clamp(0, 1))
@@ -186,9 +202,19 @@ class VisualLoss(nn.Module):
     def __init__(self, *, w_l2: float = 1.0, w_l1: float = 0.0, w_lpips: float = 0.0,
                  lpips_net: str = "vgg", frames: int = 128,
                  w_dino_v3: float = 0.0, dino_v3_net: str = "vits16",
-                 dino_v3_layer: int = -1, dino_v3_patch_weight: str = "none"):
+                 dino_v3_layer: int = -1, dino_v3_patch_weight: str = "none",
+                 saliency: str = "none", saliency_weight: float = 0.0, saliency_dilate: int = 2):
         super().__init__()
         self.w_l2, self.w_l1, self.w_lpips = float(w_l2), float(w_l1), float(w_lpips)
+        # SALIENCY (2026-09-28): a per-pixel weight on the DECODE pixel terms (L1/L2), up-weighting where
+        # cubes are so a faded small cube actually costs gradient (it is ~2% of scene pixels, drowned under
+        # uniform L1). "none"/weight 0 -> w is None -> bit-identical. Applied ONLY at site=="decode" (the
+        # rolled-latent render); the codec roundtrip anchor stays uniform (Ceiling A, already fixed).
+        self.saliency, self.saliency_weight = str(saliency), float(saliency_weight)
+        # dilate the cube mask by this many pixels so the weight covers the cube AND its boundary RING --
+        # anti-aliased/blurred edges fall below the saturation threshold, yet the edge is exactly where the
+        # decoder smears. 0 = no dilation (interior only).
+        self.saliency_dilate = int(saliency_dilate)
         self.lpips_net, self.frames = str(lpips_net), int(frames)
         # TWO WEIGHTS, not a mode switch: `w_lpips=0, w_dino_v3=1` swaps them, but leaving both
         # nonzero runs both, which is what PixelGen found best (LPIPS for local texture, DINO for
@@ -369,24 +395,56 @@ class VisualLoss(nn.Module):
             return pred.reshape(-1, *pred.shape[-3:]), target.reshape(-1, *target.shape[-3:])
         return pred, target
 
-    def _assemble(self, zero: Tensor, mode: str, *args) -> Tensor:
-        """Sum w * term over the registry. `mode` picks which reduction each term contributes."""
+    def _assemble(self, zero: Tensor, mode: str, *args, wmap: Tensor | None = None) -> Tensor:
+        """Sum w * term over the registry. `mode` picks which reduction each term contributes. `wmap` is the
+        optional per-pixel saliency weight, passed ONLY to the pointwise pixel terms (L1/L2 use it; feature
+        terms ignore it); the difference reduction never gets it."""
         total = zero
         for term in self._terms:
             w = float(term.weight(self) or 0.0)
             if not w:
                 continue
-            part = term.pointwise(self, *args) if mode == "pointwise" else term.difference(self, *args)
+            part = (term.pointwise(self, *args, w=wmap) if mode == "pointwise"
+                    else term.difference(self, *args))
             if part is None:
                 continue
             for sub in (part if isinstance(part, list) else [part]):
                 total = total + w * sub
         return total
 
+    @torch.no_grad()
+    def _saliency_map(self, target: Tensor) -> Tensor:
+        """(M,H,W,C) target in [0,1] -> per-pixel weight (M,H,W,1) = 1 + K on cube pixels. Cube mask =
+        the CANONICAL extractor threshold (logs/oneoffs/extract_cube_state.candidate): saturated,
+        bright, NON-table hue -> `observation.objects.cube` and this loss agree by construction. Derived
+        from the TARGET (clean GT), so it is reliable even when the prediction has already faded."""
+        t = target.detach().float()
+        r, g, b = t[..., 0], t[..., 1], t[..., 2]
+        mx = t.max(-1).values
+        df = (mx - t.min(-1).values).clamp_min(1e-6)
+        s = (mx - t.min(-1).values) / mx.clamp_min(1e-6)
+        rm = mx == r
+        gm = (mx == g) & ~rm
+        bm = (mx == b) & ~rm & ~gm
+        h = torch.zeros_like(mx)
+        h = torch.where(rm, ((g - b) / df) % 6, h)
+        h = torch.where(gm, ((b - r) / df) + 2, h)
+        h = torch.where(bm, ((r - g) / df) + 4, h)
+        h = (h * 60) % 360
+        table = (h >= 18) & (h <= 55)
+        cube = ((s > 0.45) & (mx > 0.2) & (~table)).float()      # (M,H,W)
+        if self.saliency_dilate > 0:                              # grow to cover the boundary ring the threshold misses
+            k = 2 * self.saliency_dilate + 1
+            cube = F.max_pool2d(cube.unsqueeze(1), kernel_size=k, stride=1, padding=self.saliency_dilate).squeeze(1)
+        return (1.0 + self.saliency_weight * cube).unsqueeze(-1)
+
     def forward(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
         pred, target = self._flatten(pred, target)     # (B,F,H,W,C) from the anchor -> (B*F,H,W,C)
         self._record(site, pred)                       # RAW range, before any term clamps -- see pop_diagnostics
-        return self._assemble(pred.new_zeros(()), "pointwise", pred, target)
+        wmap = None
+        if self.saliency != "none" and self.saliency_weight > 0.0 and site == "decode":
+            wmap = self._saliency_map(target)          # cube-weighted pixel loss (decode site only)
+        return self._assemble(pred.new_zeros(()), "pointwise", pred, target, wmap=wmap)
 
     # ---- the FIRST-ORDER term (design/derivative_loss.md) ------------------------------------------
     def _pairs(self, pred: Tensor, target: Tensor, stride: int):

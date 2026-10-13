@@ -139,7 +139,6 @@ class LitWorldModel(L.LightningModule):
         feeds = None
         _q = getattr(m, "p_tf_dynamics", 1.0)          # probability the dynamics loss uses TRUTH
         want_feeds = (_q is None) or (float(_q) < 1.0)  # None -> follows p_tf; <1 -> partial mixing
-        want_feeds = want_feeds or (float(getattr(m, "overshoot_weight", 0.0) or 0.0) > 0.0)  # overshoot reuses feeds
         # PHASE MARKERS (record_function is a no-op unless a torch.profiler is active). Added 2026-08-25:
         # NOTHING in this repo had ever measured the training step's phase breakdown -- every "X is N% of the
         # step" number, in design docs and audits alike, was inferred from epoch totals. These make one
@@ -203,6 +202,13 @@ class LitWorldModel(L.LightningModule):
             phys_abs = m.physics_proprio_chained(preds, prev0_abs, true_future_abs, act_raw, p_tf)
             raw["physics/proprio"] = F.mse_loss(self.norm.norm_obs(phys_abs), future["proprio"])
             w["physics/proprio"] = 1.0
+        # LATENT ROLLOUT LOSS: the latent-space twin of the decode loss above, on the SAME attached `preds`
+        # (one rollout, two projections). Scores the rolled latent vs the TRUE future latent directly. Off
+        # (weight 0) -> no term. Reuses the shared-encode `z_full` when available, else encodes the future once.
+        if float(getattr(m, "latent_rollout_weight", 0.0) or 0.0) > 0.0:
+            z_true = z_full[:, self.P:] if (share and z_full is not None) else m.encode_state(future, anchor)
+            lr_raw, lr_w = m.latent_rollout_losses(preds, z_true)
+            raw.update(lr_raw); w.update(lr_w)
         # recon_losses returns its OWN weights (same contract as loss_terms). It used to be reconstructed here
         # by parsing the key -- wts[k.split("/")[-1]] -- which mapped "roundtrip/image" to the IMAGE DECODE
         # weight, so ablating a head's decode recon with modalities.<i>.weight=0 silently also deleted that
