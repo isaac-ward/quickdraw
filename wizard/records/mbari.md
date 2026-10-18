@@ -53,10 +53,10 @@ what happened on the first attempt, and the commit caught nothing but the README
 - [x] 5. MOLA 6-DOF dynamics: 3 forces + 3 torques, damping so momentum dies quickly
 - [x] 6. Trajectory generators: random / forward-circles / circles-with-yaw, analytic, collision-free
 - [x] 7. Recorder: state, actions, fpv + top-down + side-on at 144x192
-- [ ] 8. Generate 240 x 30 s nominal (80 per class)
-- [ ] 9. Generate 3 OOD sets, 50 trajectories each: glitchy thruster, fish, diver
+- [x] 8. Generate 240 x 30 s nominal (80 per class)
+- [x] 9. Generate 3 OOD sets, 50 trajectories each: glitchy thruster, fish, diver
 - [ ] 10. Package to the house dataset format and push to HF
-- [ ] 11. Read `wizard/records/*.md` on main AND on the `longhand` branch
+- [x] 11. Read `wizard/records/*.md` on main AND on the `longhand` branch
 - [ ] 12. Propose a training config and ask before launching
 - [ ] 13. Train; log full open-loop and 16-step-ahead predictions
 - [ ] 14. Uncertainty: classify the three OOD types against nominal
