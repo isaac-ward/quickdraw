@@ -30,7 +30,8 @@ def one(npz_path, out_stem, cap=CAP, fps=30, gif=False, log=print):
     z = np.load(npz_path)
     panels = [z[f"frames_{c}"][:cap].astype(np.float32) / 255 for c in CAMS]
     canvas = viz.label_panels(panels, list(TITLES), panel_wh=(230, 172), header_px=40, font_px=25)
-    viz.save_mp4(f"{out_stem}.mp4", canvas, fps)
+    viz.save_mp4(f"{out_stem}.mp4", canvas, fps, quality=7)   # 7 not 9: ~870 clips ship with the
+    #                                                            dataset, and 9 doubles the upload
     if gif:
         viz.save_gif(f"{out_stem}.gif", canvas[:300], fps=12, max_mb=45, log=lambda *_: None)
     o = z["obs"]
@@ -38,14 +39,30 @@ def one(npz_path, out_stem, cap=CAP, fps=30, gif=False, log=print):
             f"pos span {np.round(np.ptp(o[:, :3], 0), 1)} | {str(z['meta'])[:70]}")
 
 
-def main(root, out, n_per=1, gif=False, log=print):
-    """One preview per split (or `n_per`), written to `out` as mbari_<split>_<i>.mp4."""
+def main(root, out, n_per=None, gif=False, shard=0, shards=1, log=print):
+    """A preview for EVERY episode (or the first `n_per` per split), as <out>/<split>/ep_xxxxx.mp4.
+
+    Every trajectory gets one, because a dataset you cannot watch is a dataset nobody checks. At
+    ~40 s per 30 s episode that is 3.3 hours serial for 390, so the work is sharded the same way
+    generation is: `--shard k --shards n` takes every n-th job and the caller runs n processes.
+    Episodes already on disk are skipped, so a re-run resumes."""
     out = pathlib.Path(out)
-    out.mkdir(parents=True, exist_ok=True)
+    jobs = []
     for split in SPLITS:
-        for i, f in enumerate(sorted(glob.glob(f"{root}/{split}/*.npz"))[:n_per]):
-            stem = out / f"mbari_{split}_{i}"
-            log(f"  {split:13s} {one(f, str(stem), gif=gif, log=log)}")
+        for i, f in enumerate(sorted(glob.glob(f"{root}/{split}/*.npz"))):
+            if n_per is not None and i >= n_per:
+                break
+            jobs.append((split, pathlib.Path(f).stem, f))
+    mine = [j for n, j in enumerate(jobs) if n % shards == shard]
+    log(f"[prev] {len(jobs)} episodes, {len(mine)} in shard {shard}/{shards}")
+    for n, (split, stem, f) in enumerate(mine, 1):
+        d = out / split
+        d.mkdir(parents=True, exist_ok=True)
+        if (d / f"{stem}.mp4").exists():
+            continue
+        line = one(f, str(d / stem), gif=gif, log=log)
+        if n % 10 == 0 or n == len(mine):
+            log(f"[prev] {n}/{len(mine)}  {split}/{stem}  {line}")
 
 
 if __name__ == "__main__":
@@ -54,7 +71,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Four-camera preview videos, one per split.")
     ap.add_argument("--root", default="/app/logs/mbari/data/v6")
     ap.add_argument("--out", default="/app/logs/mbari/data/previews")
-    ap.add_argument("--n-per", type=int, default=1)
+    ap.add_argument("--n-per", type=int, default=None, help="cap per split; default ALL episodes")
     ap.add_argument("--gif", action="store_true", help="also write a 10 s gif slice")
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--shards", type=int, default=1)
     a = ap.parse_args()
-    main(a.root, a.out, a.n_per, gif=a.gif, log=lambda m: print(m, flush=True))
+    main(a.root, a.out, a.n_per, gif=a.gif, shard=a.shard, shards=a.shards,
+         log=lambda m: print(m, flush=True))

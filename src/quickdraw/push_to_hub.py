@@ -87,15 +87,27 @@ def _preview_block(root: str) -> str:
     d = os.path.join(root, "media", "previews")
     if not os.path.isdir(d):
         return ""
-    vids = sorted(f for f in os.listdir(d) if f.endswith(".mp4"))
-    if not vids:
+    # previews are <split>/<episode>.mp4; embed ONE per split and link the rest. Embedding several
+    # hundred <video> tags would make the card unloadable.
+    picks, total = [], 0
+    for split in sorted(os.listdir(d)):
+        sd = os.path.join(d, split)
+        if not os.path.isdir(sd):
+            continue
+        vids = sorted(f for f in os.listdir(sd) if f.endswith(".mp4"))
+        total += len(vids)
+        if vids:
+            picks.append((split, len(vids), f"{split}/{vids[0]}"))
+    if not picks:
         return ""
     rows = "\n".join(
-        f'\n**{v[:-4].replace("_", " ")}**\n\n'
-        f'<video controls width="640" src="media/previews/{v}"></video>\n\n'
-        f'([download](media/previews/{v}))\n' for v in vids)
-    return ("\n## Watch it\n\nOne clip per condition, all four cameras side by side, 30 Hz.\n"
-            f"{rows}\n")
+        f'\n**{sp}** ({n} episodes, one mp4 each in '
+        f'[`media/previews/{sp}/`](media/previews/{sp}))\n\n'
+        f'<video controls width="640" src="media/previews/{rel}"></video>\n\n'
+        f'([download](media/previews/{rel}))\n' for sp, n, rel in picks)
+    return (f"\n## Watch it\n\n**Every one of the {total} trajectories has a preview mp4** under "
+            f"`media/previews/<split>/`: all four cameras side by side, labelled, at 30 Hz. One "
+            f"example per split is embedded below.\n{rows}\n")
 
 
 def _make_card(root: str, name: str) -> str:

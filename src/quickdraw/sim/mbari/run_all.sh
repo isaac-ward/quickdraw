@@ -14,10 +14,9 @@ for s in train ood_thruster ood_fish ood_buoy; do
 done
 du -sh $V
 
-echo "=== preview videos  $(date -u +%H:%M) ==="
-.venv/bin/python -u -m quickdraw.sim.mbari.previews --root $V --out $L/data/previews --n-per 3 \
-  > $L/data/previews.log 2>&1
-grep -E "^  (train|ood)" $L/data/previews.log
+echo "=== preview videos, one per episode  $(date -u +%H:%M) ==="
+bash /app/src/quickdraw/sim/mbari/gen_previews.sh $V 16 > $L/data/previews.log 2>&1
+tail -1 $L/data/previews.log
 
 echo "=== packaging all four cameras  $(date -u +%H:%M) ==="
 .venv/bin/python -u -m quickdraw.sim.mbari.package --root $V --name mbari-tank \
@@ -27,8 +26,8 @@ echo "  run_dir = $R"
 [ -z "$R" ] && { echo "PACKAGING FAILED"; tail -20 $L/data/package.log; exit 1; }
 cp $L/data/PROCESSING.md $R/PROCESSING.md 2>/dev/null
 # the clips ride along INSIDE the dataset repo, so they play on the Hub page itself
-mkdir -p $R/media/previews && cp $L/data/previews/*.mp4 $R/media/previews/
-du -sh $R/media/previews
+mkdir -p $R/media/previews && cp -r $L/data/previews/* $R/media/previews/
+echo "  previews shipped: $(find $R/media/previews -name '*.mp4' | wc -l) mp4, $(du -sh $R/media/previews | cut -f1)"
 echo "$R" > $L/data/run_dir.txt
 
 echo "=== push to hugging face  $(date -u +%H:%M) ==="

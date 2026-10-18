@@ -217,6 +217,21 @@ def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma
     return mean[0].copy(), np.roll(mean, -1, axis=0)
 
 
+# TWO PLANNING MODES, SWITCHED ON RANGE. Far from the goal the problem is reach: you need seconds
+# of lookahead, which `repeat` buys cheaply by holding each planned action for 6 control steps.
+# Close in, that same coarseness is the error floor -- the finest correction the planner can command
+# is one 0.2 s impulse, and with perfect dynamics the true-dynamics arm still settled at 0.16 m
+# mean. Inside NEAR the planner drops to one-step actions, a longer horizon in steps (but shorter in
+# seconds) and a third of the action noise, so it can place the vehicle rather than lob it.
+#
+# This costs less per call than it looks: a fine call is 48 x 18 x 17 = 14,688 mj_steps against the
+# coarse 24 x 12 x 6 x 17 = 29,376, so roughly half. It is called six times as often during the
+# final approach, so the net is about 1.7x -- and only over the last metre.
+NEAR = 1.2
+COARSE = dict(repeat=6, horizon=12, samples=24, sigma=0.50)
+FINE = dict(repeat=1, horizon=18, samples=48, sigma=0.18)
+
+
 def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0, log=None,
                 repeat=6, samples=24, horizon=12):
     """Closed loop: `dyn` plans, the MuJoCo `plant_model` executes. Returns a trace dict.
@@ -225,7 +240,10 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     planner evaluates candidates at that granularity, so replanning every single step both wastes the
     other five-sixths of the plan and multiplies the cost by six. Measured on the true plant at
     24 samples / horizon 12 / repeat 6: 993 ms per MPPI call, so replanning every step is 9.9 min per
-    600-step trial against 1.7 min when the plan is actually used."""
+    600-step trial against 1.7 min when the plan is actually used.
+
+    The mode switch above overrides `repeat`/`samples`/`horizon` once inside NEAR of the goal. Both
+    arms of the benchmark get the identical schedule, so the comparison is still only the dynamics."""
     import mujoco
 
     d = mujoco.MjData(plant_model)
@@ -236,14 +254,18 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
         observe(d)
     sub = int(round((1.0 / FPS) / plant_model.opt.timestep))
     traj, acts, prev = [], [], None
-    k = 0
+    k, mode = 0, None
     while k < steps:
         s = mola.state(d)
         if not np.isfinite(s).all():
             break
+        want = FINE if np.linalg.norm(s[:3] - goal_p) < NEAR else COARSE
+        if want is not mode:                  # the warm start has the old horizon; drop it
+            mode, prev = want, None
         a, prev = mppi(dyn, s, goal_p, goal_q, seed=seed + k, prev=prev,
-                       samples=samples, horizon=horizon, repeat=repeat)
-        for _ in range(min(repeat, steps - k)):
+                       samples=mode["samples"], horizon=mode["horizon"],
+                       sigma=mode["sigma"], repeat=mode["repeat"])
+        for _ in range(min(mode["repeat"], steps - k)):
             s = mola.state(d)
             traj.append(s)
             acts.append(a)

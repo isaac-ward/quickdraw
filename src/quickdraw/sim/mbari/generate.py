@@ -58,8 +58,10 @@ def _worker(args):
         return (False, split, idx, time.time() - t0, f"{type(exc).__name__}: {exc}")
 
 
-def plan_nominal(n=240, steps=900, seed0=1000):
-    """240 episodes, 80 per behaviour class, interleaved so any prefix is class-balanced."""
+def plan_nominal(n=720, steps=900, seed0=1000):
+    """720 episodes = 6.00 h at 30 Hz, 240 per behaviour class, interleaved so ANY PREFIX is
+    class-balanced -- which is what lets a bigger run reuse a smaller one's episodes unchanged:
+    job i always has seed 1000+i and class CLASSES[i%3], whatever n is."""
     from .trajectories import CLASSES
 
     jobs = []
@@ -166,7 +168,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="/app/logs/mbari/data/v6")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
-    ap.add_argument("--nominal", type=int, default=240)
+    ap.add_argument("--nominal", type=int, default=720)
     ap.add_argument("--steps", type=int, default=900)
     ap.add_argument("--ood-per", type=int, default=50)
     ap.add_argument("--ood-steps", type=int, default=360)
