@@ -18,8 +18,15 @@ echo "=== preview videos, one per episode  $(date -u +%H:%M) ==="
 bash /app/src/quickdraw/sim/mbari/gen_previews.sh $V 16 > $L/data/previews.log 2>&1
 tail -1 $L/data/previews.log
 
-echo "=== packaging all four cameras  $(date -u +%H:%M) ==="
-.venv/bin/python -u -m quickdraw.sim.mbari.package --root $V --name mbari-tank \
+# PACK FPV ONLY, and this is a throughput decision, not a scope cut. write_lerobot_split DECODES
+# and RE-ENCODES every clip a second time, serially per split: 4 cameras x 900 frames per episode
+# is ~43 s, so 648 train episodes is 7.7 hours. The dataloader reads ONE camera (`data.cam=fpv`),
+# and step 1 has already written all four as per-episode clips under media/<cam>/<split>/ in
+# parallel -- so chase, topdown and sideon still ship, still play on the Hub, and are still there
+# for the control benchmark. Only the LeRobot video KEYS are fpv. Re-run with --cams to add the
+# others if a consumer ever needs them as loadable keys.
+echo "=== packaging (fpv keys; all four cameras ship as clips)  $(date -u +%H:%M) ==="
+.venv/bin/python -u -m quickdraw.sim.mbari.package --root $V --name mbari-tank --cams fpv \
   > $L/data/package.log 2>&1
 R=$(grep "^run_dir:" $L/data/package.log | tail -1 | awk '{print $2}')
 echo "  run_dir = $R"
