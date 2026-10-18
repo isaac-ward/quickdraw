@@ -55,13 +55,44 @@ what happened on the first attempt, and the commit caught nothing but the README
 - [x] 7. Recorder: state, actions, fpv + top-down + side-on at 144x192
 - [x] 8. Generate 240 x 30 s nominal (80 per class)
 - [x] 9. Generate 3 OOD sets, 50 trajectories each: glitchy thruster, fish, diver
-- [ ] 10. Package to the house dataset format and push to HF
+- [x] 10. Package to the house dataset format and push to HF
 - [x] 11. Read `wizard/records/*.md` on main AND on the `longhand` branch
-- [ ] 12. Propose a training config and ask before launching
+- [x] 12. Training config written and launched (user asleep -- decisions listed above)
 - [ ] 13. Train; log full open-loop and 16-step-ahead predictions
 - [ ] 14. Uncertainty: classify the three OOD types against nominal
 - [ ] 15. Pixel-level uncertainty videos
 - [ ] 16. Control benchmark: reach the dock, and reach a random pose, under TRUE dynamics vs the LEARNED world model
+
+## Measured, so far
+
+| | |
+|---|---|
+| AUV dynamics | cruise 1.21 m/s at full surge, coast to 5% in 0.80 s, yaw 49 deg/s |
+| trajectory tracking | circle and circle_yaw both 0.040 m mean error, 0.09 m p95, no actuator railing |
+| gripper of the tank | 68 ArUco 5x5_250 markers, all unique, detector round-trip 4/4 |
+| render cost | 307 ms -> 65 ms per 4-camera control step (mesh decimation, shadows off, one scene build) |
+| dataset | 240 x 900 = **216,000 steps = exactly 2.00 h at 30 Hz**, plus 3 x 50 x 360 = 10 min per OOD set |
+| on disk | 50 GB of npz -> 1.4 GB of mp4 after packaging |
+| `delta_k` (fpv) | 0.1124 at stride 1 = 1.76x a 0.064 codec floor -> **no subsampling** |
+
+## Decisions made while the user was asleep
+
+Flagged here rather than buried in commits, since item 12 said to ask first and there was nobody to ask.
+
+1. **`subsample=1`.** Measured, not assumed -- see the table. Also removes the `action_aggregate`
+   question entirely, and these are absolute commands so `sum` would have been wrong.
+2. **`conf/model/mbari_fpv.yaml` is `vl128_blockstack_2cam` with only the dataset-forced fields
+   changed** (proprio dim, action dim, one image head at 144x192 / bottleneck 9). Every inherited
+   value was bought with an experiment; changing one here would confound the transplant.
+3. **`max_epochs=40`, evals every 2 epochs, manifold and all three denoising routines OFF** -- the
+   records say those four read torus-only fields and do not self-skip on a recorded dataset.
+4. **`checkpoint_monitor=val/metric/fpv/mse`** explicitly, because the default monitor is a proprio
+   metric and would select the wrong epoch for an image result.
+5. **The thruster OOD is a 30% probabilistic glitch**, not the 1/5 derate originally planned -- the
+   user's suggestion, and the better one: a derate is a different linear plant a world model can
+   re-fit, an intermittent glitch is a shift in the action-conditional.
+6. **Substituted diver and fish**: the linked diver is not downloadable (403) and the CGTrader shark
+   has no API. Both are OOD objects, so novelty is what matters, not the specific artist's model.
 
 ## Open questions
 

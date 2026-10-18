@@ -1,0 +1,55 @@
+# =============================================================================================
+# mbari-tank -- MOLA AUV in the MBARI test tank (simulated, MuJoCo). Select with `data=mbari`.
+#
+#   train            240 eps x 900 steps = 216,000 transitions   (exactly 2.00 h at 30 Hz)
+#   val              drawn from train by the longest-first rule at build time
+#   ood_thruster      50 eps x 360 steps =  18,000  (10 min) -- 30% of steps the command is replaced
+#   ood_fish          50 eps x 360 steps =  18,000  (10 min) -- an orange fish transits the tank
+#   ood_diver         50 eps x 360 steps =  18,000  (10 min) -- a diver transits the tank
+#
+# 30 Hz. observation_vector 13-dim, action 6-dim, FOUR cameras at 144x192.
+#
+# OBSERVATION LAYOUT (quickdraw.sim.mbari.mola.STATE_NAMES), written down because the next person
+# will otherwise guess it from starling's and be wrong -- the two are NOT the same order:
+#     0:3    x, y, z            world frame, metres
+#     3:7    qw, qx, qy, qz     body->world, MuJoCo order. NOT z-scored (obs_identity) -- these are
+#                               components of a UNIT quaternion, already O(1), and per-component
+#                               z-scoring would distort the rotation manifold.
+#     7:10   vx, vy, vz         linear velocity, WORLD frame
+#     10:13  wx, wy, wz         angular velocity, BODY frame (MuJoCo's free-joint convention)
+#   action = [surge, sway, heave, roll, pitch, yaw], body-frame forces and torques, each in [-1,1].
+#
+# CAMERAS. `fpv` is the AUV's own forward camera and the ONLY training view. `chase`, `topdown` and
+# `sideon` are third-person and exist for human review and the control benchmark -- training on them
+# would be training on information the vehicle does not have.
+#
+# SUBSAMPLE: MEASURED, and the answer is 1 -- unusually, no subsampling. Frame-delta RMSE on fpv:
+#
+#     stride     1      2      3      4      6      8     12
+#     delta_k  0.1124 0.1399 0.1536 0.1622 0.1734 0.1820 0.1935
+#     vs 0.064  1.76x  2.19x  2.40x  2.53x  2.71x  2.84x  3.02x
+#
+# The house rule (recipes/bsp32mse.md, robocasa record 13) is to pick the stride where delta_k clears
+# the codec's own RMSE floor, aiming a little above 1.0x. At the native 30 Hz this data is ALREADY at
+# 1.76x against a robocasa-like 0.064 floor and 3.21x against block-stack's measured 0.035, so every
+# larger stride moves further from the productive 1.2-1.4x band, not toward it. An AUV flying through
+# a textured tank changes its view fast.
+#
+# That also makes `action_aggregate` moot (nothing to aggregate at stride 1), which sidesteps the
+# absolute-vs-delta action trap: these actions are absolute commands, so `sum` would have been wrong.
+# =============================================================================================
+defaults:
+  - torus
+  - _self_
+
+root: /app/logs/recording_2026_10_18_07_32_38_mbari-tank
+repo_id: mbari-tank
+cam: fpv
+
+P: 8
+F: 64
+window_stride: 1         # LOCKED -- see torus.yaml
+subsample: 1             # MEASURED -- see the header
+
+autobatch: true
+workers: 16
