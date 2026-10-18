@@ -88,6 +88,44 @@ it changes exactly one thing in the frame.
 
 Every one of these was found by rendering and looking. None of them would have moved a metric.
 
+## What `longhand` says, and what it predicts for this dataset
+
+Read on `origin/longhand` (1143 lines; the copy on main is the 408-line short version). Four
+findings bear on this experiment.
+
+**§8.25 — the invariant.** Thirteen arms on block-stack, one number: `OL - floor` pinned at ~0.063,
+unmoved by weight decay (1e-4 to 1e-2), capacity in BOTH directions (16/32/64 tokens, d 128/256),
+attention window (32/64/128), four loss reweightings (L1, LPIPS, DINOv3 per-patch cosine, first-order
+derivative), `p_tf_dynamics`, `df_scale`, `detach_every`, `action_aggregate`, temporal subsampling.
+Every OL improvement measured on that branch was the CODEC getting better. The diagnosis: nothing in
+the architecture binds a token to an object, so "which block is which" is re-derived diffusely at
+each of ~30 rollout steps, costing ~0.063 LPIPS regardless.
+
+**The prediction for MBARI.** The tank is rigid and in nominal data the only thing moving is the
+camera. There are no object identities to lose, so the failure that dominates block-stack should be
+largely ABSENT here. If MBARI's long-horizon quality is also stuck at a floor-offset invariant, the
+object-binding diagnosis was incomplete and something more general is going on. That is a real test,
+and it is free -- it falls out of the run we are doing anyway.
+
+**§8.29 — the munge is the decode MEAN, not the dynamics.** `decode_kind: mse` emits
+`E[frame | latent]`, and averaging a multimodal conditional gives half-blocks. MBARI's conditional
+given the latent is close to unimodal (rigid scene, deterministic dynamics, one moving camera), so
+`mse` is defensible here in a way it was not there. Revisit only if the rollouts look soft.
+
+**§8.28 — judge on the MP4s, not the filmstrips.** Eight frames out of 1651 cannot show flicker
+between samples, which is what the operator sees. Hence an mp4 per trajectory shipping with the
+dataset.
+
+**One place the record is deliberately NOT followed.** It says report `OL - floor`. The user's
+standing instruction is raw OL LPIPS @+64/@+128 against the historical best -- not the floor, not a
+penalty, not the mechanism. Raw is what gets reported.
+
+**THE LEVER THIS OPENS, and why the dataset is now 6 h.** §8.21 and §8.25 both end at the same
+wall: *2.06 h is very small for a video world model, and there is nothing left to reprocess, so this
+means recording.* Block-stack could not get more -- it is a real robot. MBARI is simulated: 2 h costs
+25 minutes of wall clock. The one lever thirteen arms could not pull is nearly free here, so the
+nominal set went from 240 episodes (2.00 h) to **720 (6.00 h)**, OOD unchanged.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
@@ -116,7 +154,7 @@ Every one of these was found by rendering and looking. None of them would have m
 | trajectory tracking | circle and circle_yaw both 0.040 m mean error, 0.09 m p95, no actuator railing |
 | gripper of the tank | 68 ArUco 5x5_250 markers, all unique, detector round-trip 4/4 |
 | render cost | 307 ms -> 65 ms per 4-camera control step (mesh decimation, shadows off, one scene build) |
-| dataset | 240 x 900 = **216,000 steps = exactly 2.00 h at 30 Hz**, plus 3 x 50 x 360 = 10 min per OOD set |
+| dataset | 720 x 900 = **648,000 steps = exactly 6.00 h at 30 Hz**, plus 3 x 50 x 360 = 10 min per OOD set |
 | on disk | 50 GB of npz -> 1.4 GB of mp4 after packaging |
 | `delta_k` (fpv) | 0.1124 at stride 1 = 1.76x a 0.064 codec floor -> **no subsampling** |
 
