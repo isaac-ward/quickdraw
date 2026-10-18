@@ -51,8 +51,8 @@ what happened on the first attempt, and the commit caught nothing but the README
 - [x] 3. Fetch and convert the three meshes (glTF -> OBJ, recentred, per-model material dirs)
 - [x] 4. Tank MJCF: 15 x 10 x 10 m, concrete walls, two window rows, ArUco grid, yellow crane hook to 1/4 depth
 - [x] 5. MOLA 6-DOF dynamics: 3 forces + 3 torques, damping so momentum dies quickly
-- [ ] 6. Trajectory generators: random / forward-circles / circles-with-yaw, analytic, collision-free
-- [ ] 7. Recorder: state, actions, fpv + top-down + side-on at 144x192
+- [x] 6. Trajectory generators: random / forward-circles / circles-with-yaw, analytic, collision-free
+- [x] 7. Recorder: state, actions, fpv + top-down + side-on at 144x192
 - [ ] 8. Generate 240 x 30 s nominal (80 per class)
 - [ ] 9. Generate 3 OOD sets, 50 trajectories each: glitchy thruster, fish, diver
 - [ ] 10. Package to the house dataset format and push to HF

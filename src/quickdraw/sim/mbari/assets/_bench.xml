@@ -1,0 +1,91 @@
+<mujoco model="mbari_tank">
+  <compiler angle="radian" meshdir="." texturedir="build"/>
+  <!-- gravity 0: a trimmed AUV is neutrally buoyant; weight/buoyancy as opposing forces adds
+       stiffness and no behaviour. Damping lives in mola.py, applied with the thrust. -->
+  <option gravity="0 0 0" timestep="0.002" integrator="RK4" density="0" viscosity="0"/>
+  <visual>
+    <headlight ambient="0.62 0.66 0.68" diffuse="0.6 0.63 0.64" specular="0.1 0.1 0.1"/>
+    <!-- shadows off and no multisampling: measured 141 -> 65 ms per 4-camera control step,
+         and at 144x192 under 15 m of attenuating water a shadow is a handful of dim pixels. -->
+    <quality shadowsize="512" offsamples="0"/>
+  </visual>
+  <asset>
+    <texture name="t_yp" type="2d" file="wall_y+.png"/>
+    <texture name="t_ym" type="2d" file="wall_y-.png"/>
+    <texture name="t_xp" type="2d" file="wall_x+.png"/>
+    <texture name="t_xm" type="2d" file="wall_x-.png"/>
+    <texture name="t_fl" type="2d" file="floor.png"/>
+    <material name="m_yp" texture="t_yp" texuniform="false" texrepeat="1 1" specular="0.1" shininess="0.1"/>
+    <material name="m_ym" texture="t_ym" texuniform="false" texrepeat="1 1" specular="0.1" shininess="0.1"/>
+    <material name="m_xp" texture="t_xp" texuniform="false" texrepeat="1 1" specular="0.1" shininess="0.1"/>
+    <material name="m_xm" texture="t_xm" texuniform="false" texrepeat="1 1" specular="0.1" shininess="0.1"/>
+    <material name="m_fl" texture="t_fl" texuniform="false" texrepeat="1 1" specular="0.05"/>
+    <!-- open water overhead: bright blue, seen from below -->
+    <material name="m_surf" rgba="0.24 0.60 0.82 1" specular="0.9" shininess="0.9" reflectance="0.35" emission="0.25"/>
+    <material name="m_crane" rgba="0.95 0.76 0.03 1" specular="0.5" shininess="0.5"/>
+    <material name="m_mola" rgba="0.95 0.78 0.08 1" specular="0.4" shininess="0.4"/>
+    <material name="m_dock" rgba="0.72 0.74 0.78 1" specular="0.3"/>
+    <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.12"/>
+    <material name="m_buoy_g" rgba="0.08 0.80 0.25 1" specular="0.6" shininess="0.6" emission="0.12"/>
+    <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
+    <mesh name="mola" file="mola/mola.obj" scale="2.48 2.48 2.48"/>
+    <mesh name="dock" file="dock/dock.obj" scale="1 1 1"/>
+    <mesh name="diver" file="diver/diver.obj" scale="1 1 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 2" dir="0 0 -1" diffuse="0.5 0.55 0.55" specular="0.05 0.05 0.05" castshadow="false"/>
+    <light pos="-4.5 0 -1.5" dir="0.3 0 -1" diffuse="0.25 0.3 0.3" castshadow="false"/>
+
+    <!-- floor at -D, walls facing inward. Planes are one-sided; euler turns each normal into the tank.
+         Each surface has a different concrete shade (see SHADE) so a frame identifies which wall it is. -->
+    <geom name="floor"  type="plane" material="m_fl" pos="0 0 -10.0" size="7.5 5.0 0.1"/>
+    <geom name="wall_x+" type="plane" material="m_xp" pos="7.5 0 -5.0" size="5.0 5.0 0.1" euler="0 -1.5708 0"/>
+    <geom name="wall_x-" type="plane" material="m_xm" pos="-7.5 0 -5.0" size="5.0 5.0 0.1" euler="0 1.5708 0"/>
+    <geom name="wall_y+" type="plane" material="m_yp" pos="0 5.0 -5.0" size="7.5 5.0 0.1" euler="1.5708 0 0"/>
+    <geom name="wall_y-" type="plane" material="m_ym" pos="0 -5.0 -5.0" size="7.5 5.0 0.1" euler="-1.5708 0 0"/>
+    <!-- the surface, seen from below: open water, bright blue. A plane's normal is +z in its own
+         frame, so euler x=pi turns it down into the tank. -->
+    <geom name="surface" type="plane" material="m_surf" pos="0 0 0.02" size="7.5 5.0 0.1" euler="3.14159 0 0"/>
+
+    <!-- yellow crane hook, hanging to 1/4 depth in the middle. NEVER a target: a fixed obstacle that
+         must appear in training footage so the model learns it is static. -->
+    <body name="crane" pos="0 0 0">
+      <geom name="crane_arm"  type="capsule" material="m_crane" fromto="0 0 0.4 0 0 -2.5" size="0.11"/>
+      <geom name="crane_hook" type="capsule" material="m_crane"
+            fromto="0 0 -2.5 0.4 0 -2.9" size="0.08"/>
+      <geom name="crane_tip"  type="sphere"  material="m_crane" pos="0.4 0 -3.02" size="0.12"/>
+    </body>
+
+    <!-- two moored buoys at mid depth, orange and green. Static landmarks: distinct colours that give
+         the world model something unambiguous to localise against away from the walls. -->
+    <body name="buoy_orange" pos="3.375 2.5 -5.0">
+      <geom name="rope_o" type="capsule" material="m_rope" fromto="0 0 0 0 0 5.0" size="0.025"/>
+      <geom name="buoy_o" type="sphere" material="m_buoy_o" size="0.38"/>
+    </body>
+    <body name="buoy_green" pos="-3.0 -2.25 -5.6">
+      <geom name="rope_g" type="capsule" material="m_rope" fromto="0 0 0 0 0 5.6" size="0.025"/>
+      <geom name="buoy_g" type="sphere" material="m_buoy_g" size="0.34"/>
+    </body>
+
+    <!-- docking station in a corner AT THE SURFACE. AprilTag faces come from the mesh texture. -->
+    <body name="dock" pos="-5.5 -3.0 -1.4" euler="0 0 0.7854">
+      <geom name="dock_g" type="mesh" mesh="dock" material="m_dock" contype="0" conaffinity="0"/>
+      <site name="dock_entry" pos="1.6 0 0.2" size="0.08" rgba="0 1 0 0"/>
+    </body>
+
+    <body name="mola" pos="0 0 -5">
+      <freejoint name="mola_free"/>
+      <geom name="mola_g" type="mesh" mesh="mola" material="m_mola" mass="60" contype="0" conaffinity="0"/>
+      <camera name="fpv" pos="0.95 0 0.08" xyaxes="0 -1 0 0 0 1" fovy="70"/>
+      <!-- over-the-shoulder chase view: 5.4 m behind, 1.9 m up, pitched ~19 deg down. Pulled back
+           from a first attempt at 2.6 m where the hull filled the frame and the tank was invisible.
+           A SECOND view of the same episode, NOT a training input -- the world model trains on fpv. -->
+      <camera name="chase" pos="-5.4 0 1.9" xyaxes="0 -1 0 0.33 0 0.944" fovy="58"/>
+      <site name="mola_c" pos="0 0 0" size="0.05" rgba="1 0 0 0"/>
+    </body>
+
+    <camera name="topdown" pos="0 0 3.5" xyaxes="1 0 0 0 1 0" fovy="78" mode="fixed"/>
+    <camera name="sideon" pos="0 -12.5 -5.0" xyaxes="1 0 0 0 0 1" fovy="62" mode="fixed"/>
+  </worldbody>
+</mujoco>

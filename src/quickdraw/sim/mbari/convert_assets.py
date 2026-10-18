@@ -17,17 +17,29 @@ import trimesh
 HERE = pathlib.Path(__file__).parent / "assets"
 
 
-def convert(names=("mola", "dock", "diver"), src=HERE, log=print):
+# DECIMATION TARGETS. The raw MOLA is 84,619 faces and the diver 56,454, and MuJoCo rebuilds the whole
+# scene on every `update_scene` -- which made a 144x192 render take 15 ms and put the full dataset at
+# 7.4 hours of pure rendering. At 144x192 the AUV spans a couple of hundred pixels; a few thousand
+# faces is already more detail than the camera can resolve.
+FACES = {"mola": 4000, "dock": 460, "diver": 3000}
+
+
+def convert(names=("mola", "dock", "diver"), src=HERE, log=print, decimate=True):
     out = {}
     for name in names:
         g = trimesh.load(src / name / "scene.gltf", force="scene")
         m = g.to_mesh() if hasattr(g, "to_mesh") else g
         ext = m.bounds[1] - m.bounds[0]
         m.apply_translation(-m.bounds.mean(axis=0))
+        raw = len(m.faces)
+        tgt = FACES.get(name, raw)
+        if decimate and raw > tgt * 1.1:
+            m = m.simplify_quadric_decimation(face_count=tgt)
         d = src / name
         m.export(d / f"{name}.obj")
-        out[name] = {"faces": int(len(m.faces)), "bbox": [round(float(v), 3) for v in ext]}
-        log(f"  {name:6s} {len(m.faces):7d} faces  bbox {np.round(ext, 3)}  -> {name}/{name}.obj")
+        out[name] = {"faces": int(len(m.faces)), "raw_faces": int(raw),
+                     "bbox": [round(float(v), 3) for v in ext]}
+        log(f"  {name:6s} {raw:7d} -> {len(m.faces):6d} faces  bbox {np.round(ext, 3)}")
     return out
 
 

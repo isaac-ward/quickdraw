@@ -5,7 +5,9 @@
   <option gravity="0 0 0" timestep="0.002" integrator="RK4" density="0" viscosity="0"/>
   <visual>
     <headlight ambient="0.62 0.66 0.68" diffuse="0.6 0.63 0.64" specular="0.1 0.1 0.1"/>
-    <quality shadowsize="2048" offsamples="4"/>
+    <!-- shadows off and no multisampling: measured 141 -> 65 ms per 4-camera control step,
+         and at 144x192 under 15 m of attenuating water a shadow is a handful of dim pixels. -->
+    <quality shadowsize="512" offsamples="0"/>
   </visual>
   <asset>
     <texture name="t_yp" type="2d" file="wall_y+.png"/>
@@ -32,7 +34,7 @@
   </asset>
 
   <worldbody>
-    <light pos="0 0 2" dir="0 0 -1" diffuse="0.5 0.55 0.55" specular="0.05 0.05 0.05" castshadow="true"/>
+    <light pos="0 0 2" dir="0 0 -1" diffuse="0.5 0.55 0.55" specular="0.05 0.05 0.05" castshadow="false"/>
     <light pos="-4.5 0 -1.5" dir="0.3 0 -1" diffuse="0.25 0.3 0.3" castshadow="false"/>
 
     <!-- floor at -D, walls facing inward. Planes are one-sided; euler turns each normal into the tank.
