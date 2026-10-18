@@ -4,7 +4,7 @@
 # Each stage logs under /app/logs/mbari/, and each is skippable by hand if one needs redoing.
 set -u
 cd /app
-V=/app/logs/mbari/data/v4
+V=/app/logs/mbari/data/v5
 L=/app/logs/mbari
 
 echo "=== waiting for generation shards  $(date -u +%H:%M) ==="
@@ -15,7 +15,7 @@ done
 du -sh $V
 
 echo "=== preview videos  $(date -u +%H:%M) ==="
-.venv/bin/python -u -m quickdraw.sim.mbari.previews --root $V --out $L/data/previews \
+.venv/bin/python -u -m quickdraw.sim.mbari.previews --root $V --out $L/data/previews --n-per 2 \
   > $L/data/previews.log 2>&1
 tail -6 $L/data/previews.log
 

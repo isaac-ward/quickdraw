@@ -4,7 +4,7 @@
 # script resumes rather than redoing.
 cd /app
 N=24
-OUT=/app/logs/mbari/data/v4
+OUT=/app/logs/mbari/data/v5
 mkdir -p /app/logs/mbari/data/shardlogs
 for k in $(seq 0 $((N-1))); do
   CUDA_VISIBLE_DEVICES=$((k % 2)) MUJOCO_GL=egl \

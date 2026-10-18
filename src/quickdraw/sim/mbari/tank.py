@@ -83,6 +83,12 @@ def build_textures(out=BUILD, res=1024, seed=0):
     return painted
 
 
+MIN_RGB, SPEC, SHIN = 0.09, 0.55, 0.65
+# The frame group's baseColorFactor is literally (0,0,0), so it rendered as a hole in the water
+# whatever the lighting -- the chase and top-down views showed a silhouette, not a vehicle. A floor
+# of 0.09 plus real specular is what dark anodised aluminium actually looks like underwater.
+
+
 def _mola_geoms(scale):
     """One mesh + material + geom per colour group, so the AUV renders in its real colours.
 
@@ -94,8 +100,9 @@ def _mola_geoms(scale):
     meta = json.loads((ASSETS / "mola_groups.json").read_text())
     a = "".join(
         f'<mesh name="mola{k}" file="mola/{row[0]}" scale="{scale} {scale} {scale}"/>'
-        f'<material name="mola_c{k}" rgba="{row[1][0]} {row[1][1]} {row[1][2]} 1" '
-        f'specular="0.25" shininess="0.3"/>' for k, row in enumerate(meta))
+        f'<material name="mola_c{k}" rgba="{max(MIN_RGB, row[1][0]):.3f} {max(MIN_RGB, row[1][1]):.3f} '
+        f'{max(MIN_RGB, row[1][2]):.3f} 1" specular="{SPEC}" shininess="{SHIN}"/>'
+        for k, row in enumerate(meta))
     # the whole 60 kg sits on the first group: MuJoCo SUMS geom masses, and six geoms at 60 kg each
     # would give a 360 kg vehicle whose inertia no longer matches the constants in mola.py
     parts = []
