@@ -75,6 +75,7 @@ the build step.
 | the fish were approximated ellipsoids | no mesh had been found for them | **Great White Shark**, 3,690 faces, CC-BY. Swims along -Y raw, so the geom yaws +90 deg onto +X, which is the heading `mover` already writes. 1.6x -> 4 m |
 | the hook was capsules and a sphere | approximated | **Crane Hook**, 10,795 faces, CC-BY, block and hook. Hangs along -Y raw; euler x=-90 deg stands it up, 0.28x -> 1.55 m |
 | hanging buoy not neon | rgba 0.08 0.80 0.25 | 0.18 1.00 0.25, emission 0.18 |
+| the AUV was a black silhouette in the chase view | the frame group's `baseColorFactor` is literally **(0,0,0)** and it is 33k of the mesh's 85k faces, so it rendered as a hole in the water whatever the lighting | floor every channel at 0.09 and raise specular to 0.55 -- what dark anodised aluminium looks like underwater. Side by side the chase view goes from a silhouette to a readable frame with thruster pods. Worth a regenerate because generation turned out to be **25 minutes**, not the 90 I had assumed |
 | chase camera filled with wall | at -5.4 m it sat OUTSIDE the tank whenever the AUV neared an end wall, and the walls are solid boxes now | -4.2 m, 1.5 m up |
 
 **The diver OOD became a purple buoy.** The source mesh is a T-pose. The posing attempt rotated
