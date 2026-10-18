@@ -60,7 +60,7 @@ def starts(model, n, seed=1):
     return out
 
 
-def run(dyns, out="/app/logs/mbari/control", n_trials=6, steps=300, log=print):
+def run(dyns, out="/app/logs/mbari/control", n_trials=6, steps=600, log=print):
     from . import control as C, record
 
     model = record.load_model()
