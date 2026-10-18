@@ -67,6 +67,26 @@ world model trained happily on a broken mesh in a cluttered tank, and the first 
 human looking at a picture. Renders of the asset itself -- not of the scene, of the ASSET -- belong in
 the build step.
 
+## Review round 3 (2026-10-18 19:00) — the second pass over the scene
+
+| fault | cause | fix |
+|---|---|---|
+| walls lost their concrete | I had fallen back to flat shading after `type="2d"` textures tiled per box FACE and read as vertical planks | rendered the real wall geometry under four mappings side by side: 2d/uniform, 2d/non-uniform, cube/uniform, cube/non-uniform. 2d plank at every texrepeat and both uniform settings; cube+uniform projects RADIALLY into a starburst centred on each box; **cube + texuniform="false"** gives each face the whole image and reads correctly at every box size. Wall images are square now because cube faces are |
+| the fish were approximated ellipsoids | no mesh had been found for them | **Great White Shark**, 3,690 faces, CC-BY. Swims along -Y raw, so the geom yaws +90 deg onto +X, which is the heading `mover` already writes. 1.6x -> 4 m |
+| the hook was capsules and a sphere | approximated | **Crane Hook**, 10,795 faces, CC-BY, block and hook. Hangs along -Y raw; euler x=-90 deg stands it up, 0.28x -> 1.55 m |
+| hanging buoy not neon | rgba 0.08 0.80 0.25 | 0.18 1.00 0.25, emission 0.18 |
+| chase camera filled with wall | at -5.4 m it sat OUTSIDE the tank whenever the AUV neared an end wall, and the walls are solid boxes now | -4.2 m, 1.5 m up |
+
+**The diver OOD became a purple buoy.** The source mesh is a T-pose. The posing attempt rotated
+every vertex past 22% of the arm span about an estimated shoulder point (1,479 of 14,648 vertices,
+62 degrees) and rendered T-pose vs posed side by side: the arms were still out to the sides in both
+the top and the side view. The user's standing instruction for exactly that outcome was to swap the
+condition for the hanging buoy turning purple instead of neon green, so `ood_diver` -> `ood_buoy`
+everywhere. It is a cleaner OOD anyway: static, so there is nothing to confound with motion, and
+it changes exactly one thing in the frame.
+
+Every one of these was found by rendering and looking. None of them would have moved a metric.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
@@ -77,10 +97,11 @@ the build step.
 - [x] 6. Trajectory generators: random / forward-circles / circles-with-yaw, analytic, collision-free
 - [x] 7. Recorder: state, actions, fpv + top-down + side-on at 144x192
 - [x] 8. Generate 240 x 30 s nominal (80 per class)
-- [x] 9. Generate 3 OOD sets, 50 trajectories each: glitchy thruster, fish, diver
+- [x] 9. Generate 3 OOD sets, 50 trajectories each: glitchy thruster, sharks, purple buoy
 - [x] 10. Package to the house dataset format and push to HF
 - [x] 11. Read `wizard/records/*.md` on main AND on the `longhand` branch
 - [x] 12. Training config written and launched (user asleep -- decisions listed above)
+- [x] 12b. Review round 3 fixes (see below); dataset regenerated as **v4**
 - [ ] 13. Train; log full open-loop and 16-step-ahead predictions
 - [ ] 14. Uncertainty: classify the three OOD types against nominal
 - [ ] 15. Pixel-level uncertainty videos
