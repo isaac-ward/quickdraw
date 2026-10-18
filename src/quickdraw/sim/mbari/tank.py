@@ -14,6 +14,7 @@ large opposing forces would add stiffness for no behaviour.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 
 import numpy as np
@@ -434,7 +435,13 @@ def build(out=BUILD, textures=True, name="tank.xml", **kw):
             (out / dst).write_bytes(src.read_bytes())
     painted = build_textures(out) if textures else {}
     p = ASSETS / name
-    p.write_text(mjcf(**kw))
+    # ATOMIC. Every generation shard calls build(), so 24 processes write this same path while
+    # others are reading it -- and two episodes died on `ParseXML: empty file` because a reader
+    # caught a truncated write. Writing to a unique temp file and os.replace()-ing it is atomic
+    # within a filesystem, so a reader sees either the old file or the new one, never a partial.
+    tmp = p.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(mjcf(**kw))
+    os.replace(tmp, p)
     return p, painted
 
 
