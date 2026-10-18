@@ -44,6 +44,29 @@ THE ASSETS LIVE UNDER `src/` ON PURPOSE. The repo root is not bind-mounted into 
 top-level `assets/` exists only in the container's writable layer and dies with it — which is exactly
 what happened on the first attempt, and the commit caught nothing but the README.
 
+## Review round 2 (2026-10-18 16:30) — what was wrong and what was done
+
+The first dataset was generated and a world model trained on it before review. Review found real
+faults, every one of which had been invisible in the metrics:
+
+| fault | cause | fix |
+|---|---|---|
+| **the AUV was a scatter of struts** | quadric decimation per colour GROUP spends the budget on the largest connected piece and deletes the rest; 84,619 -> 5,586 destroyed the hull | decimate per connected COMPONENT with a floor; 61,299 faces, every piece intact |
+| the AUV was uniformly yellow | the model is not textured -- 14 parts, six `baseColorFactor` materials -- and merging them discarded that | one mesh/material/geom per colour group. The real MOLA: BLACK frame, light-grey hull, cyan nose dome, yellow thruster pods |
+| parts rendered white-silver | trimesh writes a `.mtl` beside each `.obj` and MuJoCo honours it OVER the MJCF material | strip the sidecar and the `mtllib` line |
+| two walls had window COLUMNS | the row index ran down the IMAGE, and the end-wall textures are portrait while the long walls are landscape | both rings placed by tank DEPTH -> continuous rings on all four walls |
+| side-on camera saw concrete | it sat outside the glass, shooting through a textured wall plane | moved INSIDE the tank |
+| windows read as black holes | they were painted as dark rectangles | each opens onto a RENDERED room, tinted glass |
+| tag and window clutter | 7+5 windows and 21+24 tags per surface | both halved |
+| tank appeared to continue above water | there was nothing above the water line but void | walls stop at z=0; enclosed dark warehouse above with eight ceiling lamps, a deck, and a gantry |
+| one fish was often never seen | a single intruder crossing 15 m in 12 s misses the FPV frustum | three fish |
+| diver stood upright | no orientation applied | pitched nose-down |
+
+THE LESSON, recorded because it is the expensive one: **the metrics could not see any of this.** A
+world model trained happily on a broken mesh in a cluttered tank, and the first sign of trouble was a
+human looking at a picture. Renders of the asset itself -- not of the scene, of the ASSET -- belong in
+the build step.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
