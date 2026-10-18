@@ -92,11 +92,36 @@ def run(dyns, out="/app/logs/mbari/control", n_trials=6, steps=600, log=print):
     return rows
 
 
+def learned_from(ckpt, plant_model, dev="cuda"):
+    """Build the learned arm from a training run directory or a .ckpt path."""
+    from ...evaluation.standalone import load_checkpoint
+    from ...training.setup import build_model, normalizer
+    from . import control as C
+    from .run_uncertainty import _cfg_for
+
+    cfg = _cfg_for(ckpt)
+    core = build_model(cfg).to(dev)
+    load_checkpoint(core, ckpt)
+    core.eval()
+    return C.LearnedDynamics(core, normalizer(cfg), plant_model, key=str(cfg.data.cam),
+                             P=int(cfg.data.P), dev=dev)
+
+
 if __name__ == "__main__":
+    import argparse
     import os
 
     os.environ.setdefault("MUJOCO_GL", "egl")
+    ap = argparse.ArgumentParser(description="Control benchmark: true vs analytic vs learned.")
+    ap.add_argument("--ckpt", default=None, help="training run dir or .ckpt; adds the learned arm")
+    ap.add_argument("--out", default="/app/logs/mbari/control")
+    ap.add_argument("--trials", type=int, default=6)
+    a = ap.parse_args()
+
     from . import control as C, record
 
     m = record.load_model()
-    run([C.TrueDynamics(m), C.AnalyticDynamics()], log=lambda s: print(s, flush=True))
+    dyns = [C.TrueDynamics(m), C.AnalyticDynamics()]
+    if a.ckpt:
+        dyns.append(learned_from(a.ckpt, m))
+    run(dyns, out=a.out, n_trials=a.trials, log=lambda s: print(s, flush=True))

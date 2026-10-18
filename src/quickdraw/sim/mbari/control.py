@@ -67,9 +67,9 @@ class AnalyticDynamics:
         self.mass, self.dt = mass, dt
         self.I = np.array([8.86, 22.45, 20.16], np.float32)
 
-    def rollout_batch(self, state, actions):
+    def rollout_batch(self, state, actions, repeat=1):
         """(N,H,6) -> (N,H,13). Vectorised over candidates; the per-candidate loop is the same maths."""
-        return np.stack([self.rollout(state, a) for a in actions])
+        return np.stack([self.rollout(state, a, repeat=repeat) for a in actions])
 
     def rollout(self, state, actions, repeat=1):
         s = np.asarray(state, np.float64).copy()
@@ -93,6 +93,78 @@ class AnalyticDynamics:
             if (k + 1) % repeat == 0:
                 out[k // repeat] = s
         return out
+
+
+class LearnedDynamics:
+    """The trained world model's proprio head, rolled on the same actions as the other two.
+
+    CONTEXT COMES FROM THE PLANT, NOT FROM THE PLANNER. The model cannot predict from a 13-vector --
+    it conditions on P past (FPV frame, proprio, action) triples. In closed loop those are free: the
+    plant is right there producing them, so `observe(d, a)` is called once per executed control step
+    with the rendered frame and the true state, exactly the stream the model saw in training. The
+    `state` argument that `mppi` passes is therefore ignored here, and that asymmetry is the point of
+    the benchmark -- TrueDynamics is handed perfect state, this one has to have been watching.
+
+    WARM START BY HOLDING THE FIRST OBSERVATION. At k=0 there is no history, so the initial frame and
+    state fill all P slots and the context actions are zero. The vehicle starts at rest, so a static
+    context is physically consistent rather than a lie the model has to unlearn.
+
+    HORIZON IS H x repeat STEPS, SUBSAMPLED BACK TO H. The planner costs trajectories at the repeat
+    granularity (see `mppi`), so to stay identical the model rolls every 30 Hz step the plan implies
+    and returns every repeat-th one. heads=["proprio"] skips the image decoder, which is the whole
+    cost; 24 candidates x 72 latent steps is cheaper than one true-dynamics candidate.
+
+    `norm` is passed to `imagine_shared` on purpose -- without it the rollout scores the black-box
+    latent dynamics instead of the physics-anchored proprio rollout, which `multimodal.py` warns
+    about in the method's own docstring."""
+
+    name = "learned"
+
+    def __init__(self, core, norm, plant_model, key="fpv", P=8, dev="cuda", size=(144, 192)):
+        from collections import deque
+
+        from .water import UnderwaterRenderer
+
+        self.core, self.norm, self.key, self.P, self.dev = core, norm, key, P, dev
+        self.rend = UnderwaterRenderer(plant_model, *size)
+        self.o = deque(maxlen=P)
+        self.f = deque(maxlen=P)
+        self.a = deque(maxlen=P - 1)
+
+    def observe(self, d, action=None):
+        """One executed control step: push the rendered frame, the true state and the action taken."""
+        import numpy as _np
+
+        s = mola.state(d)
+        fr = self.rend.render(d, self.key)
+        if not self.o:                                   # warm start: hold the first observation
+            for _ in range(self.P):
+                self.o.append(s); self.f.append(fr)
+            for _ in range(self.P - 1):
+                self.a.append(_np.zeros(6, _np.float32))
+        else:
+            self.o.append(s); self.f.append(fr)
+            if action is not None:
+                self.a.append(_np.asarray(action, _np.float32))
+
+    def rollout(self, state, actions, repeat=1):
+        return self.rollout_batch(state, np.asarray(actions)[None], repeat=repeat)[0]
+
+    def rollout_batch(self, state, actions, repeat=1):
+        import torch
+
+        acts = np.asarray(actions, np.float32)           # (K,H,6)
+        K, H = acts.shape[:2]
+        fut = np.repeat(acts, repeat, axis=1)            # (K,H*repeat,6)
+        past = np.stack([np.asarray(self.a)] * K)        # (K,P-1,6)
+        seq = torch.from_numpy(np.concatenate([past, fut], 1))
+        seq = self.norm.norm_act(seq).float().to(self.dev)
+        ctx = {"proprio": self.norm.norm_obs(torch.from_numpy(np.stack(self.o))[None]).float().to(self.dev),
+               self.key: torch.from_numpy(np.stack(self.f))[None].float().div(255.0).to(self.dev)}
+        with torch.no_grad():
+            out = self.core.imagine_shared(ctx, seq, H * repeat, K, heads=["proprio"], norm=self.norm)
+        pro = self.norm.denorm_obs(out["proprio"].cpu()).numpy()     # (K,H*repeat,13)
+        return pro[:, repeat - 1::repeat][:, :H]
 
 
 # ----------------------------------------------------------------- planner
@@ -134,8 +206,11 @@ def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma
     for _ in range(iters):
         noise = rng.normal(0, sigma, (samples, horizon, 6)).astype(np.float32)
         cand = np.clip(mean[None] + noise, -1, 1)
-        costs = np.array([pose_cost(dyn.rollout(state, c, repeat=repeat), goal_p, goal_q)
-                          for c in cand])
+        if hasattr(dyn, "rollout_batch"):      # one batched call beats `samples` python-loop calls
+            preds = dyn.rollout_batch(state, cand, repeat=repeat)
+        else:
+            preds = [dyn.rollout(state, c, repeat=repeat) for c in cand]
+        costs = np.array([pose_cost(pr, goal_p, goal_q) for pr in preds])
         wts = np.exp(-(costs - costs.min()) / temp)
         wts /= wts.sum()
         mean = np.clip((wts[:, None, None] * cand).sum(0), -1, 1)
@@ -156,6 +231,9 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     d = mujoco.MjData(plant_model)
     d.qpos[:3], d.qpos[3:7] = start[:3], start[3:7]
     mujoco.mj_forward(plant_model, d)
+    observe = getattr(dyn, "observe", None)      # the learned model needs the plant's own stream
+    if observe is not None:
+        observe(d)
     sub = int(round((1.0 / FPS) / plant_model.opt.timestep))
     traj, acts, prev = [], [], None
     k = 0
@@ -169,6 +247,8 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
             s = mola.state(d)
             traj.append(s)
             acts.append(a)
+            if observe is not None:
+                observe(d, a)
             for _ in range(sub):
                 mola.apply(plant_model, d, a)
                 mujoco.mj_step(plant_model, d)
