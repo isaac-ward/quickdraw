@@ -1,0 +1,11 @@
+Model Information:
+* title:	Scuba Diver
+* source:	https://sketchfab.com/3d-models/scuba-diver-3cffae9b572d4506b3025e29d6ff068c
+* author:	turelljc (https://sketchfab.com/turelljc)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Scuba Diver" (https://sketchfab.com/3d-models/scuba-diver-3cffae9b572d4506b3025e29d6ff068c) by turelljc (https://sketchfab.com/turelljc) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

@@ -1,0 +1,11 @@
+Model Information:
+* title:	(Unofficial) MBARI MOLA AUV
+* source:	https://sketchfab.com/3d-models/unofficial-mbari-mola-auv-8414b1b7e94c4212a5e7fcd667551858
+* author:	AlePugisi (https://sketchfab.com/AlessandroPuglisi)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "(Unofficial) MBARI MOLA AUV" (https://sketchfab.com/3d-models/unofficial-mbari-mola-auv-8414b1b7e94c4212a5e7fcd667551858) by AlePugisi (https://sketchfab.com/AlessandroPuglisi) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
