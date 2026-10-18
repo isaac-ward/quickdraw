@@ -84,7 +84,7 @@ if __name__ == "__main__":
     os.environ.setdefault("MUJOCO_GL", "egl")
     ap = argparse.ArgumentParser(description="Pixel-level uncertainty videos, one per split.")
     ap.add_argument("--ckpt", required=True, help="training run dir or .ckpt")
-    ap.add_argument("--root", default="/app/logs/mbari/data/v5")
+    ap.add_argument("--root", default="/app/logs/mbari/data/v6")
     ap.add_argument("--out", default="/app/logs/mbari/uncertainty/pixel")
     ap.add_argument("--splits", default="train,ood_thruster,ood_fish,ood_buoy")
     ap.add_argument("--ep", type=int, default=0)

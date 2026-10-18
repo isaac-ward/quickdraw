@@ -43,7 +43,8 @@ def _generic_card(name: str, s: dict) -> str:
                      f"{counts[sp]['transitions']} |" for sp in splits)
     # A hand-written PROCESSING.md in the run folder is the authoritative account of how the raw
     # recordings became this dataset; the generated card should point at it rather than compete.
-    extra = ("\n## How this dataset was produced\n\nSee **[PROCESSING.md](PROCESSING.md)** for the "
+    extra = _preview_block(_ROOT_HINT[0] or "")
+    extra += ("\n## How this dataset was produced\n\nSee **[PROCESSING.md](PROCESSING.md)** for the "
              "full account: source streams and rates, exactly which fields were kept and dropped "
              "and why, the resampling and synchronisation procedure, the train/val split rule, and "
              "the verification that images align with state rows.\n"
@@ -75,6 +76,26 @@ Generated with [quickdraw](https://github.com/isaac-ward/quickdraw) (`data.proce
 
 Normalization statistics are computed on **train only** and applied to every split.
 {extra}"""
+
+
+def _preview_block(root: str) -> str:
+    """Embed any media/previews/*.mp4 in the card, so the clips PLAY on the dataset page.
+
+    A video that only exists as a file in the repo browser is a video nobody watches. The Hub
+    renders a raw <video> tag, so each preview is embedded directly with its `resolve` URL; the
+    link beside it is the fallback for renderers that strip the tag."""
+    d = os.path.join(root, "media", "previews")
+    if not os.path.isdir(d):
+        return ""
+    vids = sorted(f for f in os.listdir(d) if f.endswith(".mp4"))
+    if not vids:
+        return ""
+    rows = "\n".join(
+        f'\n**{v[:-4].replace("_", " ")}**\n\n'
+        f'<video controls width="640" src="media/previews/{v}"></video>\n\n'
+        f'([download](media/previews/{v}))\n' for v in vids)
+    return ("\n## Watch it\n\nOne clip per condition, all four cameras side by side, 30 Hz.\n"
+            f"{rows}\n")
 
 
 def _make_card(root: str, name: str) -> str:

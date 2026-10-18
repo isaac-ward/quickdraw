@@ -4,7 +4,7 @@
 # Each stage logs under /app/logs/mbari/, and each is skippable by hand if one needs redoing.
 set -u
 cd /app
-V=/app/logs/mbari/data/v5
+V=/app/logs/mbari/data/v6
 L=/app/logs/mbari
 
 echo "=== waiting for generation shards  $(date -u +%H:%M) ==="
@@ -15,9 +15,9 @@ done
 du -sh $V
 
 echo "=== preview videos  $(date -u +%H:%M) ==="
-.venv/bin/python -u -m quickdraw.sim.mbari.previews --root $V --out $L/data/previews --n-per 2 \
+.venv/bin/python -u -m quickdraw.sim.mbari.previews --root $V --out $L/data/previews --n-per 3 \
   > $L/data/previews.log 2>&1
-tail -6 $L/data/previews.log
+grep -E "^  (train|ood)" $L/data/previews.log
 
 echo "=== packaging all four cameras  $(date -u +%H:%M) ==="
 .venv/bin/python -u -m quickdraw.sim.mbari.package --root $V --name mbari-tank \
@@ -26,6 +26,9 @@ R=$(grep "^run_dir:" $L/data/package.log | tail -1 | awk '{print $2}')
 echo "  run_dir = $R"
 [ -z "$R" ] && { echo "PACKAGING FAILED"; tail -20 $L/data/package.log; exit 1; }
 cp $L/data/PROCESSING.md $R/PROCESSING.md 2>/dev/null
+# the clips ride along INSIDE the dataset repo, so they play on the Hub page itself
+mkdir -p $R/media/previews && cp $L/data/previews/*.mp4 $R/media/previews/
+du -sh $R/media/previews
 echo "$R" > $L/data/run_dir.txt
 
 echo "=== push to hugging face  $(date -u +%H:%M) ==="

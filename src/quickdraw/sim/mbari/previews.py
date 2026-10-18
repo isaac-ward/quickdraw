@@ -52,7 +52,7 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description="Four-camera preview videos, one per split.")
-    ap.add_argument("--root", default="/app/logs/mbari/data/v5")
+    ap.add_argument("--root", default="/app/logs/mbari/data/v6")
     ap.add_argument("--out", default="/app/logs/mbari/data/previews")
     ap.add_argument("--n-per", type=int, default=1)
     ap.add_argument("--gif", action="store_true", help="also write a 10 s gif slice")

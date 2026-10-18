@@ -163,7 +163,7 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description="Generate MBARI episodes (one shard per process).")
-    ap.add_argument("--out", default="/app/logs/mbari/data/v5")
+    ap.add_argument("--out", default="/app/logs/mbari/data/v6")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=1)
     ap.add_argument("--nominal", type=int, default=240)
