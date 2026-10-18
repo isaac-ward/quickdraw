@@ -27,12 +27,18 @@ from __future__ import annotations
 import numpy as np
 
 T = 0.18                      # wall thickness
-WIN_W, WIN_H = 2.0, 1.9       # window opening
+WIN_W, WIN_H = 1.6, 1.52      # window opening, 80% of the first size, shrunk about its own centre
 N_WIN = 3
 RIM = 0.10                    # width of the black rim around an opening
 BAR = 0.055                   # half-width of a vertical mullion
 PROUD = 0.16                  # how far the mullions stand out from the inner wall face
 FRAME_MAT = "m_frame"
+TAG = 0.40                    # half-size of a wall fiducial: 0.80 m square, matching the floor
+#                               grid, whose 64 px tiles on a 1024 px texture over a 15 x 10 m plane
+#                               come out 0.94 x 0.63 m
+MAX_ASPECT = 1.15             # no wall box wider than this many times its own height, which
+#                               bounds any residual stretch to 15% whatever MuJoCo's face UV
+#                               convention turns out to be -- two attempts to out-guess it failed
 
 
 def _spans(half, n=N_WIN, w=WIN_W):
@@ -98,21 +104,36 @@ def build_wall(name, axis, sign, at, half_len, tank_d, rings, mat_fn):
     `mat_fn(tag, u0, u1, z0, z1) -> material name` lets the caller give every box its OWN material.
     That is what kills the stretched concrete: each box gets the crop of a single wall-wide texture
     that matches its own footprint, so the grain is isotropic and continuous across the whole wall.
-    """
-    g, boxes = [], []
+
+    Returns (geoms, window centres, ring depths, fiducial placements). The caller makes the fiducial
+    materials, because it owns the texture build."""
+    g, boxes, tags = [], [], []
     centres, _ = _spans(half_len)
     rows = [(-tank_d * zf - WIN_H / 2, -tank_d * zf + WIN_H / 2) for zf in rings]
     rows.sort()                                                   # deepest first
     edges = [-tank_d] + [z for r in rows for z in r] + [0.0]
 
     def box(u0, u1, z0, z1, tag):
+        """One wall panel, SPLIT ALONG THE WALL until no piece is wider than MAX_ASPECT x its height.
+
+        This is what finally fixed the stretched concrete, after two attempts at out-guessing
+        MuJoCo's cube-face UV convention. Whatever that convention is, it stretches one image to
+        fill a face -- so if the face is near-square, the result is near-isotropic, and no knowledge
+        of the mapping is needed. A 15 x 1.2 m strip becomes nine 1.7 x 1.2 m panels, each carrying
+        its own crop of the same wall-wide concrete field, so the surface still reads as continuous.
+        """
         if u1 - u0 <= 0.01 or z1 - z0 <= 0.01:
             return
-        cu, cz = (u0 + u1) / 2, (z0 + z1) / 2
-        pos, size, _ = _place(axis, sign, at, cu, at, cz, (u1 - u0) / 2, T / 2, (z1 - z0) / 2)
-        g.append(f'<geom name="{name}_{tag}" type="box" material="{mat_fn(tag, u0, u1, z0, z1)}" '
-                 f'pos="{pos}" size="{size}"/>')
-        boxes.append((tag, u0, u1, z0, z1))
+        n = max(1, int(np.ceil((u1 - u0) / ((z1 - z0) * MAX_ASPECT))))
+        edges = np.linspace(u0, u1, n + 1)
+        for i in range(n):
+            a, b = float(edges[i]), float(edges[i + 1])
+            t = tag if n == 1 else f"{tag}c{i}"
+            cu, cz = (a + b) / 2, (z0 + z1) / 2
+            pos, size, _ = _place(axis, sign, at, cu, at, cz, (b - a) / 2, T / 2, (z1 - z0) / 2)
+            g.append(f'<geom name="{name}_{t}" type="box" material="{mat_fn(t, a, b, z0, z1)}" '
+                     f'pos="{pos}" size="{size}"/>')
+            boxes.append((t, a, b, z0, z1))
 
     box(-half_len, half_len, edges[0], edges[1], "s0")
     box(-half_len, half_len, edges[2], edges[3], "s1")
@@ -123,4 +144,12 @@ def build_wall(name, axis, sign, at, half_len, tank_d, rings, mat_fn):
             box(a, b, z0, z1, f"r{ri}p{pi}")
         for ci, cu in enumerate(centres):
             g += _frame(name, axis, sign, at, cu, z0, z1, f"r{ri}w{ci}")
-    return g, centres, [(-tank_d * zf) for zf in sorted(rings, reverse=True)]
+        # FOUR FIDUCIALS PER WALL: one centred in each gap between adjacent windows, on each of the
+        # two rows, so the spacing to the window either side of a marker is equal by construction.
+        # They sit on the inner wall face, and every one carries a unique ArUco id, so a frame
+        # showing any marker localises the camera unambiguously.
+        for si, cu in enumerate((centres[i] + centres[i + 1]) / 2 for i in range(len(centres) - 1)):
+            pos, size, _ = _place(axis, sign, at, cu, at - T / 2 - 0.012, (z0 + z1) / 2,
+                                  TAG, 0.012, TAG)
+            tags.append((f"{name}_t{ri}{si}", pos, size))
+    return g, centres, [(-tank_d * zf) for zf in sorted(rings, reverse=True)], tags

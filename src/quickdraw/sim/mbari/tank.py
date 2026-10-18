@@ -22,7 +22,9 @@ import numpy as np
 from .textures import aruco_tile, concrete
 
 TANK_L, TANK_W, TANK_D = 15.0, 10.0, 10.0          # metres: length (x), width (y), depth (z)
-RING_Z = (0.24, 0.62)                              # window-ring depths, as a fraction of TANK_D
+# Window-ring depths as a fraction of TANK_D. Both rings moved DOWN by 0.95 m -- half a window
+# height at the size they were when the move was asked for (1.9 m), before the shrink to 80%.
+RING_Z = (0.335, 0.715)
 GANTRY_H, GANTRY_W = 1.0, 2.0                      # gantry height above water, and its width
 ROOM_H = 6.0                                       # warehouse headroom above the water line
 WATER_RGB = (0.08, 0.26, 0.30)
@@ -57,7 +59,9 @@ def _tags(img, nx, ny, px=72, margin=0.06, first_id=0):
 SHADE = {"wall_x+": 1.30, "wall_x-": 0.70, "wall_y+": 1.08, "wall_y-": 0.86, "floor": 0.55}
 TEX_N = 512                   # cube faces must be square; see build_textures
 WATER_Z = -0.52               # the water line, 50 cm below the tank rim, so the rim shows above it
-PX_PER_M = 70                 # concrete resolution; every wall box is CROPPED from one wall-wide
+PX_PER_M = 70
+XWALL_MODE = 'none'           # 'none' | 'rot' | 'square'; chosen by the A/B in _rotab.py
+WALL_TAG_ID0 = 200            # ArUco ids for the wall fiducials; the floor grid uses 160+                 # concrete resolution; every wall box is CROPPED from one wall-wide
 #                               field at this density, which is what stops the texture stretching
 
 
@@ -119,16 +123,28 @@ def build_textures(out=BUILD, res=1024, seed=0):
             y0 = int(round((-z1) / TANK_D * _H))
             y1 = max(y0 + 2, int(round((-z0) / TANK_D * _H)))
             crop = _f[y0:y1, x0:x1]
+            if _rot and XWALL_MODE == "rot":
+                crop = np.rot90(crop)
+            elif _rot and XWALL_MODE == "square":
+                k = max(crop.shape[0], crop.shape[1])
+                yc, xc = (y0 + y1) // 2, (x0 + x1) // 2
+                ya, xa = max(0, yc - k // 2), max(0, xc - k // 2)
+                crop = _f[ya:ya + k, xa:xa + k]
             # MuJoCo's cube mapping lays the image onto a +-X face rotated 90 degrees relative to a
             # +-Y face. Without this the aspect correction is applied across the wrong axis there,
             # and the end walls came out streaked while the long walls looked right.
-            _c[tag] = _square(np.rot90(crop) if _rot else crop)
+            _c[tag] = _square(crop)
             return f"m_{_n}_{tag}"
 
-        build_wall(name, axis, sign, at, half, TANK_D, RING_Z, mat_fn)
+        _, _, _, tags = build_wall(name, axis, sign, at, half, TANK_D, RING_Z, mat_fn)
         for tag, img in crops.items():
             imageio.imwrite(out / f"{name}_{tag}.png", img)
-        painted[name] = []
+        ids = []
+        for n, (tname, _pos, _size) in enumerate(tags):
+            tid = WALL_TAG_ID0 + fid // 40 * 4 + n
+            imageio.imwrite(out / f"{tname}.png", aruco_tile(tid, px=256, border=1))
+            ids.append(tid)
+        painted[name] = ids
     floor = np.clip(concrete(res, res, seed=seed + 99).astype(np.float32) * SHADE["floor"],
                     0, 255).astype(np.uint8)
     painted["floor"] = _tags(floor, nx=3, ny=4, px=res // 16, first_id=160)
@@ -158,11 +174,13 @@ def _mola_geoms(scale):
         for k, row in enumerate(meta))
     # the whole 60 kg sits on the first group: MuJoCo SUMS geom masses, and six geoms at 60 kg each
     # would give a 360 kg vehicle whose inertia no longer matches the constants in mola.py
-    parts = []
-    for k in range(len(meta)):
-        mass = "60" if k == 0 else "0.0001"
-        parts.append(f'<geom name="mola_g{k}" type="mesh" mesh="mola{k}" material="mola_c{k}" '
-                     f'mass="{mass}" contype="0" conaffinity="0"/>')
+    # ROLLED +90 DEG ABOUT X. The source mesh's cross-section is 0.477 m across by 0.561 m tall --
+    # taller than wide, which is a vehicle lying on its side. Rolling it upright makes it wider than
+    # tall, spreads the four thrusters to the corners, and puts the two small fore/aft fittings on
+    # top (measured at +49% of the way to the frame's top edge; the opposite roll puts them under).
+    parts = [f'<geom name="mola_g{k}" type="mesh" mesh="mola{k}" material="mola_c{k}" '
+             f'euler="1.5708 0 0" mass="0.0001" contype="0" conaffinity="0"/>'
+             for k in range(len(meta))]
     return a, "".join(parts)
 
 
@@ -187,8 +205,16 @@ def _walls_and_rooms(hl, hw, seed=4242):
             _s.append(tag)
             return f"m_{_n}_{tag}"
 
-        g, centres, ring_z = build_wall(name, axis, sign, at, half, TANK_D, RING_Z, mat_fn)
+        g, centres, ring_z, tags = build_wall(name, axis, sign, at, half, TANK_D, RING_Z, mat_fn)
         walls += g
+        for tname, tpos, tsize in tags:
+            # CUBE, not 2d: a 2d texture on a box geom is smeared along one axis, and the markers
+            # rendered as plain white squares. The tile is square so cube accepts it.
+            wall_assets.append(f'<texture name="t_{tname}" type="cube" file="{tname}.png"/>'
+                               f'<material name="m_{tname}" texture="t_{tname}" texuniform="false" '
+                               f'specular="0.03"/>')
+            walls.append(f'<geom name="{tname}" type="box" material="m_{tname}" pos="{tpos}" '
+                         f'size="{tsize}" contype="0" conaffinity="0"/>')
         for tag in seen:
             wall_assets.append(
                 f'<texture name="t_{name}_{tag}" type="cube" file="{name}_{tag}.png"/>'
@@ -204,8 +230,8 @@ def _walls_and_rooms(hl, hw, seed=4242):
     return ("\n    ".join(walls), "".join(wall_assets), "".join(mats), "".join(bodies))
 
 
-def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> str:
-    """The tank MJCF. `mola_scale` makes the AUV 2.0 m long (0.806 x 2.48)."""
+def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> str:
+    """The tank MJCF. `mola_scale` 1.24 makes the AUV 1.0 m long (0.807 x 1.24), half its first size."""
     hl, hw = TANK_L / 2, TANK_W / 2
     dx, dy = dock_corner
     HOOK_S = 0.28                       # the mesh is 5.53 m tall raw -> 1.55 m, a crane hook's size
@@ -214,9 +240,29 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
     # user's instruction -- the source diver is a T-pose and the vertex-sweep posing attempt did not
     # read as a dive pose when rendered.
     BUOY_RGB = "0.72 0.18 0.92" if buoy_purple else "0.18 1.00 0.25"
-    dock_pos = (dx * (hl - 2.0), dy * (hw - 2.0), -1.4)
+    dock_pos = (dx * (hl - 1.1), dy * (hw - 1.1), -1.4)   # tucked into the corner
     mola_assets, mola_geoms = _mola_geoms(mola_scale)
     wall_xml, wall_assets, room_mats, room_xml = _walls_and_rooms(hl, hw)
+
+    # ENTRY LADDER. Asked for "the corner opposite the dock, but not the corner with the orange
+    # buoy" -- which are the same corner: the dock is at (-x,-y) and the orange buoy sits in
+    # (+x,+y). The green buoy shares the dock's quadrant, so the only free corners are (+x,-y) and
+    # (-x,+y); this takes (+x,-y), diagonally across the tank's long axis from the dock and clear of
+    # both buoys. It hangs on the +X wall at y=-4.25, which clears the nearest window rim by 0.24 m.
+    # Starts 0.55 m above the water and runs down to the centre of the UPPER window ring.
+    lad_y, lad_bot = -4.25, -TANK_D * RING_Z[0]
+    lad_rungs = "".join(
+        f'<geom name="lad_r{i}" type="capsule" material="m_gantry" size="0.028" '
+        f'fromto="{hl-0.22} {lad_y-0.21} {z:.3f} {hl-0.22} {lad_y+0.21} {z:.3f}"/>'
+        for i, z in enumerate(np.arange(0.40, lad_bot, -0.30)))
+    ladder = f"""
+    <body name="ladder" pos="0 0 0">
+      <geom name="lad_a" type="capsule" material="m_gantry" size="0.038"
+            fromto="{hl-0.22} {lad_y-0.21} 0.55 {hl-0.22} {lad_y-0.21} {lad_bot:.3f}"/>
+      <geom name="lad_b" type="capsule" material="m_gantry" size="0.038"
+            fromto="{hl-0.22} {lad_y+0.21} 0.55 {hl-0.22} {lad_y+0.21} {lad_bot:.3f}"/>
+      {lad_rungs}
+    </body>"""
 
     lights = "".join(
         f'<geom name="ceil_{i}" type="cylinder" material="m_lamp" size="0.45 0.04" '
@@ -225,12 +271,14 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
         f'castshadow="false"/>'
         for i, (x, y) in enumerate([(ax, ay) for ax in (-5.2, -1.7, 1.7, 5.2) for ay in (-2.6, 2.6)]))
 
-    # GREAT WHITES, NOT APPROXIMATED FISH. The source mesh swims along +Y -- verified by rendering
-    # it against labelled axes, after assuming -Y and shipping sharks that swam backwards -- so the
-    # geom yaws -90 deg to put the nose on +X, which is the heading `intruders.mover` writes.
+    # GREAT WHITES, NOT APPROXIMATED FISH. Rendered against labelled axes the source mesh swims
+    # along +Y with its DARK BACK ON -Z -- it is both rotated and upside down. One quaternion fixes
+    # both: a 180 deg turn about (1,1,0)/sqrt(2) maps mesh +Y -> world +X (nose forward, the heading
+    # `intruders.mover` writes) and mesh -Z -> world +Z (back up). Assuming the nose was on -Y and
+    # the back on +Z is what shipped sharks swimming backwards and inverted.
     fish = "".join(f"""
     <body name="fish{i}" mocap="true" pos="0 0 -5">
-      <geom type="mesh" mesh="shark" material="m_shark" euler="0 0 -1.5708" contype="0" conaffinity="0"/>
+      <geom type="mesh" mesh="shark" material="m_shark" quat="0 0.7071068 0.7071068 0" contype="0" conaffinity="0"/>
     </body>""" for i in range(n_fish))
 
     extra_assets = ""
@@ -257,7 +305,7 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
          wall-spanning concrete field. Isotropic grain, continuous across the wall, no stretch. -->
     <texture name="t_fl" type="2d" file="floor.png"/>
     {wall_assets}
-    <material name="m_frame" rgba="0.045 0.045 0.05 1" specular="0.35" shininess="0.5"/>
+    <material name="m_frame" rgba="0.115 0.115 0.125 1" specular="0.35" shininess="0.5"/>
     <material name="m_fl" texture="t_fl" texuniform="false" texrepeat="1 1" specular="0.05"/>
     <material name="m_surf" rgba="0.26 0.52 0.62 0.72" specular="0.9" shininess="0.9" reflectance="0.3"/>
     <material name="m_room" rgba="0.085 0.085 0.095 1" specular="0.02"/>
@@ -324,6 +372,8 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
             pos="0 0 {-TANK_D/4 - HOOK_H/2}" contype="0" conaffinity="0"/>
     </body>
 
+    {ladder}
+
     <body name="buoy_orange" pos="{hl*0.45} {hw*0.5} -5.0">
       <geom name="rope_o" type="capsule" material="m_rope" fromto="0 0 0 0 0 {5.0 + WATER_Z}" size="0.025"/>
       <geom name="buoy_o" type="sphere" material="m_buoy_o" size="0.38"/>
@@ -340,8 +390,15 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
 
     <body name="mola" pos="0 0 -5">
       <freejoint name="mola_free"/>
+      <!-- INERTIA PINNED, NOT DERIVED FROM THE GEOMS. Halving the mesh would quarter a
+           geom-derived inertia and make the vehicle four times more angularly agile for the same
+           torque, silently invalidating every tuned gain and every measured number (cruise speed,
+           coast time, 0.040 m tracking error). The size change asked for was visual, so the
+           inertial properties are stated explicitly and the dynamics are untouched. The roll
+           swaps the y and z principal values: (8.86, 22.45, 20.16) -> (8.86, 20.16, 22.45). -->
+      <inertial pos="0 0 0" mass="60" diaginertia="8.86 20.16 22.45"/>
       {mola_geoms}
-      <camera name="fpv" pos="0.95 0 0.08" xyaxes="0 -1 0 0 0 1" fovy="70"/>
+      <camera name="fpv" pos="0.50 0 0.04" xyaxes="0 -1 0 0 0 1" fovy="70"/>
       <camera name="chase" pos="-4.2 0 1.5" xyaxes="0 -1 0 0.33 0 0.944" fovy="58"/>
       <site name="mola_c" pos="0 0 0" size="0.05" rgba="1 0 0 0"/>
     </body>
