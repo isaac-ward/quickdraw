@@ -119,6 +119,7 @@ def concrete(h, w, seed=0):
     warm = np.array([1.18, 0.98, 0.74], np.float32)                        # rust/ochre tint
     img = img * (1 - 0.45 * stain[..., None]) + img * warm * (0.45 * stain[..., None])
 
-    seam = (np.arange(h) % max(8, h // 6) < 2)[:, None, None]              # form-work lines
-    img = np.where(seam, img * 0.86, img)
+    # NO FORM-WORK SEAMS. They were drawn as hard horizontal lines, and once the walls became BOX
+    # geoms with texuniform mapping those lines tiled into what read as vertical planks. The
+    # multi-octave noise and the staining already carry the concrete look.
     return np.clip(img, 0, 255).astype(np.uint8)

@@ -18,8 +18,8 @@ import pathlib
 
 import numpy as np
 
-from .rooms import render_room, room_spec
-from .textures import aruco_tile, concrete, window_rows
+
+from .textures import aruco_tile, concrete
 
 TANK_L, TANK_W, TANK_D = 15.0, 10.0, 10.0          # metres: length (x), width (y), depth (z)
 RING_Z = (0.24, 0.62)                              # window-ring depths, as a fraction of TANK_D
@@ -58,48 +58,35 @@ SHADE = {"wall_x+": 1.30, "wall_x-": 0.70, "wall_y+": 1.08, "wall_y-": 0.86, "fl
 
 
 def build_textures(out=BUILD, res=1024, seed=0):
-    """Bake the four walls and the floor. Returns {name: [aruco ids painted on it]}."""
+    """Bake the four wall surfaces and the floor.
+
+    WALLS ARE NOW PLAIN SHADED CONCRETE. The windows became real openings in `walls.py`, so there is
+    nothing to paint, and the ArUco grid came off at the user's request -- it was clutter at 144x192
+    and the per-surface shade already tells you which wall you are looking at. The FLOOR keeps its
+    markers, at the halved density.
+    """
     import imageio.v2 as imageio
 
     out.mkdir(parents=True, exist_ok=True)
     painted = {}
-    # long walls span 15 x 10 m, end walls 10 x 10 m -> keep pixels roughly square
-    # id blocks spaced 40 apart: _tags advances its counter past markers it cannot fit, so adjacent
-    # blocks have to be wider than the tag count or the walls start sharing ids again.
-    # WINDOW AND TAG DENSITY BOTH HALVED. The first build put 7 ports and 21 markers on a long wall
-    # and 24 markers on the floor, which read as clutter at 144x192 rather than as landmarks.
-    # (h, w, window_cols, tag_nx, tag_ny, first_tag_id)
-    specs = {"wall_y+": (int(res * TANK_D / TANK_L), res, 4, 4, 2, 0),
-             "wall_y-": (int(res * TANK_D / TANK_L), res, 4, 4, 2, 40),
-             "wall_x+": (res, int(res * TANK_W / TANK_D), 3, 3, 2, 80),
-             "wall_x-": (res, int(res * TANK_W / TANK_D), 3, 3, 2, 120)}
-    rng = np.random.default_rng(seed + 4242)
-    rooms_used = {}
-    for name, (h, w, ncols, nx, ny, fid) in specs.items():
-        img = concrete(h, w, seed=seed + fid).astype(np.float32) * SHADE[name]
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        # one DISTINCT room per ring per wall -> eight interiors around the tank
-        specs_r = [room_spec(rng) for _ in RING_Z]
-        rooms_used[name] = [r["kind"] for r in specs_r]
-        img = window_rows(img, cols=ncols, rooms=[render_room(r, 140, 190) for r in specs_r],
-                          rings=RING_Z)
-        painted[name] = _tags(img, nx=nx, ny=ny, px=max(48, w // 15), first_id=fid)
+    for name, fid in (("wall_y+", 0), ("wall_y-", 40), ("wall_x+", 80), ("wall_x-", 120)):
+        img = np.clip(concrete(res // 2, res, seed=seed + fid).astype(np.float32) * SHADE[name],
+                      0, 255).astype(np.uint8)
         imageio.imwrite(out / f"{name}.png", img)
+        painted[name] = []
     floor = np.clip(concrete(res, res, seed=seed + 99).astype(np.float32) * SHADE["floor"],
                     0, 255).astype(np.uint8)
     painted["floor"] = _tags(floor, nx=3, ny=4, px=res // 16, first_id=160)
     imageio.imwrite(out / "floor.png", floor)
-    painted["_rooms"] = rooms_used
     return painted
 
 
 def _mola_geoms(scale):
     """One mesh + material + geom per colour group, so the AUV renders in its real colours.
 
-    The model is NOT textured: it is 14 parts carrying six baseColorFactor materials -- a black
-    frame, a light-grey hull, a cyan nose dome and yellow thruster pods. Painting the whole thing one
-    yellow (the first version) threw that away, and decimating it to 5,586 faces destroyed the hull
-    outright."""
+    The model is NOT textured: 14 parts carrying six baseColorFactor materials -- a black frame, a
+    light-grey hull, a cyan nose dome and yellow thruster pods. Painting it one yellow discarded that,
+    and decimating 84,619 -> 5,586 faces destroyed the hull outright."""
     import json
 
     meta = json.loads((ASSETS / "mola_groups.json").read_text())
@@ -107,9 +94,8 @@ def _mola_geoms(scale):
         f'<mesh name="mola{k}" file="mola/{row[0]}" scale="{scale} {scale} {scale}"/>'
         f'<material name="mola_c{k}" rgba="{row[1][0]} {row[1][1]} {row[1][2]} 1" '
         f'specular="0.25" shininess="0.3"/>' for k, row in enumerate(meta))
-    # The whole 60 kg sits on the first group and the rest are near-massless: MuJoCo sums geom
-    # masses, and six geoms at 60 kg each would give a 360 kg vehicle whose inertia no longer matches
-    # the constants in mola.py.
+    # the whole 60 kg sits on the first group: MuJoCo SUMS geom masses, and six geoms at 60 kg each
+    # would give a 360 kg vehicle whose inertia no longer matches the constants in mola.py
     parts = []
     for k in range(len(meta)):
         mass = "60" if k == 0 else "0.0001"
@@ -118,12 +104,43 @@ def _mola_geoms(scale):
     return a, "".join(parts)
 
 
+def _walls_and_rooms(hl, hw, seed=4242):
+    """Four boxed walls with openings, plus one room behind each (wall, ring) pair.
+
+    The room is placed at the wall surface, rotated so its depth axis points AWAY from the tank, and
+    dropped so the window sits about 1.3 m above the room floor -- which is where a window is."""
+    from .rooms import room_body, room_spec
+    from .walls import build_wall
+
+    rng = np.random.default_rng(seed)
+    walls, mats, bodies = [], [], []
+    #            name      axis sign  at   half-length   material   yaw of "away from tank"
+    for name, axis, sign, at, half, mat, yaw in (
+            ("wall_yp", "y", 1, hw, hl, "m_yp", 0.0),
+            ("wall_ym", "y", -1, hw, hl, "m_ym", np.pi),
+            ("wall_xp", "x", 1, hl, hw, "m_xp", -np.pi / 2),
+            ("wall_xm", "x", -1, hl, hw, "m_xm", np.pi / 2)):
+        g, centres, ring_z = build_wall(name, axis, sign, at, half, TANK_D, RING_Z, mat)
+        walls += g
+        for ri, zc in enumerate(ring_z):
+            spec = room_spec(rng)
+            if axis == "y":
+                pos = (0.0, sign * (at + 0.1), zc - 1.3)
+            else:
+                pos = (sign * (at + 0.1), 0.0, zc - 1.3)
+            m, b = room_body(f"{name}_r{ri}", spec, pos, yaw, span=2 * half * 0.95)
+            mats.append(m)
+            bodies.append(b)
+    return "\n    ".join(walls), "".join(mats), "".join(bodies)
+
+
 def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
     """The tank MJCF. `mola_scale` makes the AUV 2.0 m long (0.806 x 2.48)."""
     hl, hw = TANK_L / 2, TANK_W / 2
     dx, dy = dock_corner
     dock_pos = (dx * (hl - 2.0), dy * (hw - 2.0), -1.4)
     mola_assets, mola_geoms = _mola_geoms(mola_scale)
+    wall_xml, room_mats, room_xml = _walls_and_rooms(hl, hw)
 
     lights = "".join(
         f'<geom name="ceil_{i}" type="cylinder" material="m_lamp" size="0.45 0.04" '
@@ -165,15 +182,16 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
     <quality shadowsize="512" offsamples="0"/>
   </visual>
   <asset>
-    <texture name="t_yp" type="2d" file="wall_y+.png"/>
-    <texture name="t_ym" type="2d" file="wall_y-.png"/>
-    <texture name="t_xp" type="2d" file="wall_x+.png"/>
-    <texture name="t_xm" type="2d" file="wall_x-.png"/>
+    <!-- WALLS ARE FLAT SHADED, NOT TEXTURED. Once they became BOX geoms, MuJoCo's 2D texture
+         mapping tiled the concrete image per face and it read as vertical planks at every texrepeat
+         tried. The per-wall brightness is what identifies which wall the camera is on, and that
+         survives perfectly well without the noise. The floor keeps its texture (a plane, mapped
+         correctly) and its markers. -->
     <texture name="t_fl" type="2d" file="floor.png"/>
-    <material name="m_yp" texture="t_yp" texuniform="false" texrepeat="1 1" specular="0.1" shininess="0.1"/>
-    <material name="m_ym" texture="t_ym" texuniform="false" texrepeat="1 1" specular="0.1" shininess="0.1"/>
-    <material name="m_xp" texture="t_xp" texuniform="false" texrepeat="1 1" specular="0.1" shininess="0.1"/>
-    <material name="m_xm" texture="t_xm" texuniform="false" texrepeat="1 1" specular="0.1" shininess="0.1"/>
+    <material name="m_yp" rgba="0.42 0.41 0.39 1" specular="0.06" shininess="0.06"/>
+    <material name="m_ym" rgba="0.33 0.32 0.31 1" specular="0.06" shininess="0.06"/>
+    <material name="m_xp" rgba="0.50 0.49 0.47 1" specular="0.06" shininess="0.06"/>
+    <material name="m_xm" rgba="0.27 0.26 0.25 1" specular="0.06" shininess="0.06"/>
     <material name="m_fl" texture="t_fl" texuniform="false" texrepeat="1 1" specular="0.05"/>
     <material name="m_surf" rgba="0.26 0.52 0.62 0.72" specular="0.9" shininess="0.9" reflectance="0.3"/>
     <material name="m_room" rgba="0.085 0.085 0.095 1" specular="0.02"/>
@@ -183,7 +201,7 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
     <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.1"/>
     <material name="m_buoy_g" rgba="0.08 0.80 0.25 1" specular="0.6" shininess="0.6" emission="0.1"/>
     <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
-    {mola_assets}{extra_assets}
+    {mola_assets}{extra_assets}{room_mats}
     <mesh name="dock" file="dock/dock_g0.obj" scale="1 1 1"/>
     <mesh name="diver" file="diver/diver_g0.obj" scale="1 1 1"/>
   </asset>
@@ -193,12 +211,10 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
     <light pos="{-hl*0.6} 0 -1.5" dir="0.3 0 -1" diffuse="0.26 0.28 0.28" castshadow="false"/>
     <light pos="{hl*0.6} 0 -4.0" dir="-0.3 0 -0.6" diffuse="0.22 0.24 0.24" castshadow="false"/>
 
-    <!-- THE TANK. Walls span the water column only: floor at -D up to z = 0, nothing above. -->
+    <!-- THE TANK. Walls span the water column only: floor at -D up to z = 0, nothing above.
+         Each wall is eleven boxes leaving three real openings per ring (see walls.py). -->
     <geom name="floor"  type="plane" material="m_fl" pos="0 0 {-TANK_D}" size="{hl} {hw} 0.1"/>
-    <geom name="wall_x+" type="plane" material="m_xp" pos="{hl} 0 {-TANK_D/2}" size="{TANK_D/2} {hw} 0.1" euler="0 -1.5708 0"/>
-    <geom name="wall_x-" type="plane" material="m_xm" pos="{-hl} 0 {-TANK_D/2}" size="{TANK_D/2} {hw} 0.1" euler="0 1.5708 0"/>
-    <geom name="wall_y+" type="plane" material="m_yp" pos="0 {hw} {-TANK_D/2}" size="{hl} {TANK_D/2} 0.1" euler="1.5708 0 0"/>
-    <geom name="wall_y-" type="plane" material="m_ym" pos="0 {-hw} {-TANK_D/2}" size="{hl} {TANK_D/2} 0.1" euler="-1.5708 0 0"/>
+    {wall_xml}
     <geom name="surface" type="plane" material="m_surf" pos="0 0 -0.02" size="{hl} {hw} 0.1" euler="3.14159 0 0"/>
 
     <!-- THE WAREHOUSE. A dark enclosed room around the tank, lit by ceiling lamps. The tank is a
@@ -254,9 +270,12 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
       <camera name="chase" pos="-5.4 0 1.9" xyaxes="0 -1 0 0.33 0 0.944" fovy="58"/>
       <site name="mola_c" pos="0 0 0" size="0.05" rgba="1 0 0 0"/>
     </body>
-    {fish}{diver_xml}
+    {fish}{diver_xml}{room_xml}
 
-    <camera name="topdown" pos="0 0 3.2" xyaxes="1 0 0 0 1 0" fovy="84" mode="fixed"/>
+    <!-- TOP-DOWN SITS UNDER THE GANTRY. From 3.2 m it was shooting straight through the beams,
+         which cut the tank in half in every frame. Just below the water line it sees the whole pool
+         with nothing in the way; the surface plane is one-sided so it does not occlude from above. -->
+    <camera name="topdown" pos="0 0 -0.45" xyaxes="1 0 0 0 1 0" fovy="104" mode="fixed"/>
     <!-- SIDE-ON IS INSIDE THE TANK, against the -Y wall looking across. Outside the glass it was
          shooting through a textured wall plane and seeing mostly concrete. -->
     <camera name="sideon" pos="0 {-hw + 0.6} {-TANK_D/2 + 1.0}" xyaxes="1 0 0 0 0.35 0.937" fovy="75" mode="fixed"/>
