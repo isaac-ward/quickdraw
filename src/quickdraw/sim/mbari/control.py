@@ -227,6 +227,13 @@ def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma
 # This costs less per call than it looks: a fine call is 48 x 18 x 17 = 14,688 mj_steps against the
 # coarse 24 x 12 x 6 x 17 = 29,376, so roughly half. It is called six times as often during the
 # final approach, so the net is about 1.7x -- and only over the last metre.
+# `exec_n` DECOUPLES the action hold from the replan cadence. They were the same number because
+# run_episode executed exactly what it planned, but they answer different questions: `repeat` is
+# how coarse the ACTIONS are, `exec_n` is how much of a plan is spent before replanning. Dropping
+# the hold to 1 while lengthening the horizon to 72 keeps both the lookahead (2.4 s) and the cost
+# (samples x horizon x repeat x substeps = 29,376 mj_steps, identical) -- what it actually spends
+# is SEARCH, because the plan now has 72 free parameters per axis instead of 12 for the same 24
+# samples. Whether that trade is worth it is measured in scratch/_ceiling.py, not assumed.
 NEAR = 1.2
 COARSE = dict(repeat=6, horizon=12, samples=24, sigma=0.50)
 FINE = dict(repeat=1, horizon=18, samples=48, sigma=0.18)
@@ -265,7 +272,7 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
         a, prev = mppi(dyn, s, goal_p, goal_q, seed=seed + k, prev=prev,
                        samples=mode["samples"], horizon=mode["horizon"],
                        sigma=mode["sigma"], repeat=mode["repeat"])
-        for _ in range(min(mode["repeat"], steps - k)):
+        for _ in range(min(mode.get("exec_n", mode["repeat"]), steps - k)):
             s = mola.state(d)
             traj.append(s)
             acts.append(a)
