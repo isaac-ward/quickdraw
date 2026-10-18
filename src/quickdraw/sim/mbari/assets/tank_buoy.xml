@@ -9,21 +9,13 @@
     <quality shadowsize="512" offsamples="0"/>
   </visual>
   <asset>
-    <!-- CUBE TEXTURES ON THE WALLS, texuniform OFF. Rendered side by side on the real wall
-         geometry: `type="2d"` smears the image into vertical planks at every texrepeat and at both
-         texuniform settings, and cube + texuniform="true" projects it radially into a starburst.
-         Cube + texuniform="false" gives each box face the whole image, which for scale-free
-         concrete noise reads correctly at every box size. One baked image per surface, each a
-         different shade, so a frame tells you which wall you are looking at. -->
+    <!-- WALL CONCRETE IS ONE CROP PER BOX (see build_textures). MuJoCo cannot tile a texture on a
+         box geom -- 2d smears into planks, cube ignores texrepeat, cube+texuniform starbursts --
+         so instead every box carries an image already cut to its own aspect out of one
+         wall-spanning concrete field. Isotropic grain, continuous across the wall, no stretch. -->
     <texture name="t_fl" type="2d" file="floor.png"/>
-    <texture name="t_yp" type="cube" file="wall_y+.png"/>
-    <texture name="t_ym" type="cube" file="wall_y-.png"/>
-    <texture name="t_xp" type="cube" file="wall_x+.png"/>
-    <texture name="t_xm" type="cube" file="wall_x-.png"/>
-    <material name="m_yp" texture="t_yp" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
-    <material name="m_ym" texture="t_ym" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
-    <material name="m_xp" texture="t_xp" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
-    <material name="m_xm" texture="t_xm" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
+    <texture name="t_wall_y+_s0" type="cube" file="wall_y+_s0.png"/><material name="m_wall_y+_s0" texture="t_wall_y+_s0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_s1" type="cube" file="wall_y+_s1.png"/><material name="m_wall_y+_s1" texture="t_wall_y+_s1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_s2" type="cube" file="wall_y+_s2.png"/><material name="m_wall_y+_s2" texture="t_wall_y+_s2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_r0p0" type="cube" file="wall_y+_r0p0.png"/><material name="m_wall_y+_r0p0" texture="t_wall_y+_r0p0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_r0p1" type="cube" file="wall_y+_r0p1.png"/><material name="m_wall_y+_r0p1" texture="t_wall_y+_r0p1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_r0p2" type="cube" file="wall_y+_r0p2.png"/><material name="m_wall_y+_r0p2" texture="t_wall_y+_r0p2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_r0p3" type="cube" file="wall_y+_r0p3.png"/><material name="m_wall_y+_r0p3" texture="t_wall_y+_r0p3" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_r1p0" type="cube" file="wall_y+_r1p0.png"/><material name="m_wall_y+_r1p0" texture="t_wall_y+_r1p0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_r1p1" type="cube" file="wall_y+_r1p1.png"/><material name="m_wall_y+_r1p1" texture="t_wall_y+_r1p1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_r1p2" type="cube" file="wall_y+_r1p2.png"/><material name="m_wall_y+_r1p2" texture="t_wall_y+_r1p2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y+_r1p3" type="cube" file="wall_y+_r1p3.png"/><material name="m_wall_y+_r1p3" texture="t_wall_y+_r1p3" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_s0" type="cube" file="wall_y-_s0.png"/><material name="m_wall_y-_s0" texture="t_wall_y-_s0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_s1" type="cube" file="wall_y-_s1.png"/><material name="m_wall_y-_s1" texture="t_wall_y-_s1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_s2" type="cube" file="wall_y-_s2.png"/><material name="m_wall_y-_s2" texture="t_wall_y-_s2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_r0p0" type="cube" file="wall_y-_r0p0.png"/><material name="m_wall_y-_r0p0" texture="t_wall_y-_r0p0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_r0p1" type="cube" file="wall_y-_r0p1.png"/><material name="m_wall_y-_r0p1" texture="t_wall_y-_r0p1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_r0p2" type="cube" file="wall_y-_r0p2.png"/><material name="m_wall_y-_r0p2" texture="t_wall_y-_r0p2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_r0p3" type="cube" file="wall_y-_r0p3.png"/><material name="m_wall_y-_r0p3" texture="t_wall_y-_r0p3" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_r1p0" type="cube" file="wall_y-_r1p0.png"/><material name="m_wall_y-_r1p0" texture="t_wall_y-_r1p0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_r1p1" type="cube" file="wall_y-_r1p1.png"/><material name="m_wall_y-_r1p1" texture="t_wall_y-_r1p1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_r1p2" type="cube" file="wall_y-_r1p2.png"/><material name="m_wall_y-_r1p2" texture="t_wall_y-_r1p2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_y-_r1p3" type="cube" file="wall_y-_r1p3.png"/><material name="m_wall_y-_r1p3" texture="t_wall_y-_r1p3" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_s0" type="cube" file="wall_x+_s0.png"/><material name="m_wall_x+_s0" texture="t_wall_x+_s0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_s1" type="cube" file="wall_x+_s1.png"/><material name="m_wall_x+_s1" texture="t_wall_x+_s1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_s2" type="cube" file="wall_x+_s2.png"/><material name="m_wall_x+_s2" texture="t_wall_x+_s2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_r0p0" type="cube" file="wall_x+_r0p0.png"/><material name="m_wall_x+_r0p0" texture="t_wall_x+_r0p0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_r0p1" type="cube" file="wall_x+_r0p1.png"/><material name="m_wall_x+_r0p1" texture="t_wall_x+_r0p1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_r0p2" type="cube" file="wall_x+_r0p2.png"/><material name="m_wall_x+_r0p2" texture="t_wall_x+_r0p2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_r0p3" type="cube" file="wall_x+_r0p3.png"/><material name="m_wall_x+_r0p3" texture="t_wall_x+_r0p3" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_r1p0" type="cube" file="wall_x+_r1p0.png"/><material name="m_wall_x+_r1p0" texture="t_wall_x+_r1p0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_r1p1" type="cube" file="wall_x+_r1p1.png"/><material name="m_wall_x+_r1p1" texture="t_wall_x+_r1p1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_r1p2" type="cube" file="wall_x+_r1p2.png"/><material name="m_wall_x+_r1p2" texture="t_wall_x+_r1p2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x+_r1p3" type="cube" file="wall_x+_r1p3.png"/><material name="m_wall_x+_r1p3" texture="t_wall_x+_r1p3" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_s0" type="cube" file="wall_x-_s0.png"/><material name="m_wall_x-_s0" texture="t_wall_x-_s0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_s1" type="cube" file="wall_x-_s1.png"/><material name="m_wall_x-_s1" texture="t_wall_x-_s1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_s2" type="cube" file="wall_x-_s2.png"/><material name="m_wall_x-_s2" texture="t_wall_x-_s2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_r0p0" type="cube" file="wall_x-_r0p0.png"/><material name="m_wall_x-_r0p0" texture="t_wall_x-_r0p0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_r0p1" type="cube" file="wall_x-_r0p1.png"/><material name="m_wall_x-_r0p1" texture="t_wall_x-_r0p1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_r0p2" type="cube" file="wall_x-_r0p2.png"/><material name="m_wall_x-_r0p2" texture="t_wall_x-_r0p2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_r0p3" type="cube" file="wall_x-_r0p3.png"/><material name="m_wall_x-_r0p3" texture="t_wall_x-_r0p3" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_r1p0" type="cube" file="wall_x-_r1p0.png"/><material name="m_wall_x-_r1p0" texture="t_wall_x-_r1p0" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_r1p1" type="cube" file="wall_x-_r1p1.png"/><material name="m_wall_x-_r1p1" texture="t_wall_x-_r1p1" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_r1p2" type="cube" file="wall_x-_r1p2.png"/><material name="m_wall_x-_r1p2" texture="t_wall_x-_r1p2" texuniform="false" specular="0.06" shininess="0.06"/><texture name="t_wall_x-_r1p3" type="cube" file="wall_x-_r1p3.png"/><material name="m_wall_x-_r1p3" texture="t_wall_x-_r1p3" texuniform="false" specular="0.06" shininess="0.06"/>
+    <material name="m_frame" rgba="0.045 0.045 0.05 1" specular="0.35" shininess="0.5"/>
     <material name="m_fl" texture="t_fl" texuniform="false" texrepeat="1 1" specular="0.05"/>
     <material name="m_surf" rgba="0.26 0.52 0.62 0.72" specular="0.9" shininess="0.9" reflectance="0.3"/>
     <material name="m_room" rgba="0.085 0.085 0.095 1" specular="0.02"/>
@@ -33,9 +25,12 @@
     <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.1"/>
     <material name="m_buoy_g" rgba="0.72 0.18 0.92 1" specular="0.6" shininess="0.6" emission="0.18"/>
     <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
-    <mesh name="mola0" file="mola/mola_g0.obj" scale="2.48 2.48 2.48"/><material name="mola_c0" rgba="0.612 0.427 0.027 1" specular="0.25" shininess="0.3"/><mesh name="mola1" file="mola/mola_g1.obj" scale="2.48 2.48 2.48"/><material name="mola_c1" rgba="0.0 0.0 0.0 1" specular="0.25" shininess="0.3"/><mesh name="mola2" file="mola/mola_g2.obj" scale="2.48 2.48 2.48"/><material name="mola_c2" rgba="0.698 0.494 0.043 1" specular="0.25" shininess="0.3"/><mesh name="mola3" file="mola/mola_g3.obj" scale="2.48 2.48 2.48"/><material name="mola_c3" rgba="0.718 0.51 0.047 1" specular="0.25" shininess="0.3"/><mesh name="mola4" file="mola/mola_g4.obj" scale="2.48 2.48 2.48"/><material name="mola_c4" rgba="0.341 0.757 0.8 1" specular="0.25" shininess="0.3"/><mesh name="mola5" file="mola/mola_g5.obj" scale="2.48 2.48 2.48"/><material name="mola_c5" rgba="0.4 0.4 0.4 1" specular="0.25" shininess="0.3"/><material name="rm_wall_wall_yp_r0" rgba="0.39 0.38 0.35 1"/><material name="rm_floor_wall_yp_r0" rgba="0.25 0.21 0.17 1"/><material name="rm_ceil_wall_yp_r0" rgba="0.44 0.43 0.42 1"/><material name="rm_lamp_wall_yp_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_yp_r0" rgba="0.800 0.700 0.520 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_yp_r0" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_yp_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_yp_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_yp_r1" rgba="0.47 0.46 0.43 1"/><material name="rm_floor_wall_yp_r1" rgba="0.30 0.25 0.21 1"/><material name="rm_ceil_wall_yp_r1" rgba="0.53 0.53 0.50 1"/><material name="rm_lamp_wall_yp_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_yp_r1" rgba="0.720 0.520 0.300 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_yp_r1" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_yp_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_yp_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_ym_r0" rgba="0.48 0.46 0.43 1"/><material name="rm_floor_wall_ym_r0" rgba="0.31 0.25 0.21 1"/><material name="rm_ceil_wall_ym_r0" rgba="0.54 0.53 0.51 1"/><material name="rm_lamp_wall_ym_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_ym_r0" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_ym_r0" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_ym_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_ym_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_ym_r1" rgba="0.44 0.43 0.40 1"/><material name="rm_floor_wall_ym_r1" rgba="0.29 0.24 0.19 1"/><material name="rm_ceil_wall_ym_r1" rgba="0.50 0.49 0.47 1"/><material name="rm_lamp_wall_ym_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_ym_r1" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_ym_r1" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_ym_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_ym_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_xp_r0" rgba="0.48 0.46 0.43 1"/><material name="rm_floor_wall_xp_r0" rgba="0.31 0.25 0.21 1"/><material name="rm_ceil_wall_xp_r0" rgba="0.54 0.53 0.51 1"/><material name="rm_lamp_wall_xp_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_xp_r0" rgba="0.800 0.700 0.520 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_xp_r0" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_xp_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_xp_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_xp_r1" rgba="0.39 0.38 0.35 1"/><material name="rm_floor_wall_xp_r1" rgba="0.25 0.21 0.17 1"/><material name="rm_ceil_wall_xp_r1" rgba="0.44 0.44 0.42 1"/><material name="rm_lamp_wall_xp_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_xp_r1" rgba="0.400 0.260 0.160 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_xp_r1" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_xp_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_xp_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_xm_r0" rgba="0.44 0.43 0.40 1"/><material name="rm_floor_wall_xm_r0" rgba="0.29 0.24 0.19 1"/><material name="rm_ceil_wall_xm_r0" rgba="0.50 0.49 0.47 1"/><material name="rm_lamp_wall_xm_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_xm_r0" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_xm_r0" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_xm_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_xm_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_xm_r1" rgba="0.46 0.44 0.41 1"/><material name="rm_floor_wall_xm_r1" rgba="0.30 0.24 0.20 1"/><material name="rm_ceil_wall_xm_r1" rgba="0.52 0.51 0.49 1"/><material name="rm_lamp_wall_xm_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_xm_r1" rgba="0.400 0.260 0.160 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_xm_r1" rgba="0.720 0.100 0.100 1.0" specular="0.2"/><material name="rm_metal_wall_xm_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_xm_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/>
+    <material name="m_cable" rgba="0.26 0.26 0.28 1" specular="0.5" shininess="0.6"/>
+    <mesh name="mola0" file="mola/mola_g0.obj" scale="2.48 2.48 2.48"/><material name="mola_c0" rgba="0.612 0.427 0.090 1" specular="0.55" shininess="0.65"/><mesh name="mola1" file="mola/mola_g1.obj" scale="2.48 2.48 2.48"/><material name="mola_c1" rgba="0.090 0.090 0.090 1" specular="0.55" shininess="0.65"/><mesh name="mola2" file="mola/mola_g2.obj" scale="2.48 2.48 2.48"/><material name="mola_c2" rgba="0.698 0.494 0.090 1" specular="0.55" shininess="0.65"/><mesh name="mola3" file="mola/mola_g3.obj" scale="2.48 2.48 2.48"/><material name="mola_c3" rgba="0.718 0.510 0.090 1" specular="0.55" shininess="0.65"/><mesh name="mola4" file="mola/mola_g4.obj" scale="2.48 2.48 2.48"/><material name="mola_c4" rgba="0.341 0.757 0.800 1" specular="0.55" shininess="0.65"/><mesh name="mola5" file="mola/mola_g5.obj" scale="2.48 2.48 2.48"/><material name="mola_c5" rgba="0.400 0.400 0.400 1" specular="0.55" shininess="0.65"/><material name="rm_wall_wall_y+_r0" rgba="0.39 0.38 0.35 1"/><material name="rm_floor_wall_y+_r0" rgba="0.25 0.21 0.17 1"/><material name="rm_ceil_wall_y+_r0" rgba="0.44 0.43 0.42 1"/><material name="rm_lamp_wall_y+_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_y+_r0" rgba="0.800 0.700 0.520 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_y+_r0" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_y+_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_y+_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_y+_r1" rgba="0.47 0.46 0.43 1"/><material name="rm_floor_wall_y+_r1" rgba="0.30 0.25 0.21 1"/><material name="rm_ceil_wall_y+_r1" rgba="0.53 0.53 0.50 1"/><material name="rm_lamp_wall_y+_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_y+_r1" rgba="0.720 0.520 0.300 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_y+_r1" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_y+_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_y+_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_y-_r0" rgba="0.48 0.46 0.43 1"/><material name="rm_floor_wall_y-_r0" rgba="0.31 0.25 0.21 1"/><material name="rm_ceil_wall_y-_r0" rgba="0.54 0.53 0.51 1"/><material name="rm_lamp_wall_y-_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_y-_r0" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_y-_r0" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_y-_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_y-_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_y-_r1" rgba="0.44 0.43 0.40 1"/><material name="rm_floor_wall_y-_r1" rgba="0.29 0.24 0.19 1"/><material name="rm_ceil_wall_y-_r1" rgba="0.50 0.49 0.47 1"/><material name="rm_lamp_wall_y-_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_y-_r1" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_y-_r1" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_y-_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_y-_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_x+_r0" rgba="0.48 0.46 0.43 1"/><material name="rm_floor_wall_x+_r0" rgba="0.31 0.25 0.21 1"/><material name="rm_ceil_wall_x+_r0" rgba="0.54 0.53 0.51 1"/><material name="rm_lamp_wall_x+_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_x+_r0" rgba="0.800 0.700 0.520 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_x+_r0" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_x+_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_x+_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_x+_r1" rgba="0.39 0.38 0.35 1"/><material name="rm_floor_wall_x+_r1" rgba="0.25 0.21 0.17 1"/><material name="rm_ceil_wall_x+_r1" rgba="0.44 0.44 0.42 1"/><material name="rm_lamp_wall_x+_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_x+_r1" rgba="0.400 0.260 0.160 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_x+_r1" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_x+_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_x+_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_x-_r0" rgba="0.44 0.43 0.40 1"/><material name="rm_floor_wall_x-_r0" rgba="0.29 0.24 0.19 1"/><material name="rm_ceil_wall_x-_r0" rgba="0.50 0.49 0.47 1"/><material name="rm_lamp_wall_x-_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_x-_r0" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_x-_r0" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_x-_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_x-_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_x-_r1" rgba="0.46 0.44 0.41 1"/><material name="rm_floor_wall_x-_r1" rgba="0.30 0.24 0.20 1"/><material name="rm_ceil_wall_x-_r1" rgba="0.52 0.51 0.49 1"/><material name="rm_lamp_wall_x-_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_x-_r1" rgba="0.400 0.260 0.160 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_x-_r1" rgba="0.720 0.100 0.100 1.0" specular="0.2"/><material name="rm_metal_wall_x-_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_x-_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/>
     <mesh name="dock" file="dock/dock_g0.obj" scale="1 1 1"/>
     <mesh name="hook" file="hook/hook_g0.obj" scale="0.28 0.28 0.28"/>
+    <texture name="t_hook" type="2d" file="hook.png"/>
+    <material name="m_hook" texture="t_hook" texuniform="false" specular="0.4" shininess="0.5"/>
   </asset>
 
   <worldbody>
@@ -46,51 +41,291 @@
     <!-- THE TANK. Walls span the water column only: floor at -D up to z = 0, nothing above.
          Each wall is eleven boxes leaving three real openings per ring (see walls.py). -->
     <geom name="floor"  type="plane" material="m_fl" pos="0 0 -10.0" size="7.5 5.0 0.1"/>
-    <geom name="wall_yp_s0" type="box" material="m_yp" pos="0.000 5.000 -8.575" size="7.500 0.090 1.425"/>
-    <geom name="wall_yp_s1" type="box" material="m_yp" pos="0.000 5.000 -4.300" size="7.500 0.090 0.950"/>
-    <geom name="wall_yp_s2" type="box" material="m_yp" pos="0.000 5.000 -0.725" size="7.500 0.090 0.725"/>
-    <geom name="wall_yp_r0p0" type="box" material="m_yp" pos="-6.425 5.000 -6.200" size="1.075 0.090 0.950"/>
-    <geom name="wall_yp_r0p1" type="box" material="m_yp" pos="-2.175 5.000 -6.200" size="1.175 0.090 0.950"/>
-    <geom name="wall_yp_r0p2" type="box" material="m_yp" pos="2.175 5.000 -6.200" size="1.175 0.090 0.950"/>
-    <geom name="wall_yp_r0p3" type="box" material="m_yp" pos="6.425 5.000 -6.200" size="1.075 0.090 0.950"/>
-    <geom name="wall_yp_r1p0" type="box" material="m_yp" pos="-6.425 5.000 -2.400" size="1.075 0.090 0.950"/>
-    <geom name="wall_yp_r1p1" type="box" material="m_yp" pos="-2.175 5.000 -2.400" size="1.175 0.090 0.950"/>
-    <geom name="wall_yp_r1p2" type="box" material="m_yp" pos="2.175 5.000 -2.400" size="1.175 0.090 0.950"/>
-    <geom name="wall_yp_r1p3" type="box" material="m_yp" pos="6.425 5.000 -2.400" size="1.075 0.090 0.950"/>
-    <geom name="wall_ym_s0" type="box" material="m_ym" pos="0.000 -5.000 -8.575" size="7.500 0.090 1.425"/>
-    <geom name="wall_ym_s1" type="box" material="m_ym" pos="0.000 -5.000 -4.300" size="7.500 0.090 0.950"/>
-    <geom name="wall_ym_s2" type="box" material="m_ym" pos="0.000 -5.000 -0.725" size="7.500 0.090 0.725"/>
-    <geom name="wall_ym_r0p0" type="box" material="m_ym" pos="-6.425 -5.000 -6.200" size="1.075 0.090 0.950"/>
-    <geom name="wall_ym_r0p1" type="box" material="m_ym" pos="-2.175 -5.000 -6.200" size="1.175 0.090 0.950"/>
-    <geom name="wall_ym_r0p2" type="box" material="m_ym" pos="2.175 -5.000 -6.200" size="1.175 0.090 0.950"/>
-    <geom name="wall_ym_r0p3" type="box" material="m_ym" pos="6.425 -5.000 -6.200" size="1.075 0.090 0.950"/>
-    <geom name="wall_ym_r1p0" type="box" material="m_ym" pos="-6.425 -5.000 -2.400" size="1.075 0.090 0.950"/>
-    <geom name="wall_ym_r1p1" type="box" material="m_ym" pos="-2.175 -5.000 -2.400" size="1.175 0.090 0.950"/>
-    <geom name="wall_ym_r1p2" type="box" material="m_ym" pos="2.175 -5.000 -2.400" size="1.175 0.090 0.950"/>
-    <geom name="wall_ym_r1p3" type="box" material="m_ym" pos="6.425 -5.000 -2.400" size="1.075 0.090 0.950"/>
-    <geom name="wall_xp_s0" type="box" material="m_xp" pos="7.500 0.000 -8.575" size="0.090 5.000 1.425"/>
-    <geom name="wall_xp_s1" type="box" material="m_xp" pos="7.500 0.000 -4.300" size="0.090 5.000 0.950"/>
-    <geom name="wall_xp_s2" type="box" material="m_xp" pos="7.500 0.000 -0.725" size="0.090 5.000 0.725"/>
-    <geom name="wall_xp_r0p0" type="box" material="m_xp" pos="7.500 -4.450 -6.200" size="0.090 0.550 0.950"/>
-    <geom name="wall_xp_r0p1" type="box" material="m_xp" pos="7.500 -1.450 -6.200" size="0.090 0.450 0.950"/>
-    <geom name="wall_xp_r0p2" type="box" material="m_xp" pos="7.500 1.450 -6.200" size="0.090 0.450 0.950"/>
-    <geom name="wall_xp_r0p3" type="box" material="m_xp" pos="7.500 4.450 -6.200" size="0.090 0.550 0.950"/>
-    <geom name="wall_xp_r1p0" type="box" material="m_xp" pos="7.500 -4.450 -2.400" size="0.090 0.550 0.950"/>
-    <geom name="wall_xp_r1p1" type="box" material="m_xp" pos="7.500 -1.450 -2.400" size="0.090 0.450 0.950"/>
-    <geom name="wall_xp_r1p2" type="box" material="m_xp" pos="7.500 1.450 -2.400" size="0.090 0.450 0.950"/>
-    <geom name="wall_xp_r1p3" type="box" material="m_xp" pos="7.500 4.450 -2.400" size="0.090 0.550 0.950"/>
-    <geom name="wall_xm_s0" type="box" material="m_xm" pos="-7.500 0.000 -8.575" size="0.090 5.000 1.425"/>
-    <geom name="wall_xm_s1" type="box" material="m_xm" pos="-7.500 0.000 -4.300" size="0.090 5.000 0.950"/>
-    <geom name="wall_xm_s2" type="box" material="m_xm" pos="-7.500 0.000 -0.725" size="0.090 5.000 0.725"/>
-    <geom name="wall_xm_r0p0" type="box" material="m_xm" pos="-7.500 -4.450 -6.200" size="0.090 0.550 0.950"/>
-    <geom name="wall_xm_r0p1" type="box" material="m_xm" pos="-7.500 -1.450 -6.200" size="0.090 0.450 0.950"/>
-    <geom name="wall_xm_r0p2" type="box" material="m_xm" pos="-7.500 1.450 -6.200" size="0.090 0.450 0.950"/>
-    <geom name="wall_xm_r0p3" type="box" material="m_xm" pos="-7.500 4.450 -6.200" size="0.090 0.550 0.950"/>
-    <geom name="wall_xm_r1p0" type="box" material="m_xm" pos="-7.500 -4.450 -2.400" size="0.090 0.550 0.950"/>
-    <geom name="wall_xm_r1p1" type="box" material="m_xm" pos="-7.500 -1.450 -2.400" size="0.090 0.450 0.950"/>
-    <geom name="wall_xm_r1p2" type="box" material="m_xm" pos="-7.500 1.450 -2.400" size="0.090 0.450 0.950"/>
-    <geom name="wall_xm_r1p3" type="box" material="m_xm" pos="-7.500 4.450 -2.400" size="0.090 0.550 0.950"/>
-    <geom name="surface" type="plane" material="m_surf" pos="0 0 -0.02" size="7.5 5.0 0.1" euler="3.14159 0 0"/>
+    <geom name="wall_y+_s0" type="box" material="m_wall_y+_s0" pos="0.0000 5.0000 -8.5750" size="7.5000 0.0900 1.4250"/>
+    <geom name="wall_y+_s1" type="box" material="m_wall_y+_s1" pos="0.0000 5.0000 -4.3000" size="7.5000 0.0900 0.9500"/>
+    <geom name="wall_y+_s2" type="box" material="m_wall_y+_s2" pos="0.0000 5.0000 -0.7250" size="7.5000 0.0900 0.7250"/>
+    <geom name="wall_y+_r0p0" type="box" material="m_wall_y+_r0p0" pos="-6.4250 5.0000 -6.2000" size="1.0750 0.0900 0.9500"/>
+    <geom name="wall_y+_r0p1" type="box" material="m_wall_y+_r0p1" pos="-2.1750 5.0000 -6.2000" size="1.1750 0.0900 0.9500"/>
+    <geom name="wall_y+_r0p2" type="box" material="m_wall_y+_r0p2" pos="2.1750 5.0000 -6.2000" size="1.1750 0.0900 0.9500"/>
+    <geom name="wall_y+_r0p3" type="box" material="m_wall_y+_r0p3" pos="6.4250 5.0000 -6.2000" size="1.0750 0.0900 0.9500"/>
+    <geom name="wall_y+_r0w0_rt" type="box" material="m_frame" pos="-4.3500 4.8600 -5.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_rb" type="box" material="m_frame" pos="-4.3500 4.8600 -7.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_rl" type="box" material="m_frame" pos="-5.4000 4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_rr" type="box" material="m_frame" pos="-3.3000 4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_m0" type="box" material="m_frame" pos="-4.6833 4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_m0j0" type="box" material="m_frame" pos="-4.6833 4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_m0j1" type="box" material="m_frame" pos="-4.6833 4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_m1" type="box" material="m_frame" pos="-4.0167 4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_m1j0" type="box" material="m_frame" pos="-4.0167 4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w0_m1j1" type="box" material="m_frame" pos="-4.0167 4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_rt" type="box" material="m_frame" pos="0.0000 4.8600 -5.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_rb" type="box" material="m_frame" pos="0.0000 4.8600 -7.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_rl" type="box" material="m_frame" pos="-1.0500 4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_rr" type="box" material="m_frame" pos="1.0500 4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_m0" type="box" material="m_frame" pos="-0.3333 4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_m0j0" type="box" material="m_frame" pos="-0.3333 4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_m0j1" type="box" material="m_frame" pos="-0.3333 4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_m1" type="box" material="m_frame" pos="0.3333 4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_m1j0" type="box" material="m_frame" pos="0.3333 4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w1_m1j1" type="box" material="m_frame" pos="0.3333 4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_rt" type="box" material="m_frame" pos="4.3500 4.8600 -5.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_rb" type="box" material="m_frame" pos="4.3500 4.8600 -7.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_rl" type="box" material="m_frame" pos="3.3000 4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_rr" type="box" material="m_frame" pos="5.4000 4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_m0" type="box" material="m_frame" pos="4.0167 4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_m0j0" type="box" material="m_frame" pos="4.0167 4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_m0j1" type="box" material="m_frame" pos="4.0167 4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_m1" type="box" material="m_frame" pos="4.6833 4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_m1j0" type="box" material="m_frame" pos="4.6833 4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r0w2_m1j1" type="box" material="m_frame" pos="4.6833 4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1p0" type="box" material="m_wall_y+_r1p0" pos="-6.4250 5.0000 -2.4000" size="1.0750 0.0900 0.9500"/>
+    <geom name="wall_y+_r1p1" type="box" material="m_wall_y+_r1p1" pos="-2.1750 5.0000 -2.4000" size="1.1750 0.0900 0.9500"/>
+    <geom name="wall_y+_r1p2" type="box" material="m_wall_y+_r1p2" pos="2.1750 5.0000 -2.4000" size="1.1750 0.0900 0.9500"/>
+    <geom name="wall_y+_r1p3" type="box" material="m_wall_y+_r1p3" pos="6.4250 5.0000 -2.4000" size="1.0750 0.0900 0.9500"/>
+    <geom name="wall_y+_r1w0_rt" type="box" material="m_frame" pos="-4.3500 4.8600 -1.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_rb" type="box" material="m_frame" pos="-4.3500 4.8600 -3.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_rl" type="box" material="m_frame" pos="-5.4000 4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_rr" type="box" material="m_frame" pos="-3.3000 4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_m0" type="box" material="m_frame" pos="-4.6833 4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_m0j0" type="box" material="m_frame" pos="-4.6833 4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_m0j1" type="box" material="m_frame" pos="-4.6833 4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_m1" type="box" material="m_frame" pos="-4.0167 4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_m1j0" type="box" material="m_frame" pos="-4.0167 4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w0_m1j1" type="box" material="m_frame" pos="-4.0167 4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_rt" type="box" material="m_frame" pos="0.0000 4.8600 -1.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_rb" type="box" material="m_frame" pos="0.0000 4.8600 -3.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_rl" type="box" material="m_frame" pos="-1.0500 4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_rr" type="box" material="m_frame" pos="1.0500 4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_m0" type="box" material="m_frame" pos="-0.3333 4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_m0j0" type="box" material="m_frame" pos="-0.3333 4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_m0j1" type="box" material="m_frame" pos="-0.3333 4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_m1" type="box" material="m_frame" pos="0.3333 4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_m1j0" type="box" material="m_frame" pos="0.3333 4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w1_m1j1" type="box" material="m_frame" pos="0.3333 4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_rt" type="box" material="m_frame" pos="4.3500 4.8600 -1.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_rb" type="box" material="m_frame" pos="4.3500 4.8600 -3.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_rl" type="box" material="m_frame" pos="3.3000 4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_rr" type="box" material="m_frame" pos="5.4000 4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_m0" type="box" material="m_frame" pos="4.0167 4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_m0j0" type="box" material="m_frame" pos="4.0167 4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_m0j1" type="box" material="m_frame" pos="4.0167 4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_m1" type="box" material="m_frame" pos="4.6833 4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_m1j0" type="box" material="m_frame" pos="4.6833 4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y+_r1w2_m1j1" type="box" material="m_frame" pos="4.6833 4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_s0" type="box" material="m_wall_y-_s0" pos="0.0000 -5.0000 -8.5750" size="7.5000 0.0900 1.4250"/>
+    <geom name="wall_y-_s1" type="box" material="m_wall_y-_s1" pos="0.0000 -5.0000 -4.3000" size="7.5000 0.0900 0.9500"/>
+    <geom name="wall_y-_s2" type="box" material="m_wall_y-_s2" pos="0.0000 -5.0000 -0.7250" size="7.5000 0.0900 0.7250"/>
+    <geom name="wall_y-_r0p0" type="box" material="m_wall_y-_r0p0" pos="-6.4250 -5.0000 -6.2000" size="1.0750 0.0900 0.9500"/>
+    <geom name="wall_y-_r0p1" type="box" material="m_wall_y-_r0p1" pos="-2.1750 -5.0000 -6.2000" size="1.1750 0.0900 0.9500"/>
+    <geom name="wall_y-_r0p2" type="box" material="m_wall_y-_r0p2" pos="2.1750 -5.0000 -6.2000" size="1.1750 0.0900 0.9500"/>
+    <geom name="wall_y-_r0p3" type="box" material="m_wall_y-_r0p3" pos="6.4250 -5.0000 -6.2000" size="1.0750 0.0900 0.9500"/>
+    <geom name="wall_y-_r0w0_rt" type="box" material="m_frame" pos="-4.3500 -4.8600 -5.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_rb" type="box" material="m_frame" pos="-4.3500 -4.8600 -7.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_rl" type="box" material="m_frame" pos="-5.4000 -4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_rr" type="box" material="m_frame" pos="-3.3000 -4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_m0" type="box" material="m_frame" pos="-4.6833 -4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_m0j0" type="box" material="m_frame" pos="-4.6833 -4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_m0j1" type="box" material="m_frame" pos="-4.6833 -4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_m1" type="box" material="m_frame" pos="-4.0167 -4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_m1j0" type="box" material="m_frame" pos="-4.0167 -4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w0_m1j1" type="box" material="m_frame" pos="-4.0167 -4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_rt" type="box" material="m_frame" pos="0.0000 -4.8600 -5.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_rb" type="box" material="m_frame" pos="0.0000 -4.8600 -7.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_rl" type="box" material="m_frame" pos="-1.0500 -4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_rr" type="box" material="m_frame" pos="1.0500 -4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_m0" type="box" material="m_frame" pos="-0.3333 -4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_m0j0" type="box" material="m_frame" pos="-0.3333 -4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_m0j1" type="box" material="m_frame" pos="-0.3333 -4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_m1" type="box" material="m_frame" pos="0.3333 -4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_m1j0" type="box" material="m_frame" pos="0.3333 -4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w1_m1j1" type="box" material="m_frame" pos="0.3333 -4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_rt" type="box" material="m_frame" pos="4.3500 -4.8600 -5.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_rb" type="box" material="m_frame" pos="4.3500 -4.8600 -7.2000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_rl" type="box" material="m_frame" pos="3.3000 -4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_rr" type="box" material="m_frame" pos="5.4000 -4.8600 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_m0" type="box" material="m_frame" pos="4.0167 -4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_m0j0" type="box" material="m_frame" pos="4.0167 -4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_m0j1" type="box" material="m_frame" pos="4.0167 -4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_m1" type="box" material="m_frame" pos="4.6833 -4.6500 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_m1j0" type="box" material="m_frame" pos="4.6833 -4.7800 -5.3300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r0w2_m1j1" type="box" material="m_frame" pos="4.6833 -4.7800 -7.0700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1p0" type="box" material="m_wall_y-_r1p0" pos="-6.4250 -5.0000 -2.4000" size="1.0750 0.0900 0.9500"/>
+    <geom name="wall_y-_r1p1" type="box" material="m_wall_y-_r1p1" pos="-2.1750 -5.0000 -2.4000" size="1.1750 0.0900 0.9500"/>
+    <geom name="wall_y-_r1p2" type="box" material="m_wall_y-_r1p2" pos="2.1750 -5.0000 -2.4000" size="1.1750 0.0900 0.9500"/>
+    <geom name="wall_y-_r1p3" type="box" material="m_wall_y-_r1p3" pos="6.4250 -5.0000 -2.4000" size="1.0750 0.0900 0.9500"/>
+    <geom name="wall_y-_r1w0_rt" type="box" material="m_frame" pos="-4.3500 -4.8600 -1.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_rb" type="box" material="m_frame" pos="-4.3500 -4.8600 -3.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_rl" type="box" material="m_frame" pos="-5.4000 -4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_rr" type="box" material="m_frame" pos="-3.3000 -4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_m0" type="box" material="m_frame" pos="-4.6833 -4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_m0j0" type="box" material="m_frame" pos="-4.6833 -4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_m0j1" type="box" material="m_frame" pos="-4.6833 -4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_m1" type="box" material="m_frame" pos="-4.0167 -4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_m1j0" type="box" material="m_frame" pos="-4.0167 -4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w0_m1j1" type="box" material="m_frame" pos="-4.0167 -4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_rt" type="box" material="m_frame" pos="0.0000 -4.8600 -1.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_rb" type="box" material="m_frame" pos="0.0000 -4.8600 -3.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_rl" type="box" material="m_frame" pos="-1.0500 -4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_rr" type="box" material="m_frame" pos="1.0500 -4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_m0" type="box" material="m_frame" pos="-0.3333 -4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_m0j0" type="box" material="m_frame" pos="-0.3333 -4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_m0j1" type="box" material="m_frame" pos="-0.3333 -4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_m1" type="box" material="m_frame" pos="0.3333 -4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_m1j0" type="box" material="m_frame" pos="0.3333 -4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w1_m1j1" type="box" material="m_frame" pos="0.3333 -4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_rt" type="box" material="m_frame" pos="4.3500 -4.8600 -1.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_rb" type="box" material="m_frame" pos="4.3500 -4.8600 -3.4000" size="1.1000 0.0500 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_rl" type="box" material="m_frame" pos="3.3000 -4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_rr" type="box" material="m_frame" pos="5.4000 -4.8600 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_m0" type="box" material="m_frame" pos="4.0167 -4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_m0j0" type="box" material="m_frame" pos="4.0167 -4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_m0j1" type="box" material="m_frame" pos="4.0167 -4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_m1" type="box" material="m_frame" pos="4.6833 -4.6500 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_m1j0" type="box" material="m_frame" pos="4.6833 -4.7800 -1.5300" size="0.0550 0.0550 0.1681" euler="0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_y-_r1w2_m1j1" type="box" material="m_frame" pos="4.6833 -4.7800 -3.2700" size="0.0550 0.0550 0.1681" euler="-0.7854 0 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_s0" type="box" material="m_wall_x+_s0" pos="7.5000 0.0000 -8.5750" size="0.0900 5.0000 1.4250"/>
+    <geom name="wall_x+_s1" type="box" material="m_wall_x+_s1" pos="7.5000 0.0000 -4.3000" size="0.0900 5.0000 0.9500"/>
+    <geom name="wall_x+_s2" type="box" material="m_wall_x+_s2" pos="7.5000 0.0000 -0.7250" size="0.0900 5.0000 0.7250"/>
+    <geom name="wall_x+_r0p0" type="box" material="m_wall_x+_r0p0" pos="7.5000 -4.4500 -6.2000" size="0.0900 0.5500 0.9500"/>
+    <geom name="wall_x+_r0p1" type="box" material="m_wall_x+_r0p1" pos="7.5000 -1.4500 -6.2000" size="0.0900 0.4500 0.9500"/>
+    <geom name="wall_x+_r0p2" type="box" material="m_wall_x+_r0p2" pos="7.5000 1.4500 -6.2000" size="0.0900 0.4500 0.9500"/>
+    <geom name="wall_x+_r0p3" type="box" material="m_wall_x+_r0p3" pos="7.5000 4.4500 -6.2000" size="0.0900 0.5500 0.9500"/>
+    <geom name="wall_x+_r0w0_rt" type="box" material="m_frame" pos="7.3600 -2.9000 -5.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_rb" type="box" material="m_frame" pos="7.3600 -2.9000 -7.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_rl" type="box" material="m_frame" pos="7.3600 -3.9500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_rr" type="box" material="m_frame" pos="7.3600 -1.8500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_m0" type="box" material="m_frame" pos="7.1500 -3.2333 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_m0j0" type="box" material="m_frame" pos="7.2800 -3.2333 -5.3300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_m0j1" type="box" material="m_frame" pos="7.2800 -3.2333 -7.0700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_m1" type="box" material="m_frame" pos="7.1500 -2.5667 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_m1j0" type="box" material="m_frame" pos="7.2800 -2.5667 -5.3300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w0_m1j1" type="box" material="m_frame" pos="7.2800 -2.5667 -7.0700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_rt" type="box" material="m_frame" pos="7.3600 0.0000 -5.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_rb" type="box" material="m_frame" pos="7.3600 0.0000 -7.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_rl" type="box" material="m_frame" pos="7.3600 -1.0500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_rr" type="box" material="m_frame" pos="7.3600 1.0500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_m0" type="box" material="m_frame" pos="7.1500 -0.3333 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_m0j0" type="box" material="m_frame" pos="7.2800 -0.3333 -5.3300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_m0j1" type="box" material="m_frame" pos="7.2800 -0.3333 -7.0700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_m1" type="box" material="m_frame" pos="7.1500 0.3333 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_m1j0" type="box" material="m_frame" pos="7.2800 0.3333 -5.3300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w1_m1j1" type="box" material="m_frame" pos="7.2800 0.3333 -7.0700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_rt" type="box" material="m_frame" pos="7.3600 2.9000 -5.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_rb" type="box" material="m_frame" pos="7.3600 2.9000 -7.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_rl" type="box" material="m_frame" pos="7.3600 1.8500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_rr" type="box" material="m_frame" pos="7.3600 3.9500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_m0" type="box" material="m_frame" pos="7.1500 2.5667 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_m0j0" type="box" material="m_frame" pos="7.2800 2.5667 -5.3300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_m0j1" type="box" material="m_frame" pos="7.2800 2.5667 -7.0700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_m1" type="box" material="m_frame" pos="7.1500 3.2333 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_m1j0" type="box" material="m_frame" pos="7.2800 3.2333 -5.3300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r0w2_m1j1" type="box" material="m_frame" pos="7.2800 3.2333 -7.0700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1p0" type="box" material="m_wall_x+_r1p0" pos="7.5000 -4.4500 -2.4000" size="0.0900 0.5500 0.9500"/>
+    <geom name="wall_x+_r1p1" type="box" material="m_wall_x+_r1p1" pos="7.5000 -1.4500 -2.4000" size="0.0900 0.4500 0.9500"/>
+    <geom name="wall_x+_r1p2" type="box" material="m_wall_x+_r1p2" pos="7.5000 1.4500 -2.4000" size="0.0900 0.4500 0.9500"/>
+    <geom name="wall_x+_r1p3" type="box" material="m_wall_x+_r1p3" pos="7.5000 4.4500 -2.4000" size="0.0900 0.5500 0.9500"/>
+    <geom name="wall_x+_r1w0_rt" type="box" material="m_frame" pos="7.3600 -2.9000 -1.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_rb" type="box" material="m_frame" pos="7.3600 -2.9000 -3.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_rl" type="box" material="m_frame" pos="7.3600 -3.9500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_rr" type="box" material="m_frame" pos="7.3600 -1.8500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_m0" type="box" material="m_frame" pos="7.1500 -3.2333 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_m0j0" type="box" material="m_frame" pos="7.2800 -3.2333 -1.5300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_m0j1" type="box" material="m_frame" pos="7.2800 -3.2333 -3.2700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_m1" type="box" material="m_frame" pos="7.1500 -2.5667 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_m1j0" type="box" material="m_frame" pos="7.2800 -2.5667 -1.5300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w0_m1j1" type="box" material="m_frame" pos="7.2800 -2.5667 -3.2700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_rt" type="box" material="m_frame" pos="7.3600 0.0000 -1.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_rb" type="box" material="m_frame" pos="7.3600 0.0000 -3.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_rl" type="box" material="m_frame" pos="7.3600 -1.0500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_rr" type="box" material="m_frame" pos="7.3600 1.0500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_m0" type="box" material="m_frame" pos="7.1500 -0.3333 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_m0j0" type="box" material="m_frame" pos="7.2800 -0.3333 -1.5300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_m0j1" type="box" material="m_frame" pos="7.2800 -0.3333 -3.2700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_m1" type="box" material="m_frame" pos="7.1500 0.3333 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_m1j0" type="box" material="m_frame" pos="7.2800 0.3333 -1.5300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w1_m1j1" type="box" material="m_frame" pos="7.2800 0.3333 -3.2700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_rt" type="box" material="m_frame" pos="7.3600 2.9000 -1.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_rb" type="box" material="m_frame" pos="7.3600 2.9000 -3.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_rl" type="box" material="m_frame" pos="7.3600 1.8500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_rr" type="box" material="m_frame" pos="7.3600 3.9500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_m0" type="box" material="m_frame" pos="7.1500 2.5667 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_m0j0" type="box" material="m_frame" pos="7.2800 2.5667 -1.5300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_m0j1" type="box" material="m_frame" pos="7.2800 2.5667 -3.2700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_m1" type="box" material="m_frame" pos="7.1500 3.2333 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_m1j0" type="box" material="m_frame" pos="7.2800 3.2333 -1.5300" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x+_r1w2_m1j1" type="box" material="m_frame" pos="7.2800 3.2333 -3.2700" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_s0" type="box" material="m_wall_x-_s0" pos="-7.5000 0.0000 -8.5750" size="0.0900 5.0000 1.4250"/>
+    <geom name="wall_x-_s1" type="box" material="m_wall_x-_s1" pos="-7.5000 0.0000 -4.3000" size="0.0900 5.0000 0.9500"/>
+    <geom name="wall_x-_s2" type="box" material="m_wall_x-_s2" pos="-7.5000 0.0000 -0.7250" size="0.0900 5.0000 0.7250"/>
+    <geom name="wall_x-_r0p0" type="box" material="m_wall_x-_r0p0" pos="-7.5000 -4.4500 -6.2000" size="0.0900 0.5500 0.9500"/>
+    <geom name="wall_x-_r0p1" type="box" material="m_wall_x-_r0p1" pos="-7.5000 -1.4500 -6.2000" size="0.0900 0.4500 0.9500"/>
+    <geom name="wall_x-_r0p2" type="box" material="m_wall_x-_r0p2" pos="-7.5000 1.4500 -6.2000" size="0.0900 0.4500 0.9500"/>
+    <geom name="wall_x-_r0p3" type="box" material="m_wall_x-_r0p3" pos="-7.5000 4.4500 -6.2000" size="0.0900 0.5500 0.9500"/>
+    <geom name="wall_x-_r0w0_rt" type="box" material="m_frame" pos="-7.3600 -2.9000 -5.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_rb" type="box" material="m_frame" pos="-7.3600 -2.9000 -7.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_rl" type="box" material="m_frame" pos="-7.3600 -3.9500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_rr" type="box" material="m_frame" pos="-7.3600 -1.8500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_m0" type="box" material="m_frame" pos="-7.1500 -3.2333 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_m0j0" type="box" material="m_frame" pos="-7.2800 -3.2333 -5.3300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_m0j1" type="box" material="m_frame" pos="-7.2800 -3.2333 -7.0700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_m1" type="box" material="m_frame" pos="-7.1500 -2.5667 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_m1j0" type="box" material="m_frame" pos="-7.2800 -2.5667 -5.3300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w0_m1j1" type="box" material="m_frame" pos="-7.2800 -2.5667 -7.0700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_rt" type="box" material="m_frame" pos="-7.3600 0.0000 -5.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_rb" type="box" material="m_frame" pos="-7.3600 0.0000 -7.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_rl" type="box" material="m_frame" pos="-7.3600 -1.0500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_rr" type="box" material="m_frame" pos="-7.3600 1.0500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_m0" type="box" material="m_frame" pos="-7.1500 -0.3333 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_m0j0" type="box" material="m_frame" pos="-7.2800 -0.3333 -5.3300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_m0j1" type="box" material="m_frame" pos="-7.2800 -0.3333 -7.0700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_m1" type="box" material="m_frame" pos="-7.1500 0.3333 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_m1j0" type="box" material="m_frame" pos="-7.2800 0.3333 -5.3300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w1_m1j1" type="box" material="m_frame" pos="-7.2800 0.3333 -7.0700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_rt" type="box" material="m_frame" pos="-7.3600 2.9000 -5.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_rb" type="box" material="m_frame" pos="-7.3600 2.9000 -7.2000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_rl" type="box" material="m_frame" pos="-7.3600 1.8500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_rr" type="box" material="m_frame" pos="-7.3600 3.9500 -6.2000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_m0" type="box" material="m_frame" pos="-7.1500 2.5667 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_m0j0" type="box" material="m_frame" pos="-7.2800 2.5667 -5.3300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_m0j1" type="box" material="m_frame" pos="-7.2800 2.5667 -7.0700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_m1" type="box" material="m_frame" pos="-7.1500 3.2333 -6.2000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_m1j0" type="box" material="m_frame" pos="-7.2800 3.2333 -5.3300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r0w2_m1j1" type="box" material="m_frame" pos="-7.2800 3.2333 -7.0700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1p0" type="box" material="m_wall_x-_r1p0" pos="-7.5000 -4.4500 -2.4000" size="0.0900 0.5500 0.9500"/>
+    <geom name="wall_x-_r1p1" type="box" material="m_wall_x-_r1p1" pos="-7.5000 -1.4500 -2.4000" size="0.0900 0.4500 0.9500"/>
+    <geom name="wall_x-_r1p2" type="box" material="m_wall_x-_r1p2" pos="-7.5000 1.4500 -2.4000" size="0.0900 0.4500 0.9500"/>
+    <geom name="wall_x-_r1p3" type="box" material="m_wall_x-_r1p3" pos="-7.5000 4.4500 -2.4000" size="0.0900 0.5500 0.9500"/>
+    <geom name="wall_x-_r1w0_rt" type="box" material="m_frame" pos="-7.3600 -2.9000 -1.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_rb" type="box" material="m_frame" pos="-7.3600 -2.9000 -3.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_rl" type="box" material="m_frame" pos="-7.3600 -3.9500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_rr" type="box" material="m_frame" pos="-7.3600 -1.8500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_m0" type="box" material="m_frame" pos="-7.1500 -3.2333 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_m0j0" type="box" material="m_frame" pos="-7.2800 -3.2333 -1.5300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_m0j1" type="box" material="m_frame" pos="-7.2800 -3.2333 -3.2700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_m1" type="box" material="m_frame" pos="-7.1500 -2.5667 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_m1j0" type="box" material="m_frame" pos="-7.2800 -2.5667 -1.5300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w0_m1j1" type="box" material="m_frame" pos="-7.2800 -2.5667 -3.2700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_rt" type="box" material="m_frame" pos="-7.3600 0.0000 -1.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_rb" type="box" material="m_frame" pos="-7.3600 0.0000 -3.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_rl" type="box" material="m_frame" pos="-7.3600 -1.0500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_rr" type="box" material="m_frame" pos="-7.3600 1.0500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_m0" type="box" material="m_frame" pos="-7.1500 -0.3333 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_m0j0" type="box" material="m_frame" pos="-7.2800 -0.3333 -1.5300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_m0j1" type="box" material="m_frame" pos="-7.2800 -0.3333 -3.2700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_m1" type="box" material="m_frame" pos="-7.1500 0.3333 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_m1j0" type="box" material="m_frame" pos="-7.2800 0.3333 -1.5300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w1_m1j1" type="box" material="m_frame" pos="-7.2800 0.3333 -3.2700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_rt" type="box" material="m_frame" pos="-7.3600 2.9000 -1.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_rb" type="box" material="m_frame" pos="-7.3600 2.9000 -3.4000" size="0.0500 1.1000 0.0500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_rl" type="box" material="m_frame" pos="-7.3600 1.8500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_rr" type="box" material="m_frame" pos="-7.3600 3.9500 -2.4000" size="0.0500 0.0500 0.9500" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_m0" type="box" material="m_frame" pos="-7.1500 2.5667 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_m0j0" type="box" material="m_frame" pos="-7.2800 2.5667 -1.5300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_m0j1" type="box" material="m_frame" pos="-7.2800 2.5667 -3.2700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_m1" type="box" material="m_frame" pos="-7.1500 3.2333 -2.4000" size="0.0550 0.0550 0.7900" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_m1j0" type="box" material="m_frame" pos="-7.2800 3.2333 -1.5300" size="0.0550 0.0550 0.1681" euler="0 -0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="wall_x-_r1w2_m1j1" type="box" material="m_frame" pos="-7.2800 3.2333 -3.2700" size="0.0550 0.0550 0.1681" euler="0 0.7854 0" contype="0" conaffinity="0"/>
+    <geom name="surface" type="plane" material="m_surf" pos="0 0 -0.52" size="7.5 5.0 0.1" euler="3.14159 0 0"/>
 
     <!-- THE WAREHOUSE. A dark enclosed room around the tank, lit by ceiling lamps. The tank is a
          hole in its floor, so from underwater the surface reads as a lid with a lit room above. -->
@@ -119,19 +354,23 @@
       <geom name="g_leg_d" type="box" material="m_gantry" pos="7.5 -1.0 -0.55" size="0.12 0.12 0.55"/>
     </body>
     <body name="hook" pos="1.2 0 0">
-      <geom name="hook_line" type="capsule" material="m_gantry" fromto="0 0 1.0 0 0 -2.5" size="0.055"/>
-      <!-- a real crane hook (block + hook, 10.8k faces). The mesh hangs along -Y with the hook at
-           +Y, so euler x=-90 deg stands it up: sheave block at the top, hook pointing down. -->
-      <geom name="hook_g" type="mesh" mesh="hook" material="m_gantry" euler="-1.5708 0 0"
+      <!-- CYLINDER, NOT CAPSULE, for the cable: a capsule's hemispherical caps swell at the ends
+           and the line read as varying width. A cylinder is the same width the whole way down. -->
+      <geom name="hook_line" type="cylinder" material="m_cable" size="0.045 1.7500"
+            pos="0 0 -0.7500" contype="0" conaffinity="0"/>
+      <!-- a real crane hook (block + hook, 12.9k faces, its own baseColor texture). The mesh lies
+           along -Y with the hook at +Y, so euler x=+90 deg stands it up HOOK-END DOWN. At -90 it
+           was upside down, with the hook opening at the top. -->
+      <geom name="hook_g" type="mesh" mesh="hook" material="m_hook" euler="1.5708 0 0"
             pos="0 0 -3.2742" contype="0" conaffinity="0"/>
     </body>
 
     <body name="buoy_orange" pos="3.375 2.5 -5.0">
-      <geom name="rope_o" type="capsule" material="m_rope" fromto="0 0 0 0 0 5.0" size="0.025"/>
+      <geom name="rope_o" type="capsule" material="m_rope" fromto="0 0 0 0 0 4.48" size="0.025"/>
       <geom name="buoy_o" type="sphere" material="m_buoy_o" size="0.38"/>
     </body>
     <body name="buoy_green" pos="-3.0 -2.25 -5.6">
-      <geom name="rope_g" type="capsule" material="m_rope" fromto="0 0 0 0 0 5.6" size="0.025"/>
+      <geom name="rope_g" type="capsule" material="m_rope" fromto="0 0 0 0 0 5.08" size="0.025"/>
       <geom name="buoy_g" type="sphere" material="m_buoy_g" size="0.34"/>
     </body>
 
@@ -148,15 +387,15 @@
       <site name="mola_c" pos="0 0 0" size="0.05" rgba="1 0 0 0"/>
     </body>
     
-    <body name="room_wall_yp_r0" pos="0.000 5.100 -7.500" euler="0 0 0.0000">
-      <geom type="box" size="7.125 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_yp_r0"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="-7.125 2.5 1.6" material="rm_wall_wall_yp_r0"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="7.125 2.5 1.6" material="rm_wall_wall_yp_r0"/>
-      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_yp_r0"/>
-      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_yp_r0"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="-3.2062500000000003 2.5 3.12" material="rm_lamp_wall_yp_r0"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="3.2062500000000003 2.5 3.12" material="rm_lamp_wall_yp_r0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="-4.99 4.1 1.1" material="rm_wood_wall_yp_r0"/>
+    <body name="room_wall_y+_r0" pos="0.000 5.100 -7.500" euler="0 0 0.0000">
+      <geom type="box" size="7.125 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_y+_r0"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="-7.125 2.5 1.6" material="rm_wall_wall_y+_r0"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="7.125 2.5 1.6" material="rm_wall_wall_y+_r0"/>
+      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_y+_r0"/>
+      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_y+_r0"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="-3.2062500000000003 2.5 3.12" material="rm_lamp_wall_y+_r0"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="3.2062500000000003 2.5 3.12" material="rm_lamp_wall_y+_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="-4.99 4.1 1.1" material="rm_wood_wall_y+_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.43 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.25 3.9699999999999998 0.30" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.08 3.9699999999999998 0.30" rgba="0.250 0.500 0.280 1.0"/>
@@ -175,7 +414,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="-4.90 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-4.73 3.9699999999999998 1.60" rgba="0.450 0.250 0.550 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-4.55 3.9699999999999998 1.60" rgba="0.600 0.350 0.150 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="-1.66 4.1 1.1" material="rm_wood_wall_yp_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="-1.66 4.1 1.1" material="rm_wood_wall_y+_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-2.10 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-1.93 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-1.75 3.9699999999999998 0.30" rgba="0.200 0.350 0.600 1.0"/>
@@ -194,7 +433,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="-1.58 3.9699999999999998 1.60" rgba="0.250 0.500 0.280 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-1.40 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-1.23 3.9699999999999998 1.60" rgba="0.450 0.250 0.550 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="1.66 4.1 1.1" material="rm_wood_wall_yp_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="1.66 4.1 1.1" material="rm_wood_wall_y+_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="1.22 3.9699999999999998 0.30" rgba="0.450 0.250 0.550 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="1.40 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="1.57 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
@@ -213,7 +452,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="1.75 3.9699999999999998 1.60" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="1.92 3.9699999999999998 1.60" rgba="0.250 0.500 0.280 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="2.10 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="4.99 4.1 1.1" material="rm_wood_wall_yp_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="4.99 4.1 1.1" material="rm_wood_wall_y+_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.55 3.9699999999999998 0.30" rgba="0.700 0.600 0.200 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.72 3.9699999999999998 0.30" rgba="0.450 0.250 0.550 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.90 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
@@ -232,46 +471,46 @@
       <geom type="box" size="0.045 0.12 0.15" pos="5.07 3.9699999999999998 1.60" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="5.25 3.9699999999999998 1.60" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="5.42 3.9699999999999998 1.60" rgba="0.250 0.500 0.280 1.0"/>
-      <geom type="box" size="1.0 0.5 0.05" pos="0 2.1 0.72" euler="0 0 -0.244" material="rm_wood_wall_yp_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0 1.2000000000000002 0.46" material="rm_chair_wall_yp_r0"/>
+      <geom type="box" size="1.0 0.5 0.05" pos="0 2.1 0.72" euler="0 0 -0.244" material="rm_wood_wall_y+_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0 1.2000000000000002 0.46" material="rm_chair_wall_y+_r0"/>
       <light pos="0 2.5 2.9000000000000004" dir="0 0 -1" diffuse="0.35 0.33 0.28" castshadow="false"/>
     </body>
-    <body name="room_wall_yp_r1" pos="0.000 5.100 -3.700" euler="0 0 0.0000">
-      <geom type="box" size="7.125 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_yp_r1"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="-7.125 2.5 1.6" material="rm_wall_wall_yp_r1"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="7.125 2.5 1.6" material="rm_wall_wall_yp_r1"/>
-      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_yp_r1"/>
-      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_yp_r1"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="-3.2062500000000003 2.5 3.12" material="rm_lamp_wall_yp_r1"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="3.2062500000000003 2.5 3.12" material="rm_lamp_wall_yp_r1"/>
-      <geom type="box" size="2.20 0.85 0.06" pos="0 2.25 0.74" euler="0 0 -0.039" material="rm_wood_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-3.21 3.50 0.46" material="rm_chair_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-3.21 3.69 0.78" material="rm_chair_wall_yp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-3.21 3.50 0.23" material="rm_metal_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-3.21 1.00 0.46" material="rm_chair_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-3.21 0.81 0.78" material="rm_chair_wall_yp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-3.21 1.00 0.23" material="rm_metal_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0.00 3.50 0.46" material="rm_chair_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="0.00 3.69 0.78" material="rm_chair_wall_yp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="0.00 3.50 0.23" material="rm_metal_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0.00 1.00 0.46" material="rm_chair_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="0.00 0.81 0.78" material="rm_chair_wall_yp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="0.00 1.00 0.23" material="rm_metal_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="3.21 3.50 0.46" material="rm_chair_wall_yp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="3.21 3.69 0.78" material="rm_chair_wall_yp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="3.21 3.50 0.23" material="rm_metal_wall_yp_r1"/>
-      <geom type="box" size="1.0 0.04 0.58" pos="0 4.9 1.75" material="rm_screen_wall_yp_r1"/>
+    <body name="room_wall_y+_r1" pos="0.000 5.100 -3.700" euler="0 0 0.0000">
+      <geom type="box" size="7.125 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_y+_r1"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="-7.125 2.5 1.6" material="rm_wall_wall_y+_r1"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="7.125 2.5 1.6" material="rm_wall_wall_y+_r1"/>
+      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_y+_r1"/>
+      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_y+_r1"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="-3.2062500000000003 2.5 3.12" material="rm_lamp_wall_y+_r1"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="3.2062500000000003 2.5 3.12" material="rm_lamp_wall_y+_r1"/>
+      <geom type="box" size="2.20 0.85 0.06" pos="0 2.25 0.74" euler="0 0 -0.039" material="rm_wood_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-3.21 3.50 0.46" material="rm_chair_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-3.21 3.69 0.78" material="rm_chair_wall_y+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-3.21 3.50 0.23" material="rm_metal_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-3.21 1.00 0.46" material="rm_chair_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-3.21 0.81 0.78" material="rm_chair_wall_y+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-3.21 1.00 0.23" material="rm_metal_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0.00 3.50 0.46" material="rm_chair_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="0.00 3.69 0.78" material="rm_chair_wall_y+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="0.00 3.50 0.23" material="rm_metal_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0.00 1.00 0.46" material="rm_chair_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="0.00 0.81 0.78" material="rm_chair_wall_y+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="0.00 1.00 0.23" material="rm_metal_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="3.21 3.50 0.46" material="rm_chair_wall_y+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="3.21 3.69 0.78" material="rm_chair_wall_y+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="3.21 3.50 0.23" material="rm_metal_wall_y+_r1"/>
+      <geom type="box" size="1.0 0.04 0.58" pos="0 4.9 1.75" material="rm_screen_wall_y+_r1"/>
       <light pos="0 2.5 2.9000000000000004" dir="0 0 -1" diffuse="0.42 0.40 0.34" castshadow="false"/>
     </body>
-    <body name="room_wall_ym_r0" pos="0.000 -5.100 -7.500" euler="0 0 3.1416">
-      <geom type="box" size="7.125 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_ym_r0"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="-7.125 2.5 1.6" material="rm_wall_wall_ym_r0"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="7.125 2.5 1.6" material="rm_wall_wall_ym_r0"/>
-      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_ym_r0"/>
-      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_ym_r0"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="-3.2062500000000003 2.5 3.12" material="rm_lamp_wall_ym_r0"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="3.2062500000000003 2.5 3.12" material="rm_lamp_wall_ym_r0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="-4.99 4.1 1.1" material="rm_wood_wall_ym_r0"/>
+    <body name="room_wall_y-_r0" pos="0.000 -5.100 -7.500" euler="0 0 3.1416">
+      <geom type="box" size="7.125 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_y-_r0"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="-7.125 2.5 1.6" material="rm_wall_wall_y-_r0"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="7.125 2.5 1.6" material="rm_wall_wall_y-_r0"/>
+      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_y-_r0"/>
+      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_y-_r0"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="-3.2062500000000003 2.5 3.12" material="rm_lamp_wall_y-_r0"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="3.2062500000000003 2.5 3.12" material="rm_lamp_wall_y-_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="-4.99 4.1 1.1" material="rm_wood_wall_y-_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.43 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.25 3.9699999999999998 0.30" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.08 3.9699999999999998 0.30" rgba="0.250 0.500 0.280 1.0"/>
@@ -296,7 +535,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="-4.90 3.9699999999999998 1.76" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-4.73 3.9699999999999998 1.76" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-4.55 3.9699999999999998 1.76" rgba="0.250 0.500 0.280 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="4.99 4.1 1.1" material="rm_wood_wall_ym_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="4.99 4.1 1.1" material="rm_wood_wall_y-_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.55 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.72 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.90 3.9699999999999998 0.30" rgba="0.200 0.350 0.600 1.0"/>
@@ -321,19 +560,19 @@
       <geom type="box" size="0.045 0.12 0.15" pos="5.07 3.9699999999999998 1.76" rgba="0.600 0.350 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="5.25 3.9699999999999998 1.76" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="5.42 3.9699999999999998 1.76" rgba="0.200 0.350 0.600 1.0"/>
-      <geom type="box" size="1.0 0.5 0.05" pos="0 2.1 0.72" euler="0 0 0.291" material="rm_wood_wall_ym_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0 1.2000000000000002 0.46" material="rm_chair_wall_ym_r0"/>
+      <geom type="box" size="1.0 0.5 0.05" pos="0 2.1 0.72" euler="0 0 0.291" material="rm_wood_wall_y-_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0 1.2000000000000002 0.46" material="rm_chair_wall_y-_r0"/>
       <light pos="0 2.5 2.9000000000000004" dir="0 0 -1" diffuse="0.42 0.40 0.35" castshadow="false"/>
     </body>
-    <body name="room_wall_ym_r1" pos="0.000 -5.100 -3.700" euler="0 0 3.1416">
-      <geom type="box" size="7.125 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_ym_r1"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="-7.125 2.5 1.6" material="rm_wall_wall_ym_r1"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="7.125 2.5 1.6" material="rm_wall_wall_ym_r1"/>
-      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_ym_r1"/>
-      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_ym_r1"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="-3.2062500000000003 2.5 3.12" material="rm_lamp_wall_ym_r1"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="3.2062500000000003 2.5 3.12" material="rm_lamp_wall_ym_r1"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="-4.99 4.1 1.1" material="rm_wood_wall_ym_r1"/>
+    <body name="room_wall_y-_r1" pos="0.000 -5.100 -3.700" euler="0 0 3.1416">
+      <geom type="box" size="7.125 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_y-_r1"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="-7.125 2.5 1.6" material="rm_wall_wall_y-_r1"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="7.125 2.5 1.6" material="rm_wall_wall_y-_r1"/>
+      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_y-_r1"/>
+      <geom type="box" size="7.125 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_y-_r1"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="-3.2062500000000003 2.5 3.12" material="rm_lamp_wall_y-_r1"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="3.2062500000000003 2.5 3.12" material="rm_lamp_wall_y-_r1"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="-4.99 4.1 1.1" material="rm_wood_wall_y-_r1"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.43 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.25 3.9699999999999998 0.30" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-5.08 3.9699999999999998 0.30" rgba="0.250 0.500 0.280 1.0"/>
@@ -352,7 +591,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="-4.90 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-4.73 3.9699999999999998 1.60" rgba="0.450 0.250 0.550 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-4.55 3.9699999999999998 1.60" rgba="0.600 0.350 0.150 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="-1.66 4.1 1.1" material="rm_wood_wall_ym_r1"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="-1.66 4.1 1.1" material="rm_wood_wall_y-_r1"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-2.10 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-1.93 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-1.75 3.9699999999999998 0.30" rgba="0.200 0.350 0.600 1.0"/>
@@ -371,7 +610,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="-1.58 3.9699999999999998 1.60" rgba="0.250 0.500 0.280 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-1.40 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-1.23 3.9699999999999998 1.60" rgba="0.450 0.250 0.550 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="1.66 4.1 1.1" material="rm_wood_wall_ym_r1"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="1.66 4.1 1.1" material="rm_wood_wall_y-_r1"/>
       <geom type="box" size="0.045 0.12 0.15" pos="1.22 3.9699999999999998 0.30" rgba="0.450 0.250 0.550 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="1.40 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="1.57 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
@@ -390,7 +629,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="1.75 3.9699999999999998 1.60" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="1.92 3.9699999999999998 1.60" rgba="0.250 0.500 0.280 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="2.10 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="4.99 4.1 1.1" material="rm_wood_wall_ym_r1"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="4.99 4.1 1.1" material="rm_wood_wall_y-_r1"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.55 3.9699999999999998 0.30" rgba="0.700 0.600 0.200 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.72 3.9699999999999998 0.30" rgba="0.450 0.250 0.550 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="4.90 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
@@ -409,79 +648,79 @@
       <geom type="box" size="0.045 0.12 0.15" pos="5.07 3.9699999999999998 1.60" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="5.25 3.9699999999999998 1.60" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="5.42 3.9699999999999998 1.60" rgba="0.250 0.500 0.280 1.0"/>
-      <geom type="box" size="1.0 0.5 0.05" pos="0 2.1 0.72" euler="0 0 -0.103" material="rm_wood_wall_ym_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0 1.2000000000000002 0.46" material="rm_chair_wall_ym_r1"/>
+      <geom type="box" size="1.0 0.5 0.05" pos="0 2.1 0.72" euler="0 0 -0.103" material="rm_wood_wall_y-_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0 1.2000000000000002 0.46" material="rm_chair_wall_y-_r1"/>
       <light pos="0 2.5 2.9000000000000004" dir="0 0 -1" diffuse="0.39 0.37 0.32" castshadow="false"/>
     </body>
-    <body name="room_wall_xp_r0" pos="7.600 0.000 -7.500" euler="0 0 -1.5708">
-      <geom type="box" size="4.75 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_xp_r0"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="-4.75 2.5 1.6" material="rm_wall_wall_xp_r0"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="4.75 2.5 1.6" material="rm_wall_wall_xp_r0"/>
-      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_xp_r0"/>
-      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_xp_r0"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="-2.1375 2.5 3.12" material="rm_lamp_wall_xp_r0"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="2.1375 2.5 3.12" material="rm_lamp_wall_xp_r0"/>
-      <geom type="box" size="2.20 0.85 0.06" pos="0 2.25 0.74" euler="0 0 0.129" material="rm_wood_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 3.50 0.46" material="rm_chair_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 3.69 0.78" material="rm_chair_wall_xp_r0"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-2.14 3.50 0.23" material="rm_metal_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 1.00 0.46" material="rm_chair_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 0.81 0.78" material="rm_chair_wall_xp_r0"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-2.14 1.00 0.23" material="rm_metal_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-0.71 3.50 0.46" material="rm_chair_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-0.71 3.69 0.78" material="rm_chair_wall_xp_r0"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-0.71 3.50 0.23" material="rm_metal_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-0.71 1.00 0.46" material="rm_chair_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-0.71 0.81 0.78" material="rm_chair_wall_xp_r0"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-0.71 1.00 0.23" material="rm_metal_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0.71 3.50 0.46" material="rm_chair_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="0.71 3.69 0.78" material="rm_chair_wall_xp_r0"/>
-      <geom type="cylinder" size="0.05 0.23" pos="0.71 3.50 0.23" material="rm_metal_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0.71 1.00 0.46" material="rm_chair_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="0.71 0.81 0.78" material="rm_chair_wall_xp_r0"/>
-      <geom type="cylinder" size="0.05 0.23" pos="0.71 1.00 0.23" material="rm_metal_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="2.14 3.50 0.46" material="rm_chair_wall_xp_r0"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="2.14 3.69 0.78" material="rm_chair_wall_xp_r0"/>
-      <geom type="cylinder" size="0.05 0.23" pos="2.14 3.50 0.23" material="rm_metal_wall_xp_r0"/>
-      <geom type="box" size="1.0 0.04 0.58" pos="0 4.9 1.75" material="rm_screen_wall_xp_r0"/>
+    <body name="room_wall_x+_r0" pos="7.600 0.000 -7.500" euler="0 0 -1.5708">
+      <geom type="box" size="4.75 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_x+_r0"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="-4.75 2.5 1.6" material="rm_wall_wall_x+_r0"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="4.75 2.5 1.6" material="rm_wall_wall_x+_r0"/>
+      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_x+_r0"/>
+      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_x+_r0"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="-2.1375 2.5 3.12" material="rm_lamp_wall_x+_r0"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="2.1375 2.5 3.12" material="rm_lamp_wall_x+_r0"/>
+      <geom type="box" size="2.20 0.85 0.06" pos="0 2.25 0.74" euler="0 0 0.129" material="rm_wood_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 3.50 0.46" material="rm_chair_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 3.69 0.78" material="rm_chair_wall_x+_r0"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-2.14 3.50 0.23" material="rm_metal_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 1.00 0.46" material="rm_chair_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 0.81 0.78" material="rm_chair_wall_x+_r0"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-2.14 1.00 0.23" material="rm_metal_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-0.71 3.50 0.46" material="rm_chair_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-0.71 3.69 0.78" material="rm_chair_wall_x+_r0"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-0.71 3.50 0.23" material="rm_metal_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-0.71 1.00 0.46" material="rm_chair_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-0.71 0.81 0.78" material="rm_chair_wall_x+_r0"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-0.71 1.00 0.23" material="rm_metal_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0.71 3.50 0.46" material="rm_chair_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="0.71 3.69 0.78" material="rm_chair_wall_x+_r0"/>
+      <geom type="cylinder" size="0.05 0.23" pos="0.71 3.50 0.23" material="rm_metal_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0.71 1.00 0.46" material="rm_chair_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="0.71 0.81 0.78" material="rm_chair_wall_x+_r0"/>
+      <geom type="cylinder" size="0.05 0.23" pos="0.71 1.00 0.23" material="rm_metal_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="2.14 3.50 0.46" material="rm_chair_wall_x+_r0"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="2.14 3.69 0.78" material="rm_chair_wall_x+_r0"/>
+      <geom type="cylinder" size="0.05 0.23" pos="2.14 3.50 0.23" material="rm_metal_wall_x+_r0"/>
+      <geom type="box" size="1.0 0.04 0.58" pos="0 4.9 1.75" material="rm_screen_wall_x+_r0"/>
       <light pos="0 2.5 2.9000000000000004" dir="0 0 -1" diffuse="0.42 0.40 0.35" castshadow="false"/>
     </body>
-    <body name="room_wall_xp_r1" pos="7.600 0.000 -3.700" euler="0 0 -1.5708">
-      <geom type="box" size="4.75 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_xp_r1"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="-4.75 2.5 1.6" material="rm_wall_wall_xp_r1"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="4.75 2.5 1.6" material="rm_wall_wall_xp_r1"/>
-      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_xp_r1"/>
-      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_xp_r1"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="-2.1375 2.5 3.12" material="rm_lamp_wall_xp_r1"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="2.1375 2.5 3.12" material="rm_lamp_wall_xp_r1"/>
-      <geom type="box" size="2.20 0.85 0.06" pos="0 2.25 0.74" euler="0 0 0.327" material="rm_wood_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 3.50 0.46" material="rm_chair_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 3.69 0.78" material="rm_chair_wall_xp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-2.14 3.50 0.23" material="rm_metal_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 1.00 0.46" material="rm_chair_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 0.81 0.78" material="rm_chair_wall_xp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-2.14 1.00 0.23" material="rm_metal_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0.00 3.50 0.46" material="rm_chair_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="0.00 3.69 0.78" material="rm_chair_wall_xp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="0.00 3.50 0.23" material="rm_metal_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0.00 1.00 0.46" material="rm_chair_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="0.00 0.81 0.78" material="rm_chair_wall_xp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="0.00 1.00 0.23" material="rm_metal_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="2.14 3.50 0.46" material="rm_chair_wall_xp_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="2.14 3.69 0.78" material="rm_chair_wall_xp_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="2.14 3.50 0.23" material="rm_metal_wall_xp_r1"/>
-      <geom type="box" size="1.0 0.04 0.58" pos="0 4.9 1.75" material="rm_screen_wall_xp_r1"/>
+    <body name="room_wall_x+_r1" pos="7.600 0.000 -3.700" euler="0 0 -1.5708">
+      <geom type="box" size="4.75 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_x+_r1"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="-4.75 2.5 1.6" material="rm_wall_wall_x+_r1"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="4.75 2.5 1.6" material="rm_wall_wall_x+_r1"/>
+      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_x+_r1"/>
+      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_x+_r1"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="-2.1375 2.5 3.12" material="rm_lamp_wall_x+_r1"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="2.1375 2.5 3.12" material="rm_lamp_wall_x+_r1"/>
+      <geom type="box" size="2.20 0.85 0.06" pos="0 2.25 0.74" euler="0 0 0.327" material="rm_wood_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 3.50 0.46" material="rm_chair_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 3.69 0.78" material="rm_chair_wall_x+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-2.14 3.50 0.23" material="rm_metal_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 1.00 0.46" material="rm_chair_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 0.81 0.78" material="rm_chair_wall_x+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-2.14 1.00 0.23" material="rm_metal_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0.00 3.50 0.46" material="rm_chair_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="0.00 3.69 0.78" material="rm_chair_wall_x+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="0.00 3.50 0.23" material="rm_metal_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0.00 1.00 0.46" material="rm_chair_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="0.00 0.81 0.78" material="rm_chair_wall_x+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="0.00 1.00 0.23" material="rm_metal_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="2.14 3.50 0.46" material="rm_chair_wall_x+_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="2.14 3.69 0.78" material="rm_chair_wall_x+_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="2.14 3.50 0.23" material="rm_metal_wall_x+_r1"/>
+      <geom type="box" size="1.0 0.04 0.58" pos="0 4.9 1.75" material="rm_screen_wall_x+_r1"/>
       <light pos="0 2.5 2.9000000000000004" dir="0 0 -1" diffuse="0.35 0.33 0.28" castshadow="false"/>
     </body>
-    <body name="room_wall_xm_r0" pos="-7.600 0.000 -7.500" euler="0 0 1.5708">
-      <geom type="box" size="4.75 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_xm_r0"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="-4.75 2.5 1.6" material="rm_wall_wall_xm_r0"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="4.75 2.5 1.6" material="rm_wall_wall_xm_r0"/>
-      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_xm_r0"/>
-      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_xm_r0"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="-2.1375 2.5 3.12" material="rm_lamp_wall_xm_r0"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="2.1375 2.5 3.12" material="rm_lamp_wall_xm_r0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="-3.32 4.1 1.1" material="rm_wood_wall_xm_r0"/>
+    <body name="room_wall_x-_r0" pos="-7.600 0.000 -7.500" euler="0 0 1.5708">
+      <geom type="box" size="4.75 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_x-_r0"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="-4.75 2.5 1.6" material="rm_wall_wall_x-_r0"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="4.75 2.5 1.6" material="rm_wall_wall_x-_r0"/>
+      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_x-_r0"/>
+      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_x-_r0"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="-2.1375 2.5 3.12" material="rm_lamp_wall_x-_r0"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="2.1375 2.5 3.12" material="rm_lamp_wall_x-_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="-3.32 4.1 1.1" material="rm_wood_wall_x-_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-3.76 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-3.59 3.9699999999999998 0.30" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-3.41 3.9699999999999998 0.30" rgba="0.250 0.500 0.280 1.0"/>
@@ -500,7 +739,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="-3.24 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-3.06 3.9699999999999998 1.60" rgba="0.450 0.250 0.550 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-2.89 3.9699999999999998 1.60" rgba="0.600 0.350 0.150 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="0.00 4.1 1.1" material="rm_wood_wall_xm_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="0.00 4.1 1.1" material="rm_wood_wall_x-_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-0.44 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-0.27 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="-0.09 3.9699999999999998 0.30" rgba="0.200 0.350 0.600 1.0"/>
@@ -519,7 +758,7 @@
       <geom type="box" size="0.045 0.12 0.15" pos="0.08 3.9699999999999998 1.60" rgba="0.250 0.500 0.280 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="0.26 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="0.43 3.9699999999999998 1.60" rgba="0.450 0.250 0.550 1.0"/>
-      <geom type="box" size="0.6 0.16 1.1" pos="3.32 4.1 1.1" material="rm_wood_wall_xm_r0"/>
+      <geom type="box" size="0.6 0.16 1.1" pos="3.32 4.1 1.1" material="rm_wood_wall_x-_r0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="2.88 3.9699999999999998 0.30" rgba="0.450 0.250 0.550 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="3.06 3.9699999999999998 0.30" rgba="0.600 0.350 0.150 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="3.23 3.9699999999999998 0.30" rgba="0.650 0.180 0.150 1.0"/>
@@ -538,39 +777,39 @@
       <geom type="box" size="0.045 0.12 0.15" pos="3.41 3.9699999999999998 1.60" rgba="0.200 0.350 0.600 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="3.58 3.9699999999999998 1.60" rgba="0.250 0.500 0.280 1.0"/>
       <geom type="box" size="0.045 0.12 0.15" pos="3.76 3.9699999999999998 1.60" rgba="0.700 0.600 0.200 1.0"/>
-      <geom type="box" size="1.0 0.5 0.05" pos="0 2.1 0.72" euler="0 0 0.292" material="rm_wood_wall_xm_r0"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="0 1.2000000000000002 0.46" material="rm_chair_wall_xm_r0"/>
+      <geom type="box" size="1.0 0.5 0.05" pos="0 2.1 0.72" euler="0 0 0.292" material="rm_wood_wall_x-_r0"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="0 1.2000000000000002 0.46" material="rm_chair_wall_x-_r0"/>
       <light pos="0 2.5 2.9000000000000004" dir="0 0 -1" diffuse="0.39 0.37 0.32" castshadow="false"/>
     </body>
-    <body name="room_wall_xm_r1" pos="-7.600 0.000 -3.700" euler="0 0 1.5708">
-      <geom type="box" size="4.75 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_xm_r1"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="-4.75 2.5 1.6" material="rm_wall_wall_xm_r1"/>
-      <geom type="box" size="0.05 2.5 1.6" pos="4.75 2.5 1.6" material="rm_wall_wall_xm_r1"/>
-      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_xm_r1"/>
-      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_xm_r1"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="-2.1375 2.5 3.12" material="rm_lamp_wall_xm_r1"/>
-      <geom type="box" size="0.55 0.18 0.03" pos="2.1375 2.5 3.12" material="rm_lamp_wall_xm_r1"/>
-      <geom type="box" size="2.20 0.85 0.06" pos="0 2.25 0.74" euler="0 0 -0.096" material="rm_wood_wall_xm_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 3.50 0.46" material="rm_chair_wall_xm_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 3.69 0.78" material="rm_chair_wall_xm_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-2.14 3.50 0.23" material="rm_metal_wall_xm_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 1.00 0.46" material="rm_chair_wall_xm_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 0.81 0.78" material="rm_chair_wall_xm_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="-2.14 1.00 0.23" material="rm_metal_wall_xm_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="2.14 3.50 0.46" material="rm_chair_wall_xm_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="2.14 3.69 0.78" material="rm_chair_wall_xm_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="2.14 3.50 0.23" material="rm_metal_wall_xm_r1"/>
-      <geom type="box" size="0.24 0.24 0.05" pos="2.14 1.00 0.46" material="rm_chair_wall_xm_r1"/>
-      <geom type="box" size="0.24 0.05 0.30" pos="2.14 0.81 0.78" material="rm_chair_wall_xm_r1"/>
-      <geom type="cylinder" size="0.05 0.23" pos="2.14 1.00 0.23" material="rm_metal_wall_xm_r1"/>
-      <geom type="box" size="1.0 0.04 0.58" pos="0 4.9 1.75" material="rm_screen_wall_xm_r1"/>
+    <body name="room_wall_x-_r1" pos="-7.600 0.000 -3.700" euler="0 0 1.5708">
+      <geom type="box" size="4.75 0.05 1.6" pos="0 5.0 1.6" material="rm_wall_wall_x-_r1"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="-4.75 2.5 1.6" material="rm_wall_wall_x-_r1"/>
+      <geom type="box" size="0.05 2.5 1.6" pos="4.75 2.5 1.6" material="rm_wall_wall_x-_r1"/>
+      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 0" material="rm_floor_wall_x-_r1"/>
+      <geom type="box" size="4.75 2.5 0.05" pos="0 2.5 3.2" material="rm_ceil_wall_x-_r1"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="-2.1375 2.5 3.12" material="rm_lamp_wall_x-_r1"/>
+      <geom type="box" size="0.55 0.18 0.03" pos="2.1375 2.5 3.12" material="rm_lamp_wall_x-_r1"/>
+      <geom type="box" size="2.20 0.85 0.06" pos="0 2.25 0.74" euler="0 0 -0.096" material="rm_wood_wall_x-_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 3.50 0.46" material="rm_chair_wall_x-_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 3.69 0.78" material="rm_chair_wall_x-_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-2.14 3.50 0.23" material="rm_metal_wall_x-_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="-2.14 1.00 0.46" material="rm_chair_wall_x-_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="-2.14 0.81 0.78" material="rm_chair_wall_x-_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="-2.14 1.00 0.23" material="rm_metal_wall_x-_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="2.14 3.50 0.46" material="rm_chair_wall_x-_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="2.14 3.69 0.78" material="rm_chair_wall_x-_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="2.14 3.50 0.23" material="rm_metal_wall_x-_r1"/>
+      <geom type="box" size="0.24 0.24 0.05" pos="2.14 1.00 0.46" material="rm_chair_wall_x-_r1"/>
+      <geom type="box" size="0.24 0.05 0.30" pos="2.14 0.81 0.78" material="rm_chair_wall_x-_r1"/>
+      <geom type="cylinder" size="0.05 0.23" pos="2.14 1.00 0.23" material="rm_metal_wall_x-_r1"/>
+      <geom type="box" size="1.0 0.04 0.58" pos="0 4.9 1.75" material="rm_screen_wall_x-_r1"/>
       <light pos="0 2.5 2.9000000000000004" dir="0 0 -1" diffuse="0.41 0.38 0.33" castshadow="false"/>
     </body>
 
     <!-- TOP-DOWN SITS UNDER THE GANTRY. From 3.2 m it was shooting straight through the beams,
          which cut the tank in half in every frame. Just below the water line it sees the whole pool
          with nothing in the way; the surface plane is one-sided so it does not occlude from above. -->
-    <camera name="topdown" pos="0 0 -0.45" xyaxes="1 0 0 0 1 0" fovy="104" mode="fixed"/>
+    <camera name="topdown" pos="0 0 -0.97" xyaxes="1 0 0 0 1 0" fovy="104" mode="fixed"/>
     <!-- SIDE-ON IS INSIDE THE TANK, against the -Y wall looking across. Outside the glass it was
          shooting through a textured wall plane and seeing mostly concrete. -->
     <camera name="sideon" pos="0 -4.4 -4.0" xyaxes="1 0 0 0 0.35 0.937" fovy="75" mode="fixed"/>

@@ -105,13 +105,17 @@ def circle_spec(rng):
     axis = rng.normal(size=3)
     axis /= np.linalg.norm(axis)
     R = rot_from_axis_angle(axis, rng.uniform(0, 2 * np.pi))
-    rad = rng.uniform(1.2, 3.2)
-    speed = rng.uniform(0.30, 0.75)   # capped: at 1.05 m/s drag alone eats 0.84 of the
-    #                                   surge budget and the PD has nothing left to correct with
+    # the DEPTH axis is the binding one: a circle of radius r needs MARGIN + r of headroom at both
+    # ends of a 10 m column, so r > (TANK_D/2 - MARGIN) cannot be placed at all
+    rad = rng.uniform(1.0, min(3.6, TANK_D / 2 - MARGIN - 0.1))
+    speed = rng.uniform(0.22, 0.85)   # SPREAD, not two values. Capped at 0.85 because at 1.05 m/s
+    #                                   drag alone eats 0.84 of the surge budget and the loop has
+    #                                   nothing left to correct with -- measured, not guessed
     centre = np.array([rng.uniform(-1, 1) * (TANK_L / 2 - MARGIN - rad),
                        rng.uniform(-1, 1) * (TANK_W / 2 - MARGIN - rad),
-                       -rng.uniform(MARGIN + rad, TANK_D - MARGIN - rad)])
-    return dict(R=R, rad=rad, speed=speed, centre=centre, phase=rng.uniform(0, 2 * np.pi))
+                       -rng.uniform(MARGIN + rad, max(MARGIN + rad + 1e-3, TANK_D - MARGIN - rad))])
+    return dict(R=R, rad=rad, speed=speed, centre=centre, phase=rng.uniform(0, 2 * np.pi),
+                sweep_phase=rng.uniform(0, 2 * np.pi, 3))
 
 
 def circle_at(spec, t):
@@ -218,9 +222,26 @@ def orientation_error(quat, R_des):
 W_CAP = 0.9
 
 
+# Roll, pitch and yaw excursions for the third class, as (amplitude, frequency). Three different
+# frequencies so the attitude never repeats a simple cycle. Sized against the ACTUATOR, not for
+# looks: peak body rate is the sum of A*2*pi*f = 0.20 + 0.22 + 0.54 = 0.95 rad/s worst case against
+# the 1.34 rad/s the yaw torque can hold, and they peak together only rarely because the
+# frequencies are incommensurate. An earlier 60 deg at 0.22 Hz on yaw alone peaked at 1.45 and
+# saturated the actuator, which is what the sizing is avoiding.
+SWEEP = ((np.radians(20.0), 0.09), (np.radians(18.0), 0.11), (np.radians(35.0), 0.14))
+
+
+def _excursion(t, phase):
+    """The periodic attitude offset and its rate, as body-frame rotation vectors."""
+    w = np.array([2 * np.pi * f for _, f in SWEEP])
+    A = np.array([a for a, _ in SWEEP])
+    return A * np.sin(w * t + phase), A * w * np.cos(w * t + phase)
+
+
 def policy_circle(spec, yaw_sweep=False, k_pos=1.1, k_att=2.6, v_cap=1.4):
-    """Returns f(t, state) -> action. `yaw_sweep` periodically swings the facing off the tangent, so
-    the body rotates while still thrusting along the path -- the third class.
+    """Returns f(t, state) -> action. `yaw_sweep` periodically rotates the body off the path frame
+    about ALL THREE axes -- roll, pitch and yaw -- so the vehicle tumbles slowly while still
+    thrusting along the circle. That is the third class.
 
     Both loops are first order (see `thrust_for`). The position term enters as a VELOCITY correction,
     capped, rather than as an acceleration, so a large excursion asks for a bounded speed back onto the
@@ -237,19 +258,18 @@ def policy_circle(spec, yaw_sweep=False, k_pos=1.1, k_att=2.6, v_cap=1.4):
         lin = thrust_for(v_cmd, v, q)
 
         fwd = v_d / max(1e-6, np.linalg.norm(v_d))
-        if yaw_sweep:
-            # +-40 deg about the plane normal at 0.15 Hz. Sized against the hull, not chosen for
-            # looks: 60 deg at 0.22 Hz peaks at 1.45 rad/s, above the 1.34 rad/s the yaw torque can
-            # hold, so the sweep itself was saturating the actuator. 40 deg at 0.15 Hz peaks at 0.66.
-            fwd = rot_from_axis_angle(n_hat, np.radians(40.0) * np.sin(2 * np.pi * 0.15 * t)) @ fwd
+        R_des = frame_on_plane(fwd, n_hat)
         # FEEDFORWARD + correction. Without the feedforward the loop can only generate the path's own
         # turn rate by holding a standing error (w_des / k_att = 5.5 deg here), which is both sloppy
         # and the seed the intermediate-axis instability grows from.
         w_ff = (quat_to_mat(q).T @ n_hat) * w_path
         if yaw_sweep:
-            w_ff = w_ff + (quat_to_mat(q).T @ n_hat) * (
-                np.radians(40.0) * 2 * np.pi * 0.15 * np.cos(2 * np.pi * 0.15 * t))
-        w_cmd = w_ff + k_att * orientation_error(q, frame_on_plane(fwd, n_hat))
+            e, de = _excursion(float(t), spec["sweep_phase"])
+            ne = np.linalg.norm(e)
+            if ne > 1e-9:
+                R_des = R_des @ rot_from_axis_angle(e / ne, ne)
+            w_ff = w_ff + de                     # the excursion rate is already in body axes
+        w_cmd = w_ff + k_att * orientation_error(q, R_des)
         nw = np.linalg.norm(w_cmd)
         if nw > W_CAP:
             w_cmd = w_cmd * (W_CAP / nw)
@@ -257,18 +277,28 @@ def policy_circle(spec, yaw_sweep=False, k_pos=1.1, k_att=2.6, v_cap=1.4):
     return act
 
 
-def policy_random(rng, dt, hold=0.7, scale=1.0):
-    """Piecewise-constant random actions, resampled every `hold` seconds.
+HOLD_RANGE = (0.25, 1.60)         # seconds; log-uniform, resampled at every switch
+
+
+def policy_random(rng, dt, hold=None, scale=1.0):
+    """Piecewise-constant random actions, each held for a RANDOM duration.
 
     Held rather than per-step white noise: at 30 Hz, independent samples average to nothing against a
     0.3 s time constant and the AUV would just sit there vibrating. Measured -- at hold 0.4 s and scale
     0.75 a 30 s episode wandered a 2 m box; at 0.7 s and full scale it covers the tank, which is what
-    the world model needs to see."""
-    n = max(1, int(round(hold / dt)))
-    state = {"k": 10 ** 9, "a": np.zeros(6, np.float32)}
+    the world model needs to see.
+
+    A DISTRIBUTION OF HOLDS, not one constant. A fixed 0.7 s puts a single timescale into every
+    random episode, and a model can learn that period rather than the dynamics. Holds are drawn
+    log-uniform over 0.25-1.6 s so short jabs and long sustained pushes both appear, with the
+    geometric mean near the old constant. Pass `hold` to pin it for a test."""
+    lo, hi = HOLD_RANGE
+    state = {"k": 10 ** 9, "n": 1, "a": np.zeros(6, np.float32)}
 
     def act(t, s):
-        if state["k"] >= n:
+        if state["k"] >= state["n"]:
+            h = hold if hold is not None else float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            state["n"] = max(1, int(round(h / dt)))
             state["a"] = (rng.uniform(-1, 1, 6) * scale).astype(np.float32)
             state["k"] = 0
         state["k"] += 1

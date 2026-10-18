@@ -28,7 +28,11 @@ import numpy as np
 import trimesh
 
 HERE = pathlib.Path(__file__).parent / "assets"
-BUDGET = {"mola": 34000, "dock": 460, "diver": 14000, "fish": 4000, "hook": 9000}
+BUDGET = {"mola": 34000, "dock": 460, "diver": 14000, "fish": 4000, "hook": 13000}
+# Models that ship a baseColor TEXTURE rather than flat baseColorFactor colours. These go down a
+# different path: one mesh keeping its UVs, the texture written out beside it, and no decimation
+# (quadric decimation drops the uv attribute, and a textured mesh without uvs is a grey blob).
+TEXTURED = ("fish", "hook")
 MIN_FACES = 300
 
 
@@ -75,10 +79,49 @@ def _decimate_components(mesh, ratio):
     return trimesh.util.concatenate(out)
 
 
+def _convert_textured(name, src, log):
+    """One mesh, UVs kept, baseColor image written as <name>_tex.png. Returns [(obj, tex, faces)].
+
+    The shark and the crane hook are not flat-coloured models -- they carry a baseColor texture, and
+    reading only `baseColorFactor` (which is absent on both) produced the fallback grey shark and
+    the uniformly yellow hook. MuJoCo's OBJ loader reads `vt`, so the fix is simply to stop throwing
+    the uvs away: no decimation, no colour grouping, one material with a texture."""
+    scene = trimesh.load(src / name / "scene.gltf", force="scene")
+    parts, img = [], None
+    for node in scene.graph.nodes_geometry:
+        T, gname = scene.graph[node]
+        geo = scene.geometry[gname]
+        if not isinstance(geo, trimesh.Trimesh):
+            continue
+        m = geo.copy()
+        m.apply_transform(T)
+        parts.append(m)
+        tex = getattr(getattr(geo.visual, "material", None), "baseColorTexture", None)
+        if tex is not None and img is None:
+            img = tex
+    mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+    mesh.apply_translation(-mesh.bounds.mean(axis=0))
+    obj = src / name / f"{name}_g0.obj"
+    mesh.export(obj, include_texture=True)   # include_texture is what writes the `vt` lines
+    txt = [ln for ln in obj.read_text().splitlines() if not ln.startswith(("mtllib", "usemtl"))]
+    obj.write_text("\n".join(txt) + "\n")
+    for cand in (obj.with_suffix(".obj.mtl"), obj.parent / "material.mtl"):
+        if cand.exists():
+            cand.unlink()
+    tex_name = f"{name}_tex.png"
+    img.convert("RGB").save(src / name / tex_name)
+    has_uv = "vt " in obj.read_text()[:400000]
+    log(f"  {name:6s} {len(mesh.faces):6d} faces, textured {img.size}, uvs in obj: {has_uv}")
+    return [(obj.name, tex_name, int(len(mesh.faces)))]
+
+
 def convert(names=("mola", "dock", "diver", "fish", "hook"), src=HERE, log=print):
     """Write <name>/<name>_g<k>.obj per colour group. Returns {name: [(file, rgba, faces)]}."""
     out = {}
     for name in names:
+        if name in TEXTURED:
+            out[name] = _convert_textured(name, src, log)
+            continue
         scene = trimesh.load(src / name / "scene.gltf", force="scene")
         groups = _colour_groups(scene)
         merged = {rgba: trimesh.util.concatenate(ms) for rgba, ms in groups.items()}

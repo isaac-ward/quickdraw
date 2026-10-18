@@ -55,26 +55,79 @@ def _tags(img, nx, ny, px=72, margin=0.06, first_id=0):
 # way to tell from a frame whether the camera is pointing at +x or -y, which makes a wrong pose or a
 # mirrored texture invisible in review. The spread is large enough to read at a glance.
 SHADE = {"wall_x+": 1.30, "wall_x-": 0.70, "wall_y+": 1.08, "wall_y-": 0.86, "floor": 0.55}
+TEX_N = 512                   # cube faces must be square; see build_textures
+WATER_Z = -0.52               # the water line, 50 cm below the tank rim, so the rim shows above it
+PX_PER_M = 70                 # concrete resolution; every wall box is CROPPED from one wall-wide
+#                               field at this density, which is what stops the texture stretching
+
+
+def _square(crop, n=TEX_N):
+    """Resample a crop to n x n, PER AXIS. Undone exactly by MuJoCo's stretch onto the box face.
+
+    The axis being shrunk is area-averaged; the axis being grown is nearest-neighbour. Bilinear on
+    the growing axis was the bug behind the streaks: a 15 x 1.2 m strip crops to 1050 x 84, and
+    smoothly interpolating 84 rows up to 512 turns honest speckle into soft horizontal bands. Taking
+    them nearest keeps each source pixel a sharp block, so the stretched result is square speckle at
+    PX_PER_M in both directions."""
+    import cv2
+
+    h, w = crop.shape[:2]
+    out = cv2.resize(crop, (n, h), interpolation=cv2.INTER_AREA if w > n else cv2.INTER_NEAREST)
+    return cv2.resize(out, (n, n), interpolation=cv2.INTER_AREA if h > n else cv2.INTER_NEAREST)
 
 
 def build_textures(out=BUILD, res=1024, seed=0):
-    """Bake the four wall surfaces and the floor.
+    """Bake ONE concrete field per wall at a fixed px/metre, then a crop per wall box.
 
-    WALL TEXTURES ARE SQUARE AND CUBE-MAPPED. The walls are box geoms, and a `type="2d"` texture on
-    a box is stretched to each face independently -- on a 7.5 x 0.18 x 1.5 m strip that turned the
-    concrete into vertical planks. A `type="cube"` texture with `texuniform="true"` maps in world
-    units instead, so the grain is the same size on a long strip and a narrow pillar. Square because
-    cube faces are square. No ArUco on the walls (removed at the user's request); the floor keeps
-    its markers at the halved density.
+    THE STRETCH, AND WHY CROPPING IS THE FIX. The walls are box geoms. A `type="2d"` texture on a box
+    is smeared per face into vertical planks; a `type="cube"` texture ignores `texrepeat` entirely
+    (measured: rep=1 and rep=4 render identically) and `texuniform="true"` projects it radially into
+    a starburst. So MuJoCo offers no way to TILE on a box -- whatever image a face gets is stretched
+    to fill it, and a 15 x 0.4 m strip and a 1.5 x 1.9 m pillar given the same square image show
+    wildly different grain.
+
+    CROP, THEN SQUASH TO SQUARE, AND LET MUJOCO STRETCH IT BACK. Each box gets the region of one
+    wall-spanning concrete field that matches its own footprint -- so neighbouring boxes are
+    neighbouring crops and the concrete runs continuously across the wall -- and that crop is then
+    resampled to TEX_N x TEX_N. Cube textures must be square, and the square-ing is undone exactly
+    when MuJoCo stretches the image onto the face, so the grain lands back at PX_PER_M in both
+    directions on every box regardless of its aspect. (A 2d texture cannot be used instead: on a box
+    MuJoCo smears it along one axis only, which is the vertical-plank artifact, and feeding it a
+    correctly-shaped crop does not help because the mapping never reads the second axis.)
     """
     import imageio.v2 as imageio
 
+    from .walls import build_wall
+
     out.mkdir(parents=True, exist_ok=True)
+    hl, hw = TANK_L / 2, TANK_W / 2
     painted = {}
-    for name, fid in (("wall_y+", 0), ("wall_y-", 40), ("wall_x+", 80), ("wall_x-", 120)):
-        img = np.clip(concrete(res, res, seed=seed + fid).astype(np.float32) * SHADE[name],
-                      0, 255).astype(np.uint8)
-        imageio.imwrite(out / f"{name}.png", img)
+    for name, axis, sign, at, half, fid in (("wall_y+", "y", 1, hw, hl, 0),
+                                            ("wall_y-", "y", -1, hw, hl, 40),
+                                            ("wall_x+", "x", 1, hl, hw, 80),
+                                            ("wall_x-", "x", -1, hl, hw, 120)):
+        W = int(2 * half * PX_PER_M)
+        H = int(TANK_D * PX_PER_M)
+        field = np.clip(concrete(H, W, seed=seed + fid).astype(np.float32) * SHADE[name],
+                        0, 255).astype(np.uint8)
+        crops = {}
+
+        def mat_fn(tag, u0, u1, z0, z1, _n=name, _f=field, _h=half, _W=W, _H=H, _c=crops,
+                   _rot=(axis == "x")):
+            x0 = int(round((u0 + _h) / (2 * _h) * _W))
+            x1 = max(x0 + 2, int(round((u1 + _h) / (2 * _h) * _W)))
+            y0 = int(round((-z1) / TANK_D * _H))
+            y1 = max(y0 + 2, int(round((-z0) / TANK_D * _H)))
+            crop = _f[y0:y1, x0:x1]
+            # MuJoCo's cube mapping lays the image onto a +-X face rotated 90 degrees relative to a
+            # +-Y face. Without this the aspect correction is applied across the wrong axis there,
+            # and the end walls came out streaked while the long walls looked right.
+            _c[tag] = _square(np.rot90(crop) if _rot else crop)
+            return f"m_{_n}_{tag}"
+
+        build_wall(name, axis, sign, at, half, TANK_D, RING_Z, mat_fn)
+        for tag, img in crops.items():
+            imageio.imwrite(out / f"{name}_{tag}.png", img)
         painted[name] = []
     floor = np.clip(concrete(res, res, seed=seed + 99).astype(np.float32) * SHADE["floor"],
                     0, 255).astype(np.uint8)
@@ -85,8 +138,8 @@ def build_textures(out=BUILD, res=1024, seed=0):
 
 MIN_RGB, SPEC, SHIN = 0.09, 0.55, 0.65
 # The frame group's baseColorFactor is literally (0,0,0), so it rendered as a hole in the water
-# whatever the lighting -- the chase and top-down views showed a silhouette, not a vehicle. A floor
-# of 0.09 plus real specular is what dark anodised aluminium actually looks like underwater.
+# whatever the lighting. A floor of 0.09 plus real specular is what dark anodised aluminium looks
+# like underwater.
 
 
 def _mola_geoms(scale):
@@ -114,33 +167,41 @@ def _mola_geoms(scale):
 
 
 def _walls_and_rooms(hl, hw, seed=4242):
-    """Four boxed walls with openings, plus one room behind each (wall, ring) pair.
+    """Four boxed walls with openings and frames, one room behind each (wall, ring) pair.
 
-    The room is placed at the wall surface, rotated so its depth axis points AWAY from the tank, and
-    dropped so the window sits about 1.3 m above the room floor -- which is where a window is."""
+    Returns (wall geoms, wall texture+material assets, room materials, room bodies). Each wall box
+    declares its OWN texture -- the crop `build_textures` wrote for it -- which is what keeps the
+    concrete isotropic on boxes of wildly different aspect."""
     from .rooms import room_body, room_spec
     from .walls import build_wall
 
     rng = np.random.default_rng(seed)
-    walls, mats, bodies = [], [], []
-    #            name      axis sign  at   half-length   material   yaw of "away from tank"
-    for name, axis, sign, at, half, mat, yaw in (
-            ("wall_yp", "y", 1, hw, hl, "m_yp", 0.0),
-            ("wall_ym", "y", -1, hw, hl, "m_ym", np.pi),
-            ("wall_xp", "x", 1, hl, hw, "m_xp", -np.pi / 2),
-            ("wall_xm", "x", -1, hl, hw, "m_xm", np.pi / 2)):
-        g, centres, ring_z = build_wall(name, axis, sign, at, half, TANK_D, RING_Z, mat)
+    walls, wall_assets, mats, bodies = [], [], [], []
+    for name, axis, sign, at, half, yaw in (("wall_y+", "y", 1, hw, hl, 0.0),
+                                            ("wall_y-", "y", -1, hw, hl, np.pi),
+                                            ("wall_x+", "x", 1, hl, hw, -np.pi / 2),
+                                            ("wall_x-", "x", -1, hl, hw, np.pi / 2)):
+        seen = []
+
+        def mat_fn(tag, u0, u1, z0, z1, _n=name, _s=seen):
+            _s.append(tag)
+            return f"m_{_n}_{tag}"
+
+        g, centres, ring_z = build_wall(name, axis, sign, at, half, TANK_D, RING_Z, mat_fn)
         walls += g
+        for tag in seen:
+            wall_assets.append(
+                f'<texture name="t_{name}_{tag}" type="cube" file="{name}_{tag}.png"/>'
+                f'<material name="m_{name}_{tag}" texture="t_{name}_{tag}" texuniform="false" '
+                f'specular="0.06" shininess="0.06"/>')
         for ri, zc in enumerate(ring_z):
             spec = room_spec(rng)
-            if axis == "y":
-                pos = (0.0, sign * (at + 0.1), zc - 1.3)
-            else:
-                pos = (sign * (at + 0.1), 0.0, zc - 1.3)
+            pos = ((0.0, sign * (at + 0.1), zc - 1.3) if axis == "y"
+                   else (sign * (at + 0.1), 0.0, zc - 1.3))
             m, b = room_body(f"{name}_r{ri}", spec, pos, yaw, span=2 * half * 0.95)
             mats.append(m)
             bodies.append(b)
-    return "\n    ".join(walls), "".join(mats), "".join(bodies)
+    return ("\n    ".join(walls), "".join(wall_assets), "".join(mats), "".join(bodies))
 
 
 def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> str:
@@ -155,7 +216,7 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
     BUOY_RGB = "0.72 0.18 0.92" if buoy_purple else "0.18 1.00 0.25"
     dock_pos = (dx * (hl - 2.0), dy * (hw - 2.0), -1.4)
     mola_assets, mola_geoms = _mola_geoms(mola_scale)
-    wall_xml, room_mats, room_xml = _walls_and_rooms(hl, hw)
+    wall_xml, wall_assets, room_mats, room_xml = _walls_and_rooms(hl, hw)
 
     lights = "".join(
         f'<geom name="ceil_{i}" type="cylinder" material="m_lamp" size="0.45 0.04" '
@@ -164,17 +225,20 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
         f'castshadow="false"/>'
         for i, (x, y) in enumerate([(ax, ay) for ax in (-5.2, -1.7, 1.7, 5.2) for ay in (-2.6, 2.6)]))
 
-    # GREAT WHITES, NOT APPROXIMATED FISH. The source mesh swims along -Y, so the geom yaws +90 deg
-    # to put the nose on +X, which is the heading `intruders.mover` writes into mocap_quat.
+    # GREAT WHITES, NOT APPROXIMATED FISH. The source mesh swims along +Y -- verified by rendering
+    # it against labelled axes, after assuming -Y and shipping sharks that swam backwards -- so the
+    # geom yaws -90 deg to put the nose on +X, which is the heading `intruders.mover` writes.
     fish = "".join(f"""
     <body name="fish{i}" mocap="true" pos="0 0 -5">
-      <geom type="mesh" mesh="shark" material="m_shark" euler="0 0 1.5708" contype="0" conaffinity="0"/>
+      <geom type="mesh" mesh="shark" material="m_shark" euler="0 0 -1.5708" contype="0" conaffinity="0"/>
     </body>""" for i in range(n_fish))
 
     extra_assets = ""
     if n_fish:
         extra_assets += ('<mesh name="shark" file="fish/fish_g0.obj" scale="1.6 1.6 1.6"/>'
-                         '<material name="m_shark" rgba="0.40 0.44 0.48 1" specular="0.35" shininess="0.4"/>')
+                         '<texture name="t_shark" type="2d" file="shark.png"/>'
+                         '<material name="m_shark" texture="t_shark" texuniform="false" '
+                         'specular="0.3" shininess="0.35"/>')
 
     return f"""<mujoco model="mbari_tank">
   <compiler angle="radian" meshdir="." texturedir="build"/>
@@ -187,21 +251,13 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
     <quality shadowsize="512" offsamples="0"/>
   </visual>
   <asset>
-    <!-- CUBE TEXTURES ON THE WALLS, texuniform OFF. Rendered side by side on the real wall
-         geometry: `type="2d"` smears the image into vertical planks at every texrepeat and at both
-         texuniform settings, and cube + texuniform="true" projects it radially into a starburst.
-         Cube + texuniform="false" gives each box face the whole image, which for scale-free
-         concrete noise reads correctly at every box size. One baked image per surface, each a
-         different shade, so a frame tells you which wall you are looking at. -->
+    <!-- WALL CONCRETE IS ONE CROP PER BOX (see build_textures). MuJoCo cannot tile a texture on a
+         box geom -- 2d smears into planks, cube ignores texrepeat, cube+texuniform starbursts --
+         so instead every box carries an image already cut to its own aspect out of one
+         wall-spanning concrete field. Isotropic grain, continuous across the wall, no stretch. -->
     <texture name="t_fl" type="2d" file="floor.png"/>
-    <texture name="t_yp" type="cube" file="wall_y+.png"/>
-    <texture name="t_ym" type="cube" file="wall_y-.png"/>
-    <texture name="t_xp" type="cube" file="wall_x+.png"/>
-    <texture name="t_xm" type="cube" file="wall_x-.png"/>
-    <material name="m_yp" texture="t_yp" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
-    <material name="m_ym" texture="t_ym" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
-    <material name="m_xp" texture="t_xp" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
-    <material name="m_xm" texture="t_xm" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
+    {wall_assets}
+    <material name="m_frame" rgba="0.045 0.045 0.05 1" specular="0.35" shininess="0.5"/>
     <material name="m_fl" texture="t_fl" texuniform="false" texrepeat="1 1" specular="0.05"/>
     <material name="m_surf" rgba="0.26 0.52 0.62 0.72" specular="0.9" shininess="0.9" reflectance="0.3"/>
     <material name="m_room" rgba="0.085 0.085 0.095 1" specular="0.02"/>
@@ -211,9 +267,12 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
     <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.1"/>
     <material name="m_buoy_g" rgba="{BUOY_RGB} 1" specular="0.6" shininess="0.6" emission="0.18"/>
     <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
+    <material name="m_cable" rgba="0.26 0.26 0.28 1" specular="0.5" shininess="0.6"/>
     {mola_assets}{extra_assets}{room_mats}
     <mesh name="dock" file="dock/dock_g0.obj" scale="1 1 1"/>
     <mesh name="hook" file="hook/hook_g0.obj" scale="{HOOK_S} {HOOK_S} {HOOK_S}"/>
+    <texture name="t_hook" type="2d" file="hook.png"/>
+    <material name="m_hook" texture="t_hook" texuniform="false" specular="0.4" shininess="0.5"/>
   </asset>
 
   <worldbody>
@@ -225,7 +284,7 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
          Each wall is eleven boxes leaving three real openings per ring (see walls.py). -->
     <geom name="floor"  type="plane" material="m_fl" pos="0 0 {-TANK_D}" size="{hl} {hw} 0.1"/>
     {wall_xml}
-    <geom name="surface" type="plane" material="m_surf" pos="0 0 -0.02" size="{hl} {hw} 0.1" euler="3.14159 0 0"/>
+    <geom name="surface" type="plane" material="m_surf" pos="0 0 {WATER_Z}" size="{hl} {hw} 0.1" euler="3.14159 0 0"/>
 
     <!-- THE WAREHOUSE. A dark enclosed room around the tank, lit by ceiling lamps. The tank is a
          hole in its floor, so from underwater the surface reads as a lid with a lit room above. -->
@@ -254,19 +313,23 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
       <geom name="g_leg_d" type="box" material="m_gantry" pos="{hl} {-GANTRY_W/2} -0.55" size="0.12 0.12 0.55"/>
     </body>
     <body name="hook" pos="1.2 0 0">
-      <geom name="hook_line" type="capsule" material="m_gantry" fromto="0 0 {GANTRY_H} 0 0 {-TANK_D/4}" size="0.055"/>
-      <!-- a real crane hook (block + hook, 10.8k faces). The mesh hangs along -Y with the hook at
-           +Y, so euler x=-90 deg stands it up: sheave block at the top, hook pointing down. -->
-      <geom name="hook_g" type="mesh" mesh="hook" material="m_gantry" euler="-1.5708 0 0"
+      <!-- CYLINDER, NOT CAPSULE, for the cable: a capsule's hemispherical caps swell at the ends
+           and the line read as varying width. A cylinder is the same width the whole way down. -->
+      <geom name="hook_line" type="cylinder" material="m_cable" size="0.045 {(GANTRY_H + TANK_D/4)/2:.4f}"
+            pos="0 0 {(GANTRY_H - TANK_D/4)/2:.4f}" contype="0" conaffinity="0"/>
+      <!-- a real crane hook (block + hook, 12.9k faces, its own baseColor texture). The mesh lies
+           along -Y with the hook at +Y, so euler x=+90 deg stands it up HOOK-END DOWN. At -90 it
+           was upside down, with the hook opening at the top. -->
+      <geom name="hook_g" type="mesh" mesh="hook" material="m_hook" euler="1.5708 0 0"
             pos="0 0 {-TANK_D/4 - HOOK_H/2}" contype="0" conaffinity="0"/>
     </body>
 
     <body name="buoy_orange" pos="{hl*0.45} {hw*0.5} -5.0">
-      <geom name="rope_o" type="capsule" material="m_rope" fromto="0 0 0 0 0 5.0" size="0.025"/>
+      <geom name="rope_o" type="capsule" material="m_rope" fromto="0 0 0 0 0 {5.0 + WATER_Z}" size="0.025"/>
       <geom name="buoy_o" type="sphere" material="m_buoy_o" size="0.38"/>
     </body>
     <body name="buoy_green" pos="{-hl*0.40} {-hw*0.45} -5.6">
-      <geom name="rope_g" type="capsule" material="m_rope" fromto="0 0 0 0 0 5.6" size="0.025"/>
+      <geom name="rope_g" type="capsule" material="m_rope" fromto="0 0 0 0 0 {5.6 + WATER_Z}" size="0.025"/>
       <geom name="buoy_g" type="sphere" material="m_buoy_g" size="0.34"/>
     </body>
 
@@ -287,7 +350,7 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
     <!-- TOP-DOWN SITS UNDER THE GANTRY. From 3.2 m it was shooting straight through the beams,
          which cut the tank in half in every frame. Just below the water line it sees the whole pool
          with nothing in the way; the surface plane is one-sided so it does not occlude from above. -->
-    <camera name="topdown" pos="0 0 -0.45" xyaxes="1 0 0 0 1 0" fovy="104" mode="fixed"/>
+    <camera name="topdown" pos="0 0 {WATER_Z - 0.45}" xyaxes="1 0 0 0 1 0" fovy="104" mode="fixed"/>
     <!-- SIDE-ON IS INSIDE THE TANK, against the -Y wall looking across. Outside the glass it was
          shooting through a textured wall plane and seeing mostly concrete. -->
     <camera name="sideon" pos="0 {-hw + 0.6} {-TANK_D/2 + 1.0}" xyaxes="1 0 0 0 0.35 0.937" fovy="75" mode="fixed"/>
@@ -306,6 +369,12 @@ def build(out=BUILD, textures=True, name="tank.xml", **kw):
     if not (ASSETS / "mola_groups.json").exists():
         rows = convert(log=lambda *_: None)
         (ASSETS / "mola_groups.json").write_text(json.dumps([[r[0], list(r[1])] for r in rows["mola"]]))
+    # the shark and hook carry their own baseColor images; MuJoCo looks for textures in `texturedir`
+    for src_name, dst in (("fish/fish_tex.png", "shark.png"), ("hook/hook_tex.png", "hook.png")):
+        src = ASSETS / src_name
+        if src.exists() and not (out / dst).exists():
+            out.mkdir(parents=True, exist_ok=True)
+            (out / dst).write_bytes(src.read_bytes())
     painted = build_textures(out) if textures else {}
     p = ASSETS / name
     p.write_text(mjcf(**kw))
