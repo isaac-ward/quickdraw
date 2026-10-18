@@ -75,3 +75,31 @@ def render(core, norm, root, split, ep_idx, out_dir, key="fpv", P=8, dev="cuda",
     mb = viz.save_gif(str(out_dir / f"{split}_ep{ep_idx}.gif"), canvas, fps=12, max_mb=45, log=log)
     log(f"  {split} ep{ep_idx}: {len(obs)} frames, surprise {sur.min():.2f}-{sur.max():.2f}, gif {mb:.1f} MB")
     return sur
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    ap = argparse.ArgumentParser(description="Pixel-level uncertainty videos, one per split.")
+    ap.add_argument("--ckpt", required=True, help="training run dir or .ckpt")
+    ap.add_argument("--root", default="/app/logs/mbari/data/v4")
+    ap.add_argument("--out", default="/app/logs/mbari/uncertainty/pixel")
+    ap.add_argument("--splits", default="train,ood_thruster,ood_fish,ood_buoy")
+    ap.add_argument("--ep", type=int, default=0)
+    ap.add_argument("--K", type=int, default=32)
+    a = ap.parse_args()
+
+    from ...evaluation.standalone import load_checkpoint
+    from ...training.setup import build_model, normalizer
+    from .run_uncertainty import _cfg_for
+
+    cfg = _cfg_for(a.ckpt)
+    core = build_model(cfg).to("cuda")
+    load_checkpoint(core, a.ckpt)
+    core.eval()
+    norm = normalizer(cfg)
+    for sp in a.splits.split(","):
+        render(core, norm, a.root, sp, a.ep, a.out, key=str(cfg.data.cam), P=int(cfg.data.P),
+               K=a.K, log=lambda m: print(m, flush=True))

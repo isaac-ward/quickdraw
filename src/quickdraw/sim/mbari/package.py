@@ -55,7 +55,7 @@ def episodes_from(root, split, cams=CAMS, limit=None, log=print):
     return eps
 
 
-def build(root="/app/logs/mbari/data/v1", name="mbari-tank", cams=CAMS, log=print):
+def build(root="/app/logs/mbari/data/v4", name="mbari-tank", cams=CAMS, log=print):
     """MEMORY. build_recorded_dataset holds every Episode in RAM before encoding, and four 144x192
     streams over 390 episodes is ~116 GB of uint8. That fits on this box but loading it took longer
     than training would. Pass `cams=("fpv",)` for the training dataset (18 GB) and run the full
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/app/logs/mbari/data/v1")
+    ap.add_argument("--root", default="/app/logs/mbari/data/v4")
     ap.add_argument("--name", default="mbari-tank")
     ap.add_argument("--cams", default=",".join(CAMS))
     a = ap.parse_args()
