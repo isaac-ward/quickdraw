@@ -13,8 +13,8 @@ world model that sees nothing but fog at range learns nothing from the far wall.
 """
 import numpy as np
 
-K_RGB = np.array([0.17, 0.075, 0.055], np.float32)        # per-metre extinction, red attenuates fastest
-WATER = np.array([0.09, 0.27, 0.31], np.float32)        # the colour an infinitely thick slab tends to
+K_RGB = np.array([0.125, 0.055, 0.040], np.float32)        # per-metre extinction, red attenuates fastest
+WATER = np.array([0.10, 0.30, 0.35], np.float32)        # the colour an infinitely thick slab tends to
 
 
 def attenuate(rgb_u8, depth_m, k=K_RGB, water=WATER, floor=0.0):

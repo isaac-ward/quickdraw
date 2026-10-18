@@ -33,6 +33,45 @@ def aruco_tile(idx: int, px: int = 64, border: int = 1) -> np.ndarray:
     return np.repeat(img[:, :, None], 3, 2)
 
 
+def window_rows(img, cols, rooms, rings=(0.22, 0.62), h_frac=0.20, w_frac=0.15, tint=(0.62, 0.86, 0.92)):
+    """Two RINGS of viewing ports, each opening onto a rendered room.
+
+    DENSITY HALVED from the first version (7 and 5 ports per wall became 4 and 3) and both rings are
+    at the same two depths on every wall, so they read as two continuous rows around the tank rather
+    than as rows on two walls and columns on the other two -- which is what the first version did,
+    because it indexed rows down the IMAGE and the end-wall textures are portrait while the long-wall
+    textures are landscape.
+
+    `rooms` is one rendered room image per ring. The glass is the room image under a slight blue-green
+    tint rather than a dark rectangle, so a window reads as something you can see through.
+    """
+    H, W = img.shape[:2]
+    tint = np.asarray(tint, np.float32)
+    for r, zf in enumerate(rings):
+        y0, y1 = int(H * zf), int(H * zf) + int(H * h_frac)
+        room = rooms[r % len(rooms)]
+        for c in range(cols):
+            cx = W * (0.14 + c * 0.72 / max(1, cols - 1))
+            x0, x1 = int(cx - W * w_frac / 2), int(cx + W * w_frac / 2)
+            x0, x1 = max(0, x0), min(W, x1)
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                continue
+            img[max(0, y0 - 6):y1 + 6, max(0, x0 - 6):x1 + 6] = (206, 206, 200)     # frame
+            pane = _fit(room, y1 - y0, x1 - x0).astype(np.float32)
+            img[y0:y1, x0:x1] = np.clip(pane * tint[None, None, :] * 0.92, 0, 255).astype(np.uint8)
+            img[y0:y0 + max(2, (y1 - y0) // 7), x0:x1] = (
+                0.45 * img[y0:y0 + max(2, (y1 - y0) // 7), x0:x1] + 0.55 * np.array([150, 195, 210])
+            ).astype(np.uint8)                                                       # specular band
+    return img
+
+
+def _fit(src, h, w):
+    """Nearest-neighbour resize without pulling in cv2 for three lines."""
+    yi = (np.linspace(0, src.shape[0] - 1, h)).astype(int)
+    xi = (np.linspace(0, src.shape[1] - 1, w)).astype(int)
+    return src[np.ix_(yi, xi)]
+
+
 def _splotches(acc, rng, n, radius, strength):
     """Soft elliptical stains, added in-place to a [0,1] field."""
     h, w = acc.shape

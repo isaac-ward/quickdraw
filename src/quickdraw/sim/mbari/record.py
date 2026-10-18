@@ -29,7 +29,10 @@ TRAIN_CAM = "fpv"
 def load_model():
     import mujoco
 
-    return mujoco.MjModel.from_xml_path(str(ASSETS / "tank.xml"))
+    from .tank import build
+
+    p, _ = build(textures=False, name="tank.xml")
+    return mujoco.MjModel.from_xml_path(str(p))
 
 
 def _start_pose(rng, spec=None):
