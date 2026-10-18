@@ -1,4 +1,4 @@
-"""The two object-OOD intruders: three orange fish, or a diver.
+"""The object/appearance OOD conditions: three great white sharks, or a purple buoy.
 
 MOCAP BODIES, NOT FREE BODIES. Both are scripted: they follow analytic paths across the tank and
 nothing in the scene reacts to them. A mocap body is kinematic -- driven by `data.mocap_pos` -- with
@@ -9,9 +9,11 @@ THREE FISH, NOT ONE. A single intruder crossing a 15 m tank during a 12 s episod
 the FPV frustum at all, and an OOD the camera never sees is not one the detector can be asked about.
 Three independent transits at different depths raise the odds of at least one being seen.
 
-The fish are procedural: the requested great white is CGTrader, which has no public download API. For
-an appearance OOD what matters is a compact moving object of a colour and shape absent from every
-nominal frame.
+THE DIVER OOD BECAME A PURPLE BUOY. The source diver is a T-pose; sweeping its arms back by rotating
+the vertices beyond 22% of the arm-span did not read as a dive pose when rendered, and the user's
+standing instruction for that case was to swap the condition for the hanging buoy turning purple
+instead of neon green. That condition is static -- there is nothing to move -- so `mover` returns a
+no-op for it.
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ def load_model(intruder: str):
     name = f"tank_{intruder}.xml"
     p, _ = build(textures=False, name=name,
                  n_fish=N_FISH if intruder == "fish" else 0,
-                 diver=(intruder == "diver"))
+                 buoy_purple=(intruder == "buoy"))
     return mujoco.MjModel.from_xml_path(str(p))
 
 
@@ -54,7 +56,7 @@ def mover(model, intruder: str, seed: int):
     import mujoco
 
     rng = np.random.default_rng(seed)
-    names = [f"fish{i}" for i in range(N_FISH)] if intruder == "fish" else ["diver"]
+    names = [f"fish{i}" for i in range(N_FISH)] if intruder == "fish" else []
     plan = []
     for nm in names:
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, nm)

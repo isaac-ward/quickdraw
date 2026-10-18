@@ -9,16 +9,21 @@
     <quality shadowsize="512" offsamples="0"/>
   </visual>
   <asset>
-    <!-- WALLS ARE FLAT SHADED, NOT TEXTURED. Once they became BOX geoms, MuJoCo's 2D texture
-         mapping tiled the concrete image per face and it read as vertical planks at every texrepeat
-         tried. The per-wall brightness is what identifies which wall the camera is on, and that
-         survives perfectly well without the noise. The floor keeps its texture (a plane, mapped
-         correctly) and its markers. -->
+    <!-- CUBE TEXTURES ON THE WALLS, texuniform OFF. Rendered side by side on the real wall
+         geometry: `type="2d"` smears the image into vertical planks at every texrepeat and at both
+         texuniform settings, and cube + texuniform="true" projects it radially into a starburst.
+         Cube + texuniform="false" gives each box face the whole image, which for scale-free
+         concrete noise reads correctly at every box size. One baked image per surface, each a
+         different shade, so a frame tells you which wall you are looking at. -->
     <texture name="t_fl" type="2d" file="floor.png"/>
-    <material name="m_yp" rgba="0.42 0.41 0.39 1" specular="0.06" shininess="0.06"/>
-    <material name="m_ym" rgba="0.33 0.32 0.31 1" specular="0.06" shininess="0.06"/>
-    <material name="m_xp" rgba="0.50 0.49 0.47 1" specular="0.06" shininess="0.06"/>
-    <material name="m_xm" rgba="0.27 0.26 0.25 1" specular="0.06" shininess="0.06"/>
+    <texture name="t_yp" type="cube" file="wall_y+.png"/>
+    <texture name="t_ym" type="cube" file="wall_y-.png"/>
+    <texture name="t_xp" type="cube" file="wall_x+.png"/>
+    <texture name="t_xm" type="cube" file="wall_x-.png"/>
+    <material name="m_yp" texture="t_yp" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
+    <material name="m_ym" texture="t_ym" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
+    <material name="m_xp" texture="t_xp" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
+    <material name="m_xm" texture="t_xm" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
     <material name="m_fl" texture="t_fl" texuniform="false" texrepeat="1 1" specular="0.05"/>
     <material name="m_surf" rgba="0.26 0.52 0.62 0.72" specular="0.9" shininess="0.9" reflectance="0.3"/>
     <material name="m_room" rgba="0.085 0.085 0.095 1" specular="0.02"/>
@@ -26,11 +31,11 @@
     <material name="m_gantry" rgba="0.93 0.74 0.05 1" specular="0.5" shininess="0.5"/>
     <material name="m_dock" rgba="0.72 0.74 0.78 1" specular="0.3"/>
     <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.1"/>
-    <material name="m_buoy_g" rgba="0.08 0.80 0.25 1" specular="0.6" shininess="0.6" emission="0.1"/>
+    <material name="m_buoy_g" rgba="0.18 1.00 0.25 1" specular="0.6" shininess="0.6" emission="0.18"/>
     <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
     <mesh name="mola0" file="mola/mola_g0.obj" scale="2.48 2.48 2.48"/><material name="mola_c0" rgba="0.612 0.427 0.027 1" specular="0.25" shininess="0.3"/><mesh name="mola1" file="mola/mola_g1.obj" scale="2.48 2.48 2.48"/><material name="mola_c1" rgba="0.0 0.0 0.0 1" specular="0.25" shininess="0.3"/><mesh name="mola2" file="mola/mola_g2.obj" scale="2.48 2.48 2.48"/><material name="mola_c2" rgba="0.698 0.494 0.043 1" specular="0.25" shininess="0.3"/><mesh name="mola3" file="mola/mola_g3.obj" scale="2.48 2.48 2.48"/><material name="mola_c3" rgba="0.718 0.51 0.047 1" specular="0.25" shininess="0.3"/><mesh name="mola4" file="mola/mola_g4.obj" scale="2.48 2.48 2.48"/><material name="mola_c4" rgba="0.341 0.757 0.8 1" specular="0.25" shininess="0.3"/><mesh name="mola5" file="mola/mola_g5.obj" scale="2.48 2.48 2.48"/><material name="mola_c5" rgba="0.4 0.4 0.4 1" specular="0.25" shininess="0.3"/><material name="rm_wall_wall_yp_r0" rgba="0.39 0.38 0.35 1"/><material name="rm_floor_wall_yp_r0" rgba="0.25 0.21 0.17 1"/><material name="rm_ceil_wall_yp_r0" rgba="0.44 0.43 0.42 1"/><material name="rm_lamp_wall_yp_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_yp_r0" rgba="0.800 0.700 0.520 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_yp_r0" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_yp_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_yp_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_yp_r1" rgba="0.47 0.46 0.43 1"/><material name="rm_floor_wall_yp_r1" rgba="0.30 0.25 0.21 1"/><material name="rm_ceil_wall_yp_r1" rgba="0.53 0.53 0.50 1"/><material name="rm_lamp_wall_yp_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_yp_r1" rgba="0.720 0.520 0.300 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_yp_r1" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_yp_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_yp_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_ym_r0" rgba="0.48 0.46 0.43 1"/><material name="rm_floor_wall_ym_r0" rgba="0.31 0.25 0.21 1"/><material name="rm_ceil_wall_ym_r0" rgba="0.54 0.53 0.51 1"/><material name="rm_lamp_wall_ym_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_ym_r0" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_ym_r0" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_ym_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_ym_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_ym_r1" rgba="0.44 0.43 0.40 1"/><material name="rm_floor_wall_ym_r1" rgba="0.29 0.24 0.19 1"/><material name="rm_ceil_wall_ym_r1" rgba="0.50 0.49 0.47 1"/><material name="rm_lamp_wall_ym_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_ym_r1" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_ym_r1" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_ym_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_ym_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_xp_r0" rgba="0.48 0.46 0.43 1"/><material name="rm_floor_wall_xp_r0" rgba="0.31 0.25 0.21 1"/><material name="rm_ceil_wall_xp_r0" rgba="0.54 0.53 0.51 1"/><material name="rm_lamp_wall_xp_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_xp_r0" rgba="0.800 0.700 0.520 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_xp_r0" rgba="0.640 0.220 0.160 1.0" specular="0.2"/><material name="rm_metal_wall_xp_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_xp_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_xp_r1" rgba="0.39 0.38 0.35 1"/><material name="rm_floor_wall_xp_r1" rgba="0.25 0.21 0.17 1"/><material name="rm_ceil_wall_xp_r1" rgba="0.44 0.44 0.42 1"/><material name="rm_lamp_wall_xp_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_xp_r1" rgba="0.400 0.260 0.160 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_xp_r1" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_xp_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_xp_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_xm_r0" rgba="0.44 0.43 0.40 1"/><material name="rm_floor_wall_xm_r0" rgba="0.29 0.24 0.19 1"/><material name="rm_ceil_wall_xm_r0" rgba="0.50 0.49 0.47 1"/><material name="rm_lamp_wall_xm_r0" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_xm_r0" rgba="0.580 0.300 0.210 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_xm_r0" rgba="0.550 0.060 0.120 1.0" specular="0.2"/><material name="rm_metal_wall_xm_r0" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_xm_r0" rgba="0.07 0.08 0.10 1" specular="0.5"/><material name="rm_wall_wall_xm_r1" rgba="0.46 0.44 0.41 1"/><material name="rm_floor_wall_xm_r1" rgba="0.30 0.24 0.20 1"/><material name="rm_ceil_wall_xm_r1" rgba="0.52 0.51 0.49 1"/><material name="rm_lamp_wall_xm_r1" rgba="1 0.95 0.72 1" emission="0.9"/><material name="rm_wood_wall_xm_r1" rgba="0.400 0.260 0.160 1.0" specular="0.3" shininess="0.4"/><material name="rm_chair_wall_xm_r1" rgba="0.720 0.100 0.100 1.0" specular="0.2"/><material name="rm_metal_wall_xm_r1" rgba="0.55 0.56 0.58 1" specular="0.7" shininess="0.6"/><material name="rm_screen_wall_xm_r1" rgba="0.07 0.08 0.10 1" specular="0.5"/>
     <mesh name="dock" file="dock/dock_g0.obj" scale="1 1 1"/>
-    <mesh name="diver" file="diver/diver_g0.obj" scale="1 1 1"/>
+    <mesh name="hook" file="hook/hook_g0.obj" scale="0.28 0.28 0.28"/>
   </asset>
 
   <worldbody>
@@ -115,8 +120,10 @@
     </body>
     <body name="hook" pos="1.2 0 0">
       <geom name="hook_line" type="capsule" material="m_gantry" fromto="0 0 1.0 0 0 -2.5" size="0.055"/>
-      <geom name="hook_j" type="capsule" material="m_gantry" fromto="0 0 -2.5 0.42 0 -2.92" size="0.085"/>
-      <geom name="hook_tip" type="sphere" material="m_gantry" pos="0.42 0 -3.05" size="0.12"/>
+      <!-- a real crane hook (block + hook, 10.8k faces). The mesh hangs along -Y with the hook at
+           +Y, so euler x=-90 deg stands it up: sheave block at the top, hook pointing down. -->
+      <geom name="hook_g" type="mesh" mesh="hook" material="m_gantry" euler="-1.5708 0 0"
+            pos="0 0 -3.2742" contype="0" conaffinity="0"/>
     </body>
 
     <body name="buoy_orange" pos="3.375 2.5 -5.0">
@@ -137,7 +144,7 @@
       <freejoint name="mola_free"/>
       <geom name="mola_g0" type="mesh" mesh="mola0" material="mola_c0" mass="60" contype="0" conaffinity="0"/><geom name="mola_g1" type="mesh" mesh="mola1" material="mola_c1" mass="0.0001" contype="0" conaffinity="0"/><geom name="mola_g2" type="mesh" mesh="mola2" material="mola_c2" mass="0.0001" contype="0" conaffinity="0"/><geom name="mola_g3" type="mesh" mesh="mola3" material="mola_c3" mass="0.0001" contype="0" conaffinity="0"/><geom name="mola_g4" type="mesh" mesh="mola4" material="mola_c4" mass="0.0001" contype="0" conaffinity="0"/><geom name="mola_g5" type="mesh" mesh="mola5" material="mola_c5" mass="0.0001" contype="0" conaffinity="0"/>
       <camera name="fpv" pos="0.95 0 0.08" xyaxes="0 -1 0 0 0 1" fovy="70"/>
-      <camera name="chase" pos="-5.4 0 1.9" xyaxes="0 -1 0 0.33 0 0.944" fovy="58"/>
+      <camera name="chase" pos="-4.2 0 1.5" xyaxes="0 -1 0 0.33 0 0.944" fovy="58"/>
       <site name="mola_c" pos="0 0 0" size="0.05" rgba="1 0 0 0"/>
     </body>
     

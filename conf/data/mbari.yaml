@@ -5,7 +5,7 @@
 #   val              drawn from train by the longest-first rule at build time
 #   ood_thruster      50 eps x 360 steps =  18,000  (10 min) -- 30% of steps the command is replaced
 #   ood_fish          50 eps x 360 steps =  18,000  (10 min) -- an orange fish transits the tank
-#   ood_diver         50 eps x 360 steps =  18,000  (10 min) -- a diver transits the tank
+#   ood_buoy          50 eps x 360 steps =  18,000  (10 min) -- the hanging buoy is purple
 #
 # 30 Hz. observation_vector 13-dim, action 6-dim, FOUR cameras at 144x192.
 #

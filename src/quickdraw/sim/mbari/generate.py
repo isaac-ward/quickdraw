@@ -73,13 +73,13 @@ def plan_ood(n_per=50, steps=360, seed0=50000):
     """Three OOD sets. 50 trajectories each, 12 s apiece = 10 minutes per set.
 
     Behaviour classes are drawn from the SAME nominal mix, so the only thing that changes is the
-    condition under test -- a glitching thruster, a fish, a diver. If the trajectories also differed
-    the detector could separate them on motion statistics alone and tell us nothing."""
+    condition under test -- a glitching thruster, a shark, a purple buoy. If the trajectories
+    also differed the detector could separate them on motion statistics alone and tell us nothing."""
     from .trajectories import CLASSES
 
     jobs = []
-    for s, (glitch_p, intruder) in enumerate([(0.30, None), (0.0, "fish"), (0.0, "diver")]):
-        split = ["ood_thruster", "ood_fish", "ood_diver"][s]
+    for s, (glitch_p, intruder) in enumerate([(0.30, None), (0.0, "fish"), (0.0, "buoy")]):
+        split = ["ood_thruster", "ood_fish", "ood_buoy"][s]
         for i in range(n_per):
             jobs.append((split, i, CLASSES[i % len(CLASSES)], seed0 + 1000 * s + i, steps,
                          None, glitch_p, intruder))

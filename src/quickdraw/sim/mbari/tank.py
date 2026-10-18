@@ -60,17 +60,19 @@ SHADE = {"wall_x+": 1.30, "wall_x-": 0.70, "wall_y+": 1.08, "wall_y-": 0.86, "fl
 def build_textures(out=BUILD, res=1024, seed=0):
     """Bake the four wall surfaces and the floor.
 
-    WALLS ARE NOW PLAIN SHADED CONCRETE. The windows became real openings in `walls.py`, so there is
-    nothing to paint, and the ArUco grid came off at the user's request -- it was clutter at 144x192
-    and the per-surface shade already tells you which wall you are looking at. The FLOOR keeps its
-    markers, at the halved density.
+    WALL TEXTURES ARE SQUARE AND CUBE-MAPPED. The walls are box geoms, and a `type="2d"` texture on
+    a box is stretched to each face independently -- on a 7.5 x 0.18 x 1.5 m strip that turned the
+    concrete into vertical planks. A `type="cube"` texture with `texuniform="true"` maps in world
+    units instead, so the grain is the same size on a long strip and a narrow pillar. Square because
+    cube faces are square. No ArUco on the walls (removed at the user's request); the floor keeps
+    its markers at the halved density.
     """
     import imageio.v2 as imageio
 
     out.mkdir(parents=True, exist_ok=True)
     painted = {}
     for name, fid in (("wall_y+", 0), ("wall_y-", 40), ("wall_x+", 80), ("wall_x-", 120)):
-        img = np.clip(concrete(res // 2, res, seed=seed + fid).astype(np.float32) * SHADE[name],
+        img = np.clip(concrete(res, res, seed=seed + fid).astype(np.float32) * SHADE[name],
                       0, 255).astype(np.uint8)
         imageio.imwrite(out / f"{name}.png", img)
         painted[name] = []
@@ -134,10 +136,16 @@ def _walls_and_rooms(hl, hw, seed=4242):
     return "\n    ".join(walls), "".join(mats), "".join(bodies)
 
 
-def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
+def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> str:
     """The tank MJCF. `mola_scale` makes the AUV 2.0 m long (0.806 x 2.48)."""
     hl, hw = TANK_L / 2, TANK_W / 2
     dx, dy = dock_corner
+    HOOK_S = 0.28                       # the mesh is 5.53 m tall raw -> 1.55 m, a crane hook's size
+    HOOK_H = 5.53 * HOOK_S
+    # NEON GREEN normally; PURPLE is the appearance OOD. The diver OOD was dropped for this at the
+    # user's instruction -- the source diver is a T-pose and the vertex-sweep posing attempt did not
+    # read as a dive pose when rendered.
+    BUOY_RGB = "0.72 0.18 0.92" if buoy_purple else "0.18 1.00 0.25"
     dock_pos = (dx * (hl - 2.0), dy * (hw - 2.0), -1.4)
     mola_assets, mola_geoms = _mola_geoms(mola_scale)
     wall_xml, room_mats, room_xml = _walls_and_rooms(hl, hw)
@@ -149,27 +157,17 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
         f'castshadow="false"/>'
         for i, (x, y) in enumerate([(ax, ay) for ax in (-5.2, -1.7, 1.7, 5.2) for ay in (-2.6, 2.6)]))
 
+    # GREAT WHITES, NOT APPROXIMATED FISH. The source mesh swims along -Y, so the geom yaws +90 deg
+    # to put the nose on +X, which is the heading `intruders.mover` writes into mocap_quat.
     fish = "".join(f"""
     <body name="fish{i}" mocap="true" pos="0 0 -5">
-      <geom type="ellipsoid" size="0.40 0.14 0.21" material="m_fish" contype="0" conaffinity="0"/>
-      <geom type="box" size="0.16 0.02 0.18" pos="-0.50 0 0.04" material="m_fish" contype="0" conaffinity="0"/>
-      <geom type="box" size="0.11 0.02 0.13" pos="0.02 0 0.28" material="m_fish" contype="0" conaffinity="0"/>
-      <geom type="sphere" size="0.042" pos="0.29 0.095 0.075" material="m_eye" contype="0" conaffinity="0"/>
+      <geom type="mesh" mesh="shark" material="m_shark" euler="0 0 1.5708" contype="0" conaffinity="0"/>
     </body>""" for i in range(n_fish))
-
-    # DIVER NOSE-DOWN. euler pitches the model so it is head-first into the tank rather than standing
-    # upright; the source mesh is a T-pose and `pose_diver` in convert_assets sweeps the arms back.
-    diver_xml = """
-    <body name="diver" mocap="true" pos="0 0 -5" euler="0 1.3963 0">
-      <geom name="diver_g" type="mesh" mesh="diver" material="m_diver" contype="0" conaffinity="0"/>
-    </body>""" if diver else ""
 
     extra_assets = ""
     if n_fish:
-        extra_assets += ('<material name="m_fish" rgba="0.96 0.42 0.07 1" specular="0.5" shininess="0.5"/>'
-                         '<material name="m_eye" rgba="0.05 0.05 0.05 1"/>')
-    if diver:
-        extra_assets += '<material name="m_diver" rgba="0.14 0.17 0.22 1" specular="0.4"/>'
+        extra_assets += ('<mesh name="shark" file="fish/fish_g0.obj" scale="1.6 1.6 1.6"/>'
+                         '<material name="m_shark" rgba="0.40 0.44 0.48 1" specular="0.35" shininess="0.4"/>')
 
     return f"""<mujoco model="mbari_tank">
   <compiler angle="radian" meshdir="." texturedir="build"/>
@@ -182,16 +180,21 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
     <quality shadowsize="512" offsamples="0"/>
   </visual>
   <asset>
-    <!-- WALLS ARE FLAT SHADED, NOT TEXTURED. Once they became BOX geoms, MuJoCo's 2D texture
-         mapping tiled the concrete image per face and it read as vertical planks at every texrepeat
-         tried. The per-wall brightness is what identifies which wall the camera is on, and that
-         survives perfectly well without the noise. The floor keeps its texture (a plane, mapped
-         correctly) and its markers. -->
+    <!-- CUBE TEXTURES ON THE WALLS, texuniform OFF. Rendered side by side on the real wall
+         geometry: `type="2d"` smears the image into vertical planks at every texrepeat and at both
+         texuniform settings, and cube + texuniform="true" projects it radially into a starburst.
+         Cube + texuniform="false" gives each box face the whole image, which for scale-free
+         concrete noise reads correctly at every box size. One baked image per surface, each a
+         different shade, so a frame tells you which wall you are looking at. -->
     <texture name="t_fl" type="2d" file="floor.png"/>
-    <material name="m_yp" rgba="0.42 0.41 0.39 1" specular="0.06" shininess="0.06"/>
-    <material name="m_ym" rgba="0.33 0.32 0.31 1" specular="0.06" shininess="0.06"/>
-    <material name="m_xp" rgba="0.50 0.49 0.47 1" specular="0.06" shininess="0.06"/>
-    <material name="m_xm" rgba="0.27 0.26 0.25 1" specular="0.06" shininess="0.06"/>
+    <texture name="t_yp" type="cube" file="wall_y+.png"/>
+    <texture name="t_ym" type="cube" file="wall_y-.png"/>
+    <texture name="t_xp" type="cube" file="wall_x+.png"/>
+    <texture name="t_xm" type="cube" file="wall_x-.png"/>
+    <material name="m_yp" texture="t_yp" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
+    <material name="m_ym" texture="t_ym" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
+    <material name="m_xp" texture="t_xp" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
+    <material name="m_xm" texture="t_xm" texuniform="false" texrepeat="1 1" specular="0.06" shininess="0.06"/>
     <material name="m_fl" texture="t_fl" texuniform="false" texrepeat="1 1" specular="0.05"/>
     <material name="m_surf" rgba="0.26 0.52 0.62 0.72" specular="0.9" shininess="0.9" reflectance="0.3"/>
     <material name="m_room" rgba="0.085 0.085 0.095 1" specular="0.02"/>
@@ -199,11 +202,11 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
     <material name="m_gantry" rgba="0.93 0.74 0.05 1" specular="0.5" shininess="0.5"/>
     <material name="m_dock" rgba="0.72 0.74 0.78 1" specular="0.3"/>
     <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.1"/>
-    <material name="m_buoy_g" rgba="0.08 0.80 0.25 1" specular="0.6" shininess="0.6" emission="0.1"/>
+    <material name="m_buoy_g" rgba="{BUOY_RGB} 1" specular="0.6" shininess="0.6" emission="0.18"/>
     <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
     {mola_assets}{extra_assets}{room_mats}
     <mesh name="dock" file="dock/dock_g0.obj" scale="1 1 1"/>
-    <mesh name="diver" file="diver/diver_g0.obj" scale="1 1 1"/>
+    <mesh name="hook" file="hook/hook_g0.obj" scale="{HOOK_S} {HOOK_S} {HOOK_S}"/>
   </asset>
 
   <worldbody>
@@ -245,8 +248,10 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
     </body>
     <body name="hook" pos="1.2 0 0">
       <geom name="hook_line" type="capsule" material="m_gantry" fromto="0 0 {GANTRY_H} 0 0 {-TANK_D/4}" size="0.055"/>
-      <geom name="hook_j" type="capsule" material="m_gantry" fromto="0 0 {-TANK_D/4} 0.42 0 {-TANK_D/4 - 0.42}" size="0.085"/>
-      <geom name="hook_tip" type="sphere" material="m_gantry" pos="0.42 0 {-TANK_D/4 - 0.55}" size="0.12"/>
+      <!-- a real crane hook (block + hook, 10.8k faces). The mesh hangs along -Y with the hook at
+           +Y, so euler x=-90 deg stands it up: sheave block at the top, hook pointing down. -->
+      <geom name="hook_g" type="mesh" mesh="hook" material="m_gantry" euler="-1.5708 0 0"
+            pos="0 0 {-TANK_D/4 - HOOK_H/2}" contype="0" conaffinity="0"/>
     </body>
 
     <body name="buoy_orange" pos="{hl*0.45} {hw*0.5} -5.0">
@@ -267,10 +272,10 @@ def mjcf(mola_scale=2.48, dock_corner=(-1, -1), n_fish=0, diver=False) -> str:
       <freejoint name="mola_free"/>
       {mola_geoms}
       <camera name="fpv" pos="0.95 0 0.08" xyaxes="0 -1 0 0 0 1" fovy="70"/>
-      <camera name="chase" pos="-5.4 0 1.9" xyaxes="0 -1 0 0.33 0 0.944" fovy="58"/>
+      <camera name="chase" pos="-4.2 0 1.5" xyaxes="0 -1 0 0.33 0 0.944" fovy="58"/>
       <site name="mola_c" pos="0 0 0" size="0.05" rgba="1 0 0 0"/>
     </body>
-    {fish}{diver_xml}{room_xml}
+    {fish}{room_xml}
 
     <!-- TOP-DOWN SITS UNDER THE GANTRY. From 3.2 m it was shooting straight through the beams,
          which cut the tank in half in every frame. Just below the water line it sees the whole pool

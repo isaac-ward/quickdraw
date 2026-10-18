@@ -73,7 +73,7 @@ def score_split(core, norm, root, split, key="fpv", P=8, dev="cuda", limit=None,
 
 
 def run(ckpt, root="/app/logs/mbari/data/v1", out="/app/logs/mbari/uncertainty",
-        splits=("train", "ood_thruster", "ood_fish", "ood_diver"), key="fpv",
+        splits=("train", "ood_thruster", "ood_fish", "ood_buoy"), key="fpv",
         limit=30, dev="cuda", log=print):
     """Score every split, calibrate on nominals, classify the three conditions, write JSON."""
     import json

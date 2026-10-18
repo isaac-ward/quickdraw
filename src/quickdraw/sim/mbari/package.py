@@ -28,8 +28,8 @@ from .mola import ACTION_NAMES, STATE_NAMES
 from .record import CAMS, FPS
 
 QUAT_DIMS = [3, 4, 5, 6]
-SPLIT_TASK = {"ood_thruster": "ood_thruster_glitch", "ood_fish": "ood_object_fish",
-              "ood_diver": "ood_object_diver"}
+SPLIT_TASK = {"ood_thruster": "ood_thruster_glitch", "ood_fish": "ood_object_shark",
+              "ood_buoy": "ood_appearance_buoy"}
 
 
 def _load(path):

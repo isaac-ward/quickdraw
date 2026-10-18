@@ -1,0 +1,11 @@
+Model Information:
+* title:	Crane Hook
+* source:	https://sketchfab.com/3d-models/crane-hook-7d2601023a2041abb04f6fad4a8289e8
+* author:	avkpiter (https://sketchfab.com/avkpiter)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Crane Hook" (https://sketchfab.com/3d-models/crane-hook-7d2601023a2041abb04f6fad4a8289e8) by avkpiter (https://sketchfab.com/avkpiter) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

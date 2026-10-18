@@ -1,0 +1,11 @@
+Model Information:
+* title:	Great White Shark
+* source:	https://sketchfab.com/3d-models/great-white-shark-bf81b64f0121443da38112f706b7356f
+* author:	charliegodofsharks (https://sketchfab.com/charliegodofsharks)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Great White Shark" (https://sketchfab.com/3d-models/great-white-shark-bf81b64f0121443da38112f706b7356f) by charliegodofsharks (https://sketchfab.com/charliegodofsharks) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

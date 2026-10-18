@@ -28,7 +28,7 @@ import numpy as np
 import trimesh
 
 HERE = pathlib.Path(__file__).parent / "assets"
-BUDGET = {"mola": 34000, "dock": 460, "diver": 14000}
+BUDGET = {"mola": 34000, "dock": 460, "diver": 14000, "fish": 4000, "hook": 9000}
 MIN_FACES = 300
 
 
@@ -75,7 +75,7 @@ def _decimate_components(mesh, ratio):
     return trimesh.util.concatenate(out)
 
 
-def convert(names=("mola", "dock", "diver"), src=HERE, log=print):
+def convert(names=("mola", "dock", "diver", "fish", "hook"), src=HERE, log=print):
     """Write <name>/<name>_g<k>.obj per colour group. Returns {name: [(file, rgba, faces)]}."""
     out = {}
     for name in names:
