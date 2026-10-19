@@ -11,6 +11,8 @@ import os
 import shutil
 import time
 
+PROGRESS_EVERY = 1000        # at most this many batches between intra-epoch progress lines
+
 import lightning as L
 import torch
 from omegaconf import OmegaConf
@@ -163,7 +165,11 @@ class ProgressPrinter(L.Callback):
         # parallel epoch 0, so without this a long epoch looks hung. The ~left is a THIS-EPOCH estimate.
         nb = trainer.num_training_batches
         if self._t0 and nb and nb != float("inf"):
-            q = max(1, int(nb) // 4)
+            # QUARTILES ARE TOO COARSE ON A LONG EPOCH. At 79,584 batches -- a 6 h dataset at
+            # batch 6 -- the first progress line lands 19,896 batches in, which was HOURS of a run
+            # whose step rate was then unknowable and unplannable. Cap the interval at PROGRESS_EVERY
+            # batches so a long epoch reports steadily; short epochs keep the old quartile cadence.
+            q = max(1, min(int(nb) // 4, PROGRESS_EVERY))
             done = batch_idx + 1
             if done % q == 0 and done < nb:
                 el = time.time() - self._t0
