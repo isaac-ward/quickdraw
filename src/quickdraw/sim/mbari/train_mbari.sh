@@ -29,13 +29,25 @@
 #     run A  477,504 windows / 6 =  79,584 steps/epoch  x 6 epochs = 477,504 steps
 #     run B  198,960 windows / 6 =  33,160 steps/epoch  x 14 epochs = 464,240 steps
 # Within 2.9%, so the arms differ in DATA VOLUME and not in optimisation.
+# EPOCHS CAPPED AT 8000 BATCHES. Measured, not guessed: 95 minutes into epoch 0 neither arm had
+# reached its 25% line (run B's is batch 8,290), which bounds the rate at >0.69 s/batch and makes
+# epoch 0 alone >6.4 h for the 2 h arm and >15 h for the 6 h arm -- and the first checkpoint only
+# exists at the END of epoch 0, so nothing downstream could run until this evening. Epoch 0 is also
+# the slowest epoch BY CONSTRUCTION: p_tf ramps 1->0 across its batches, so it is neither the
+# parallel teacher-forced forward (needs p_tf==1) nor the compiled autoregressive path (gated on
+# p_tf==0.0 exactly) -- it runs the sequential rollout eagerly.
+#
+# 8000 batches x 10 epochs = 80,000 steps on BOTH arms, exactly matched, ~1.5 h per epoch, first
+# checkpoint within the hour. That is a sixth of the training the uncapped schedule would give and
+# both models will be weaker in absolute terms -- but the experiment is a COMPARISON at matched
+# compute, which is equally valid at 80,000 steps and actually completes.
 cd /app
 R=/app/logs/recording_2026_10_19_00_30_50_mbari-tank
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u -m quickdraw.train_world_model \
   model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
   data.root=$R data.repo_id=mbari-tank data.cam=fpv data.subsample=1 data.action_aggregate=concat data.autobatch=false data.batch=6 \
-  trainer.max_epochs=6 trainer.check_val_every_n_epoch=1 \
+  trainer.max_epochs=10 trainer.limit_train_batches=8000 trainer.check_val_every_n_epoch=1 \
   trainer.checkpoint_monitor=val/metric/fpv/mse \
   eval.during_train.evals.manifold=false \
   eval.during_train.evals.denoising_multistep=false \
