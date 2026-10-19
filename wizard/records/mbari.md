@@ -249,6 +249,97 @@ Plus: attribute the docking fix (`scratch/_attrib.py`, queued), and dock videos
 - Val is **20%**, not the house 10%, because val is both the checkpoint monitor AND that nominal
   reference, and a 90th-percentile threshold from 72 episodes rests on about 7 in the tail.
 
+## Session update (2026-10-19 02:00) — control, cameras, and two loader fixes
+
+### The control benchmark now scores POSE, not position
+`goals()` returned only the dock entry POSITION and `run_episode` was called with `goal_q=None`, so
+even the task named "reach a random POSE" was scoring position alone — and an AUV that arrives at
+the dock entry pointing the wrong way has not docked. Both tasks now carry a target quaternion:
+the dock's is the DOCK BODY'S OWN orientation, so the vehicle ends aligned with the entry axis.
+
+Scoring it needed care after the MPPI port. `controller.mppi._score` builds its observation as
+`cat(p_xyz, v_xyz)` — six dims, no quaternion — so a `reward_fn` physically cannot see attitude.
+The shared module's other path takes a per-step `dist` (G,K,H) override, which is what language
+steering uses, so attitude rides there:
+
+    dist = ||p - p*||  +  w_att * angle(q, q*)  +  wall barrier        w_att = 1.2 rad^-1
+
+The benchmark reports final attitude in degrees beside final distance, so a position-only
+"success" cannot hide. First pose-targeted results, TRUE dynamics:
+
+| trial | start | final | attitude |
+|---|---|---|---|
+| dock 0 | 7.86 m | 0.093 m | 12.5 deg |
+| dock 1 | 9.03 m | 0.154 m | 8.2 deg |
+| random pose 0 | 2.92 m | 0.172 m | 12.7 deg |
+
+### Cameras for watching a control episode
+`run_episode` takes a `render=` and captures frames from the PLANT's own MjData each executed
+step, so an episode can be watched in the tank rather than read off a plot.
+
+- **The chase camera is useless at the moment that matters.** It is body-mounted 4.2 m astern, and
+  the dock sits 1.1 m from a corner, so at arrival the camera is inside the concrete.
+- **A GOAL camera was added, and it does NOT orbit.** First attempt circled the target, which looks
+  better for one second and then sweeps straight through a tank wall. It is now fixed, aimed once
+  at the goal, and placed on the tank-centre side of it: MuJoCo puts a free camera at
+  `lookat - d*(cos az, sin az)`, so setting the azimuth to the target's own bearing from the origin
+  guarantees the camera sits between the goal and the middle of the tank, which is always water.
+  `UnderwaterRenderer.look_at(target, dist=4.6, elev=-18)`, addressed as camera `dockcam`.
+- **Playback is REAL TIME.** Every frame at the 30 Hz sim rate written at 30 fps. The first version
+  kept every 4th frame and wrote 15 fps, so a 20 s approach played in 10 and looked hurried.
+- Five panels: FPV, Chase, Top-down, Side-on, Goal cam.
+- A second `UnderwaterRenderer` in one process returns an UNINITIALISED buffer — every episode
+  after the first rendered as pure noise. One renderer, reused. (Hit once before on the MOLA
+  material A/B, solved there with separate processes, and walked straight back into here.)
+
+### Two loader inefficiencies, fixed at the general layer (`data/dataset.py`, not MBARI)
+- **Reading more than you keep.** A run capped to 240 of 576 train episodes called `np.load` on the
+  whole 43 GB frame cache and discarded 25 GB, because the cap was applied after episodes were
+  built. `load_fpv_frames(mmap=True)` + filtering ids BEFORE indexing -> ~18 GB touched.
+- **Two processes decoding the same video.** The cache write was already atomic (per-pid temp then
+  rename), but atomicity protects the FILE, not the WORK: two runs started together each decoded
+  all 648k frames. Now one builder holds `<cache>.building` and the rest wait and mmap the result;
+  a lock older than 30 min with no cache is treated as a crashed builder and stolen. Verified with
+  three concurrent workers: one build, two waiters.
+- Deliberately NOT fixed: a capped run still builds the FULL cache. The cache is keyed only by
+  camera and size, so a partial one could be silently reused by a run that needs all of it.
+
+### The ablation, as actually launched
+Both arms read ONE dataset (`recording_2026_10_19_00_30_50_mbari-tank`, 576/144 at **20% val**),
+with run B capped by `+data.train_episodes=240` in the loader. Packing a second smaller dataset —
+the first attempt — gave it its own val split and its own normalization stats, so two things moved
+at once.
+
+| | run A | run B |
+|---|---|---|
+| train | 576 eps (6.00 h) | 240 eps (2.00 h) |
+| batch | 6 | 6 |
+| epochs | 6 | 14 |
+| steps | 477,504 | 464,240 |
+
+**Batch is PINNED at 6.** Autobatch sizes per-arm from `card - reserve - resident frame store`, and
+6 h of frames is ~43 GB resident, so it offered run A batch 6 and run B batch 12 — different
+gradient noise, and step counts diverging to 1.11 M vs 663 k.
+
+**OPEN RISK: epoch wall-clock is unmeasured.** 79,584 steps/epoch for run A, and this harness logs
+nothing between epoch boundaries, so there is no step rate until the first `[ep 0]` line. If an
+epoch is ~11 h then 6 epochs is 66 h and the epoch counts need cutting. A cleaner design if it has
+to be redone: `trainer.limit_train_batches=20000` on both arms, 4 epochs each = 80,000 steps
+exactly equal, with identical val cadence.
+
+### What is automatic and what is not
+- **Automatic**, during training, every 2 epochs: `eval.during_train.evals.ood_horizon` writes
+  open-loop AND both closed-loop modes (1-step and **16-step-ahead**) with filmstrips, mp4s and
+  curves. That is checklist item 13.
+- **Not automatic**: items 14 (uncertainty + 3-way OOD), 15 (pixel-uncertainty videos) and 16 (the
+  control benchmark's learned arm). They need a checkpoint AND the raw npz episodes, which no
+  training hook knows about — `run_after_train.sh <run_dir>` runs all three.
+
+### Published
+`https://huggingface.co/datasets/isaac-ronald-ward/mbari-tank` — 576 train / 144 val / 3 x 50 OOD,
+plus **870 per-trajectory preview mp4s** (one per episode, four cameras, 3.0 GB) embedded in the
+dataset card so they play on the page.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
