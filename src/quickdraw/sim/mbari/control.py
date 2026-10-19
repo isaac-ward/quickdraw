@@ -274,7 +274,7 @@ FINE = dict(repeat=1, horizon=18, samples=48, sigma=0.18)
 
 
 def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0, log=None,
-                repeat=6, samples=24, horizon=12, fan=None, render=None):
+                repeat=6, samples=24, horizon=12, fan=None, render=None, ghost=None):
     """Closed loop: `dyn` plans, the MuJoCo `plant_model` executes. Returns a trace dict.
 
     EACH PLANNED ACTION IS EXECUTED FOR `repeat` CONTROL STEPS, which is what it was costed as: the
@@ -290,6 +290,10 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     d = mujoco.MjData(plant_model)
     d.qpos[:3], d.qpos[3:7] = start[:3], start[3:7]
     mujoco.mj_forward(plant_model, d)
+    if ghost is not None:                        # (mocap_id, pos, quat) -> the translucent goal pose
+        gid, gpos, gquat = ghost
+        d.mocap_pos[gid], d.mocap_quat[gid] = gpos, gquat
+        mujoco.mj_forward(plant_model, d)
     observe = getattr(dyn, "observe", None)      # the learned model needs the plant's own stream
     if observe is not None:
         observe(d)

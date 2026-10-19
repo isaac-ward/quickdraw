@@ -1,7 +1,8 @@
 #!/bin/bash
 # MBARI world-model run. The 5-point run_summary is REQUIRED (train_world_model.py:52) and its values
 # must avoid parentheses, commas and apostrophes -- Hydra's override grammar rejects them with a bare
-# error naming one character.
+# error naming one character. The forbidden set includes ' = ' as well -- a run_summary
+# reading 'x 10 = 80000' is rejected with 'mismatched input'.
 #
 # EVAL SIZED DOWN, and it took reading ood_horizon_shapes to do it correctly. Autobatch put
 # closed_loop_16_steps at 52.0 GB against the 6 h arm's 42 GB budget (the budget is card - reserve
@@ -47,7 +48,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u -m quickdraw.train_world_model \
   model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
   data.root=$R data.repo_id=mbari-tank data.cam=fpv data.subsample=1 data.action_aggregate=concat data.autobatch=false data.batch=6 \
-  trainer.max_epochs=10 trainer.limit_train_batches=8000 trainer.check_val_every_n_epoch=1 \
+  trainer.max_epochs=10 +trainer.limit_train_batches=8000 trainer.check_val_every_n_epoch=1 \
   trainer.checkpoint_monitor=val/metric/fpv/mse \
   eval.during_train.evals.manifold=false \
   eval.during_train.evals.denoising_multistep=false \
@@ -56,8 +57,8 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u -m quickdraw.train_world_model \
   eval.during_train.every_epochs=2 \
   eval.decode_chunk=32 eval.closed_loop_horizon=64 \
   +run_summary.problem="No world model exists for the MBARI tank underwater domain so we cannot do uncertainty based OOD detection or model based control there" \
-  +run_summary.tried="Nothing on this dataset yet. The longhand branch records thirteen arms that all failed to move OL minus floor off 0.063 on 2.06 h of block-stack and concluded the remaining lever was more data which a real robot could not supply - this dataset is simulated so 6 h cost 65 minutes" \
+  +run_summary.tried="An uncapped schedule on this data was launched three times tonight and abandoned - autobatch gave the two arms different batch sizes which breaks the comparison and epoch 0 alone ran over six hours because p_tf ramps inside it so neither the parallel teacher forced path nor the compiled autoregressive path applies" \
   +run_summary.trying="vl128_blockstack_2cam transplanted to one fpv image head at 144x192 plus a 13 dim proprio head on 6 hours of 30 Hz AUV data" \
-  +run_summary.trying_detail="Only dataset forced fields changed - proprio dim 13 action dim 6 one image head bottleneck 9. subsample 1 because delta_k 0.112 already clears the codec floor at 1.76x. Evals manifold and denoising off because they read torus only fields" \
+  +run_summary.trying_detail="Data volume ablation arm on 576 train episodes of one shared pack so both arms see identical val episodes and identical norm stats. Epochs capped at 8000 batches x 10 is 80000 matched gradient steps at batch 6 because an uncapped epoch measured over 2.8 s per batch and the first checkpoint would have been a day away. Only dataset forced fields changed - proprio 13 action 6 one image head bottleneck 9" \
   +run_summary.rationale="That recipe holds the open loop records on robocasa and block-stack and every inherited value was bought with an experiment so a minimal transplant isolates the new domain as the only variable. Epochs cut 40 to 14 so the 6 h arm gets matched gradient steps rather than 3x of them" \
   experiment=mbari_fpv_v1
