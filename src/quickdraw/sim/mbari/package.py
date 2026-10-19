@@ -60,14 +60,18 @@ def episodes_from(root, split, cams=CAMS, limit=None, log=print):
     return eps
 
 
-def build(root="/app/logs/mbari/data/v6", name="mbari-tank", cams=CAMS, log=print):
+def build(root="/app/logs/mbari/data/v6", name="mbari-tank", cams=CAMS, limit=None, log=print):
     """MEMORY. build_recorded_dataset holds every Episode in RAM before encoding, and four 144x192
     streams over 390 episodes is ~116 GB of uint8. That fits on this box but loading it took longer
     than training would. Pass `cams=("fpv",)` for the training dataset (18 GB) and run the full
     four-camera pack separately -- the npz shards on disk are the source of truth for both."""
     from ...data.processors import build_recorded_dataset
 
-    train = episodes_from(root, "train", cams, log=log)
+    # `limit` caps the NOMINAL episodes only, taking the first N. Job i always carries seed 1000+i
+    # and class CLASSES[i%3], so the first 240 of 720 are exactly the 2.00 h dataset and any prefix
+    # stays class-balanced -- which is what makes a data-volume ablation a strict subset rather than
+    # a different draw.
+    train = episodes_from(root, "train", cams, limit=limit, log=log)
     extra = {s: episodes_from(root, s, cams, log=log) for s in SPLIT_TASK if
              (pathlib.Path(root) / s).exists()}
     extra = {k: v for k, v in extra.items() if v}
@@ -85,5 +89,6 @@ if __name__ == "__main__":
     ap.add_argument("--root", default="/app/logs/mbari/data/v6")
     ap.add_argument("--name", default="mbari-tank")
     ap.add_argument("--cams", default=",".join(CAMS))
+    ap.add_argument("--limit", type=int, default=None, help="cap nominal episodes (data ablation)")
     a = ap.parse_args()
-    print("run_dir:", build(a.root, a.name, cams=tuple(a.cams.split(","))), flush=True)
+    print("run_dir:", build(a.root, a.name, cams=tuple(a.cams.split(",")), limit=a.limit), flush=True)

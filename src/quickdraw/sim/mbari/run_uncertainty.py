@@ -56,11 +56,37 @@ def one_step(core, norm, o, a, fr, key, P, dev, chunk=64):
 CHANNELS = ("image_lpips", "image_l1", "proprio_pos", "proprio_vel", "proprio_angvel", "proprio_rot_deg")
 
 
-def score_split(core, norm, root, split, key="fpv", P=8, dev="cuda", limit=None, log=print):
-    """Per-episode channel scores (90th percentile over steps) for one split."""
+def held_out_ids(run_dir):
+    """The episode indices the packer sent to val, reproduced exactly.
+
+    THE NOMINAL REFERENCE MUST BE HELD OUT. Calibrating OOD thresholds on `train` scores the model
+    on episodes it was fit to, where its surprise is systematically lower than on unseen nominal --
+    every threshold then sits too low and every detection rate reads too high. Leave-one-out
+    thresholding does not help: it removes an episode from its own threshold, not from the training
+    set. The packer's split is a deterministic draw (seed SPLIT_SEED) over the nominal episodes in
+    processor order, so the same draw recovers exactly which npz files were held out."""
+    import json
+
+    import numpy as _np
+
+    from ...data.processors import SPLIT_SEED
+    n = sum(json.load(open(pathlib.Path(run_dir) / sp / "meta" / "info.json"))["total_episodes"]
+            for sp in ("train", "val"))
+    n_val = json.load(open(pathlib.Path(run_dir) / "val" / "meta" / "info.json"))["total_episodes"]
+    return set(_np.random.default_rng(SPLIT_SEED).choice(n, size=n_val, replace=False).tolist()), n
+
+
+def score_split(core, norm, root, split, key="fpv", P=8, dev="cuda", limit=None, idx=None,
+                log=print):
+    """Per-episode channel scores (90th percentile over steps) for one split.
+
+    `idx` restricts to those episode indices -- used to score ONLY the held-out nominal episodes."""
     import ast
 
-    files = sorted(glob.glob(str(pathlib.Path(root) / split / "ep_*.npz")))[:limit]
+    files = sorted(glob.glob(str(pathlib.Path(root) / split / "ep_*.npz")))
+    if idx is not None:
+        files = [f for i, f in enumerate(files) if i in idx]
+    files = files[:limit]
     rows = []
     for n, f in enumerate(files):
         z = np.load(f)
@@ -88,15 +114,18 @@ def run(ckpt, root="/app/logs/mbari/data/v6", out="/app/logs/mbari/uncertainty",
     core.eval()
     norm = normalizer(cfg)
 
+    val_ids, n_nom = held_out_ids(cfg.data.root)
+    log(f"  nominal reference = {len(val_ids)} HELD-OUT episodes of {n_nom} "
+        f"(the packer's val draw, seed 0) -- not the episodes the model trained on")
     scores = {}
     for sp in splits:
         if not (pathlib.Path(root) / sp).exists():
             continue
         scores[sp] = score_split(core, norm, root, sp, key=key, P=int(cfg.data.P), dev=dev,
-                                 limit=limit, log=log)
+                                 limit=limit, idx=val_ids if sp == "train" else None, log=log)
         log(f"  {sp:14s} scored {len(next(iter(scores[sp].values())))} episodes")
 
-    nominal = scores["train"]
+    nominal = scores["train"]          # held-out nominal only -- see held_out_ids
     report = {"channels": list(CHANNELS), "detection": {}, "n": {k: len(v["image_l1"]) for k, v in scores.items()}}
     for sp in [s for s in scores if s != "train"]:
         report["detection"][sp] = {c: U.detect(nominal[c], scores[sp][c]) for c in CHANNELS}

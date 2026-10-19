@@ -185,43 +185,77 @@ def pose_cost(states, goal_p, goal_q=None, w_pos=1.0, w_att=0.35, w_vel=0.08, w_
     return float(c)
 
 
+def _mbari_reward(goal_p, goal_q, w_att, w_wall, w_vel, r_settle):
+    """Per-step reward for `controller.mppi._score`, carrying this task's terms.
+
+    _score sums a per-step reward over the horizon, so the terminal-weighted cost this module used
+    to apply is expressed as a sum of -distance instead. That is the same shape as the mean-path
+    term it already had, and it removes the terminal weighting that -- together with the velocity
+    penalty -- is the prime suspect for the error floor.
+
+    `obs` arrives as cat(p_xyz, v_xyz) (...,6), which is what _score builds; the quaternion is not
+    in it, so the attitude term is applied by the caller's rollout wrapper when a goal attitude is
+    asked for. Wall barrier and velocity gating are per-step and live here."""
+    import torch
+
+    def reward(obs, goal):
+        p, v = obs[..., :3], obs[..., 3:6]
+        d = (p - goal).norm(dim=-1)
+        r = -d
+        if w_vel > 0.0:                       # gated near-goal velocity penalty, as controller/mppi
+            r = r - w_vel * (d < r_settle).float() * v.norm(dim=-1)
+        lim = torch.tensor([tj.TANK_L / 2 - 0.8, tj.TANK_W / 2 - 0.8], device=p.device, dtype=p.dtype)
+        out = ((p[..., :2].abs() > lim).any(-1) |
+               (p[..., 2] > -0.8) | (p[..., 2] < -(tj.TANK_D - 0.8)))
+        return r - w_wall * out.float()
+    return reward
+
+
+def _rollout_fn(dyn, state, repeat):
+    """Adapt a dynamics object to controller.mppi's rollout_fn: (G,K,H,A) -> (p_xyz, v_xyz, None)."""
+    import torch
+
+    def fn(cand):
+        c = cand.detach().cpu().numpy()[0]                      # (K,H,A); G is always 1 here
+        preds = (dyn.rollout_batch(state, c, repeat=repeat) if hasattr(dyn, "rollout_batch")
+                 else np.stack([dyn.rollout(state, x, repeat=repeat) for x in c]))
+        t = torch.as_tensor(preds, dtype=cand.dtype, device=cand.device)[None]   # (1,K,H,13)
+        return t[..., :3], t[..., 7:10], None
+    return fn
+
+
 def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma=0.5,
-         temp=0.35, seed=0, prev=None, repeat=6, fan=None):
-    """One MPPI step -> (action, planned_mean). Actions are clipped to the box the plant accepts.
+         temp=0.35, seed=0, prev=None, repeat=6, fan=None,
+         w_att=0.35, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02):
+    """One MPPI step -> (action, planned_mean), THROUGH `controller.mppi`.
 
-    `fan`, if given, is a list the candidate cloud is appended to as {"pts": (K,H,3), "ret": (K,)}
-    -- the same contract `logging.viz._add_fan` already uses for the torus, so the cloud of
-    possible futures can be drawn. `ret` is NEGATED cost, so higher is better, matching that
-    function's colouring.
+    This used to be a bespoke forty-line sampler, which was a mistake: the shared module's core
+    (_mppi_step / _score / _commit) is generic given a rollout_fn and a reward_fn, and writing a
+    second one meant reinventing its `chunk` as `exec_n` and keeping a near-goal velocity penalty
+    that module had already measured and switched OFF ("it made the controller stall at the gate
+    boundary"). Routing through it also brings `beta_ctrl`, which damps the settling jitter, and
+    the Proposal interface -- so the learned action prior can later propose candidates instead of
+    white noise, which the bespoke version could not do at all.
 
-    BUDGET, because the true plant is the expensive one. Each candidate costs horizon x 17 MuJoCo
-    substeps, so the first attempt (160 samples, horizon 25, 2 iterations) was 136,000 mj_steps PER
-    CONTROL STEP and did not finish. 48 x 15 x 1 is 12,000, and the warm start -- the previous plan,
-    shifted one step -- recovers most of what the smaller search gives up, because consecutive
-    problems differ by one step. The learned model is batched and far cheaper, but it uses the same
-    budget: the benchmark only means something if the planner is identical on both sides.
+    `fan` still collects {"pts": (K,H,3), "ret": (K,)} per call for mppi_viz."""
+    import torch
 
-    LOOKAHEAD IS IN SECONDS, NOT STEPS. `repeat` holds each planned action for that many control
-    steps, so horizon 15 x repeat 6 at 30 Hz is a 3-second plan at the cost of a 15-step one. The
-    first version planned 15 raw steps = 0.5 s and every trial closed about 3 m and stalled whatever
-    the start distance -- at half a second of lookahead the terminal cost barely moves, so there is
-    almost nothing to descend."""
-    rng = np.random.default_rng(seed)
-    mean = np.zeros((horizon, 6), np.float32) if prev is None else prev.copy()
-    for _ in range(iters):
-        noise = rng.normal(0, sigma, (samples, horizon, 6)).astype(np.float32)
-        cand = np.clip(mean[None] + noise, -1, 1)
-        if hasattr(dyn, "rollout_batch"):      # one batched call beats `samples` python-loop calls
-            preds = dyn.rollout_batch(state, cand, repeat=repeat)
-        else:
-            preds = [dyn.rollout(state, c, repeat=repeat) for c in cand]
-        costs = np.array([pose_cost(pr, goal_p, goal_q) for pr in preds])
-        if fan is not None:
-            fan.append({"pts": np.asarray([p[:, :3] for p in preds], np.float32), "ret": -costs})
-        wts = np.exp(-(costs - costs.min()) / temp)
-        wts /= wts.sum()
-        mean = np.clip((wts[:, None, None] * cand).sum(0), -1, 1)
-    return mean[0].copy(), np.roll(mean, -1, axis=0)
+    from ...controller.mppi import MPPIConfig, _mppi_step
+    from ...evaluation.steering import GaussianProposal
+
+    cfg = MPPIConfig(horizon=horizon, num_samples=samples, noise_sigma=sigma, lambda_=temp,
+                     beta_vel=w_vel, r_settle=r_settle, beta_ctrl=beta_ctrl)
+    mean = (torch.zeros(1, horizon, 6) if prev is None
+            else torch.as_tensor(prev, dtype=torch.float32)[None].clone())
+    g = torch.Generator().manual_seed(int(seed))
+    plan, a0, p_xyz, ret = _mppi_step(
+        _rollout_fn(dyn, state, repeat), mean, torch.as_tensor(goal_p, dtype=torch.float32)[None],
+        cfg, GaussianProposal(sigma), g,
+        reward_fn=_mbari_reward(goal_p, goal_q, w_att, w_wall, w_vel, r_settle))
+    if fan is not None:
+        fan.append({"pts": p_xyz[0].numpy(), "ret": ret[0].numpy()})
+    plan = plan[0].numpy()
+    return plan[0].copy(), np.roll(plan, -1, axis=0)
 
 
 # TWO PLANNING MODES, SWITCHED ON RANGE. Far from the goal the problem is reach: you need seconds
