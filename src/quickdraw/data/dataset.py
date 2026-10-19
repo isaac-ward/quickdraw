@@ -333,11 +333,16 @@ def resize_frames_area(x, hw: tuple[int, int]):
 
 
 def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 128,
-                    max_frames: int | None = None, cache: bool = True, cam: str = "fpv"):
+                    max_frames: int | None = None, cache: bool = True, cam: str = "fpv",
+                    mmap: bool = False):
     """All egocentric frames for a split (lerobot chunked video, camera `cam`), AREA-downsampled ONCE
     and cached to disk (npy next to the split). `size`: int -> size×size (torus default), (H, W) tuple,
     or None -> native resolution (no resize). Returns uint8 (N, H, W, 3). The downsample is the
-    only per-frame work and it's cached, so repeat loads are instant (mmap)."""
+    only per-frame work and it's cached, so repeat loads are instant (mmap).
+
+    `mmap=True` returns the cache memory-mapped instead of read into RAM. A caller that keeps only
+    some episodes then faults in only those rows -- see load_split_episodes_mm, where a capped
+    training run would otherwise pull the whole 43 GB cache through memory to keep 18 GB of it."""
     import glob as _glob
 
     import imageio.v2 as imageio
@@ -345,7 +350,7 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
     tag = size if isinstance(size, int) else ("native" if hw is None else f"{hw[0]}x{hw[1]}")
     cache_path = os.path.join(root, split, f"{cam}_{tag}.npy")
     if cache and max_frames is None and os.path.exists(cache_path):
-        return np.load(cache_path)
+        return np.load(cache_path, mmap_mode="r") if mmap else np.load(cache_path)
     vid = os.path.join(root, split, "videos", f"observation.images.{cam}")
     mp4s = sorted(_glob.glob(os.path.join(vid, "*", "*.mp4")))
     assert mp4s, f"no {cam} mp4s under {vid}"
@@ -431,13 +436,18 @@ def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_
     act_all = np.stack(hf["action"]).astype(np.float32)
     per_key = {}
     for k, c, sz in zip(keys, cams, sizes):
-        fr = load_fpv_frames(root, split, size=sz, cam=c)                  # (N, H, W, 3), row order
+        # MEMORY-MAPPED, and the cap applied BEFORE any row is touched. A run capped to 240 of 576
+        # episodes used to pull the entire 43 GB frame cache through RAM and then throw 25 GB of it
+        # away; mmap plus an up-front episode filter faults in only the rows that survive.
+        fr = load_fpv_frames(root, split, size=sz, cam=c, mmap=True)        # (N, H, W, 3), row order
         assert len(fr) == len(obs_all), f"{c}/row count mismatch: {len(fr)} vs {len(obs_all)}"
         per_key[k] = fr
+    ids = np.unique(ep_idx)
+    if _TRAIN_EPISODES is not None and split == "train":
+        ids = ids[:_TRAIN_EPISODES]
     return _subsample_episodes(
-        _cap_train([(obs_all[ep_idx == e], act_all[ep_idx == e],
-                     {k: fr[ep_idx == e] for k, fr in per_key.items()}) for e in np.unique(ep_idx)],
-                   split),
+        [(obs_all[ep_idx == e], act_all[ep_idx == e],
+          {k: np.asarray(fr[ep_idx == e]) for k, fr in per_key.items()}) for e in ids],
         f"{repo_id}/{split}+{'+'.join(cams)}")
 
 

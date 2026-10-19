@@ -43,7 +43,30 @@ class UnderwaterRenderer:
         self.r = mujoco.Renderer(model, height, width)
         self.cams = tuple(cams)      # which cameras a caller should capture; see control.run_episode
 
+    def orbit(self, lookat, dist=4.6, elev=-18.0, period_s=24.0, fps=30, name="dockcam"):
+        """Register a FREE camera that slowly circles `lookat`, addressed by `name`.
+
+        A body-mounted chase camera is useless at exactly the moment worth watching: it sits a
+        fixed distance behind the vehicle, so when the vehicle reaches a goal in a corner the
+        camera is inside the wall. Anchoring to the GOAL instead keeps the approach in frame the
+        whole way in, and the slow orbit gives the depth cue a single fixed view does not."""
+        import mujoco
+
+        self._orbit = {"lookat": np.asarray(lookat, float), "dist": float(dist),
+                       "elev": float(elev), "dpsi": 360.0 / (period_s * fps), "k": 0,
+                       "cam": mujoco.MjvCamera()}
+        self.cams = tuple(self.cams) + ((name,) if name not in self.cams else ())
+        self._orbit_name = name
+
     def render(self, data, camera):
+        if getattr(self, "_orbit", None) is not None and camera == self._orbit_name:
+            o = self._orbit
+            c = o["cam"]
+            c.lookat[:] = o["lookat"]
+            c.distance, c.elevation = o["dist"], o["elev"]
+            c.azimuth = (o["k"] * o["dpsi"]) % 360.0
+            o["k"] += 1
+            camera = c
         self.r.update_scene(data, camera=camera)
         self.r.disable_depth_rendering()
         rgb = self.r.render()
