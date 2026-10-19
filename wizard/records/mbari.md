@@ -179,6 +179,76 @@ the evidence that the metric was wrong, not the planner -- and one curve of the 
 settled in minutes what three rounds of reasoning about the planner had got wrong. Look at the
 trajectory, not the summary statistic.
 
+## STATE OF PLAY (2026-10-19 01:15) — read this first if you are picking this up
+
+**Everything upstream of training is done.** What is running, and what to do next.
+
+### The data
+- Raw episodes: `/app/logs/mbari/data/v6/{train,ood_thruster,ood_fish,ood_buoy}/ep_*.npz`
+  — **720 nominal (6.00 h at 30 Hz) + 3 x 50 OOD**, 100 GB, no gaps.
+- Per-trajectory videos: `/app/logs/mbari/data/previews/<split>/ep_*.mp4` — **870 of them**, four
+  cameras side by side (FPV / chase / top-down / side-on), 3.0 GB.
+- Processed (LeRobot) dataset: `/app/logs/recording_2026_10_19_00_30_50_mbari-tank`, **20% val**
+  (576 train / 144 val). An earlier build at 10% val is on HF and is being replaced.
+- Published: `https://huggingface.co/datasets/isaac-ronald-ward/mbari-tank`.
+
+### The experiment now running: a DATA-VOLUME ablation
+This is the point of generating 6 h. `longhand` §8.21/§8.25 end at the same wall — thirteen arms
+failed to move `OL - floor` off 0.063 and the conclusion was *"2.06 h is very small for a video
+world model and there is nothing left to reprocess, so this means recording"*. Block-stack could
+not get more data; this dataset is simulated, so 6 h cost 65 minutes.
+
+| | run A | run B |
+|---|---|---|
+| script | `train_mbari.sh` | `train_mbari_2h.sh` |
+| GPU | 0 | 1 |
+| train episodes | 576 (**6.00 h**) | 240 (**2.00 h**) via `+data.train_episodes=240` |
+| epochs x steps | 14 x 35,812 = **501,368** | 40 x 11,937 = **477,480** |
+| dataset / val / norm stats | **the same one, the same 144 val episodes, the same stats** |
+
+Matched compute to within 5%, so the arms differ in DATA VOLUME and nothing else. They read ONE
+dataset and run B is capped inside the loader (`set_train_episodes`, train-only) — packing a
+second smaller dataset would have given it its own val split and its own normalization statistics,
+so two things would move at once.
+
+`finish_and_train.sh` is armed: it waits for the rebuild, ships the previews + PROCESSING.md into
+the dataset, pushes to HF, then starts run A and (120 s later) run B.
+
+### What remains
+13. open-loop + 16-step-ahead on both arms — `run_after_train.sh <run_dir>`
+14. uncertainty -> 3-way OOD classification
+15. pixel-level uncertainty videos
+16. control benchmark, learned arm vs true vs analytic
+Plus: attribute the docking fix (`scratch/_attrib.py`, queued), and dock videos
+(`scratch/_mppi_clips.py` -> `logs/mbari/control/clips/`).
+
+### Things that will bite you, all found the hard way tonight
+- **`pgrep -f "foo"` inside `bash -lc '... foo ...'` matches ITSELF.** Two queued jobs deadlocked
+  on this. Use the bracket trick: `pgrep -f "[f]oo"`.
+- **Killing a wrapper by pattern does not take its children.** Relaunching generation without
+  checking left two processes per shard racing on the same npz; one file was corrupted (not even a
+  valid zip). Count the distinct `--shard` arguments afterwards.
+- **`tank.build()` writes `assets/tank.xml`, and every shard calls it.** Two episodes died on
+  `ParseXML: empty file`. The write is atomic now (temp file + `os.replace`); do not undo that.
+- **The eval memory knobs are not what they look like.** `eval.horizon_n_episodes` is NEVER READ on
+  the ood_horizon path (n_ep is hardcoded to 8 with an image head), and rows =
+  `min(max(n_ep,64), n_ep*n_seg)` is CAPPED at 64. Only `closed_loop_horizon=64` (n_seg < 8) gets
+  under it: 52.0 -> 28.7 GB. Both arms must carry the identical eval shape or their closed-loop
+  numbers are not comparable.
+- **The autobatch budget differs per arm**: card - reserve - resident frame store, and 6 h of
+  frames takes ~54 GB, so run A's budget is 42 GB where run B's is 78 GB.
+- **MuJoCo cannot tile a texture on a box geom.** 2d smears along one axis, cube ignores
+  `texrepeat`, cube+texuniform starbursts. Wall panels are split until near-square instead.
+- **Assets written by the container are root-owned** and will block a `git merge`. `chown -R
+  1000:1000` the assets dir first.
+
+### Two methodological fixes worth not regressing
+- The OOD detector calibrated its nominal reference on **training** episodes. It now uses the
+  held-out val draw (`held_out_ids`, reproducing the packer's split) and logs how many episodes the
+  threshold came from. Thresholds set on data the model was fit to read optimistically.
+- Val is **20%**, not the house 10%, because val is both the checkpoint monitor AND that nominal
+  reference, and a 90th-percentile threshold from 72 episodes rests on about 7 in the tail.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
@@ -188,13 +258,15 @@ trajectory, not the summary statistic.
 - [x] 5. MOLA 6-DOF dynamics: 3 forces + 3 torques, damping so momentum dies quickly
 - [x] 6. Trajectory generators: random / forward-circles / circles-with-yaw, analytic, collision-free
 - [x] 7. Recorder: state, actions, fpv + top-down + side-on at 144x192
-- [x] 8. Generate 240 x 30 s nominal (80 per class)
+- [x] 8. Generate 720 x 30 s nominal (240 per class) = **6.00 h** -- raised from 240 (see below)
 - [x] 9. Generate 3 OOD sets, 50 trajectories each: glitchy thruster, sharks, purple buoy
-- [x] 10. Package to the house dataset format and push to HF
+- [x] 10. Package to the house dataset format and push to HF -- `isaac-ronald-ward/mbari-tank`
 - [x] 11. Read `wizard/records/*.md` on main AND on the `longhand` branch
 - [x] 12. Training config written and launched (user asleep -- decisions listed above)
 - [x] 12b. Review round 3 fixes (see below); dataset regenerated as **v4**
-- [ ] 13. Train; log full open-loop and 16-step-ahead predictions
+- [x] 12c. Review rounds 4 and 5; dataset regenerated as **v6**; an mp4 per trajectory
+- [x] 12d. MPPI deduplicated onto `controller/mppi.py`; docking 0.173 m -> 0.006 m
+- [ ] 13. Train BOTH ablation arms; log full open-loop and 16-step-ahead predictions
 - [ ] 14. Uncertainty: classify the three OOD types against nominal
 - [ ] 15. Pixel-level uncertainty videos
 - [ ] 16. Control benchmark: reach the dock, and reach a random pose, under TRUE dynamics vs the LEARNED world model

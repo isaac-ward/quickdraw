@@ -21,7 +21,7 @@
 # of what 40 epochs bought on 2 h, so the comparison isolates DATA VOLUME -- which is the whole
 # reason for generating 6 h in the first place.
 cd /app
-R=logs/recording_2026_10_18_23_12_14_mbari-tank
+R=/app/logs/recording_2026_10_19_00_30_50_mbari-tank
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u -m quickdraw.train_world_model \
   model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
