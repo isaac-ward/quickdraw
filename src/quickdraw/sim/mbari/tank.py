@@ -165,7 +165,7 @@ MIN_RGB, SPEC, SHIN = 0.09, 0.55, 0.65
 # caller. Matched by colour, not by group index, because the index moves if the mesh is reconverted.
 HULL_GREY = (0.4, 0.4, 0.4)
 HULL_YELLOW = (0.88, 0.72, 0.06)
-GHOST_RGBA = "0.10 0.95 0.25 0.5"     # the translucent goal-pose marker; see `ghost` in mjcf()
+GHOST_RGBA = "0.10 0.95 0.25 0.25"     # the translucent goal-pose marker; see `ghost` in mjcf()
 
 
 def _recolour(rgb):
@@ -200,6 +200,42 @@ def _mola_geoms(scale):
              f'euler="1.5708 0 0" mass="0.0001" contype="0" conaffinity="0"/>'
              for k in range(len(meta))]
     return a, "".join(parts)
+
+
+def _dock_geoms():
+    """A simple WHITE docking cradle, built from boxes instead of the Sketchfab mesh.
+
+    The mesh had to go. Its geometry is not aligned to its own body frame, so even with the body
+    square to the tank (DOCK_YAW=0) it rendered visibly skewed -- and since the dock's body
+    quaternion is the control benchmark's ATTITUDE TARGET, the ghost marking that target could not
+    line up with the structure the eye reads as the dock. A procedural cradle is axis-aligned by
+    construction, so "the vehicle is square in the dock" and "the vehicle matches the target
+    quaternion" are the same statement.
+
+    Local frame: +X is the approach direction, so the entry hoop is at +X and the cradle runs back
+    toward -X. Sized for the 1.0 m vehicle: a 0.90 x 0.72 m hoop with 1.30 m of rail behind it."""
+    HW, HH, L, T = 0.45, 0.36, 1.30, 0.045      # hoop half-width/height, cradle length, bar radius
+    g = []
+
+    def bar(a, b, r=T):
+        g.append(f'<geom type="capsule" material="m_dock" size="{r}" '
+                 f'fromto="{a[0]:.3f} {a[1]:.3f} {a[2]:.3f} {b[0]:.3f} {b[1]:.3f} {b[2]:.3f}" '
+                 f'contype="0" conaffinity="0"/>')
+
+    # entry hoop at +X, square to the body frame
+    c = [(0.0, -HW, -HH), (0.0, HW, -HH), (0.0, HW, HH), (0.0, -HW, HH)]
+    for i in range(4):
+        bar(c[i], c[(i + 1) % 4])
+    # four rails running back to a smaller rear hoop, so it reads as a cradle the AUV slides into
+    r = [(-L, -HW * 0.62, -HH * 0.62), (-L, HW * 0.62, -HH * 0.62),
+         (-L, HW * 0.62, HH * 0.62), (-L, -HW * 0.62, HH * 0.62)]
+    for i in range(4):
+        bar(c[i], r[i], T * 0.75)
+        bar(r[i], r[(i + 1) % 4], T * 0.75)
+    # a pair of guide vanes flaring out from the hoop, the visual cue for which way is "in"
+    for sy in (-1, 1):
+        bar((0.0, sy * HW, 0.0), (0.42, sy * (HW + 0.30), 0.0), T * 0.7)
+    return "".join(g)
 
 
 def _walls_and_rooms(hl, hw, seed=4242):
@@ -262,6 +298,7 @@ def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False,
     dock_pos = (dx * (hl - 1.1), dy * (hw - 1.1), -1.4)   # tucked into the corner
     dock_yaw = float(np.arctan2(-dy, -dx)) if DOCK_YAW is None else float(DOCK_YAW)
     mola_assets, mola_geoms = _mola_geoms(mola_scale)
+    dock_geoms = _dock_geoms()
     # GHOST: a translucent green copy of the vehicle marking the GOAL POSE, as a mocap body so a
     # caller can place it per episode. OFF by default and never built for data generation -- a
     # target marker in the training frames would be a feature the model could read instead of
@@ -271,9 +308,13 @@ def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False,
         import json as _json
         n_g = len(_json.loads((ASSETS / "mola_groups.json").read_text()))
         ghost_assets = f'<material name="m_ghost" rgba="{GHOST_RGBA}" specular="0.1"/>'
+        # rgba ON THE GEOM, not only on the material: a geom's own rgba defaults to
+        # (0.5, 0.5, 0.5, 1) and that default WINS over the material's alpha, so the ghost
+        # rendered fully opaque while the material said 0.25.
         ghost_body = ("\n    <body name=\"ghost\" mocap=\"true\" pos=\"0 0 -40\">"
                       + "".join(f'<geom type="mesh" mesh="mola{k}" material="m_ghost" '
-                                f'euler="1.5708 0 0" contype="0" conaffinity="0" group="2"/>'
+                                f'rgba="{GHOST_RGBA}" euler="1.5708 0 0" '
+                                f'contype="0" conaffinity="0" group="2"/>'
                                 for k in range(n_g)) + "</body>")
     wall_xml, wall_assets, room_mats, room_xml = _walls_and_rooms(hl, hw)
 
@@ -344,13 +385,12 @@ def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False,
     <material name="m_room" rgba="0.085 0.085 0.095 1" specular="0.02"/>
     <material name="m_lamp" rgba="1.0 0.92 0.45 1" emission="0.95" specular="0.1"/>
     <material name="m_gantry" rgba="0.93 0.74 0.05 1" specular="0.5" shininess="0.5"/>
-    <material name="m_dock" rgba="0.72 0.74 0.78 1" specular="0.3"/>
+    <material name="m_dock" rgba="0.93 0.94 0.96 1" specular="0.35" shininess="0.4"/>
     <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.1"/>
     <material name="m_buoy_g" rgba="{BUOY_RGB} 1" specular="0.6" shininess="0.6" emission="0.18"/>
     <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
     <material name="m_cable" rgba="0.26 0.26 0.28 1" specular="0.5" shininess="0.6"/>
     {mola_assets}{ghost_assets}{extra_assets}{room_mats}
-    <mesh name="dock" file="dock/dock_g0.obj" scale="1 1 1"/>
     <mesh name="hook" file="hook/hook_g0.obj" scale="{HOOK_S} {HOOK_S} {HOOK_S}"/>
     <texture name="t_hook" type="2d" file="hook.png"/>
     <material name="m_hook" texture="t_hook" texuniform="false" specular="0.4" shininess="0.5"/>
@@ -417,8 +457,8 @@ def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False,
     </body>
 
     <body name="dock" pos="{dock_pos[0]} {dock_pos[1]} {dock_pos[2]}" euler="0 0 {dock_yaw:.4f}">
-      <geom name="dock_g" type="mesh" mesh="dock" material="m_dock" contype="0" conaffinity="0"/>
-      <site name="dock_entry" pos="1.6 0 0.2" size="0.08" rgba="0 1 0 0"/>
+      {dock_geoms}
+      <site name="dock_entry" pos="0 0 0" size="0.08" rgba="0 1 0 0"/>
     </body>
 
     <body name="mola" pos="0 0 -5">

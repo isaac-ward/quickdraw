@@ -359,13 +359,20 @@ TO FIX: regenerate and re-push when the dataset is next rebuilt for any other re
 
 Two other scene changes made at the same time, both AFTER the dataset was built, so they carry the
 same caveat:
-- **The dock is flush and square** against the -X wall (`DOCK_YAW = 0.0`, entry facing +X down the
-  length of the tank) instead of rotated 45 degrees to face the tank centre from its corner. It
-  matters more than cosmetics now: the dock's orientation is the control benchmark's attitude
-  target, so a square dock makes that target a clean "face down the tank".
+- **The dock is a procedural white cradle**, flush and square against the -X wall (`DOCK_YAW=0.0`,
+  entry facing +X), replacing the Sketchfab mesh. Two reasons, and the second is not cosmetic.
+  The mesh's geometry is NOT aligned to its own body frame, so even with the body square the dock
+  rendered visibly skewed; and because the body quaternion is the control benchmark's ATTITUDE
+  TARGET, the translucent ghost marking that target could never line up with the structure the eye
+  reads as the dock. `_dock_geoms` builds a 0.90 x 0.72 m entry hoop with 1.30 m of rail behind it
+  and a pair of guide vanes, axis-aligned by construction -- so "square in the dock" and "matches
+  the target quaternion" are the same statement.
 - **A translucent green ghost of the vehicle** can be placed at the goal pose (`mjcf(ghost=True)`,
-  a mocap body). OPT-IN and off by default, and never built for data generation -- a goal marker
-  in the training frames would be a feature the model could read instead of learning the dynamics.
+  a mocap body, 25% alpha). OPT-IN and off by default, and never built for data generation -- a
+  goal marker in the training frames would be a feature the model could read instead of learning
+  the dynamics. NOTE: the alpha must be set on the GEOM, not only on the material. A geom's own
+  rgba defaults to (0.5, 0.5, 0.5, 1) and that default OVERRIDES the material's alpha, so the first
+  version rendered fully opaque while the material said 0.25.
 
 ## Checklist
 
