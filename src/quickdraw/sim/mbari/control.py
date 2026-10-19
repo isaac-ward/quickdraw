@@ -185,34 +185,18 @@ def pose_cost(states, goal_p, goal_q=None, w_pos=1.0, w_att=0.35, w_vel=0.08, w_
     return float(c)
 
 
-def _mbari_reward(goal_p, goal_q, w_att, w_wall, w_vel, r_settle):
-    """Per-step reward for `controller.mppi._score`, carrying this task's terms.
+def _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall):
+    """Adapt a dynamics object to controller.mppi's rollout_fn: (G,K,H,A) -> (p_xyz, v_xyz, dist).
 
-    _score sums a per-step reward over the horizon, so the terminal-weighted cost this module used
-    to apply is expressed as a sum of -distance instead. That is the same shape as the mean-path
-    term it already had, and it removes the terminal weighting that -- together with the velocity
-    penalty -- is the prime suspect for the error floor.
+    ATTITUDE RIDES IN `dist`, and it has to. `_score` builds its observation as cat(p_xyz, v_xyz)
+    -- six dims, no quaternion -- so a reward_fn physically cannot see orientation. The shared
+    module's other scoring path takes a per-step `dist` (G,K,H) override, which is what language
+    steering uses, and `_score` then applies the same velocity gating and control cost to it. So
+    `dist` here is the full per-step POSE error: position + w_att * angle + a wall barrier.
 
-    `obs` arrives as cat(p_xyz, v_xyz) (...,6), which is what _score builds; the quaternion is not
-    in it, so the attitude term is applied by the caller's rollout wrapper when a goal attitude is
-    asked for. Wall barrier and velocity gating are per-step and live here."""
-    import torch
-
-    def reward(obs, goal):
-        p, v = obs[..., :3], obs[..., 3:6]
-        d = (p - goal).norm(dim=-1)
-        r = -d
-        if w_vel > 0.0:                       # gated near-goal velocity penalty, as controller/mppi
-            r = r - w_vel * (d < r_settle).float() * v.norm(dim=-1)
-        lim = torch.tensor([tj.TANK_L / 2 - 0.8, tj.TANK_W / 2 - 0.8], device=p.device, dtype=p.dtype)
-        out = ((p[..., :2].abs() > lim).any(-1) |
-               (p[..., 2] > -0.8) | (p[..., 2] < -(tj.TANK_D - 0.8)))
-        return r - w_wall * out.float()
-    return reward
-
-
-def _rollout_fn(dyn, state, repeat):
-    """Adapt a dynamics object to controller.mppi's rollout_fn: (G,K,H,A) -> (p_xyz, v_xyz, None)."""
+    Without this the benchmark was position-only on both tasks -- including "reach a random POSE",
+    which is then not the task that was asked for, and including docking, where an AUV that arrives
+    at the entry pointing the wrong way has not docked."""
     import torch
 
     def fn(cand):
@@ -220,13 +204,23 @@ def _rollout_fn(dyn, state, repeat):
         preds = (dyn.rollout_batch(state, c, repeat=repeat) if hasattr(dyn, "rollout_batch")
                  else np.stack([dyn.rollout(state, x, repeat=repeat) for x in c]))
         t = torch.as_tensor(preds, dtype=cand.dtype, device=cand.device)[None]   # (1,K,H,13)
-        return t[..., :3], t[..., 7:10], None
+        p, v, q = t[..., :3], t[..., 7:10], t[..., 3:7]
+        d = (p - torch.as_tensor(goal_p, dtype=p.dtype, device=p.device)).norm(dim=-1)
+        if goal_q is not None:
+            gq = torch.as_tensor(np.asarray(goal_q), dtype=q.dtype, device=q.device)
+            qn = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            ang = 2.0 * torch.arccos((qn * gq).sum(-1).abs().clamp(max=1.0))     # radians, 0..pi
+            d = d + w_att * ang
+        lim = torch.tensor([tj.TANK_L / 2 - 0.8, tj.TANK_W / 2 - 0.8], device=p.device, dtype=p.dtype)
+        out = ((p[..., :2].abs() > lim).any(-1) |
+               (p[..., 2] > -0.8) | (p[..., 2] < -(tj.TANK_D - 0.8)))
+        return p, v, d + w_wall * out.to(d.dtype)
     return fn
 
 
 def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma=0.5,
          temp=0.35, seed=0, prev=None, repeat=6, fan=None,
-         w_att=0.35, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02):
+         w_att=1.2, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02):
     """One MPPI step -> (action, planned_mean), THROUGH `controller.mppi`.
 
     This used to be a bespoke forty-line sampler, which was a mistake: the shared module's core
@@ -249,9 +243,8 @@ def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma
             else torch.as_tensor(prev, dtype=torch.float32)[None].clone())
     g = torch.Generator().manual_seed(int(seed))
     plan, a0, p_xyz, ret = _mppi_step(
-        _rollout_fn(dyn, state, repeat), mean, torch.as_tensor(goal_p, dtype=torch.float32)[None],
-        cfg, GaussianProposal(sigma), g,
-        reward_fn=_mbari_reward(goal_p, goal_q, w_att, w_wall, w_vel, r_settle))
+        _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall), mean,
+        torch.as_tensor(goal_p, dtype=torch.float32)[None], cfg, GaussianProposal(sigma), g)
     if fan is not None:
         fan.append({"pts": p_xyz[0].numpy(), "ret": ret[0].numpy()})
     plan = plan[0].numpy()
@@ -281,7 +274,7 @@ FINE = dict(repeat=1, horizon=18, samples=48, sigma=0.18)
 
 
 def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0, log=None,
-                repeat=6, samples=24, horizon=12, fan=None):
+                repeat=6, samples=24, horizon=12, fan=None, render=None):
     """Closed loop: `dyn` plans, the MuJoCo `plant_model` executes. Returns a trace dict.
 
     EACH PLANNED ACTION IS EXECUTED FOR `repeat` CONTROL STEPS, which is what it was costed as: the
@@ -301,6 +294,10 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     if observe is not None:
         observe(d)
     sub = int(round((1.0 / FPS) / plant_model.opt.timestep))
+    # `render` = an UnderwaterRenderer; frames are captured from the PLANT's own MjData each
+    # executed step, so a control episode can be watched in the tank from every camera rather than
+    # read off a plot.
+    frames = {c: [] for c in (render.cams if render is not None else ())}
     traj, acts, prev = [], [], None
     k, mode = 0, None
     while k < steps:
@@ -319,6 +316,9 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
             acts.append(a)
             if observe is not None:
                 observe(d, a)
+            if render is not None:
+                for c in render.cams:
+                    frames[c].append(render.render(d, c))
             for _ in range(sub):
                 mola.apply(plant_model, d, a)
                 mujoco.mj_step(plant_model, d)
@@ -328,5 +328,6 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     traj = np.asarray(traj, np.float32)
     dist = np.linalg.norm(traj[:, :3] - goal_p, axis=1)
     return {"traj": traj, "act": np.asarray(acts, np.float32), "dist": dist, "fan": fan,
+            "frames": {c: np.stack(v) for c, v in frames.items() if v},
             "final_dist": float(dist[-1]), "best_dist": float(dist.min()),
             "steps_to_0p5m": int(np.argmax(dist < 0.5)) if (dist < 0.5).any() else -1}

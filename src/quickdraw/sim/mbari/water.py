@@ -37,10 +37,11 @@ class UnderwaterRenderer:
     built once. On 864,000 renders that is the difference between an 8-hour pass and a 2-hour one.
     """
 
-    def __init__(self, model, height=144, width=192):
+    def __init__(self, model, height=144, width=192, cams=()):
         import mujoco
 
         self.r = mujoco.Renderer(model, height, width)
+        self.cams = tuple(cams)      # which cameras a caller should capture; see control.run_episode
 
     def render(self, data, camera):
         self.r.update_scene(data, camera=camera)

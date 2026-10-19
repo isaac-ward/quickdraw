@@ -14,7 +14,15 @@
 # Both arms carry the IDENTICAL eval shape, or their closed-loop numbers are not comparable, which
 # is the whole point of the ablation.
 #
-# RUN B: the 2.00 h CONTROL arm, on THE SAME PACK as run A, capped to its first 240 train episodes.
+# BATCH PINNED AT 6 ON BOTH ARMS, and epochs set so the two match on GRADIENT STEPS.
+# Autobatch sizes per-arm from `card - reserve - resident frame store`, and 6 h of frames is ~43 GB
+# resident, so it offered batch 6 to run A and batch 12 to run B. Two arms at different batch sizes
+# are not comparable -- different gradient noise, different effective learning rate -- and the step
+# counts diverge too (1.11 M vs 663 k). Pinned to 6, the smaller of the two, which is what the 6 h
+# arm can actually fit:
+#     run A  477,504 windows / 6 =  79,584 steps/epoch  x 6 epochs = 477,504 steps
+#     run B  198,960 windows / 6 =  33,160 steps/epoch  x 14 epochs = 464,240 steps
+# Within 2.9%, so the arms differ in DATA VOLUME and not in optimisation.
 #
 # Packing a separate smaller dataset -- which is what this did first -- gives the small arm its own
 # val split AND its own normalization statistics, so two things move at once and a val difference
@@ -30,8 +38,8 @@ R=/app/logs/recording_2026_10_19_00_30_50_mbari-tank
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -u -m quickdraw.train_world_model \
   model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
-  data.root=$R data.repo_id=mbari-tank data.cam=fpv data.subsample=1 data.action_aggregate=concat +data.train_episodes=240 \
-  trainer.max_epochs=40 trainer.check_val_every_n_epoch=1 \
+  data.root=$R data.repo_id=mbari-tank data.cam=fpv data.subsample=1 data.action_aggregate=concat data.autobatch=false data.batch=6 +data.train_episodes=240 \
+  trainer.max_epochs=14 trainer.check_val_every_n_epoch=1 \
   trainer.checkpoint_monitor=val/metric/fpv/mse \
   eval.during_train.evals.manifold=false \
   eval.during_train.evals.denoising_multistep=false \
