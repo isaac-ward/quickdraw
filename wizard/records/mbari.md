@@ -126,6 +126,59 @@ means recording.* Block-stack could not get more -- it is a real robot. MBARI is
 25 minutes of wall clock. The one lever thirteen arms could not pull is nearly free here, so the
 nominal set went from 240 episodes (2.00 h) to **720 (6.00 h)**, OOD unchanged.
 
+## Docking: 0.173 m -> 0.006 m, and three wrong guesses on the way
+
+**The number was never a ceiling.** I reported 0.16 m mean final distance under TRUE dynamics as
+"the ceiling any learned model is measured against". The user pushed back that it should be better.
+It should, and it was not even a ceiling.
+
+Guess 1: coarse actions. `repeat=6` holds each command 0.2 s, so the finest correction available is
+one impulse. Built a near-goal fine mode (1-step actions, more samples, less noise) and measured
+**no change at all**: coarse 0.173 m, fine 0.173 m, best-along-path actually worse (0.052 -> 0.085).
+
+Two different planners cannot land on the same number by coincidence, so instead of a third guess I
+dumped the distance-vs-time curve of a single trial:
+
+| step | 0 | 240 | 480 | 560 |
+|---|---|---|---|---|
+| dist (m) | 7.87 | 5.92 | 1.61 | 0.20 |
+| speed (m/s) | 0.00 | 0.52 | 0.63 | **0.57** |
+
+**It was still in transit when the 600-step budget expired.** "Final distance" was measuring where
+the clock stopped it, which is exactly why two planners returned the same figure. And it crawls:
+7.9 m in 19 s, averaging 0.4 m/s against a 1.21 m/s cruise, `|a_lin|` at 0.2-0.6 of max. With a
+TERMINAL-weighted cost at 2.4 s of lookahead, closing 1 m from 7.9 m out moves the objective 13%,
+which sampling noise and the mean-path term swamp -- there is almost no gradient to descend until
+it is already close.
+
+Also misread: `within 0.5 m: 100%` counts trials that PASSED THROUGH 0.5 m, not trials that ended
+there.
+
+**The fix was deleting my own MPPI.** The user asked why `sim/mbari/control.py` had a bespoke
+sampler when `controller/mppi.py` exists. Reading that module answered the control question too --
+its config carries `chunk` ("execute this many steps of each plan before replanning"), which is the
+`exec_n` I had reinvented an hour earlier, and `beta_vel: 0.0  # near-goal velocity penalty OFF: it
+made the controller stall at the gate boundary`, which is the term `pose_cost` still had at 0.08.
+
+Routed through the shared core (`_mppi_step` / `_score` / `_commit`, given a rollout_fn and a
+reward_fn), same trial, same seed, same start:
+
+| | old | ported |
+|---|---|---|
+| final | 0.173 m | **0.006 m** |
+| best | 0.052 m | 0.002 m |
+| holds position | no | yes -- last samples 0.06, 0.00, 0.00 |
+
+**Not yet attributed.** Three things changed together: summed `-distance` instead of terminal
+weighting (dense shaping, which is what the crawl predicts is missing), `beta_vel` 0.08 -> 0, and
+`beta_ctrl` 0.02 added. A three-way ablation runs while the GPUs are busy so this says which one
+bought the 29x instead of asserting it.
+
+**The lesson, which is the same one this file keeps recording.** Two planners agreeing exactly was
+the evidence that the metric was wrong, not the planner -- and one curve of the raw quantity
+settled in minutes what three rounds of reasoning about the planner had got wrong. Look at the
+trajectory, not the summary statistic.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
