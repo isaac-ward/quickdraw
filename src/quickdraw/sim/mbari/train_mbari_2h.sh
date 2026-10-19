@@ -14,16 +14,23 @@
 # Both arms carry the IDENTICAL eval shape, or their closed-loop numbers are not comparable, which
 # is the whole point of the ablation.
 #
-# RUN B: the 2.00 h CONTROL arm. Same recipe, same seeds, a strict PREFIX of the 6 h episodes
-# (job i always carries seed 1000+i and class CLASSES[i%3], so the first 240 are class-balanced).
-# 40 epochs x 11,937 steps = 477,480 against the 6 h arm's 501,368, within 5% -- so the two arms
-# differ in DATA VOLUME and not in compute, which is the only way the comparison means anything.
+# RUN B: the 2.00 h CONTROL arm, on THE SAME PACK as run A, capped to its first 240 train episodes.
+#
+# Packing a separate smaller dataset -- which is what this did first -- gives the small arm its own
+# val split AND its own normalization statistics, so two things move at once and a val difference
+# cannot be attributed to data volume. One pack with `data.train_episodes` capped means identical
+# val episodes, identical norm stats, identical preprocessing, and the single difference is how
+# much training data the model is shown. The cap takes the first 240, and the generator numbers
+# episodes so any prefix is class-balanced (job i carries seed 1000+i, class CLASSES[i%3]).
+#
+# 40 epochs x 11,937 steps = 477,480 against run A's 501,368, within 5% -- so the arms differ in
+# DATA VOLUME and not in compute, which is the only way the comparison means anything.
 cd /app
-R=/app/logs/recording_2026_10_19_00_28_23_mbari-tank-2h
+R=/app/logs/recording_2026_10_19_00_30_50_mbari-tank
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -u -m quickdraw.train_world_model \
   model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
-  data.root=$R data.repo_id=mbari-tank-2h data.cam=fpv data.subsample=1 data.action_aggregate=concat \
+  data.root=$R data.repo_id=mbari-tank data.cam=fpv data.subsample=1 data.action_aggregate=concat +data.train_episodes=240 \
   trainer.max_epochs=40 trainer.check_val_every_n_epoch=1 \
   trainer.checkpoint_monitor=val/metric/fpv/mse \
   eval.during_train.evals.manifold=false \
