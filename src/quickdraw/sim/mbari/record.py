@@ -84,10 +84,19 @@ def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=N
     act = np.zeros((steps, 6), np.float32)
     frames = {c: np.zeros((steps, size[0], size[1], 3), np.uint8) for c in cams}
     try:
+        n_done = steps
         for k in range(steps):
             s = mola.state(data)
             if not np.isfinite(s).all():
                 return None                                   # drop rather than ship a NaN episode
+            # COLLISION ENDS THE EPISODE. The AUV's geoms are contype=0 -- it has no contact
+            # physics, deliberately, so the dynamics stay the analytic ones the trajectories are
+            # solved against. Without a check, nothing stopped it leaving: measured on v6, 6% of
+            # all steps were outside the tank and one episode reached |x| = 9.18 m in a tank that
+            # ends at 7.5. Frames of the vehicle flying through concrete are not data.
+            if not bool(tj.clear(s[None, :3])[0]):
+                n_done = k
+                break
             a_cmd = np.asarray(policy(k * dt, s), np.float32)
             obs[k], act[k] = s, a_cmd
             for c in cams:
@@ -102,7 +111,10 @@ def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=N
         if own:
             r.close()
 
-    meta = {"kind": kind, "seed": int(seed), "steps": int(steps), "glitch_p": float(glitch_p)}
+    obs, act = obs[:n_done], act[:n_done]
+    frames = {c: v[:n_done] for c, v in frames.items()}
+    meta = {"kind": kind, "seed": int(seed), "steps": int(n_done), "glitch_p": float(glitch_p),
+            "ended_on_contact": bool(n_done < steps)}
     if spec is not None:
         meta.update(radius=float(spec["rad"]), speed=float(spec["speed"]),
                     centre=[float(v) for v in spec["centre"]])

@@ -23,10 +23,15 @@ from __future__ import annotations
 import numpy as np
 
 from .mola import C_ANG_LIN, C_ANG_QUAD, C_LIN, C_QUAD, F_MAX, T_MAX, quat_to_mat
-from .tank import TANK_D, TANK_L, TANK_W
+from .tank import KEEPOUT, TANK_D, TANK_L, TANK_W, VEHICLE_R, WATER_Z
 
 MASS = 60.0
 MARGIN = 1.6                      # metres of clearance from every wall
+PLAN_SLACK = 0.30                 # extra clearance a PLANNED path must keep beyond the vehicle
+#                                   radius, so tracking error cannot turn a legal plan into a
+#                                   collision. `clear` is the physical test (clearance >= 0); a
+#                                   circle grazing a keep-out by a millimetre passed it and then
+#                                   truncated on the controller's own 0.04 m tracking error.
 CRANE_KEEPOUT = 1.2               # radius around the crane line at x=y=0
 CLASSES = ("random", "circle", "circle_yaw")
 
@@ -91,6 +96,24 @@ def frame_on_plane(fwd, normal):
     return np.stack([x, np.cross(z, x), z], axis=1)
 
 
+def clear(p, r=VEHICLE_R):
+    """True where a vehicle of radius `r` touches NOTHING -- not a wall, the floor, the surface, or
+    any of the tank's furniture.
+
+    Separate from `inside`, which exists for PLANNING and carries a generous 1.6 m margin so a
+    circle never comes near a wall. This is the PHYSICAL test: the real clearance, used to end an
+    episode on contact and to reject target poses that cannot be reached without one. Measured on
+    the v6 data before it existed: 6% of all steps were out of bounds, 20 of 210 sampled episodes
+    touched a wall and one reached |x| = 9.18 m in a tank that stops at 7.5."""
+    x, y, z = p[..., 0], p[..., 1], p[..., 2]
+    ok = ((np.abs(x) < TANK_L / 2 - r) & (np.abs(y) < TANK_W / 2 - r)
+          & (z < WATER_Z - r) & (z > -TANK_D + r))
+    for cx, cy, cr, z0, z1 in KEEPOUT:
+        hit = (np.hypot(x - cx, y - cy) < cr + r) & (z > z0 - r) & (z < z1 + r)
+        ok = ok & ~hit
+    return ok
+
+
 def inside(p, margin=MARGIN):
     x, y, z = p[..., 0], p[..., 1], p[..., 2]
     ok = ((np.abs(x) < TANK_L / 2 - margin) & (np.abs(y) < TANK_W / 2 - margin)
@@ -138,7 +161,11 @@ def fit_circle(rng, T, dt, tries=60):
         s = circle_spec(rng)
         for _ in range(6):
             p, _, _ = circle_at(s, ts)
-            if inside(p).all():
+            # BOTH: `inside` keeps a planning margin off the walls, `clear` is the physical test
+            # that also rejects a path through a buoy tether, the ladder or the crane hook. Without
+            # the second, a planned circle truncated on contact as often as a random episode did
+            # (48% vs 83% measured on v6) -- the planner simply did not know the furniture existed.
+            if inside(p).all() and clear(p, VEHICLE_R + PLAN_SLACK).all():
                 return s
             s["rad"] *= 0.82
             s["centre"][2] = np.clip(s["centre"][2], -TANK_D + MARGIN + s["rad"], -MARGIN - s["rad"])

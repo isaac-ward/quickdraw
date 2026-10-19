@@ -21,6 +21,10 @@ from __future__ import annotations
 import numpy as np
 
 from . import mola, trajectories as tj
+from .tank import KEEPOUT, VEHICLE_R as VEH_R
+
+W_CRASH = 50.0        # per-step cost of being inside anything solid. Large on purpose:
+#                       a plan that clips a buoy to save travel must never score well.
 from .record import FPS
 
 
@@ -185,7 +189,7 @@ def pose_cost(states, goal_p, goal_q=None, w_pos=1.0, w_att=0.35, w_vel=0.08, w_
     return float(c)
 
 
-def _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall):
+def _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall=W_CRASH):
     """Adapt a dynamics object to controller.mppi's rollout_fn: (G,K,H,A) -> (p_xyz, v_xyz, dist).
 
     ATTITUDE RIDES IN `dist`, and it has to. `_score` builds its observation as cat(p_xyz, v_xyz)
@@ -211,10 +215,18 @@ def _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall):
             qn = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-9)
             ang = 2.0 * torch.arccos((qn * gq).sum(-1).abs().clamp(max=1.0))     # radians, 0..pi
             d = d + w_att * ang
-        lim = torch.tensor([tj.TANK_L / 2 - 0.8, tj.TANK_W / 2 - 0.8], device=p.device, dtype=p.dtype)
-        out = ((p[..., :2].abs() > lim).any(-1) |
-               (p[..., 2] > -0.8) | (p[..., 2] < -(tj.TANK_D - 0.8)))
-        return p, v, d + w_wall * out.to(d.dtype)
+        # COLLISION IS CATASTROPHIC, NOT A NUDGE. The barrier used to cover the four walls only,
+        # at a weight comparable to a metre of distance -- so a plan that clipped a buoy to save
+        # two metres of travel scored WELL. It now covers every solid in the tank (the same
+        # KEEPOUT volumes `trajectories.clear` uses, so planner and plant agree on what a
+        # collision IS) and costs W_CRASH per step, which no amount of saved distance can buy back.
+        out = ((p[..., :2].abs() > torch.tensor([tj.TANK_L / 2 - VEH_R, tj.TANK_W / 2 - VEH_R],
+                                                device=p.device, dtype=p.dtype)).any(-1)
+               | (p[..., 2] > tj.WATER_Z - VEH_R) | (p[..., 2] < -tj.TANK_D + VEH_R))
+        for cx, cy, cr, z0, z1 in KEEPOUT:
+            out = out | ((torch.hypot(p[..., 0] - cx, p[..., 1] - cy) < cr + VEH_R)
+                         & (p[..., 2] > z0 - VEH_R) & (p[..., 2] < z1 + VEH_R))
+        return p, v, d + W_CRASH * out.to(d.dtype)
     return fn
 
 
@@ -303,7 +315,7 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     # read off a plot.
     frames = {c: [] for c in (render.cams if render is not None else ())}
     traj, acts, prev = [], [], None
-    k, mode = 0, None
+    k, mode, crashed = 0, None, False
     while k < steps:
         s = mola.state(d)
         if not np.isfinite(s).all():
@@ -311,11 +323,16 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
         want = FINE if np.linalg.norm(s[:3] - goal_p) < NEAR else COARSE
         if want is not mode:                  # the warm start has the old horizon; drop it
             mode, prev = want, None
+        if crashed:
+            break
         a, prev = mppi(dyn, s, goal_p, goal_q, seed=seed + k, prev=prev,
                        samples=mode["samples"], horizon=mode["horizon"],
                        sigma=mode["sigma"], repeat=mode["repeat"], fan=fan)
         for _ in range(min(mode.get("exec_n", mode["repeat"]), steps - k)):
             s = mola.state(d)
+            if not bool(tj.clear(s[None, :3])[0]):
+                crashed = True
+                break
             traj.append(s)
             acts.append(a)
             if observe is not None:
@@ -332,6 +349,7 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     traj = np.asarray(traj, np.float32)
     dist = np.linalg.norm(traj[:, :3] - goal_p, axis=1)
     return {"traj": traj, "act": np.asarray(acts, np.float32), "dist": dist, "fan": fan,
+            "crashed": bool(crashed),
             "frames": {c: np.stack(v) for c, v in frames.items() if v},
             "final_dist": float(dist[-1]), "best_dist": float(dist.min()),
             "steps_to_0p5m": int(np.argmax(dist < 0.5)) if (dist < 0.5).any() else -1}

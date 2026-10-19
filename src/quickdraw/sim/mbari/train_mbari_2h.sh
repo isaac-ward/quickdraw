@@ -37,13 +37,18 @@
 #
 # 40 epochs x 11,937 steps = 477,480 against run A's 501,368, within 5% -- so the arms differ in
 # DATA VOLUME and not in compute, which is the only way the comparison means anything.
+# VALIDATION IS CAPPED TOO, and leaving it uncapped was the expensive mistake. Capping only
+# limit_train_batches left val at 19,896 batches -- 2.5x the train epoch, and autoregressive so
+# just as slow per batch -- which made one epoch CYCLE 13.5 h and ten epochs 135 h. 400 val
+# batches is 2,400 windows: ample to rank checkpoints, and the heavyweight open-loop and
+# 16-step-ahead evals run on their own cadence regardless of this number.
 cd /app
 R=/app/logs/recording_2026_10_19_00_30_50_mbari-tank
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -u -m quickdraw.train_world_model \
   model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
   data.root=$R data.repo_id=mbari-tank data.cam=fpv data.subsample=1 data.action_aggregate=concat data.autobatch=false data.batch=6 +data.train_episodes=240 \
-  trainer.max_epochs=10 +trainer.limit_train_batches=8000 trainer.check_val_every_n_epoch=1 \
+  trainer.max_epochs=10 +trainer.limit_train_batches=8000 +trainer.limit_val_batches=400 trainer.check_val_every_n_epoch=1 \
   trainer.checkpoint_monitor=val/metric/fpv/mse \
   eval.during_train.evals.manifold=false \
   eval.during_train.evals.denoising_multistep=false \
