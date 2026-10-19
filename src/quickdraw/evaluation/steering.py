@@ -326,6 +326,7 @@ class DataProposal:
 @torch.no_grad()
 def plan(model, lang, t_e, ctx_obs, ctx_act, proposal, *, horizon: int, lookahead: int,
          n_samples: int, lam: float, objective: str = "level", commit: int = 0,
+         commit_rule: str = "argmax",
          beta_jerk: float = 0.0, generator=None, log=None):
     """Receding-horizon plan inside the imagination. Returns (bags, actions, scores).
 
@@ -395,6 +396,19 @@ def plan(model, lang, t_e, ctx_obs, ctx_act, proposal, *, horizon: int, lookahea
             ret = ret - beta_jerk * (seq[:, 1:] - seq[:, :-1]).abs().mean(dim=(1, 2))
         best = int(torch.argmax(ret))
         w = torch.softmax(ret / max(lam, 1e-6), dim=0)                 # logged for diagnostics only
+        if commit_rule == "mppi":
+            # THE TEXTBOOK MPPI COMMIT, OFF BY DEFAULT and used only to measure what argmax discards.
+            # The weighted mean of the candidates has no rolled trajectory of its own -- `rolled` holds
+            # one per candidate -- so it is rolled separately, as a batch of one, and then treated as
+            # candidate `best`. One extra rollout of one candidate per block.
+            a_bar = (w[:, None, None] * cand).sum(0, keepdim=True)     # (1, steps, a)
+            r_bar = m._rollout_from([b[:1] for b in bag_buf],
+                                    torch.cat([hist[:1], a_bar], dim=1), steps, 0.0, None, 0)
+            cand = torch.cat([cand, a_bar], 0)
+            rolled = torch.cat([rolled, r_bar], 0)
+            s = torch.cat([s, lang.score(r_bar.reshape(steps, -1), t_e).reshape(1, steps)], 0)
+            ret = torch.cat([ret, chunk_return(s[-1:], objective)], 0)
+            best = int(len(cand) - 1)
         # NOTE: best is committed for EITHER proposal, ignoring proposal.commit -- the gaussian arm is a
         # control, and it is only a control if the selection rule is held fixed and the candidate source is
         # the only thing that changes. eval_control honours proposal.commit instead, because there the

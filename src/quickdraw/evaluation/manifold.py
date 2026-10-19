@@ -55,8 +55,12 @@ def manifold_predictions(m, norm, mm_eps, *, P, n_points, stride, seed, device):
         pred = m(obs, act)                                   # (1,T,n_state,d)
         sel = pred[0, np.array(sorted(ts))]                  # (nt,n_state,d)
         latents.extend(sel.reshape(sel.shape[0], -1).cpu().numpy())            # flatten bag -> (n_state*d,)
-        data_phys.extend(norm.denorm_obs(m.to_obs(sel)["proprio"]).cpu().numpy())  # decoded proprio vector
-    data_phys, latents = np.stack(data_phys), np.stack(latents)
+        # DISCARDED BY eval_manifold (`_, latents, n_avail = ...`) and impossible without a proprio head,
+        # so it is computed only when both a caller wants it and the model has one.
+        if any(n == "proprio" for n, _ in m.layout):
+            data_phys.extend(norm.denorm_obs(m.to_obs(sel)["proprio"]).cpu().numpy())
+    latents = np.stack(latents)
+    data_phys = np.stack(data_phys) if data_phys else np.zeros((len(latents), 0), dtype=np.float32)
     return data_phys, latents, n_avail
 
 

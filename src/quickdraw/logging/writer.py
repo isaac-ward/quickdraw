@@ -182,6 +182,16 @@ class RunWriter:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         np.savez_compressed(p, **arrays)
 
+    def text(self, tag, content: str, step: int):
+        """Save plain text next to the media at logs/epoch_<step>/<tag>.txt (LOCAL only — not sent to
+        wandb). For a product whose content is words rather than numbers or pixels: the prompts an
+        external text-conditioned model was actually given, say, which are otherwise unrecoverable from
+        the mp4 they produced."""
+        p = os.path.join(self.dir, f"epoch_{step:04d}", tag) + ".txt"
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(content)
+
     def config(self, cfg: dict):
         for b in self.backends:
             b.config(cfg)

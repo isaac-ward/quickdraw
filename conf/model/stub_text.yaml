@@ -1,0 +1,12 @@
+# =============================================================================================
+# The RepeatLastFrame external stub -- a harness test, not a model.
+#
+# `name: stub` routes build_model to models/external.EXTERNAL["stub"] BEFORE any multimodal model is
+# constructed. The `modalities` list below is still required and still honoured: it is what tells the
+# DATA side which camera to load and at what size. The model side never sees it except to read the head
+# name and frame size off it.
+# =============================================================================================
+name: stub_text
+d: 128            # unused by the adapter; present so configs that read cfg.model.d do not fail
+modalities:
+  - {name: image, kind: image, weight: 1.0, img_size: [112, 192], ae_bottleneck: 7, pretrained: false}

@@ -43,7 +43,8 @@ def _generic_card(name: str, s: dict) -> str:
                      f"{counts[sp]['transitions']} |" for sp in splits)
     # A hand-written PROCESSING.md in the run folder is the authoritative account of how the raw
     # recordings became this dataset; the generated card should point at it rather than compete.
-    extra = ("\n## How this dataset was produced\n\nSee **[PROCESSING.md](PROCESSING.md)** for the "
+    extra = _preview_block(_ROOT_HINT[0] or "")
+    extra += ("\n## How this dataset was produced\n\nSee **[PROCESSING.md](PROCESSING.md)** for the "
              "full account: source streams and rates, exactly which fields were kept and dropped "
              "and why, the resampling and synchronisation procedure, the train/val split rule, and "
              "the verification that images align with state rows.\n"
@@ -75,6 +76,38 @@ Generated with [quickdraw](https://github.com/isaac-ward/quickdraw) (`data.proce
 
 Normalization statistics are computed on **train only** and applied to every split.
 {extra}"""
+
+
+def _preview_block(root: str) -> str:
+    """Embed any media/previews/*.mp4 in the card, so the clips PLAY on the dataset page.
+
+    A video that only exists as a file in the repo browser is a video nobody watches. The Hub
+    renders a raw <video> tag, so each preview is embedded directly with its `resolve` URL; the
+    link beside it is the fallback for renderers that strip the tag."""
+    d = os.path.join(root, "media", "previews")
+    if not os.path.isdir(d):
+        return ""
+    # previews are <split>/<episode>.mp4; embed ONE per split and link the rest. Embedding several
+    # hundred <video> tags would make the card unloadable.
+    picks, total = [], 0
+    for split in sorted(os.listdir(d)):
+        sd = os.path.join(d, split)
+        if not os.path.isdir(sd):
+            continue
+        vids = sorted(f for f in os.listdir(sd) if f.endswith(".mp4"))
+        total += len(vids)
+        if vids:
+            picks.append((split, len(vids), f"{split}/{vids[0]}"))
+    if not picks:
+        return ""
+    rows = "\n".join(
+        f'\n**{sp}** ({n} episodes, one mp4 each in '
+        f'[`media/previews/{sp}/`](media/previews/{sp}))\n\n'
+        f'<video controls width="640" src="media/previews/{rel}"></video>\n\n'
+        f'([download](media/previews/{rel}))\n' for sp, n, rel in picks)
+    return (f"\n## Watch it\n\n**Every one of the {total} trajectories has a preview mp4** under "
+            f"`media/previews/<split>/`: all four cameras side by side, labelled, at 30 Hz. One "
+            f"example per split is embedded below.\n{rows}\n")
 
 
 def _make_card(root: str, name: str) -> str:

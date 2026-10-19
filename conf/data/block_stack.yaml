@@ -13,7 +13,9 @@
 #
 # THE VAL SPLIT IS ONLY TWO EPISODES (very long ones). Thin for evaluation -- read any val number
 # with that in mind. `eval_purple_play` / `eval_purple_stack` are the more interesting held-out
-# targets, and nothing in quickdraw reads a split by those names automatically.
+# targets: both load with no code change via `eval.horizon_split=eval_purple_stack`, and both stay
+# OPT-IN, because they are the OOD test for anything trained here and a default that reads them spends
+# that for every model at once.
 #
 # THE OBSERVATION LAYOUT IS DOCUMENTED (PROCESSING.md §5), so unlike robocasa it needed no recovery:
 #     0:3    ee_{x,y,z}_mm      world frame, MILLIMETRES

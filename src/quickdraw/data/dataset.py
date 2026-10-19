@@ -109,6 +109,7 @@ class Normalizer:
 # call sites. That is deliberate: the catastrophic failure here is a MISSED call site leaving eval at
 # 20 Hz while training runs at 4 Hz -- the metrics would be measuring a different problem and would look
 # like the model failing. One source of truth makes that inconsistency impossible to write.
+_TRAIN_EPISODES = None     # cap on TRAIN episodes; None = all. See set_train_episodes.
 _SUBSAMPLE = 1
 _SUBSAMPLE_USED = False
 
@@ -191,6 +192,27 @@ def set_subsample_all_phases(v: bool) -> None:
 
 _OBS_KEEP = None
 _OBS_KEEP_USED = False
+
+
+def set_train_episodes(n) -> None:
+    """Cap how many TRAIN episodes the loaders return (None = all). Val and every other split are
+    untouched, on purpose.
+
+    THIS IS HOW A DATA-VOLUME ABLATION SHOULD BE RUN. Packing a second, smaller dataset gives the
+    small arm its OWN val split and its OWN normalization statistics, so two things move at once and
+    a difference in val metrics cannot be attributed to data volume. Capping train episodes inside
+    the loader keeps ONE pack: identical val episodes, identical norm stats, identical preprocessing,
+    and the only difference is how much training data the model is shown. The cap takes the FIRST n
+    episodes, and the generator numbers them so any prefix is class-balanced (job i carries seed
+    1000+i and class CLASSES[i%3])."""
+    global _TRAIN_EPISODES
+    _TRAIN_EPISODES = None if n in (None, 0) else int(n)
+
+
+def _cap_train(eps, split):
+    if _TRAIN_EPISODES is None or split != "train":
+        return eps
+    return eps[:_TRAIN_EPISODES]
 
 
 def set_obs_keep(idx) -> None:
@@ -284,8 +306,9 @@ def load_split_episodes(root: str, split: str, repo_id: str = "torus"):
     ep_idx = np.asarray(hf["episode_index"])
     obs_all = _apply_obs_keep(np.stack(hf["observation_vector"]).astype(np.float32))
     act_all = np.stack(hf["action"]).astype(np.float32)
-    return _subsample_episodes([(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)],
-                               f"{repo_id}/{split}")
+    return _subsample_episodes(
+        _cap_train([(obs_all[ep_idx == e], act_all[ep_idx == e]) for e in np.unique(ep_idx)], split),
+        f"{repo_id}/{split}")
 
 
 def resize_frames_area(x, hw: tuple[int, int]):
@@ -412,8 +435,9 @@ def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_
         assert len(fr) == len(obs_all), f"{c}/row count mismatch: {len(fr)} vs {len(obs_all)}"
         per_key[k] = fr
     return _subsample_episodes(
-        [(obs_all[ep_idx == e], act_all[ep_idx == e],
-          {k: fr[ep_idx == e] for k, fr in per_key.items()}) for e in np.unique(ep_idx)],
+        _cap_train([(obs_all[ep_idx == e], act_all[ep_idx == e],
+                     {k: fr[ep_idx == e] for k, fr in per_key.items()}) for e in np.unique(ep_idx)],
+                   split),
         f"{repo_id}/{split}+{'+'.join(cams)}")
 
 

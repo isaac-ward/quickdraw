@@ -1,0 +1,86 @@
+# ACTION AXES ONLY, for `data=block_stack`. Select with `interpret=block_stack`.
+#
+# WHAT THIS FILE IS FOR, AND WHAT IT IS NOT. `action_axes` is the one thing in an interpret config that
+# the EXTERNAL-MODEL text bridge needs (models/external.py `_actions`, action_mode="text"): it is how a
+# recorded stick becomes a sentence a video model can be prompted with. Everything else an interpret
+# config carries -- `factors`, the VLM prompts, the segmentation schema -- is absent here, so
+# eval_interpret and train_reward_model will fail on this file BY DESIGN. Write those when block-stack
+# actually gets an interpretability run; do not stub them, because a stubbed factor silently labels one
+# environment's data with another's categories (that is the whole argument in interpret/unset.yaml).
+#
+# THE SIGNS ARE MEASURED, NOT READ OFF THE NAMES. Correlating action[t] against the observation delta
+# over all 43 train episodes (scratch calibration, 2026-09-20) gives r = +0.94 on every diagonal:
+#
+#     move_x -> d ee_x  +0.944     height -> d ee_z  +0.942
+#     move_y -> d ee_y  +0.939     yaw    -> d(atan2 of the rot6 first column)  +0.947
+#     gripper -> d gripper_open  -0.167   (obs dim 9 is 1 = OPEN, the action is 1 = SQUEEZE)
+#
+# rot6 (obs 3:9) is COLUMN-major -- [c0|c1] is orthonormal to 1e-4, [r0|r1] is not -- so world yaw is
+# atan2(rot6_1, rot6_0), and a POSITIVE yaw stick turns the gripper counter-clockwise seen from above.
+#
+# HOW THAT LOOKS IN THE CAMERA, which is what the wording below actually has to convey. `scene_left` is
+# FIXED, so the background never moves and a global image shift is identically zero; the arm was located
+# instead as the centroid of frame-to-frame change and regressed on ee_xyz (val ep0, 18k frames):
+#
+#     centroid v (px DOWN per 100 mm):  d/d ee_x -11.45   d/d ee_y  -1.73   d/d ee_z -16.93   R2 0.90
+#     centroid u (px RIGHT per 100 mm): d/d ee_x  -3.73   d/d ee_y  -6.61   d/d ee_z  +2.81   R2 0.33
+#
+# The v fit is strong and its x-coefficient is a PARTIAL effect at fixed height, so +x rising in the
+# frame can only mean receding from the camera. The u fit is weak (R2 0.33) -- +y reads as "leftward" on
+# the best available estimate, not on a confident one. If a block-stack Cosmos row ever turns on getting
+# left/right right, re-measure it against the second scene camera before trusting this line.
+# THE SCENE, for the prose prompt form (evaluation/interpret.build_action_prose, which is what an external
+# VIDEO GENERATOR is given -- see models/external.py `_actions`). The axes below say what MOVES; these two
+# say what is in frame and what the moving thing is called. A generator conditioned only on motion words
+# has been told nothing about the workspace it is supposed to be drawing.
+# THE SCENE, for the prose prompt form (evaluation/interpret.build_action_prose, which is what an
+# external VIDEO GENERATOR is given). The action_axes below say what MOVES; this says what is in frame.
+# Written to the Cosmos card's spec -- "a scene description, key objects or characters, background, and
+# any specific actions or motions", under 300 words -- because the generic one-liner it replaces used 14
+# words of a 300-word budget and named none of the objects.
+#
+# THE LAST TWO SENTENCES ARE AIMED AT MEASURED FAILURES, not decoration. At 720x960 Cosmos drifts the
+# viewpoint (scene_left is bolted down), mutates the arm's geometry, and grows extra arms in from the
+# edges of the frame. All three are in NVIDIA's own Limitations section -- "camera and object motion
+# instability ... disappearing or morphing objects" -- so they are the model's known failure modes, not
+# something our setup induced. Stating the arm COUNT is a legitimate "key objects" description and the
+# cheapest thing to try against it; the matching negative preset is `scene_stable`.
+scene_prompt: "A fixed camera in a laboratory looks down at a wooden table from about 45 degrees above
+  it. A black robotic arm with a two-finger gripper reaches over the table: it picks up coloured cubes,
+  lifts them clear of the surface, carries them and stacks them on top of one another, so the cubes move
+  and do not stay where they start. Three cubes are in the scene -- green, blue and red. Behind the table
+  is a plain grey wall, with chairs and a tiled floor visible at the edges of the frame. There is exactly
+  one robotic arm, and it keeps the same shape throughout; no other arm, machine or person ever enters
+  the frame. The camera is bolted down and never moves."
+# WHAT MUST NOT APPEAR. Same scene, stated in the negative -- classifier-free guidance pushes the
+# sampler away from this. The first half is NVIDIA's own text from the Predict2 card MINUS "static with
+# no motion", "shaky footage", "jerky movements" and "low frame rate": those punish stillness, and this
+# arm is parked for much of an episode. The second half names the three artifacts actually observed at
+# 720x960 -- a second arm sliding in from the edge, the arm's shape morphing, the viewpoint drifting.
+negative_prompt: "The video captures a series of frames showing ugly scenes, motion blur,
+  over-saturation, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and
+  overexposed scenes, poor color balance, washed out colors, choppy sequences, artifacting, color
+  banding, unnatural transitions, fake elements, unconvincing visuals, jump cuts, visual noise, and
+  flickering. The video also shows duplicate robotic arms, a second arm entering from the edge of the
+  frame, extra grippers, arms that morph or change shape between frames, objects that appear from
+  nowhere or dissolve, and a camera that pans, zooms or drifts. Overall, the video is of poor quality."
+
+prose_subject: "The arm"
+
+# WORDED IN THE THIRD PERSON because both consumers read better that way: the VLM legend becomes
+# "move_x: + is moves away from the camera" and the prose prompt becomes "The arm moves away from the
+# camera". `neutral` is where a stick RESTS -- 0 for the four rate axes, and 0.85 for the gripper, which
+# lives in [0, 1] and is held closed for most of an episode. Measured from zero it would clear any
+# threshold in every span and crowd out the axes that are actually moving.
+action_axes:
+  - {name: move_x,  positive: moves away from the camera,     negative: moves toward the camera}
+  - {name: move_y,  positive: moves left across the bench,    negative: moves right across the bench}
+  - {name: height,  positive: rises,                          negative: lowers}
+  - {name: yaw,     positive: rotates counter-clockwise seen from above, negative: rotates clockwise seen from above}
+  # role: gripper marks this as a STATE, not a rate -- build_action_prose reads its TRANSITIONS as grasp
+  # and release events instead of averaging it. The action is 1 = squeeze and is bimodal (mean 0.51,
+  # std 0.42, values at the rails), so 0.5 separates held from empty cleanly.
+  - {name: gripper, positive: closes its gripper,             negative: opens its gripper, neutral: 0.85,
+     role: gripper, closed_above: 0.5}
+
+factors: {}

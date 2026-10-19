@@ -98,11 +98,16 @@ vlm:
 # axis3 pushed negative the scene EXPANDS (mean radial flow +0.555 against +0.045 centred), i.e. the camera
 # moves toward what it sees. Every sign below is confirmed the same way (axis0 POS: flow +2.35 rightward =
 # turning left; axis2 NEG: flow +2.15 rightward = strafing left; axis1 NEG: scene flows down = climbing).
+# THE SCENE, for the prose prompt form (build_action_prose) used when an external VIDEO GENERATOR is the
+# model under test. Unused by eval_interpret, which gives a VLM the numeric table instead.
+scene_prompt: "Onboard forward-facing video from a small quadrotor flying inside an indoor flight room."
+prose_subject: "The drone"
+
 action_axes:
-  - {name: yaw,      positive: rotate left,   negative: rotate right}    # joy_axis_0
-  - {name: vertical, positive: descend,       negative: climb}           # joy_axis_1 (inverted stick)
-  - {name: lateral,  positive: strafe right,  negative: strafe left}     # joy_axis_2
-  - {name: fore/aft, positive: fly backward,  negative: fly forward}     # joy_axis_3 (inverted stick)
+  - {name: yaw,      positive: rotates left,   negative: rotates right}    # joy_axis_0
+  - {name: vertical, positive: descends,       negative: climbs}           # joy_axis_1 (inverted stick)
+  - {name: lateral,  positive: strafes right,  negative: strafes left}     # joy_axis_2
+  - {name: fore/aft, positive: flies backward, negative: flies forward}    # joy_axis_3 (inverted stick)
 
 # FOUR MOTION FACTORS, ONE PER STICK AXIS, each analytic and exact from the COMMANDED action -- not from
 # the imagined proprio, because "does the video show the motion it was TOLD to make" is the sharper question

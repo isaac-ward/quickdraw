@@ -1,0 +1,54 @@
+# =============================================================================================
+# MOLA AUV in the MBARI test tank. One image head (the AUV's own forward camera) + proprio.
+# Select with `model=mbari_fpv`.
+#
+# This is `vl128_blockstack_2cam` -- the record-holding recipe -- transplanted onto underwater data,
+# with only what the dataset forces changed. Everything else is inherited from `vl128` deliberately:
+# each of those values was bought with an experiment (decode_arch: up, flow_hidden: 128, the L1+LPIPS
+# mix, window 32, detach_every 32, latent_loss_weight 10), and changing one here would confound the
+# transplant with a re-litigation of a settled question.
+#
+# WHAT THE DATASET FORCES, and only this:
+#
+#  1. `proprio.dim: 13`, `action_dim: 6`. State is x y z | quaternion wxyz | linear velocity (world) |
+#     angular velocity (BODY -- MuJoCo's free-joint convention, kept rather than converted). Action is
+#     three body-frame forces and three body-frame torques, each in [-1,1].
+#     Obs dims 3:7 are a UNIT QUATERNION and are passed as `obs_identity` at dataset build, so they
+#     are never z-scored per component -- the same argument block-stack's rot6 dims get.
+#
+#  2. `img_size: [144, 192]` -- the source resolution, NEVER an int (an int squashes to square and
+#     silently distorts). `ae_bottleneck: 9` is PAIRED with it: 144/16 = 9 exactly, so four levels give
+#     an exact 9x12 grid. An unpaired bottleneck builds the wrong pyramid with no warning.
+#
+#  3. ONE image head. The three other camera streams in the dataset (chase, topdown, sideon) are
+#     third-person views for human review and for the control benchmark; training on them would be
+#     training on information the AUV does not have.
+#
+# THE RATE IS NOT SUBSAMPLED, which is unusual here and was measured rather than assumed. delta_k on
+# the fpv stream at stride 1 is 0.1124, i.e. 1.76x a robocasa-like 0.064 codec floor and 3.21x
+# block-stack's measured 0.035 -- already above the degenerate zero-motion regime at the native rate,
+# and every larger stride only pushes further above the productive 1.2-1.4x band. An AUV flying
+# through a textured tank changes its view fast. `data.subsample=1` also makes `action_aggregate` moot,
+# which removes the absolute-vs-delta action trap entirely.
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+action_dim: 6
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them.
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0,
+     decode_arch: mlp}
+
+  - {name: fpv, kind: image, cam: fpv,
+     weight: 1.0,
+     img_size: [144, 192],    # (H, W) -- the native 3:4 source. NEVER an int.
+     ae_bottleneck: 9,        # PAIRED with img_size -> an exact 9x12 bottleneck grid
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}

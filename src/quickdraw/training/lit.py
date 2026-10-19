@@ -105,10 +105,12 @@ class LitWorldModel(L.LightningModule):
         m = self._core()
         P, L = self.P, self.P + self.F
         p_tf = self._cur_p_tf() if tag == "train" else 0.0   # val = pure autoregressive + deterministic (no teacher forcing)
-        obs = {"proprio": batch["obs_seq"]}
-        for name, _ in m.layout:
-            if name != "proprio":
-                obs[name] = batch[name]
+        # THE OBS DICT FOLLOWS THE MODEL'S LAYOUT. It used to seed itself with a literal "proprio" key
+        # from batch["obs_seq"] -- the loader's name for the vector stream -- so a model configured
+        # without that modality was handed a head it does not have and asked to score it. The dataset
+        # still carries obs_seq either way; what changes is whether the model is given it.
+        obs = {name: (batch["obs_seq"] if name == "proprio" else batch[name]) for name, _ in m.layout}
+        has_pro = "proprio" in obs
         act = batch["act_seq"]
         # relative-position encoding: the per-window anchor = the CLEAN position at the window's first step.
         # Threaded (as an ARG, never stored) into encode/rollout/recon/decode so the codec works in the small
@@ -228,6 +230,15 @@ class LitWorldModel(L.LightningModule):
         # ONE VariationSuite so any variation applies to every model. obs is the dict-of-streams bag; enable_grad
         # lets contraction build its Jacobian graph on val (Trainer runs with inference_mode=False).
         if self.variations:
+            # LOUD, not silent. The two physics blocks above are already gated on dynamics_prior, which
+            # build_model now refuses without a proprio modality -- but variations are gated only on
+            # being configured, and VarContext takes the proprio future positionally. Rather than hand
+            # it None and let some variation deref it three frames deep, say which two settings conflict.
+            if not has_pro:
+                raise ValueError(
+                    "variations are configured but model.modalities declares no `proprio` entry "
+                    f"(heads: {[n for n, _ in m.layout]}). The variation context is built around the "
+                    "proprio future; either add the modality or clear `variations`.")
             ctx = VarContext(m, preds, future["proprio"], obs, act, self.norm,
                              tag == "train", self._physical_ramp(), env=self.env)
             with torch.enable_grad():

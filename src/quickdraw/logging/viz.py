@@ -8,6 +8,7 @@ squares (visual-OOD). A black arrow at each particle shows its net velocity (all
 
 from __future__ import annotations
 
+import os
 import math
 import textwrap
 import time
@@ -1313,6 +1314,94 @@ def image_rollout_video(true_full, pred_future, context_len, sep_px=2):
     top = np.concatenate([black, pred_future], axis=0)[:T]            # black during context, then predictions
     sep = np.zeros((T, sep_px, W, 3), np.uint8)                       # thin divider (no text)
     return np.concatenate([top, sep, true_full], axis=1)             # vstack: pred on top, GT on bottom
+
+
+def label_panels(panels, titles, *, panel_wh=(512, 384), sep_px=3, bg=(18, 18, 18),
+                 header_px=87, font_px=53, fg=(255, 255, 255)):
+    """N frame streams side by side under a titled header band — the house layout for pred videos/GIFs.
+
+    `panels` is a list of (T,H,W,3) arrays (uint8 or float [0,1]), each CUBIC-upscaled to `panel_wh`;
+    `titles` names each one. Returns (T, header_px + panel_h, N*panel_w + (N-1)*sep_px, 3) uint8, so the
+    2-panel default is 1027x471 and the 4-panel 2057x471.
+
+    panel_wh is the OUTPUT size rather than an upscale factor on purpose: the factor varies with the
+    dataset (a 128x96 source needs x4 to reach 512x384, a 144x192 one x2.67) and what has to stay fixed
+    across figures is the canvas, not the multiplier.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    assert len(panels) == len(titles), f"{len(panels)} panels but {len(titles)} titles"
+    pw, ph = int(panel_wh[0]), int(panel_wh[1])
+    ups = [np.asarray([np.asarray(Image.fromarray(f).resize((pw, ph), Image.BICUBIC))
+                       for f in _img_u8(v)]) for v in panels]
+    T = min(len(v) for v in ups)
+    n = len(ups)
+    W = n * pw + (n - 1) * sep_px
+    out = np.empty((T, header_px + ph, W, 3), np.uint8)
+    out[:] = np.asarray(bg, np.uint8)
+    for k, v in enumerate(ups):
+        x = k * (pw + sep_px)
+        out[:, header_px:, x:x + pw] = v[:T]
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_px)
+    except OSError:                                       # no DejaVu -> PIL's bitmap default, still legible
+        font = ImageFont.load_default()
+    band = Image.new("RGB", (W, header_px), tuple(bg))    # drawn ONCE: the titles never change per frame
+    d = ImageDraw.Draw(band)
+    for k, t in enumerate(titles):
+        x0 = k * (pw + sep_px)
+        bb = d.textbbox((0, 0), str(t), font=font)
+        d.text((x0 + (pw - (bb[2] - bb[0])) // 2, (header_px - (bb[3] + bb[1])) // 2),
+               str(t), font=font, fill=tuple(fg))
+    out[:, :header_px] = np.asarray(band)
+    return out
+
+
+def save_gif(path, frames, fps=15, scale=1.0, max_mb=40.0, log=None):
+    """GIF with a GENUINELY per-frame 256-colour palette and Floyd-Steinberg dither, via ffmpeg.
+
+    PIL is not used for this and the reason is measured: `Image.save(..., optimize=True)` on a list of
+    P-mode images consolidates them, so a 450-frame clip came out with TWO distinct palettes and most
+    frames rendered through another frame's colours. ffmpeg's `palettegen=stats_mode=single` plus
+    `paletteuse=new=1` writes a local colour table per frame, which is what these clips need since their
+    content changes completely over their length.
+
+    WHAT THIS CANNOT FIX, so that nobody re-investigates it later: GIF is 256 colours per frame across
+    the WHOLE canvas, and median-cut allocates them by area, so a smooth gradient gets very few levels --
+    measured at 20 colours in a wall patch that holds 480 in the source. Banding in flat regions is the
+    format, not the encoder. Use the mp4 when the gradients matter.
+
+    `scale` resamples before encoding; prefer building the canvas at its final size (one resample) over
+    upscaling in `label_panels` and shrinking here (two).
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+
+    fr = _img_u8(frames)
+    h, w = fr.shape[1:3]
+    vf = []
+    if abs(float(scale) - 1.0) > 1e-6:
+        vf.append(f"scale={max(2, int(round(w * scale)))}:{max(2, int(round(h * scale)))}:flags=lanczos")
+    vf.append("split[a][b];[a]palettegen=stats_mode=single:max_colors=256[p];"
+              "[b][p]paletteuse=new=1:dither=floyd_steinberg")
+    proc = subprocess.Popen(
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(float(fps)),
+         "-i", "-", "-vf", ",".join(vf), "-loop", "0", "-y", str(path)], stdin=subprocess.PIPE)
+    for f in fr:
+        proc.stdin.write(np.ascontiguousarray(f, np.uint8).tobytes())
+    proc.stdin.close()
+    if proc.wait() != 0:
+        raise RuntimeError(f"ffmpeg failed writing {path}")
+    mb = os.path.getsize(path) / 1e6
+    if log is not None:
+        log(f"[gif] {os.path.basename(path)}  {len(fr)} frames  {w}x{h}  {fps} fps  {mb:.1f} MB")
+    if mb > max_mb:
+        raise RuntimeError(f"{path} is {mb:.1f} MB, over the {max_mb:.0f} MB cap — smaller panels, "
+                           f"a shorter clip, or {int(fps) // 2} fps")
+    return mb
 
 
 def points_collapse_frames(paths, color=None, title="", n_frames=60, lims=None, point_size=4.0,

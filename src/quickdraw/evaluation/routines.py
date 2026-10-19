@@ -24,7 +24,7 @@ import torch
 
 from .conditional import blind_null, energy_score, energy_skill, rank_calibration, rest_skill
 from .openloop import emit_horizon_readouts, eval_batched, image_curves, latent_curves, proprio_curves
-from .products import emit_openloop
+from .products import emit_openloop, product_tag
 
 
 def _is_mm(model):
@@ -32,6 +32,43 @@ def _is_mm(model):
 
 
 _POS_IDX_WARNED = [False]
+
+
+def _emit_prompt_log(writer, prompts, subroutine, n_plot, step):
+    """`<subroutine>/action/prompts_<i>.txt` — what a text-conditioned model was actually told, in order.
+
+    Nested under `action/` the same way the pixels are nested under `image/`: the products directory is
+    organised by WHAT THE CHANNEL IS, and for these models the prompt is the action channel, not a note
+    about it.
+
+    For an external video model the prompt is rendered at run time from the recorded future actions, so
+    it survives nowhere else — the mp4 beside this file cannot be read back into the words that produced
+    it. Models that take actions as numbers log nothing and no file is written.
+
+    `prompts` comes from rollout_regrounded, already re-indexed to GLOBAL rows. Rows are
+    (episode, segment), so a closed-loop mode contributes n_seg entries per episode and the step ranges
+    below are made ABSOLUTE by adding the segment's own offset — otherwise every segment of a cl_16 run
+    would claim to cover steps +1..+16.
+    """
+    rows, n_seg, every = prompts.get("rows") or [], prompts.get("n_seg", 1), prompts.get("every", 0)
+    if not rows:
+        return
+    for i in range(n_plot):
+        got = []
+        for s in range(n_seg):
+            r = i * n_seg + s
+            got += [(s * every + lo, s * every + hi, t) for rr, lo, hi, t in rows if rr == r]
+        if not got:
+            continue
+        body = "\n\n".join(f"[{k + 1}] predicted steps +{lo + 1}..+{hi}\n{t}"
+                             for k, (lo, hi, t) in enumerate(got))
+        writer.text(product_tag(subroutine, "prompts", i=i, head="action"),
+                    f"# {subroutine} — episode {i}\n"
+                    f"# {len(got)} prompt window(s), in the order the model saw them"
+                    + (f", across {n_seg} re-grounded segments of {every} steps" if n_seg > 1 else "") + ".\n"
+                    f"# Rendered from the RECORDED future actions by build_action_prose; the numbers are\n"
+                    f"# ground truth, the wording comes from conf/interpret/<env>.yaml action_axes.\n\n"
+                    f"{body}\n", step)
 
 
 def _pos_idx(cfg, env=None):
@@ -163,7 +200,14 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     tag = str(tag or "eval_ood_horizon")
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
-    heads = ["proprio"] + img_heads
+    # THE HEAD LIST IS THE MODEL'S, NOT A LITERAL. This used to prepend "proprio" unconditionally, so a
+    # model configured without that modality was asked to decode a head it does not have. Every run to
+    # date declares proprio, so the assumption was invisible rather than absent; ordering is preserved
+    # (proprio first) so this is a no-op for all of them.
+    from .timing import Timer
+    tm = Timer()                       # every model gets this, ours and external alike -- no opt-in
+    has_pro = any(n == "proprio" for n, _ in m.layout)
+    heads = (["proprio"] if has_pro else []) + img_heads
     was = m.training
     m.eval()
     t0 = time.perf_counter()
@@ -208,6 +252,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     itrue = {h: torch.stack([torch.from_numpy(fr[h][P:P + H]) for _, _, fr in eps]).float().div(255.0).to(device)
              for h in img_heads}
 
+    # What a text-conditioned model was told, filled by rollout_regrounded and drained by score_and_emit.
+    # Shared state rather than a return value so the rollout's signature is unchanged for every other model.
+    prompts: dict = {}
+
     def rollout_regrounded(every, Hm, want_bag=False):
         """Hm-step predicted obs (dict per head, (n_ep,Hm,...)), re-grounding on GT every `every` steps. Segment
         the horizon into ceil(Hm/every) chunks; segment s uses GT context obs[s*every:s*every+P] and actions
@@ -217,28 +265,38 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         Hm = this mode's horizon (open_loop uses the full H; closed-loop uses min(H, eval.closed_loop_horizon))."""
         every = min(int(every), Hm)
         n_seg = -(-Hm // every)                                             # ceil(Hm/every)
-        C = {"proprio": []}
+        C = {"proprio": []} if has_pro else {}
         C.update({h: [] for h in img_heads})
         A = []
         for o, a, fr in eps:                                                # (episode, segment) row order
             for s in range(n_seg):
                 st = s * every
-                C["proprio"].append(norm.norm_obs(torch.from_numpy(o[st:st + P])))
+                if has_pro:
+                    C["proprio"].append(norm.norm_obs(torch.from_numpy(o[st:st + P])))
                 for h in img_heads:
                     C[h].append(torch.from_numpy(fr[h][st:st + P]))          # per-head frames, not one shared array
                 idx = _np.clip(_np.arange(st, st + P + every - 1), 0, len(a) - 1)   # last seg: pad+clamp (tail discarded)
                 A.append(norm.norm_act(torch.from_numpy(a[idx])))
-        ctx = {"proprio": torch.stack(C["proprio"]).float().to(device)}
+        ctx = {"proprio": torch.stack(C["proprio"]).float().to(device)} if has_pro else {}
         for h in img_heads:
             ctx[h] = torch.stack(C[h]).float().div(255.0).to(device)
         acts = torch.stack(A).float().to(device)                           # (n_ep*n_seg, P+every-1, act_dim)
         rows = n_ep * n_seg
         cap = max(n_ep, 64)                                                 # per-call batch cap (open_loop: rows=n_ep -> ONE call)
         segs, bag_out = {h: [] for h in heads}, None
+        prompts.clear(); prompts.update(rows=[], n_seg=n_seg, every=every, Hm=Hm)
         for r0 in range(0, rows, cap):
             sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
-            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc, norm=norm,
-                                 return_bag=want_bag)
+            with tm.phase("rollout"):
+                o_c = m.imagine_eval(sub, acts[r0:r0 + cap], every, heads=heads, decode_chunk=dc,
+                                     norm=norm, return_bag=want_bag)
+            # A TEXT-CONDITIONED ADAPTER LOGGED WHAT IT WAS TOLD, indexed by its position in THIS call's
+            # sub-batch. Translate to the global row here, because only this loop knows r0 -- and the row
+            # is (episode, segment), which only this function knows how to decompose.
+            pl = getattr(m, "prompt_log", None)
+            if pl:
+                prompts["rows"] += [(r0 + i, lo, hi, t) for i, lo, hi, t in pl]
+                pl.clear()
             for h in heads:
                 segs[h].append(o_c[h])
             if want_bag and "_bag" in o_c:
@@ -272,10 +330,12 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
                 _plog(writer, f"[{tag} @ep{step}] latent curves SKIPPED: imagine_eval returned no "
                               f"`_bag` (return_bag path). The decoded-image products are unaffected.")
                 return {}
-            gt = {"proprio": norm.norm_obs(p_true[:, :Hm])}
+            gt = {"proprio": norm.norm_obs(p_true[:, :Hm])} if has_pro else {}
             for h in img_heads:
                 gt[h] = itrue[h][:, :Hm]
-            anc = m.rel_anchor({"proprio": pro0}) if getattr(m, "_rel_on", lambda: False)() else None
+            # the anchor is a PROPRIO position, so it cannot exist without that head
+            anc = (m.rel_anchor({"proprio": pro0})
+                   if has_pro and getattr(m, "_rel_on", lambda: False)() else None)
             with torch.autocast(device_type=(device if isinstance(device, str) else device.type),
                                 dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
                 z_gt = m.encode_state(gt, anc)
@@ -289,31 +349,45 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         """Score (image_curves per head + proprio_curves) + emit (emit_openloop) a completed rollout under the
         `subroutine` tag (e.g. eval_ood_horizon/open_loop). Head nesting rides under it via product_tag. `Hm`
         is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H)."""
-        pred = out["proprio"]
-        p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
-        pt = p_true[:, :Hm]                                                    # GT future sliced to this mode's horizon
-        per_step = proprio_curves(pred, norm.norm_obs(pt), p_hat, pt, env,
-                                  pos_slice=(pos if pos_explicit else None))    # position-L2 pointwise iff explicit
-        curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}
+        # THE PROPRIO BLOCK IS SKIPPED WHOLESALE without that head. The error curves, the trajectory
+        # plots and the xyz overlays are all derived from proprio, so an image-only model emits its
+        # per-head image readouts (the loop below) and nothing else. Computed BEFORE the image loop, as
+        # it always was, so the order of writer calls is unchanged for every model that has proprio.
+        curves = p_hat = pt = None
+        if has_pro:
+            pred = out["proprio"]
+            p_hat = torch.nan_to_num(norm.denorm_obs(pred), nan=10.0, posinf=10.0, neginf=-10.0)
+            pt = p_true[:, :Hm]                                                # GT future sliced to this mode's horizon
+            per_step = proprio_curves(pred, norm.norm_obs(pt), p_hat, pt, env,
+                                      pos_slice=(pos if pos_explicit else None))  # position-L2 pointwise iff explicit
+            curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}
         images = {}
         for head in img_heads:
             ipred = out[head].clamp(0, 1)
-            ic = image_curves(ipred, itrue[head][:, :Hm])
+            with tm.phase("metrics"):
+                ic = image_curves(ipred, itrue[head][:, :Hm])
             ic.update(lat or {})            # latent_motion_ratio / latent_cos ride the head's curve dict, so they
             #                                 reach the SAME panel + the same @+x scalar readouts as motion_ratio
             images[head] = {"icurves": ic,
                             "full_true": _np.stack([eps[i][2][head][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
                             "ipred": ipred[:n_plot].cpu().numpy()}
             emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
+        # EMITTED FOR EVERY MODEL, proprio or not. `emit_openloop` skips each proprio product whose input
+        # is None and still writes the image rollouts and filmstrips -- which for an image-only model are
+        # the entire visual record, and the reason the external wrapper exists at all.
         emit_openloop(writer, subroutine, step, env=env, R=getattr(ecfg, "R", None), r=getattr(ecfg, "r", None),
                       coloring="hsv", fps=fps, P=P, smooth_window=int(cfg.data.action_smooth_window), description=desc,
                       ctx_xyz=ctx_obs[:, :, pos],
-                      p_true_xyz=pt[:n_plot][:, :, pos].cpu().numpy(), p_hat_xyz=p_hat[:n_plot][:, :, pos].cpu().numpy(),
+                      p_true_xyz=pt[:n_plot][:, :, pos].cpu().numpy() if has_pro else None,
+                      p_hat_xyz=p_hat[:n_plot][:, :, pos].cpu().numpy() if has_pro else None,
                       actions=[eps[i][1][:P + Hm].astype(_np.float32) for i in range(n_plot)],
                       curves=curves, n_plot=n_plot, images=(images or None),
-                      obs_true=_np.concatenate([ctx_obs, pt[:n_plot].cpu().numpy()], axis=1),
-                      obs_pred=p_hat[:n_plot].cpu().numpy(), pos_explicit=pos_explicit,
+                      obs_true=_np.concatenate([ctx_obs, pt[:n_plot].cpu().numpy()], axis=1) if has_pro else None,
+                      obs_pred=p_hat[:n_plot].cpu().numpy() if has_pro else None, pos_explicit=pos_explicit,
                       title_fn=lambda i: f"{subroutine} #{i} H={Hm}", log=lambda msg: prog(50, msg))
+        _emit_prompt_log(writer, prompts, subroutine, n_plot, step)
+        if not has_pro:
+            return {}                       # the image products are emitted; the SCALAR here is proprio
         return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
 
     modes = _modes               # from ood_horizon_shapes above -- ONE definition, shared with probe_eval
@@ -332,6 +406,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         lat = latent_pass(Hm, bag) if open_loop else None      # open-loop only (see latent_pass)
         summary.update(score_and_emit(out, f"{tag}/{name}", desc, Hm, lat=lat))
 
+    tm.emit(writer, tag, step, horizon=H, n_ep=n_ep, n_heads=max(1, len(img_heads)))
+    _plog(writer, f"[{tag} @ep{step}] timing: {tm.summary()}")
     if was:
         m.train()
     prog(100, f"done in {time.perf_counter() - t0:.1f}s")
@@ -1649,6 +1725,7 @@ def eval_steer(cfg, model, norm, ecfg, writer, device, step=0):
             bags, acts, sco = S.plan(m, lang, t_e, ctx, ca, prop, horizon=H, lookahead=look,
                                      n_samples=int(sc["n_samples"]), lam=float(sc.get("lam", 0.3)),
                                      objective=str(sc.get("objective", "level")),
+                                     commit_rule=str(sc.get("commit_rule", "argmax")),
                                      commit=int(sc.get("commit", 0) or 0),
                                      beta_jerk=float(sc.get("beta_jerk", 0.0)), generator=g)
             gains.append(float(sco[-max(1, len(sco) // 8):].mean() - sco[:max(1, len(sco) // 8)].mean()))
@@ -1767,13 +1844,16 @@ def eval_steer(cfg, model, norm, ecfg, writer, device, step=0):
     return {"eval_steer_requests": float(len(rows))}
 
 
+from .timing import eval_timing as _eval_timing          # fixed-workload benchmark, model-agnostic
+
 REGISTRY = {"steer": eval_steer, "ood_horizon": eval_ood_horizon,
             "held_out_splits": eval_held_out_splits, "ood_visual": eval_ood_visual,
             "ood_geometric": eval_ood_geometric, "ood_dynamics": eval_ood_dynamics,
             "control": eval_control, "denoising_multistep": eval_denoising_multistep,
             "denoising_aggregate": eval_denoising_aggregate, "denoising_filmstrip": eval_denoising_filmstrip,
             "ae_floor": eval_ae_floor, "manifold": eval_manifold,
-            "interpret": eval_interpret, "action_distribution": eval_action_distribution}
+            "interpret": eval_interpret, "action_distribution": eval_action_distribution,
+            "timing": _eval_timing}
 
 
 def _quiver_round_data(swarm, grow=10, collapse=5):

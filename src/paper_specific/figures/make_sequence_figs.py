@@ -2,7 +2,7 @@
 
 Emits every component on ONE SHARED CANVAS so the PNGs overlay exactly in a figure editor:
 
-    final.png                       everything, in the folder root
+    architecture.png                everything, in the folder root -- this is paper Fig. 4
     elements/items_vision.png       the image cascade alone, no braces, no tokenizer
     elements/items_proprio.png      the observation-vector cascade alone
     elements/items_action.png       the action-vector cascade alone
@@ -11,7 +11,7 @@ Emits every component on ONE SHARED CANVAS so the PNGs overlay exactly in a figu
     elements/tokenizers.png         the three tokenizer blocks, nothing else
 
 Because the layout is solved once and every render draws into it, dropping all six on top of each other
-reproduces final.png pixel for pixel.
+reproduces architecture.png pixel for pixel.
 
 Real data: frames from starling-2's train split and the matching rows of its parquet. The action is
 rebuilt the way data/dataset.py::_subsample_episodes does under action_aggregate=concat.
@@ -23,9 +23,11 @@ import re
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.colors
 import matplotlib.pyplot as plt
+import cv2
 import numpy as np
-from matplotlib.patches import Ellipse, FancyArrow, PathPatch, Polygon, Rectangle
+from matplotlib.patches import Circle, Ellipse, FancyArrow, PathPatch, Polygon, Rectangle
 from matplotlib.path import Path
 
 # ----------------------------------------------------------------------------------------------------
@@ -49,6 +51,8 @@ ASTERISKS    = ((7, "*\u2081"), (8, "*\u2082"))
 OFFSET_X     = 48.0      # per-item step in x
 OFFSET_Y     = OFFSET_X / 2          # ...and half that in y: the cascade angle
 IMG_W        = 300.0     # image item width
+PRED_BAND_PX = 16.0      # predicted IMAGES are hatched only in a band this many IMAGE PIXELS in from
+#                          the edge: hatching the whole frame greyed out the thing the figure is for
 CELL         = 32.0      # square vector cell
 PROPRIO_CELLS = 7        # observation dims DRAWN (the vector is 16-D; this is a schematic)
 # ONE COLOURMAP PER MODALITY, and everything that modality touches is drawn from it: the cascade's cells,
@@ -80,7 +84,7 @@ STREAM_FRAC  = 1.0      # vertical spacing between the three cascades, as a frac
 #                         heads, the token blocks, the decoders), not by the streams. Lifting the streams
 #                         only moves whitespace around inside the same box.
 TIME_M       = 40.0      # clearance between the last cascade and the arrow of time
-TIME_LAB     = "Time"   # capitalised, like every arrow-of-time label in the paper
+TIME_LAB     = "$t$"    # at the ARROWHEAD, not the middle of the axis
 BRACE_HALO   = 6.0       # white halo width, as a multiple of LW
 
 ENC_GAP      = 170.0     # gap between the cascade and its tokenizer (holds the stem risers)
@@ -98,6 +102,29 @@ BLK_RUN      = 150.0     # horizontal run of the 45-degree arrow from a tokenize
 BLK_ROW_SEP  = 150.0     # vertical separation between the two feed points on the action tokenizer
 BLK_DIAG     = 210.0     # length of the 45-degree feed arrow, from the tokenizer edge to the block
 BLK_LABELS   = False      # draw A/B/C on the three faces so they can be referred to unambiguously
+
+# ---- THE REWARD MODEL, bottom right ----------------------------------------------------------------
+# It is not part of the world model, so it is drawn as its own block rather than solved into the stack:
+# a brace along the BOTTOM face of the token column (mirroring the summariser's, and including the
+# predicted slice, because the reward is read on IMAGINED latents), a sentence entering from below, and
+# one scalar out.
+RM_ON        = True
+RM_TITLE     = "Reward head\n(contrastive)"
+RM_LAT       = "Project to $f_z$"     # the latent branch, fed by the brace, drawn ON TOP
+RM_TXT       = "Project to $f_t$"     # the text branch, drawn BELOW the latent one
+RM_ENC       = "MiniLM"               # ...and its sentence encoder is its OWN block: it is frozen
+RM_COS       = "$\\cos(f_z, f_t)$"
+RM_REQ       = "\u201cGo forward to the ladder\nin the middle of the room\u201d"   # no box, two lines
+RM_REQ_PAD   = 90.0      # clear space between the request and the box it feeds
+RM_OUT       = "Similarity score"
+RM_ROW_H     = 58.0      # internal row height
+RM_ROW_SEP   = 16.0      # between the two stacked branches
+RM_COS_GAP   = 110.0     # branch boxes -> the cosine: the two feed arrows have to be visible in it
+#                          tall and the figure has no room under the token column for that
+RM_PAD       = 26.0
+RM_GAP_BR    = BRACE_M   # column bottom -> brace line: THE SAME LIFT the summariser's input brace uses
+RM_GAP_BOX   = 134.0     # brace line -> box top (lowered four times now, at the author's ask)
+RM_GAP_TXT   = 70.0      # box -> the sentence, which sits to its LEFT
 # ---- Z ORDER (one place, because the stacking rules are not obvious) --------------------------------
 # RULE: A FEED ARROW MUST NEVER CROSS A TOKENIZER OUTLINE. The tokenizers therefore sit ABOVE every
 # arrow, and the arrows sit above the blocks (the extension feed has to thread past the stacked column
@@ -126,7 +153,8 @@ BLK_EC       = "#5b82ab"
 # hue answer both, which is what forced the slice to orange and made it look like a third stream.
 PRED_HATCH   = "//"     # THICKER AND SPARSER than the default: "///" at the block line weight read as a
 #                         grey wash at print size rather than as a texture, so the stripe count is halved
-#                         and hatch.linewidth is tripled below. Every predicted thing carries it: the
+#                         and hatch.linewidth is tripled below. Halved a second time to a single
+#                         stripe. Every predicted thing carries it: the
 #                         slice in the token column, both
 #                         decoded outputs, the sampled chunk. The hatch always takes the object's OWN
 #                         outline colour, so it never introduces a hue -- it only adds a texture.
@@ -146,6 +174,11 @@ PRED_STEPS   = 1       # ONE predicted slice in this variant. Everything downstr
 #                        decoder feeds leave that one slice's face, and each decoder emits one item.
 BLK_LW       = 1.1
 plt.rcParams["hatch.linewidth"] = BLK_LW * 2.7   # 3x the old 0.9x: a hatch that reads AS a hatch
+# HATCH COLOUR IS PER MODALITY, so it cannot be an rcParam: hatch.color is global, and the author wants
+# the predicted proprioception striped in orange and the sampled action plan in purple. Hatches are
+# therefore drawn as an OVERLAY patch whose EDGE colour carries the hue and the alpha (matplotlib draws
+# hatch strokes in the patch edge colour), at HATCH_A.
+HATCH_A = 0.25
 # ---- decoders: mirrored trapezia off the RED blocks, producing the predicted frame and vector --------
 DEC_GAP      = 170.0     # red column's right face -> decoder input edge
 OUT_GAP      = 150.0     # decoder output edge -> the predicted item
@@ -190,8 +223,14 @@ BOX_FS       = ENC_FS    # the box titles are set at the TOKENIZER LABEL SIZE, a
 #   contours  nested level sets: the observation head samples a whole 33-token BAG, a vector, not a scalar
 #   bimodal   a 1-D density with two modes: the action head samples a stick, and the prior over one really
 #             is multimodal (a bell would quietly deny that)
-GLYPH_W      = 52.0
-GLYPH_H      = 36.0
+HEAD_IN_DX   = -32.0     # the flow heads' MECHANISM shifts left inside its own box, at the author's ask:
+#                          the sublayer stack, the trunk and its residual arcs, the bars and tail, the
+#                          repeat brace and both x N labels, the sampling loop and the `denoising` caption.
+#                          NOT the box outline, NOT the centred title or its badge, and NOT the
+#                          probability glyph -- the glyph is pinned to the right margin and the space this
+#                          opens in front of it is the point.
+GLYPH_W      = 67.6     # 1.3x, at the author's ask
+GLYPH_H      = 46.8     # ...both axes, so the density keeps its shape
 # (centre, width, weight) per mode. Two peaks each, but not the SAME two: a reader who sees one mark
 # twice reads it as one distribution, and these are distributions over different things.
 GLYPH_OBS    = ((-1.35, 0.55, 0.62), (1.30, 0.78, 0.40))    # observation head: a dominant mode and a tail
@@ -277,6 +316,8 @@ BB_SUBSEP    = 22.0      # gap between sublayer boxes -- where the residual arcs
 BB_ARC       = 26.0      # width of the channel the residual bypass arcs run down, left of the boxes
 BB_BRACE     = 16.0      # how far right of the sublayer boxes the "x 4" brace line sits
 BB_FS        = 14.0
+BADGE_R      = 20.0      # the circled number in each head's top-left corner: 1 observation, 2 action,
+BADGE_FS     = 16.0      #   3 reward -- the order the paper introduces them in
 # The flow head's ENTRY BAR. flow.py refuses cond="adaln": every input is CONCATENATED once, here, and
 # after that it is a plain transformer. Linear(544 -> 128) over [x_tau 128 | tau_emb 32 | cond 384].
 # TWO bars, because they are two different operations: the concatenation (whose arguments are the whole
@@ -459,7 +500,8 @@ def vector_item_factory(mat, arrows=None, cmap=None, cmap_vec=None):
                                         length_includes_head=True, fc=EDGE, ec=EDGE, alpha=a, zorder=z + 0.4))
         ax.add_patch(Rectangle((x, y), CELL, D * CELL, fill=False, ec=EDGE, lw=LW, alpha=a, zorder=z + 0.5))
 
-    def draw_vec(ax, x, y, w, h, vec, a, z, ang=None, hatch=None, horizontal=False):
+    def draw_vec(ax, x, y, w, h, vec, a, z, ang=None, hatch=None, horizontal=False,
+                 hatch_col=None):
         """Same tile for a vector that is NOT one of the N items -- the model's prediction. Normalised with
         the STREAM's lo/hi, so its colours mean the same thing as the inputs' do.
 
@@ -472,7 +514,10 @@ def vector_item_factory(mat, arrows=None, cmap=None, cmap_vec=None):
         for k in range(D):
             cx0, cy0 = (x + k * CELL, y) if horizontal else (x, y + k * CELL)
             ax.add_patch(Rectangle((cx0, cy0), CELL, CELL, fc=_c(u[k], cmv),
-                                   ec=EDGE, lw=LW, alpha=a, hatch=hatch, zorder=z))
+                                   ec=EDGE, lw=LW, alpha=a, zorder=z))
+            if hatch:                                    # the stripes, in their own hue and alpha
+                ax.add_patch(Rectangle((cx0, cy0), CELL, CELL, fc="none", lw=0.0,
+                                       ec=hatch_rgba(hatch_col or EDGE), hatch=hatch, zorder=z + 0.2))
             if ang is not None:                          # same glyph the stream's own tiles carry
                 a_, L = ang[k], CELL * 0.54
                 cx, cy = cx0 + CELL / 2, cy0 + CELL / 2
@@ -704,6 +749,12 @@ def ray_exit(poly, p, d):
         if t > 1e-9 and -1e-9 <= u <= 1 + 1e-9 and (best is None or t < best):
             best = t
     return p + d * (best if best is not None else 0.0)
+
+
+def hatch_rgba(col, a=None):
+    """The hatch stroke colour for a patch: the modality's own hue, at HATCH_A."""
+    r, g, b = matplotlib.colors.to_rgb(col)
+    return (r, g, b, HATCH_A if a is None else a)
 
 
 def iso_block(ax, tip, depth, height, width, z, fc=BLK_FC, ec=BLK_EC, hatch=None):
@@ -1108,13 +1159,19 @@ def solve_layout():
         d["cx"] = 0.5 * (d["sub_x0"] + d["sub_x1"])
         d["loop_x"] = d["sub_x1"] + BB_BRACE + BRACE_T + m["x4_w"] + DT_LOOP / 2.0
         d["title_cy"] = d["y0"] + m["vtop"] + m["ttl_h"] / 2.0   # BOTH boxes: the band along the TOP
-        # The glyph shares the title's band, tucked into the right margin the centred title leaves. Only
-        # its X is fixed here: the Y is read off title_cy at DRAW time, because the boxes get shifted twice
-        # after this (the x_0 lift, then the canvas offset) and a y cached now would be left behind -- which
-        # is exactly what happened: the marks drew above the boxes and were clipped off the canvas.
+        # Only the glyph's X is fixed here: the Y is read off glyph_cy at DRAW time, because the boxes get
+        # shifted twice after this (the x_0 lift, then the canvas offset) and a y cached now would be left
+        # behind -- which is exactly what happened: the marks drew above the boxes and were clipped off.
         if glyph:
-            assert d["x1"] - BB_PAD - GLYPH_W >= 0.5 * (d["x0"] + d["x1"]) + m["ttl_w"] / 2.0 + MIN_SEG, (
-                f"{title.splitlines()[0]}: the distribution glyph collides with the title")
+            # THE GLYPH SHARES THE "x N" ROW, not the title band: it says what the head EMITS, which reads
+            # with the denoising loop rather than with the name. So the collision it can actually have is
+            # with the step count on that same baseline, and that is what is checked. The old assert
+            # guarded the title, which the glyph no longer sits anywhere near -- it fired at 1.3x on a
+            # clearance that does not exist.
+            _lx = d["loop_x"] + (HEAD_IN_DX if flow < 0 else 0.0)
+            assert d["x1"] - BB_PAD - GLYPH_W >= _lx + MIN_SEG \
+                + text_extent(f"\u00d7 {steps}", ENC_FS * 0.62)[0] + MIN_SEG, (
+                f"{title.splitlines()[0]}: the distribution glyph collides with '\u00d7 {steps}'")
         span = len(subs) * m["subh"] + (len(subs) - 1) * m["subsep"]
         y = d["title_cy"] + m["ttl_h"] / 2.0 + m["subsep"]
         if flow > 0:                                       # enters BOTTOM, stacks UP, leaves RIGHT
@@ -1179,9 +1236,11 @@ def solve_layout():
     # thread past the action head to get there. They share an x, so their left edges line up and the h
     # bus can serve both from one vertical.
     dt = box(m_dt, _dt_x1, bb_y1 - m_dt["h"], DT_SUBS, DT_DEPTH, DT_TITLE, -1, glyph=GLYPH_OBS)
+    dt["badge"] = 1
     ah = box(m_ah, _dt_x1, dt["y0"] - HEAD_GAP - m_ah["h"], AH_SUBS, AH_DEPTH, AH_TITLE, -1,
              bars=(AH_BAR,), tail=AH_TAIL, exit_kind="stub", residual=False, steps=AH_STEPS,
              glyph=GLYPH_ACT)
+    ah["badge"] = 2
     # The arrow carries the notation ONLY when the draws are missing: with the panel there, the caption
     # under it says the same thing properly, and a HAT on the arrow would claim a point estimate.
     ah["out_lab"] = "" if ACT_SMP is not None else AH_OUT
@@ -1258,11 +1317,35 @@ def solve_layout():
               + [b[1] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[1], DEC_BOX[1],
                                                                  BB["y0"], DT["y0"], AH["y0"]]
               + _ld_box[:1] + _as_y[:1])
-    bot = max([stack_bot] + [L["enc_cy_abs"] + ENC_H / 2 for L in LAYERS]
-              + [b[3] for L in LAYERS for b in L["blk_box"]]
-              + [BB["y1"], DT["y1"], AH["y1"], PRED_BOX[3], DEC_BOX[3]] + _ld_box[1:] + _as_y[1:])
+    # LIFT THE THREE STREAMS AS A GROUP. They descend diagonally and the arrow of time hangs below the
+    # last one, so the cascades -- not the right-hand column -- set the bottom of the canvas, 248 units
+    # below the lowest ink anything else contributes. Lift them until the arrow is level with that, and
+    # the figure loses that height outright. The tokenizers do NOT move, so every stem re-routes: they
+    # are drawn from the brace midpoint (which moves with sy) to the tokenizer entry (which does not),
+    # and route() re-solves each one. The lift is capped by the headroom above the topmost cascade.
+    bot_ns = max([L["enc_cy_abs"] + ENC_H / 2 for L in LAYERS]
+                 + [b[3] for L in LAYERS for b in L["blk_box"]]
+                 + [BB["y1"], DT["y1"], AH["y1"], PRED_BOX[3], DEC_BOX[3]] + _ld_box[1:] + _as_y[1:])
+    # 24 units of that lift is given back, at the author's ask: flush with the lowest other ink
+    # read as slightly too high.
+    lift = float(np.clip(stack_bot - bot_ns - 24.0, 0.0, max(0.0, stack_top - top)))
+    globals()["STREAM_LIFT"] = lift
+    bot = max(stack_bot - lift, bot_ns)
+    if RM_ON:
+        # THE REWARD MODEL HANGS BELOW THE TOKEN COLUMN, and after the stream lift the column is flush
+        # with the bottom of the canvas -- measured, zero free height. So reserve its band here, which
+        # is what makes the figure ~250 units taller than it would otherwise be, and the only place the
+        # block can go without crossing something.
+        # THE ANGLED BRACE DROPS AS IT RUNS. It is drawn at the cascade angle, so its midpoint sits
+        # half a span times the slope BELOW where a flat brace would -- leaving that out clipped the
+        # bottom of the box off the canvas.
+        _rm_span = max(b[2] for b in LAYERS[1]["blk_box"]) - min(b[0] for b in LAYERS[-1]["blk_box"])
+        _rm_h = RM_GAP_BR + 0.5 * _rm_span * SLOPE + RM_GAP_BOX + 2 * RM_PAD \
+                + text_extent(RM_TITLE, BOX_FS)[1] + 2 * text_extent(RM_LAT, BB_FS)[1] * 2.5 \
+                + RM_ROW_SEP + 4 * MIN_SEG
+        bot = max(bot, max([b[3] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[3]]) + _rm_h)
     for L in LAYERS:
-        L["sx"], L["sy"] = MARGIN - x_min, MARGIN - top + L["sy0"]
+        L["sx"], L["sy"] = MARGIN - x_min, MARGIN - top + L["sy0"] - lift
         L["enc_cy"] = L["enc_cy_abs"] + MARGIN - top
         L["entry"] = [y + MARGIN - top for y in L["entry_abs"]]
         L["feed"] = [(x, y + MARGIN - top) for x, y in L["feed_abs"]]
@@ -1294,7 +1377,10 @@ def solve_layout():
     for D in DEC:
         D["cy"] += dy; D["out_cy"] += dy
         D["src"] = (D["src"][0], D["src"][1] + dy)
-    return max([blk_x + blk_w, DEC_BOX[2] + MARGIN, AH["x1"] + MARGIN]
+    # THE REWARD MODEL'S OUTPUT LABEL IS THE RIGHTMOST INK, now that the block's right edge is aligned
+    # with the decoders': its arrow and "Similarity score" run past that edge and were clipped.
+    _rm_x = (DEC_BOX[2] + 2.6 * ARROW_L + text_extent(RM_OUT, BOX_FS * 0.8)[0] + MARGIN) if RM_ON else 0.0
+    return max([blk_x + blk_w, DEC_BOX[2] + MARGIN, AH["x1"] + MARGIN, _rm_x]
                + ([LD["x1"] + MARGIN] if LD_ON else [])
                + ([AS_BOX[2] + MIN_SEG + max(text_extent(nm, BB_FS * 0.85)[0] for nm in AS_AXES)
                    + MARGIN] if AS_BOX else [])) - x_min + 2 * MARGIN, (bot - top) + 2 * MARGIN, enc_x, blk_x
@@ -1306,6 +1392,13 @@ CANVAS_W, CANVAS_H, ENC_X, BLK_X = solve_layout()
 # ----------------------------------------------------------------------------------------------------
 # RENDER
 # ----------------------------------------------------------------------------------------------------
+def badge(ax, cx, cy, n):
+    """A circled number, for the three heads in the order the paper introduces them."""
+    ax.add_patch(Circle((cx, cy), BADGE_R, fc="white", ec=EDGE, lw=LW * 1.6, zorder=Z_TOKENIZER + 5))
+    ax.text(cx, cy, str(n), ha="center", va="center", fontsize=BADGE_FS, color=EDGE,
+            zorder=Z_TOKENIZER + 6)
+
+
 def dist_glyph(ax, modes, box, z):
     """The implicit-distribution mark, in FIGURE coordinates. `box` is (x0, y0, x1, y1) with y0 the TOP
     (the axis is inverted), so the mark scales with the box instead of being a pasted bitmap.
@@ -1335,17 +1428,33 @@ def draw_box(ax, D, sx):
       +1  enters at the BOTTOM, stacks UP,   leaves to the RIGHT   (the space-time backbone)
       -1  enters at the LEFT,   stacks DOWN, leaves out the BOTTOM  (the rectified-flow head)"""
     f = D["flow"]
+    # THE MECHANISM'S OWN OFFSET, flow heads only (the summariser keeps its internals centred).
+    idx = HEAD_IN_DX if f < 0 else 0.0
     x0, x1, y0, y1 = D["x0"] + sx, D["x1"] + sx, D["y0"], D["y1"]
-    cx, arc_x = D["cx"] + sx, D["arc_x"] + sx
-    bx0, bx1 = D["sub_x0"] + sx, D["sub_x1"] + sx
+    cx, arc_x = D["cx"] + sx + idx, D["arc_x"] + sx + idx
+    bx0, bx1 = D["sub_x0"] + sx + idx, D["sub_x1"] + sx + idx
     ax.add_patch(PathPatch(rounded_polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], CORNER_R),
                            fc=ENC_FC, ec=BOX_EC, lw=ENC_LW, zorder=Z_TOKENIZER))
-    ax.text(0.5 * (x0 + x1), D["title_cy"], D["title"], ha="center", va="center",
-            fontsize=BOX_FS, color="black", linespacing=1.3, zorder=Z_TOKENIZER + 4)
+    # THE HEADS ARE BOLD, the summariser is not: bold marks the three things the paper trains, and the
+    # summariser is a component inside the first of them.
+    # THE NAME IS BOLD, THE PARENTHETICAL IS NOT: "(rectified flow)" is a qualifier, not the name, so
+    # the two lines are drawn separately rather than as one bold block.
+    _tl = D["title"].split("\n")
+    _bold = "head" in _tl[0]
+    _lh = text_extent("Ay", BOX_FS)[1] * 1.3
+    for _i, _ln in enumerate(_tl):
+        ax.text(0.5 * (x0 + x1), D["title_cy"] + (_i - (len(_tl) - 1) / 2.0) * _lh, _ln,
+                ha="center", va="center", fontsize=BOX_FS, color="black", zorder=Z_TOKENIZER + 4,
+                fontweight="bold" if (_bold and _i == 0) else "normal")
+    if D.get("badge"):
+        badge(ax, x0 + BB_PAD + BADGE_R, y0 + BB_PAD + BADGE_R, D["badge"])
     if D.get("glyph"):
         gx1 = x1 - BB_PAD
-        dist_glyph(ax, D["glyph"], (gx1 - GLYPH_W, D["title_cy"] - GLYPH_H / 2.0, gx1,
-                                    D["title_cy"] + GLYPH_H / 2.0), Z_TOKENIZER + 4)
+        # IN LINE WITH THE REPEAT LABEL, not with the title: the glyph says what the head EMITS, and
+        # that reads with the denoising loop rather than with the name.
+        _gy = D.get("glyph_cy", D["title_cy"])
+        dist_glyph(ax, D["glyph"], (gx1 - GLYPH_W, _gy - GLYPH_H / 2.0, gx1,
+                                    _gy + GLYPH_H / 2.0), Z_TOKENIZER + 4)
     ys = [D["sub_y"] - f * i * (D["subh"] + D["subsep"]) for i in range(len(D["subs"]))]
     # the trunk spans the whole run, from where the signal enters to where it leaves
     trunk = (y1, D["out_y"]) if f > 0 else (D["bars"][-1][3], D["loop_y"])
@@ -1386,7 +1495,7 @@ def draw_box(ax, D, sx):
             inner.append(dict(pts=leg + [(t[0] - ARROW_L, t[1])], tip=t))
         kind = f"bus + {len(tips)} branch" + ("es" if len(tips) > 1 else "")
     else:                                                # in at the LEFT, down, out the BOTTOM
-        bars = [(b[0] + sx, b[1], b[2] + sx, b[3]) for b in D["bars"]]
+        bars = [(b[0] + sx + idx, b[1], b[2] + sx + idx, b[3]) for b in D["bars"]]
         for (bx0, by0, bx1, by1), txt in zip(bars, D["bars_txt"]):
             ax.add_patch(PathPatch(rounded_polygon([(bx0, by0), (bx1, by0), (bx1, by1), (bx0, by1)],
                                                    CORNER_R),
@@ -1397,7 +1506,8 @@ def draw_box(ax, D, sx):
         for lo, hi in zip(bars, bars[1:]):               # concat -> project, with the SHORT head
             inner.append(dict(pts=[(cx, lo[1]), (cx, hi[3] + edge + ARROW_L * 0.5)],
                               tip=(cx, hi[3] + edge), head_dir=(0.0, -1.0), head_len=ARROW_L * 0.5))
-        for (tx0, ty0, tx1, ty1), txt in zip([(b[0] + sx, b[1], b[2] + sx, b[3]) for b in D["tail"]],
+        for (tx0, ty0, tx1, ty1), txt in zip([(b[0] + sx + idx, b[1], b[2] + sx + idx, b[3])
+                                              for b in D["tail"]],
                                              D["tail_txt"]):
             ax.add_patch(PathPatch(rounded_polygon([(tx0, ty0), (tx1, ty0), (tx1, ty1), (tx0, ty1)],
                                                    CORNER_R),
@@ -1408,7 +1518,7 @@ def draw_box(ax, D, sx):
         inner.append(dict(pts=[(x0, D["out_y"]), (cat[0], D["out_y"])]))
         # THE SAMPLING LOOP, kept INSIDE the box, in its own channel right of the "x N" brace.
         tap = D["loop_y"]                        # the loop CLOSES below everything the box stacks
-        lx = D["loop_x"] + sx
+        lx = D["loop_x"] + sx + idx
         inner.append(dict(pts=[(cx, tap), (lx, tap), (lx, D["out_y"]),
                                (cat[2] + edge + ARROW_L * 0.5, D["out_y"])],
                           tip=(cat[2] + edge, D["out_y"]), head_dir=(-1.0, 0.0),
@@ -1420,6 +1530,7 @@ def draw_box(ax, D, sx):
             f"{D['title'].splitlines()[0]}: '{D['x4_steps']}' runs past the box edge -- narrow DT_LOOP")
         ax.text(lx + MIN_SEG, xmid[1], D["x4_steps"], ha="left", va="center",
                 fontsize=D["x4_fs"], color=EDGE, zorder=Z_TOKENIZER + 5)   # same styling as the "x N" brace
+        D["glyph_cy"] = xmid[1]                          # ...and the glyph lines up with it
         ax.text(0.5 * (cx + lx), tap + MIN_SEG, "denoising", ha="center", va="top",
                 fontsize=BB_FS, color=EDGE, zorder=Z_TOKENIZER + 5)
         # x_0 leaves the BOTTOM of the box and descends into the top faces of the predicted slices. It
@@ -1460,7 +1571,13 @@ def draw_box(ax, D, sx):
             # THE SAME WORD THE ACTION HEAD'S OUTPUT CARRIES: x_0 is a draw from this head's terminal
             # law, not its mean. Beside the vertical shaft rather than over it, since that shaft is
             # vertical and a label above it would sit on the box it just left.
-            ax.text(cx + MIN_SEG, 0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="left", va="center",
+            # ROTATED to run along the shaft it names: horizontal beside a vertical line reads as a
+            # label for something else.
+            # CENTRED ON ITS OWN BOX, offset clear of the shaft. rotation_mode="anchor" put the
+            # baseline on the line itself, so the word straddled it whatever the offset.
+            # rotation 270, NOT 90: turned end over end so it reads down the shaft.
+            ax.text(cx + 2.2 * MIN_SEG + text_extent(SAMPLE_LAB, BOX_FS * 0.78)[1] - 20.0,
+                    0.5 * (y1 + legs[0][0]), SAMPLE_LAB, ha="center", va="center", rotation=270,
                     fontsize=BOX_FS * 0.78, color=EDGE, zorder=Z_TOKENIZER + 5)
             ROUTES.append((D["title"].splitlines()[0], "x_0", f"45 arrival x {len(legs)}"))
             kind = "up-and-out"
@@ -1522,7 +1639,8 @@ def _draw_action_tiles(ax, x0, y0, x1, y1):
     the word on the arrow is what says so; see SAMPLE_LAB for why the distribution is not drawn."""
     for c in range(AS_TILES):
         _p_act_vec(ax, x0 + c * OFFSET_X, y0 + c * OFFSET_Y, CELL, _vh_a, ACT_SMP[0, c], 1.0,
-                   Z_ARROW + 1 + c, ang=_smp_arrows[c], hatch=PRED_HATCH)
+                   Z_ARROW + 1 + c, ang=_smp_arrows[c], hatch=PRED_HATCH,
+                   hatch_col=plt.get_cmap(ACT_OUT_CMAP)(0.85))
     ROUTES.append(("Action head", "out", f"tiles: 1 sampled chunk, {AS_TILES} steps"))
 
 
@@ -1533,8 +1651,10 @@ def draw_legend(ax):
     about TEXTURE: colour already means modality everywhere in this figure, and a coloured swatch here
     would read as a fifth stream."""
     w_lab = max(text_extent(t, ENC_FS)[0] for t in (LEG_TRUE, LEG_PRED))
-    lx = CANVAS_W - MARGIN - LEG_S - LEG_GAP - w_lab
-    ly = CANVAS_H - MARGIN - 2 * LEG_S - LEG_SEP
+    # BOTTOM LEFT, and its BOTTOM is level with the reward head's bottom, so the figure ends where the
+    # ink does rather than leaving a band under both.
+    lx = MARGIN
+    ly = globals().get("RM_BOT", CANVAS_H - MARGIN) - 2 * LEG_S - LEG_SEP
     for k, (lab, hatch) in enumerate(((LEG_TRUE, None), (LEG_PRED, PRED_HATCH))):
         y = ly + k * (LEG_S + LEG_SEP)
         ax.add_patch(Rectangle((lx, y), LEG_S, LEG_S, fc="white", ec=EDGE, lw=LW * 1.6, hatch=hatch,
@@ -1544,7 +1664,8 @@ def draw_legend(ax):
 
 
 def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, backbone=False, dit=False,
-           pred=False, decoders=False, group=False, action_head=False, legend=False):
+           pred=False, decoders=False, group=False, action_head=False, legend=False, crop_bottom=False,
+           reward=False):
     """`items` = indices of LAYERS whose cascades to draw. Every component uses the SAME canvas, so the
     outputs stack exactly."""
     fig = plt.figure(figsize=(CANVAS_W / 100, CANVAS_H / 100), dpi=DPI)
@@ -1567,10 +1688,8 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
             p0, p1 = (tx0 + sx, ty0 + sy), (tx1 + sx, ty1 + sy)
             u = np.array([OFFSET_X, OFFSET_Y], float); u /= np.linalg.norm(u)
             draw_arrow(ax, [p0, tuple(np.asarray(p1) - u * ARROW_L)], Z_ARROW, tip=p1, head_dir=tuple(u))
-            mid = 0.5 * (np.asarray(p0) + np.asarray(p1))
-            ax.text(mid[0], mid[1] + MIN_SEG, TIME_LAB, ha="center", va="top", fontsize=ENC_FS,
-                    color=EDGE, rotation=-np.degrees(np.arctan(SLOPE)), rotation_mode="anchor",
-                    zorder=Z_ARROW + 1)
+            ax.text(p1[0] + 2.0 * MIN_SEG, p1[1] + 0.6 * MIN_SEG, TIME_LAB, ha="left", va="center",
+                    fontsize=ENC_FS * 1.15, color=EDGE, zorder=Z_ARROW + 1)
             ROUTES.append(("Time", "axis", "parallel to the cascade"))
         if braces:
             for bi, (i0, i1) in enumerate(L["braces"]):
@@ -1649,7 +1768,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
             pal = LAYERS[row]                        # row 0 predicts VISION, row 1 predicts PROPRIO
             iso_block(ax, (P["tip"][0] + LAYERS[0]["sx"], P["tip"][1]), P["d"], P["h"], P["w"],
                       Z_BLOCK["vision"] + 50 + 10 * step + (n_b - 1 - row),
-                      fc=pal["blk"], ec=pal["ec"], hatch=PRED_HATCH)
+                      fc=pal["blk"], ec=pal["ec"], hatch=PRED_HATCH)   # slice: its own hue
     if decoders:
         sx = LAYERS[0]["sx"]
         for k, D in enumerate(DEC):
@@ -1685,22 +1804,30 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                 if D["label"].startswith("Vision") and PRED_IMG is not None:
                     ax.imshow(PRED_IMG[t_], extent=(ox, ox + D["ow"], oy + D["oh"], oy), zorder=zt,
                               interpolation="bilinear")
+                    # A HATCHED BAND, NOT A HATCHED IMAGE: a ring path (outer rectangle, inner rectangle
+                    # reversed) carries the hatch, so the predicted frame is marked at its border and
+                    # left legible in the middle.
+                    bw = PRED_BAND_PX * D["ow"] / PRED_IMG[t_].shape[1]
+                    W_, H_ = D["ow"], D["oh"]
+                    for bx, by, bwd, bht in ((ox, oy, W_, bw), (ox, oy + H_ - bw, W_, bw),
+                                             (ox, oy + bw, bw, H_ - 2 * bw),
+                                             (ox + W_ - bw, oy + bw, bw, H_ - 2 * bw)):
+                        ax.add_patch(Rectangle((bx, by), bwd, bht, fc="none", lw=0.0,
+                                               ec=hatch_rgba(VIS_EC), hatch=PRED_HATCH,
+                                               zorder=zt + 0.4))
                     ax.add_patch(Rectangle((ox, oy), D["ow"], D["oh"], fill=False, ec=VIS_EC,
-                                           lw=LW * 2, hatch=PRED_HATCH, zorder=zt + 0.5))
+                                           lw=LW * 2, zorder=zt + 0.5))
                 elif PRED_OBS is not None:
-                    # FLAT, and re-centred on the arrow: horizontal makes the tile CELL tall rather than
-                    # D*CELL, so the oy computed for a column would hang it below the tip.
-                    _p_prop_vec(ax, ox, D["out_cy"] - CELL / 2 + t_ * OFFSET_Y, D["ow"], D["oh"],
-                                PRED_OBS[t_], 1.0, zt, hatch=PRED_HATCH, horizontal=True)
+                    _p_prop_vec(ax, ox, oy, D["ow"], D["oh"], PRED_OBS[t_], 1.0, zt,
+                                hatch=PRED_HATCH,
+                                hatch_col=plt.get_cmap(MOD_CMAP["proprio"])(0.85))
                 else:
                     D["draw"](ax, ox, oy, D["ow"], D["oh"], PRED_AT, 1.0, zt)
     if dit:
         sx = LAYERS[0]["sx"]
         draw_box(ax, DT, sx)
-        # h is labelled on the SHARED STEM, before the bus splits it -- putting it on one branch would
-        # read as though only that head gets it.
-        ax.text(BB["x1"] + sx + 0.4 * DT_GAP, BB["out_y"] - MIN_SEG, "$h$", ha="center", va="bottom",
-                fontsize=BB_FS, color=EDGE, zorder=Z_ARROW + 1)
+        # (the `h` label that used to sit on the shared stem is gone: the text says what h is, and the
+        #  figure was carrying a symbol nothing else in it defines)
     if action_head:
         # THE BOX. Its h arrives as one branch of the summariser's fan (draw_box, flow > 0), because that
         # fan is one connected set of lines and splitting it across two render calls would let one halo
@@ -1718,13 +1845,140 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                 # the arrow carries the word instead: this is A DRAW, not the distribution
                 # over the SHAFT: the arrow now runs flush into the first tile, so there is no gap
                 # at its head to put a word in
-                ax.text(0.5 * (AH["x1"] + AH["exit_tip"][0]) + sx, AH["exit_tip"][1] - MIN_SEG,
+                ax.text(0.5 * (AH["x1"] + AH["exit_tip"][0]) + sx - 24.0, AH["exit_tip"][1] - MIN_SEG,
                         SAMPLE_LAB, ha="center", va="bottom", fontsize=BOX_FS * 0.78, color=EDGE,
                         zorder=Z_ARROW + 2)
+    if reward and RM_ON:
+        sx = LAYERS[0]["sx"]
+        dy_ = LAYERS[0]["tip"][0][1] - LAYERS[0]["tip_abs"][0][1]      # solve_layout's own y offset
+        # THE BRACE, AND WHY IT WAS SHORT. brace_between PROJECTS its two corners onto a line through
+        # the lifted start point in direction `u`, and `u` defaults to the CASCADE ANGLE -- which is
+        # right for the summariser's brace, because that one sits on an isometric edge of the block and
+        # runs parallel to it. The bottom span here is horizontal, so projecting it onto a sloped line
+        # shortened it by cos(angle) and slid the left end inward: the ends no longer matched the corners
+        # they were meant to mark. Passing u=(1,0) makes the projection the identity in x, so the brace
+        # runs from the ACTION (blue) block's left edge to the PROPRIOCEPTION (orange) block's right
+        # edge exactly, which is the width of the token bag the reward reads. The lift is BRACE_M, the
+        # same depth as the summariser's input brace.
+        # FLUSH WITH THE BLUE CUBOID, and built exactly the way the summariser's input brace is built --
+        # from the block's OWN bottom edge rather than from a bounding box. The action block's depth edge
+        # runs at the cascade angle (ISO_C, ISO_S is OFFSET_X, OFFSET_Y normalised), which is why
+        # brace_between's default direction is the right one here: same primitive, lift the other way.
+        _O = np.asarray(LAYERS[-1]["blk_O"][0], float) + np.array([sx, dy_])
+        _d = LAYERS[-1]["blks"][0][0]
+        _vdu = np.array([-BLK_S * ISO_C, -BLK_S * ISO_S])
+        poly, mid = brace_between(tuple(_O + _vdu * _d), tuple(_O), RM_GAP_BR)
+        draw_arrow(ax, poly, Z_ARROW)
+        # SAME RENDERING AS THE HEADS: outer box at ENC_LW with a BOX_FS title, internals at ENC_LW*0.6
+        # with BB_FS text, which is what draw_box uses -- the reward model was drawn at its own weights
+        # and read as a different kind of object.
+        sub_h = text_extent(RM_LAT, BB_FS)[1] * 2.5
+        ttl_h = text_extent(RM_TITLE, BOX_FS)[1]
+        rh = 2 * RM_PAD + ttl_h + 2 * sub_h + RM_ROW_SEP
+        # ALIGNED WITH THE TWO HEADS: same left and right edges as the observation and action head
+        # boxes, so the three things the model runs read as one column of boxes.
+        rx0, rx1 = AH["x0"] + sx, AH["x1"] + sx
+        rw = rx1 - rx0
+        ry0 = mid[1] + RM_GAP_BOX
+        ax.add_patch(PathPatch(rounded_polygon([(rx0, ry0), (rx1, ry0), (rx1, ry0 + rh), (rx0, ry0 + rh)],
+                                               CORNER_R), fc=ENC_FC, ec=BOX_EC, lw=ENC_LW,
+                               zorder=Z_TOKENIZER))
+        _rl = RM_TITLE.split("\n")
+        _rlh = text_extent("Ay", BOX_FS)[1] * 1.3
+        for _i, _ln in enumerate(_rl):
+            ax.text(0.5 * (rx0 + rx1), ry0 + RM_PAD * 0.45 + ttl_h / 2
+                    + (_i - (len(_rl) - 1) / 2.0) * _rlh, _ln, ha="center", va="center",
+                    fontsize=BOX_FS, zorder=Z_TOKENIZER + 4,
+                    fontweight="bold" if _i == 0 else "normal")
+        badge(ax, rx0 + BB_PAD + BADGE_R, ry0 + BB_PAD + BADGE_R, 3)
+        w_cos = text_extent(RM_COS, BB_FS)[0] + 1.7 * RM_PAD
+        # THE BRANCH CELLS MUST FIT THEIR OWN TEXT. The box width is fixed (it matches the two heads), so
+        # what gives is the gap before the cosine -- sizing the cells from the leftover instead clipped
+        # "Project to f_t".
+        w_enc = text_extent(RM_ENC, BB_FS)[0] + 1.3 * RM_PAD
+        w_prj = text_extent(RM_TXT, BB_FS)[0] + 1.3 * RM_PAD
+        w_br = w_enc + RM_ROW_SEP + max(w_prj, text_extent(RM_LAT, BB_FS)[0] + 1.3 * RM_PAD)
+        cos_gap = max(2.2 * ARROW_L, rw - 2 * RM_PAD - w_br - w_cos)
+        bx0 = rx0 + RM_PAD
+        y_lat = ry0 + RM_PAD + ttl_h + sub_h / 2
+        y_txt = y_lat + sub_h + RM_ROW_SEP
+        _z_in = Z_TOKENIZER + 1.5          # above the box fill, or the arrows inside it are painted over
+
+        def _cell(x, y, w, lab):
+            ax.add_patch(PathPatch(rounded_polygon([(x, y - sub_h / 2), (x + w, y - sub_h / 2),
+                                                    (x + w, y + sub_h / 2), (x, y + sub_h / 2)],
+                                                   CORNER_R), fc="white", ec=BOX_EC, lw=ENC_LW * 0.6,
+                                   zorder=Z_TOKENIZER + 2))
+            ax.text(x + w / 2, y, lab, ha="center", va="center", fontsize=BB_FS,
+                    zorder=Z_TOKENIZER + 3)
+        # THE TEXT BRANCH IS TWO BLOCKS: a frozen sentence encoder, then the projection that is trained.
+        # THE TWO PROJECTIONS ARE THE SAME BOX, one above the other: they do the same thing to two
+        # different inputs, and drawing one full-width and one inset said otherwise.
+        w_prj = max(w_prj, text_extent(RM_LAT, BB_FS)[0] + 1.3 * RM_PAD)
+        px0 = bx0 + w_enc + RM_ROW_SEP
+        _cell(px0, y_lat, w_prj, RM_LAT)
+        _cell(bx0, y_txt, w_enc, RM_ENC)
+        _cell(px0, y_txt, w_prj, RM_TXT)
+        draw_arrow(ax, [(bx0 + w_enc, y_txt), (bx0 + w_enc + RM_ROW_SEP, y_txt)], Z_TOKENIZER + 2.5)
+        cx0 = bx0 + w_br + cos_gap
+        y_cos = 0.5 * (y_lat + y_txt)
+        ax.add_patch(PathPatch(rounded_polygon([(cx0, y_cos - sub_h / 2), (cx0 + w_cos, y_cos - sub_h / 2),
+                                                (cx0 + w_cos, y_cos + sub_h / 2), (cx0, y_cos + sub_h / 2)],
+                                               CORNER_R), fc="white", ec=BOX_EC, lw=ENC_LW * 0.6,
+                               zorder=Z_TOKENIZER + 2))
+        ax.text(cx0 + w_cos / 2, y_cos, RM_COS, ha="center", va="center", fontsize=BB_FS,
+                zorder=Z_TOKENIZER + 3)
+        for yy in (y_lat, y_txt):
+            _turn = px0 + w_prj + 0.25 * (cx0 - (px0 + w_prj))
+            draw_arrow(ax, [(px0 + w_prj, yy), (_turn, yy), (_turn, y_cos), (cx0 - ARROW_L, y_cos)],
+                       _z_in, tip=(cx0, y_cos), head_dir=(1.0, 0.0))
+        # the brace stem comes down and turns into the latent branch
+        # AT _z_in, NOT Z_ARROW: the last leg runs INSIDE the box, and the box fill sits far above
+        # arrow depth, so at Z_ARROW the line vanished the moment it crossed the wall.
+        # THE HEAD LANDS ON THE BOX, and a plain line carries on inside it to the block -- an arrowhead
+        # at the block would say the box wall is not a boundary.
+        draw_arrow(ax, [(mid[0], mid[1]), (mid[0], y_lat), (rx0 - ARROW_L, y_lat)], _z_in,
+                   tip=(rx0, y_lat), head_dir=(1.0, 0.0))
+        draw_arrow(ax, [(rx0, y_lat), (px0, y_lat)], _z_in)
+        # ...and the request runs in from the SAME x the brace stem turns at, so the two inputs align
+        lines = RM_REQ.split(chr(10))
+        tw = max(text_extent(l, BB_FS * 1.5)[0] for l in lines)
+        # THE REQUEST IS BRACED, like every other group of things in this figure, and the brace's stem
+        # is the line that carries it into the text branch.
+        _tw, _th = text_extent(RM_REQ, BB_FS * 2.0)
+        _tx1 = mid[0] - RM_REQ_PAD
+        ax.text(_tx1, y_txt, RM_REQ, ha="right", va="center", fontsize=BB_FS * 2.0,
+                style="italic", color=EDGE, linespacing=1.25, zorder=Z_TOKENIZER + 1)
+        rpoly, rmid = brace_between((_tx1 + MIN_SEG, y_txt - _th / 2 - BRACE_T),
+                                    (_tx1 + MIN_SEG, y_txt + _th / 2 + BRACE_T),
+                                    BRACE_M * 0.7, u=(0.0, 1.0), off=(1.0, 0.0))
+        draw_arrow(ax, rpoly, Z_ARROW)
+        draw_arrow(ax, [rmid, (rx0 - ARROW_L, y_txt)], _z_in, tip=(rx0, y_txt), head_dir=(1.0, 0.0))
+        draw_arrow(ax, [(rx0, y_txt), (bx0, y_txt)], _z_in)
+        draw_arrow(ax, [(cx0 + w_cos, y_cos), (rx1 + 1.2 * ARROW_L, y_cos)], _z_in,
+                   tip=(rx1 + 2.2 * ARROW_L, y_cos), head_dir=(1.0, 0.0))
+        ax.text(rx1 + 2.6 * ARROW_L, y_cos, RM_OUT, ha="left", va="center", fontsize=BOX_FS * 0.8,
+                zorder=Z_ARROW + 1)
+        globals()["RM_BOT"] = ry0 + rh
+        ROUTES.append(("Reward model", "brace", "action block left -> proprio block right"))
     if legend:
         draw_legend(ax)
     fig.savefig(path, transparent=True, dpi=DPI, pad_inches=0)
     plt.close(fig)
+    if crop_bottom:
+        # ...AND THE RIGHT. solve_layout reserves room for the widest thing it can predict, which left
+        # dead columns past the last drawn pixel; at width=\textwidth those columns are inside the float,
+        # so \centering was centring a box that was part air and the figure read as left-justified.
+        im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        pad = MARGIN * DPI / 100
+        rows = np.where(im[:, :, 3].max(axis=1) > 0)[0]
+        cols = np.where(im[:, :, 3].max(axis=0) > 0)[0]
+        keep_r = min(im.shape[0], int(rows[-1] + 1 + pad))
+        keep_c = min(im.shape[1], int(cols[-1] + 1 + pad))
+        cv2.imwrite(path, im[:keep_r, :keep_c])
+        print(f"  wrote {path.split('/')[-1]}  (trimmed {im.shape[0] - keep_r} px bottom, "
+              f"{im.shape[1] - keep_c} px right)")
+        return
     print(f"  wrote {path.split('/')[-1]}")
 
 
@@ -1743,9 +1997,10 @@ render(f"{ELEM}/latent_dynamics.png", group=True)
 render(f"{ELEM}/predicted.png", pred=True)
 render(f"{ELEM}/decoders.png", decoders=True)
 render(f"{ELEM}/legend.png", legend=True)
-render(f"{OUT}/final.png", items=(0, 1, 2), braces=True, tokenizers=True, blocks=True,
+render(f"{ELEM}/reward.png", reward=True)
+render(f"{OUT}/architecture.png", items=(0, 1, 2), braces=True, tokenizers=True, blocks=True,
        backbone=True, dit=True, pred=True, decoders=True, group=LD_ON, action_head=True,
-       legend=True)
+       legend=True, reward=True, crop_bottom=True)
 print(f"  canvas {int(CANVAS_W * DPI / 100)} x {int(CANVAS_H * DPI / 100)} px, identical for every component")
 print(f"\n  ONE SPACING, both axes: {_GAP:.1f} u ({_GAP * 3:.0f} px)")
 print(f"    MEASURED as proprioception riser x - right edge of the last image item, then reused as the")

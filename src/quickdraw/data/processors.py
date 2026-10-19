@@ -113,7 +113,7 @@ def _frame_hw(frames) -> tuple[int, int]:
 
 def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, log=None,
                            extra_splits: dict[str, list[Episode]] | None = None,
-                           val_ids: set[int] | None = None,
+                           val_ids: set[int] | None = None, val_frac: float | None = None,
                            obs_identity: list[int] | None = None,
                            obs_names: "list[str] | None" = None,
                            act_names: "list[str] | None" = None) -> str:
@@ -154,9 +154,9 @@ def build_recorded_dataset(name: str, episodes: list[Episode], fps: int, cam, lo
 
     # deterministic ~VAL_FRAC val split BY EPISODE (seed SPLIT_SEED), preserving processor order
     if val_ids is None:
-        n_val = max(1, round(VAL_FRAC * len(episodes)))
+        n_val = max(1, round((VAL_FRAC if val_frac is None else float(val_frac)) * len(episodes)))
         val_ids = set(np.random.default_rng(SPLIT_SEED).choice(len(episodes), size=n_val, replace=False).tolist())
-        split_rule = f"random, seed {SPLIT_SEED}"
+        split_rule = f"random, seed {SPLIT_SEED}, val_frac {VAL_FRAC if val_frac is None else val_frac}"
     else:
         val_ids = {int(i) for i in val_ids}
         bad = [i for i in val_ids if not 0 <= i < len(episodes)]

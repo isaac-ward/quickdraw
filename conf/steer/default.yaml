@@ -63,6 +63,12 @@ beta_jerk: 0.0        # continuity penalty on the candidate chunk: reward - beta
 #                       and 8-9x at the seam, because nothing in this planner ever asked for smoothness.
 #                       Normalized action units (the recorded raw step-to-step change is 0.055).
 n_samples: 64         # candidate chunks per block
+commit_rule: argmax   # argmax | mppi -- WHICH candidate is committed. `argmax` commits the single best
+#                       chunk and is what every number in the paper was measured with. `mppi` commits the
+#                       softmax-weighted MEAN of the candidates, the textbook rule, which is wrong in
+#                       principle for a structured proposal -- averaging two plausible manoeuvres gives an
+#                       implausible one -- and is here only so that claim can be measured rather than
+#                       asserted. It costs one extra rollout of one candidate per block.
 objective: level      # level | progress | terminal -- WHAT A CANDIDATE CHUNK IS JUDGED BY, and the one
 #                       knob that changes which candidate gets committed. `level` (mean R over the chunk) is
 #                       what every run before 2026-09-14 used; it SATURATES, measured: a plan hits its

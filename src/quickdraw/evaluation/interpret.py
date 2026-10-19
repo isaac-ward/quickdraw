@@ -205,6 +205,70 @@ def build_action_text(actions: np.ndarray, axes: list) -> str:
     return (f"Commanded stick inputs over this clip, each in [-1, 1] ({legend}):\n{head}\n{rows}")
 
 
+
+def build_action_prose(actions: np.ndarray, axes: list, scene: str = "", subject: str = "The view",
+                       max_phases: int = 4, thresh: float = 0.2) -> str:
+    """The commanded actions as a SENTENCE, for conditioning a video generator (build_action_text is the
+    table form, for a VLM that can already see the clip).
+
+    WHY THIS IS NOT JUST A LIST OF DIRECTIONS. An axis whose value is a STATE rather than a rate -- a
+    gripper -- averages to nothing useful: reporting its per-phase mean produced "opens its gripper, then
+    opens its gripper and lowers, then opens its gripper and rises", one fact repeated three times, while
+    the thing that actually happened (a cube was grasped, lifted and placed) was never said at all. A
+    grasp is an EVENT, and the manipulation is the whole content of the clip.
+
+    So an axis may declare `role: gripper` in `action_axes`, and it is then read as a transition:
+      open -> closed   "closes its gripper on the cube"
+      closed -> open   "opens its gripper and releases the cube"
+      closed throughout, while moving   "... while holding the cube", said ONCE per hold and not
+                                        repeated on every phase it spans
+    Everything else is a rate axis and keeps the direction-of-mean treatment, two per phase, ranked by
+    distance from its own `neutral`.
+
+    WHAT IT STILL CANNOT SAY: WHICH cube. The dataset records the arm (ee pose, joints, gripper) and not
+    the objects, so there are no cube poses to read; naming one from the future frames would be feeding
+    the model the answer. "the cube" is the honest limit until object state exists.
+
+    Magnitude and sub-phase reversals are lost either way -- a stick that swings +1 then -1 inside one
+    span averages to nothing, which is the argument for calling this per CHUNK rather than per rollout.
+    """
+    a = np.asarray(actions, dtype=np.float32)
+    n = len(axes)
+    assert a.shape[-1] % n == 0, f"action width {a.shape[-1]} is not a multiple of {n} declared axes"
+    a = a.reshape(a.shape[0], a.shape[-1] // n, n).mean(axis=1)      # fold concat sub-steps, keep sign
+    k = max(1, min(int(max_phases), len(a)))
+    spans = np.array_split(np.arange(len(a)), k)
+    neutral = np.array([float(ax.get("neutral", 0.0)) for ax in axes], dtype=np.float32)
+
+    gi = next((j for j, ax in enumerate(axes) if str(ax.get("role", "")) == "gripper"), None)
+    shut = None if gi is None else a[:, gi] > float(axes[gi].get("closed_above", 0.5))
+
+    phrases, held_said = [], False
+    for sp in spans:
+        m = a[sp].mean(0) - neutral
+        rate = [j for j in np.argsort(-np.abs(m)) if j != gi and abs(m[j]) >= thresh]
+        moved = [axes[j]["positive"] if m[j] > 0 else axes[j]["negative"] for j in rate[:2]]
+
+        grip, holding = [], ""
+        if shut is not None:
+            a0, a1 = bool(shut[sp[0]]), bool(shut[sp[-1]])
+            if not a0 and a1:
+                grip = ["closes its gripper on the cube"]
+            elif a0 and not a1:
+                grip = ["opens its gripper and releases the cube"]
+            elif a1 and shut[sp].mean() > 0.5 and moved and not held_said:
+                holding = " while holding the cube"       # once per hold; a 5 s grasp spans ~2 phases
+            held_said = a1 and (held_said or bool(holding) or bool(grip))
+            if not a1:
+                held_said = False
+        said = grip + ([" and ".join(moved)] if moved else [])
+        phrases.append((", ".join(said) + holding) if said else "holds still")
+
+    seq = [ph for i, ph in enumerate(phrases) if i == 0 or ph != phrases[i - 1]]
+    motion = seq[0] if len(seq) == 1 else ", then ".join(seq)
+    return f"{scene.strip()} {subject.strip()} {motion}.".strip()
+
+
 # ------------------------- analytic labels (exact, from the imagined proprio) -------------------------
 def analytic_scalar(kind: str, pro_phys: np.ndarray, R: float, dims=None, fc: dict | None = None) -> float:
     """One scalar per clip for an analytic factor; `bucketize` turns a set of them into labels.
