@@ -3,6 +3,14 @@
 # must avoid parentheses, commas and apostrophes -- Hydra's override grammar rejects them with a bare
 # error naming one character.
 #
+# EVAL SIZED DOWN, because autobatch said it would not fit. Our val episodes are 891 usable steps
+# -- far longer than block-stack's -- and at the defaults (n_ep=8, decode_chunk=64) the probe put
+# closed_loop_16_steps at 52.0 GB against a 42 GB budget, with the warning that "training is sized
+# independently and will still run; eval routines may fail". The 16-step-ahead prediction IS one of
+# the deliverables, so losing it eight hours in is not acceptable. n_ep 8->4 and decode_chunk 64->32
+# cuts the worst mode to roughly a quarter. Four episodes of 891 steps is still 3,564 scored steps
+# per mode, which is plenty for the curves.
+#
 # 14 EPOCHS, NOT 40, AND THE REASON IS COMPARABILITY. The dataset went from 2 h to 6 h, so an epoch
 # is 3x longer: 537,192 training windows against 179,064, i.e. 35,812 steps per epoch at batch 15
 # against 11,937. Holding epochs fixed would have handed the 6 h arm 3x the gradient steps as well
@@ -10,7 +18,7 @@
 # of what 40 epochs bought on 2 h, so the comparison isolates DATA VOLUME -- which is the whole
 # reason for generating 6 h in the first place.
 cd /app
-R=/app/logs/recording_2026_10_18_07_32_38_mbari-tank
+R=logs/recording_2026_10_18_23_12_14_mbari-tank
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u -m quickdraw.train_world_model \
   model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
@@ -22,6 +30,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -u -m quickdraw.train_world_model \
   eval.during_train.evals.denoising_aggregate=false \
   eval.during_train.evals.denoising_filmstrip=false \
   eval.during_train.every_epochs=2 \
+  eval.horizon_n_episodes=4 eval.decode_chunk=32 \
   +run_summary.problem="No world model exists for the MBARI tank underwater domain so we cannot do uncertainty based OOD detection or model based control there" \
   +run_summary.tried="Nothing on this dataset yet. The longhand branch records thirteen arms that all failed to move OL minus floor off 0.063 on 2.06 h of block-stack and concluded the remaining lever was more data which a real robot could not supply - this dataset is simulated so 6 h cost 65 minutes" \
   +run_summary.trying="vl128_blockstack_2cam transplanted to one fpv image head at 144x192 plus a 13 dim proprio head on 6 hours of 30 Hz AUV data" \

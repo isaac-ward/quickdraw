@@ -186,8 +186,13 @@ def pose_cost(states, goal_p, goal_q=None, w_pos=1.0, w_att=0.35, w_vel=0.08, w_
 
 
 def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma=0.5,
-         temp=0.35, seed=0, prev=None, repeat=6):
+         temp=0.35, seed=0, prev=None, repeat=6, fan=None):
     """One MPPI step -> (action, planned_mean). Actions are clipped to the box the plant accepts.
+
+    `fan`, if given, is a list the candidate cloud is appended to as {"pts": (K,H,3), "ret": (K,)}
+    -- the same contract `logging.viz._add_fan` already uses for the torus, so the cloud of
+    possible futures can be drawn. `ret` is NEGATED cost, so higher is better, matching that
+    function's colouring.
 
     BUDGET, because the true plant is the expensive one. Each candidate costs horizon x 17 MuJoCo
     substeps, so the first attempt (160 samples, horizon 25, 2 iterations) was 136,000 mj_steps PER
@@ -211,6 +216,8 @@ def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma
         else:
             preds = [dyn.rollout(state, c, repeat=repeat) for c in cand]
         costs = np.array([pose_cost(pr, goal_p, goal_q) for pr in preds])
+        if fan is not None:
+            fan.append({"pts": np.asarray([p[:, :3] for p in preds], np.float32), "ret": -costs})
         wts = np.exp(-(costs - costs.min()) / temp)
         wts /= wts.sum()
         mean = np.clip((wts[:, None, None] * cand).sum(0), -1, 1)
@@ -240,7 +247,7 @@ FINE = dict(repeat=1, horizon=18, samples=48, sigma=0.18)
 
 
 def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0, log=None,
-                repeat=6, samples=24, horizon=12):
+                repeat=6, samples=24, horizon=12, fan=None):
     """Closed loop: `dyn` plans, the MuJoCo `plant_model` executes. Returns a trace dict.
 
     EACH PLANNED ACTION IS EXECUTED FOR `repeat` CONTROL STEPS, which is what it was costed as: the
@@ -271,7 +278,7 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
             mode, prev = want, None
         a, prev = mppi(dyn, s, goal_p, goal_q, seed=seed + k, prev=prev,
                        samples=mode["samples"], horizon=mode["horizon"],
-                       sigma=mode["sigma"], repeat=mode["repeat"])
+                       sigma=mode["sigma"], repeat=mode["repeat"], fan=fan)
         for _ in range(min(mode.get("exec_n", mode["repeat"]), steps - k)):
             s = mola.state(d)
             traj.append(s)
@@ -286,6 +293,6 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
             log(f"    k={k:3d} dist {np.linalg.norm(s[:3]-goal_p):.2f} m")
     traj = np.asarray(traj, np.float32)
     dist = np.linalg.norm(traj[:, :3] - goal_p, axis=1)
-    return {"traj": traj, "act": np.asarray(acts, np.float32), "dist": dist,
+    return {"traj": traj, "act": np.asarray(acts, np.float32), "dist": dist, "fan": fan,
             "final_dist": float(dist[-1]), "best_dist": float(dist.min()),
             "steps_to_0p5m": int(np.argmax(dist < 0.5)) if (dist < 0.5).any() else -1}

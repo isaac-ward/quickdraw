@@ -28,6 +28,11 @@ from .mola import ACTION_NAMES, STATE_NAMES
 from .record import CAMS, FPS
 
 QUAT_DIMS = [3, 4, 5, 6]
+# 20% val, not the house 10%. Val does double duty here: it is the checkpoint monitor AND the
+# nominal reference the OOD detector calibrates against, and that second job is the binding one --
+# thresholds set on data the model trained on are optimistically biased, so the reference has to be
+# held out, and 72 episodes is a thin sample to set a 90th-percentile threshold from. 144 is not.
+VAL_FRAC = 0.2
 SPLIT_TASK = {"ood_thruster": "ood_thruster_glitch", "ood_fish": "ood_object_shark",
               "ood_buoy": "ood_appearance_buoy"}
 
@@ -70,7 +75,7 @@ def build(root="/app/logs/mbari/data/v6", name="mbari-tank", cams=CAMS, log=prin
         raise RuntimeError(f"no train episodes under {root}")
     return build_recorded_dataset(name, train, FPS, list(cams), log=log, extra_splits=extra,
                                   obs_identity=QUAT_DIMS, obs_names=STATE_NAMES,
-                                  act_names=ACTION_NAMES)
+                                  act_names=ACTION_NAMES, val_frac=VAL_FRAC)
 
 
 if __name__ == "__main__":
