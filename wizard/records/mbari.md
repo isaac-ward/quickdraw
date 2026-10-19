@@ -340,6 +340,33 @@ exactly equal, with identical val cadence.
 plus **870 per-trajectory preview mp4s** (one per episode, four cameras, 3.0 GB) embedded in the
 dataset card so they play on the page.
 
+## Known mismatch: the published dataset shows a SILVER hull, the code now renders YELLOW
+
+The MOLA's large pressure-hull group ships from the source model as flat grey (0.4, 0.4, 0.4) and
+is recoloured to yellow in `tank._recolour`, matched BY COLOUR rather than group index so a mesh
+reconversion cannot silently break it. The change was made after the dataset was generated, so:
+
+- `huggingface.co/datasets/isaac-ronald-ward/mbari-tank` — all 870 preview videos, and the
+  chase / top-down / side-on streams inside the LeRobot splits, show the **silver** hull.
+- Anything rendered from here — control videos, new previews — shows the **yellow** hull.
+
+**Training is unaffected.** The only stream the model sees is `fpv`, the vehicle's own forward
+camera, and the vehicle does not appear in its own FPV. The mismatch is cosmetic and confined to
+the third-person views.
+
+TO FIX: regenerate and re-push when the dataset is next rebuilt for any other reason. Not worth a
+65-minute regeneration plus a re-upload on its own.
+
+Two other scene changes made at the same time, both AFTER the dataset was built, so they carry the
+same caveat:
+- **The dock is flush and square** against the -X wall (`DOCK_YAW = 0.0`, entry facing +X down the
+  length of the tank) instead of rotated 45 degrees to face the tank centre from its corner. It
+  matters more than cosmetics now: the dock's orientation is the control benchmark's attitude
+  target, so a square dock makes that target a clean "face down the tank".
+- **A translucent green ghost of the vehicle** can be placed at the goal pose (`mjcf(ghost=True)`,
+  a mocap body). OPT-IN and off by default, and never built for data generation -- a goal marker
+  in the training frames would be a feature the model could read instead of learning the dynamics.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
