@@ -43,30 +43,31 @@ class UnderwaterRenderer:
         self.r = mujoco.Renderer(model, height, width)
         self.cams = tuple(cams)      # which cameras a caller should capture; see control.run_episode
 
-    def orbit(self, lookat, dist=4.6, elev=-18.0, period_s=24.0, fps=30, name="dockcam"):
-        """Register a FREE camera that slowly circles `lookat`, addressed by `name`.
+    def look_at(self, target, dist=4.6, elev=-18.0, name="dockcam"):
+        """Register a FIXED free camera aimed at `target`, addressed by `name`.
 
         A body-mounted chase camera is useless at exactly the moment worth watching: it sits a
         fixed distance behind the vehicle, so when the vehicle reaches a goal in a corner the
-        camera is inside the wall. Anchoring to the GOAL instead keeps the approach in frame the
-        whole way in, and the slow orbit gives the depth cue a single fixed view does not."""
+        camera is inside the wall. This one is anchored to the GOAL, so the approach is in frame
+        the whole way in.
+
+        IT DOES NOT ORBIT. A circling camera looks better for one second and then sweeps straight
+        through a tank wall. The azimuth is chosen ONCE so the camera sits on the tank-centre side
+        of the target -- MuJoCo places a free camera at lookat - d*(cos az, sin az), so pointing
+        az along the target's own bearing from the origin puts the camera between the target and
+        the middle of the tank, which is always water."""
         import mujoco
 
-        self._orbit = {"lookat": np.asarray(lookat, float), "dist": float(dist),
-                       "elev": float(elev), "dpsi": 360.0 / (period_s * fps), "k": 0,
-                       "cam": mujoco.MjvCamera()}
+        t = np.asarray(target, float)
+        cam = mujoco.MjvCamera()
+        cam.lookat[:] = t
+        cam.distance, cam.elevation = float(dist), float(elev)
+        cam.azimuth = float(np.degrees(np.arctan2(t[1], t[0])))
+        self._free = {name: cam}
         self.cams = tuple(self.cams) + ((name,) if name not in self.cams else ())
-        self._orbit_name = name
 
     def render(self, data, camera):
-        if getattr(self, "_orbit", None) is not None and camera == self._orbit_name:
-            o = self._orbit
-            c = o["cam"]
-            c.lookat[:] = o["lookat"]
-            c.distance, c.elevation = o["dist"], o["elev"]
-            c.azimuth = (o["k"] * o["dpsi"]) % 360.0
-            o["k"] += 1
-            camera = c
+        camera = getattr(self, "_free", {}).get(camera, camera)
         self.r.update_scene(data, camera=camera)
         self.r.disable_depth_rendering()
         rgb = self.r.render()

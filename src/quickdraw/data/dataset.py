@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import numpy as np
 import torch
@@ -110,6 +111,8 @@ class Normalizer:
 # 20 Hz while training runs at 4 Hz -- the metrics would be measuring a different problem and would look
 # like the model failing. One source of truth makes that inconsistency impossible to write.
 _TRAIN_EPISODES = None     # cap on TRAIN episodes; None = all. See set_train_episodes.
+LOCK_STALE_S = 1800.0      # a frame-cache build lock older than this with no cache = a dead builder
+LOCK_WAIT_S = 5400.0       # how long to wait for another process's build before doing it ourselves
 _SUBSAMPLE = 1
 _SUBSAMPLE_USED = False
 
@@ -351,6 +354,32 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
     cache_path = os.path.join(root, split, f"{cam}_{tag}.npy")
     if cache and max_frames is None and os.path.exists(cache_path):
         return np.load(cache_path, mmap_mode="r") if mmap else np.load(cache_path)
+    # ONE BUILDER, NOT N. The write below is atomic, so a torn .npy cannot corrupt training -- but
+    # atomicity protects the FILE, not the WORK: two runs started together on the same dataset each
+    # decode every frame of the split independently. Measured here: a 43 GB cache being built twice
+    # at once, ~648k frames of redundant video decode. The first process to create the lock builds;
+    # the others wait for the finished cache and then mmap it. A lock older than LOCK_STALE_S with
+    # no cache beside it is treated as a crashed builder and stolen, so a dead run cannot wedge
+    # every future one.
+    lock = cache_path + ".building"
+    holder = False
+    if cache and max_frames is None:
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            holder = True
+        except FileExistsError:
+            if time.time() - os.path.getmtime(lock) > LOCK_STALE_S:
+                os.replace(lock, lock)                      # refresh mtime, then take it over
+                holder = True
+            else:
+                t0 = time.time()
+                while not os.path.exists(cache_path) and time.time() - t0 < LOCK_WAIT_S:
+                    if not os.path.exists(lock):
+                        break
+                    time.sleep(5.0)
+                if os.path.exists(cache_path):
+                    return np.load(cache_path, mmap_mode="r") if mmap else np.load(cache_path)
+                holder = True                                # builder vanished; do it ourselves
     vid = os.path.join(root, split, "videos", f"observation.images.{cam}")
     mp4s = sorted(_glob.glob(os.path.join(vid, "*", "*.mp4")))
     assert mp4s, f"no {cam} mp4s under {vid}"
@@ -388,6 +417,11 @@ def load_fpv_frames(root: str, split: str, size: int | tuple[int, int] | None = 
         tmp = f"{cache_path}.{os.getpid()}.tmp.npy"   # atomic: write to a per-pid temp then rename, so two
         np.save(tmp, frames)                           # concurrent cold starts can't read a half-written .npy
         os.replace(tmp, cache_path)                    # (12+ GB here; a torn npy silently corrupts training)
+    if holder:
+        try:
+            os.remove(lock)
+        except FileNotFoundError:
+            pass
     return frames
 
 
