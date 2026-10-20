@@ -197,11 +197,11 @@ def _scenes(W, H, hfov_deg):
         body, logo, blades, tips = _mk_drone(green)
         bn = sc.add(body); ln_ = sc.add(logo); bl = [sc.add(b) for b in blades]
         cam = sc.add(pyrender.PerspectiveCamera(yfov=yf, aspectRatio=W / H, znear=0.02))
-        light = sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=4.0))
+        light = sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=5.5))
         return dict(sc=sc, body=bn, logo=ln_, blades=bl, tips=tips, cam=cam, light=light)
 
     scn = dict(cave=dict(sc=cave_sc, node=cave_node, cam=cave_cam, light=cave_light),
-               drone=drone_scene(False, 0.55), ghost=drone_scene(True, 0.7),
+               drone=drone_scene(False, 0.85), ghost=drone_scene(True, 0.7),   # drone ambient up -> brighter drone
                rend=pyrender.OffscreenRenderer(int(W), int(H)))
     _CACHE["scn"] = scn; _CACHE["scn_key"] = key
     return scn
