@@ -232,7 +232,7 @@ def _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall=W_CRASH):
 
 def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma=0.5,
          temp=0.35, seed=0, prev=None, repeat=6, fan=None,
-         w_att=1.2, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02):
+         w_att=1.2, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02, mean_decay=0.7):
     """One MPPI step -> (action, planned_mean), THROUGH `controller.mppi`.
 
     This used to be a bespoke forty-line sampler, which was a mistake: the shared module's core
@@ -260,7 +260,21 @@ def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma
     if fan is not None:
         fan.append({"pts": p_xyz[0].numpy(), "ret": ret[0].numpy()})
     plan = plan[0].numpy()
-    return plan[0].copy(), np.roll(plan, -1, axis=0)
+    # WARM START: SHIFT, ZERO-PAD, DECAY -- the three things the bespoke version got wrong.
+    # `np.roll` WRAPPED, so the last action of a plan became the first action of the next one:
+    # stale thrust recycled in a loop rather than retired. And mean_decay was never applied at all
+    # (it lives in MPPIConfig and controller/mppi.py's own loop applies it; _mppi_step leaves it to
+    # the caller, and this caller did not). Together they meant the warm start could never bleed
+    # away: near the goal the cost landscape is almost flat, every candidate scores alike, the
+    # softmax weights go uniform, the update barely moves `mean` -- so whatever thrust the plan
+    # carried on approach kept firing forever. Measured at the goal before this fix: |a| = 0.33 of
+    # full thrust on all six axes, continuously, at 5 cm from the target.
+    # 0.7 measured best: 1.0 (no decay) leaves |a|=0.170 of full thrust at the goal, 0.7 takes it
+    # to 0.072, and 0.0 -- a cold start every replan -- is CATASTROPHIC at 0.867 m final. The warm
+    # start was never the problem; failing to RETIRE it was. It still has to give MPPI a sensible
+    # centre to sample around, and 96 draws of pure noise cannot find the approach without one.
+    nxt = np.concatenate([plan[1:], np.zeros((1, plan.shape[1]), plan.dtype)], 0) * mean_decay
+    return plan[0].copy(), nxt
 
 
 # TWO PLANNING MODES, SWITCHED ON RANGE. Far from the goal the problem is reach: you need seconds
