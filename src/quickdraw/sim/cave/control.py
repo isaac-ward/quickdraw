@@ -128,27 +128,33 @@ class LearnedDyn:
 
 
 # ------------------------------------------------------------------ planner
-def _cost(pos, yaw, vel, acts, goal_p, goal_yaw, scene, w_term=1.6, w_path=0.15, w_yaw=0.3, w_wall=50.0,
-          w_vel=0.5, r_settle=0.5, beta_ctrl=0.02):
-    """Trajectory cost (K,): terminal + mean-path position, terminal yaw, a hard clearance barrier, a SMOOTH
-    near-goal velocity-damping term, and a small control-effort penalty. The wall term uses the clearance SDF on
-    the PREDICTED path, so MPPI avoids geometry for both arms identically (the WM has no collision knowledge; the
+def _cost(pos, yaw, vel, acts, goal_p, goal_yaw, scene, w_term=1.6, w_path=0.15, w_yaw=2.5, w_wall=50.0,
+          w_vel=0.5, r_settle=0.5, beta_ctrl=0.035):
+    """Trajectory cost (K,): terminal + mean-path position, a strong yaw-alignment term (terminal + mean path so
+    the vehicle turns ONTO the goal heading early, not just at the end), a hard clearance barrier, a SMOOTH
+    near-goal velocity-damping term, and a control-effort penalty. The wall term uses the clearance SDF on the
+    PREDICTED path, so MPPI avoids geometry for both arms identically (the WM has no collision knowledge; the
     cost supplies it).
+
+    YAW must actually converge onto the ghost's heading (w_yaw=0.3 was far too weak -- yaw ended 70-140 deg off).
+    It is now a dominant terminal term plus a smaller mean-path term (turn throughout the approach, not a last-
+    second snap), both in radians so a half-turn costs ~pi*w_yaw.
 
     The velocity term is weighted by a SMOOTH proximity bump exp(-(d/r_settle)^2) rather than a hard d<r gate: a
     hard gate makes the controller stall at the mode boundary (it stops braking the instant it steps outside r,
     then over-shoots back in -- the classic ~0.37 m floor). The control-effort term penalises ||a|| which, in
-    velocity mode, is deviation from hover (a=0) -- it damps the near-goal jitter without a speed gate that stalls
-    the approach (friend's recipe: penalise effort, not a boundary-gated speed)."""
+    velocity mode, is deviation from hover (a=0) -- it damps the near-goal jitter (the ~0.13 m 'wander' bob)
+    without a speed gate that stalls the approach (friend's recipe: penalise effort, not a boundary-gated speed)."""
     term = np.linalg.norm(pos[:, -1] - goal_p, axis=1)
     path = np.linalg.norm(pos - goal_p, axis=2).mean(1)
-    yerr = np.abs(wrap(yaw[:, -1] - goal_yaw))
+    yerr = np.abs(wrap(yaw[:, -1] - goal_yaw))                               # terminal heading error (rad)
+    ypath = np.abs(wrap(yaw - goal_yaw)).mean(1)                             # mean heading error along the plan
     clr = batch_clearance(scene, pos)                                        # (K,H)
     wall = np.maximum(0.0, DRONE_R + 0.15 - clr).sum(1)                      # penalise entering the margin
     prox = np.exp(-(term / r_settle) ** 2)                                   # smooth 1-near-goal -> 0-far (no gate)
     vdamp = w_vel * prox * np.linalg.norm(vel[:, -1], axis=1)                # damp terminal speed, smoothly
     effort = beta_ctrl * np.linalg.norm(acts, axis=2).mean(1)                # ||a|| = deviation from hover (vel mode)
-    return w_term * term + w_path * path + w_yaw * yerr + w_wall * wall + vdamp + effort
+    return w_term * term + w_path * path + w_yaw * yerr + 0.2 * w_yaw * ypath + w_wall * wall + vdamp + effort
 
 
 def mppi_step(model, s12, goal_p, goal_yaw, scene, mean, rng,
@@ -266,17 +272,33 @@ def run_episode(plant, model, s0_12, goal_p, goal_yaw, scene, geodesic,
     path_len = float(np.linalg.norm(np.diff(traj[:, :3], axis=0), axis=1).sum()) if len(traj) > 1 else 0.0
     yaw_at = yawerr[inside].min() if inside.any() else yawerr[-1]            # best yaw error while on-goal
     acts_a = np.asarray(acts, np.float32)
-    tail = slice(max(0, len(traj) - 60), len(traj))                         # last ~2 s: thrash diagnostics at goal
+    # att_deg (submarine metric): geodesic angle between final attitude and the GOAL attitude (goal_yaw, level).
+    # This is "converge on the ghost's rotation", quantified -- 0 = pointing exactly like the ghost. Computed from
+    # the relative rotation R_final^T R_goal (arccos((tr-1)/2)); dominated by heading since the goal is level.
+    from prospector.cave_wm.record import euler_zyx_R
+    Rg = euler_zyx_R(goal_yaw, 0.0, 0.0)
+
+    def _att(sr):
+        Rf = euler_zyx_R(sr[3], sr[4], sr[5])
+        return float(np.degrees(np.arccos(np.clip((np.trace(Rf.T @ Rg) - 1.0) / 2.0, -1.0, 1.0))))
+    att_deg = _att(traj[-1]) if len(traj) else float("nan")
+    att_best = min((_att(traj[i]) for i in np.where(inside)[0]), default=att_deg) if inside.any() else att_deg
+    # |a|, da as a FRACTION OF FULL COMMAND (normalise each axis by its limit) so they read like the AUV's 0.072.
+    anorm = acts_a / ALIM[:, 1] if len(acts_a) else acts_a
+    tail = slice(max(0, len(traj) - 60), len(traj))                         # last ~2 s: settling-window statistics
     v_goal = float(speed[tail].mean()) if len(traj) else float("nan")       # mean speed at goal (should -> 0)
-    a_goal = float(np.linalg.norm(acts_a[tail], axis=1).mean()) if len(acts_a) else float("nan")  # effort at goal
-    da_goal = (float(np.linalg.norm(np.diff(acts_a[tail], axis=0), axis=1).mean())
-               if len(acts_a) > 1 else float("nan"))                        # action chatter at goal
-    wander = float(dist[tail].max() - dist[tail].min()) if len(traj) else float("nan")  # distance spread (jitter)
+    a_goal = float(np.abs(anorm[tail]).mean()) if len(acts_a) else float("nan")   # mean |a| at rest (fraction)
+    da_goal = (float(np.abs(np.diff(anorm[tail], axis=0)).mean())
+               if len(acts_a) > 1 else float("nan"))                        # command change at rest (fraction/step)
+    wander = float(dist[tail].max() - dist[tail].min()) if len(traj) else float("nan")  # peak-to-peak dist (jitter)
+    in05 = dist < 0.5
+    steps_to_0p5m = int(np.argmax(in05)) if in05.any() else -1              # first step inside 0.5 m (approach speed)
     return {"traj": traj, "act": acts_a, "dist": dist, "clear": clrs,
-            "success": reached, "collided": collided,
+            "success": reached, "collided": collided, "crashed": collided,
             "time_to_complete": t_complete, "settle_time": t_settle,
             "final_dist": float(dist[-1]), "min_dist": float(dist.min()) if len(traj) else float("nan"),
-            "yaw_err_deg": float(np.degrees(yaw_at)),
+            "best_dist": float(dist.min()) if len(traj) else float("nan"), "steps_to_0p5m": steps_to_0p5m,
+            "yaw_err_deg": float(np.degrees(yaw_at)), "att_deg": att_deg, "att_best": att_best,
             "v_goal": v_goal, "a_goal": a_goal, "da_goal": da_goal, "wander": wander,
             "path_len": path_len, "geodesic": float(geodesic),
             "path_mult": (path_len / geodesic) if geodesic > 1e-6 else float("nan"),

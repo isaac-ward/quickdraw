@@ -47,7 +47,8 @@ def _cams(scene, p, R):
     off = -0.18 * body_fwd - 0.72 * body_right + 0.38 * body_up         # behind, LEFT, above (logo side); close
     chase_eye = _safe_eye(scene, p + off, p)
     chase = (chase_eye, p - chase_eye, body_up, None)
-    top = (p + TOP_H * UP, -UP + 0.12 * fwd_h, fwd_h, TOP_H - CEIL_SLICE)
+    top_up = np.array([-fwd_h[1], fwd_h[0], 0.0], np.float32)            # fwd_h rotated 90 deg CCW -> SISL reads L-to-R
+    top = (p + TOP_H * UP, -UP + 0.12 * fwd_h, top_up, TOP_H - CEIL_SLICE)
     return fpv, chase, top
 
 
@@ -62,7 +63,7 @@ def _views(scene, s, goal_p, goal_yaw, fi):
     fpv, chase, top = _cams(scene, p, R)
     out = []
     for (eye, fwd, up, cut), show in ((fpv, False), (chase, True), (top, True)):   # FPV shows no drone (it IS the drone)
-        out.append(DR.render_view(eye, fwd, up, W, H, HFOV, p, R, ang, goal_p, Rg,
+        out.append(DR.render_view(scene, eye, fwd, up, W, H, HFOV, p, R, ang, goal_p, Rg,
                                   show_drone=show, show_ghost=show, ghost_a=GHOST_A, ceil_cut=cut))
     return out
 
@@ -102,11 +103,10 @@ def run(ckpt, root, out, points_npz, pairs, steps=360, dev="cuda", log=print):
     import jax.numpy as jnp  # noqa
     from prospector.cave_wm.record import build_dynamics
     from .control import TrueDyn, LearnedDyn
-    from .run_control import load_wm, sample_pose_pairs, _patch_scene_render
+    from .run_control import load_wm, sample_pose_pairs
 
-    _patch_scene_render()
     from prospector.cave_wm.scene import CaveScene
-    log("[setup] CaveScene (collision-only; cave is drawn from the mesh, not splats) ...")
+    log("[setup] CaveScene (FULL: splat + rock mesh fallback, rendered for the video) ...")
     scene = CaveScene(log=lambda *a: None)
     dyn = build_dynamics(dt=1.0 / 30.0)
     core, norm, P = load_wm(ckpt, root, dev)
