@@ -70,6 +70,30 @@ def _load_parts():
     return _CACHE
 
 
+def _value_noise(p, L, seed):
+    """Smooth trilinear VALUE noise over 3D points `p` (N,3), feature size ~L -> (N,) in [0,1]. Random values on an
+    L-lattice, smoothstep-interpolated inside each cell -> organic flow (no visible cell squares, unlike per-cell
+    constant noise)."""
+    x = p / L
+    c = np.floor(x).astype(np.int64)
+    f = x - c
+    f = f * f * (3 - 2 * f)                                              # smoothstep per axis
+
+    def h(ix, iy, iz):
+        hh = (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791) ^ (seed * 2654435761)
+        u = np.abs(np.sin(hh.astype(np.float64) * 12.9898) * 43758.5453)
+        return u - np.floor(u)
+    c0, c1, c2 = c[:, 0], c[:, 1], c[:, 2]
+    fx, fy, fz = f[:, 0], f[:, 1], f[:, 2]
+    x00 = h(c0, c1, c2) * (1 - fx) + h(c0 + 1, c1, c2) * fx
+    x10 = h(c0, c1 + 1, c2) * (1 - fx) + h(c0 + 1, c1 + 1, c2) * fx
+    x01 = h(c0, c1, c2 + 1) * (1 - fx) + h(c0 + 1, c1, c2 + 1) * fx
+    x11 = h(c0, c1 + 1, c2 + 1) * (1 - fx) + h(c0 + 1, c1 + 1, c2 + 1) * fx
+    y0 = x00 * (1 - fy) + x10 * fy
+    y1 = x01 * (1 - fy) + x11 * fy
+    return y0 * (1 - fz) + y1 * fz
+
+
 def _load_cave():
     """grapevine cave surface MESH (crisp triangles), flat rock browns/greys (height-tinted + mottled). This is the
     FALLBACK everywhere the splat has no coverage; the real splat is composited over it by its alpha. Cached."""
@@ -84,13 +108,11 @@ def _load_cave():
     brown = np.array([0.47, 0.36, 0.27]); grey = np.array([0.48, 0.42, 0.35])   # browner muted rock
     col = (1 - t)[:, None] * grey + t[:, None] * brown                 # ceiling browner-grey, floor browner
     rng = np.random.default_rng(0)
-    # COARSE spatial mottle: one random shade per ~L cube so patches are ~5x coarser than per-vertex speckle; a
-    # faint per-vertex grain on top keeps it from looking perfectly blocky.
-    L = 0.20
-    cell = np.floor(m.vertices / L).astype(np.int64)
-    hsh = (cell[:, 0] * 73856093) ^ (cell[:, 1] * 19349663) ^ (cell[:, 2] * 83492791)
-    u = np.abs(np.sin(hsh.astype(np.float64) * 12.9898) * 43758.5453); u = u - np.floor(u)   # per-cell [0,1)
-    col = col * (0.72 + 0.56 * u[:, None]) * (1.0 + 0.04 * (rng.random((len(z), 1)) - 0.5))
+    # SMOOTH two-octave value noise (no cell squares): a big ~0.8 m octave for broad rock shading + a ~0.3 m octave
+    # for finer relief; a faint per-vertex grain breaks up any residual banding.
+    v = m.vertices
+    n = 0.68 * _value_noise(v, 0.8, 1) + 0.32 * _value_noise(v, 0.3, 2)
+    col = col * (0.70 + 0.60 * n[:, None]) * (1.0 + 0.03 * (rng.random((len(z), 1)) - 0.5))
     vc = np.clip(col, 0, 1)
     m.visual.vertex_colors = (np.concatenate([vc, np.ones((len(z), 1))], 1) * 255).astype(np.uint8)
     _CACHE["cave"] = m
