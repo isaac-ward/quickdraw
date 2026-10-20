@@ -112,7 +112,7 @@ def _load_cave():
     # for finer relief; a faint per-vertex grain breaks up any residual banding.
     v = m.vertices
     n = 0.68 * _value_noise(v, 0.8, 1) + 0.32 * _value_noise(v, 0.3, 2)
-    col = col * (0.70 + 0.60 * n[:, None]) * (1.0 + 0.03 * (rng.random((len(z), 1)) - 0.5))
+    col = col * (0.45 + 0.85 * n[:, None]) * (1.0 + 0.03 * (rng.random((len(z), 1)) - 0.5))   # darker darks, same lights
     vc = np.clip(col, 0, 1)
     m.visual.vertex_colors = (np.concatenate([vc, np.ones((len(z), 1))], 1) * 255).astype(np.uint8)
     _CACHE["cave"] = m
