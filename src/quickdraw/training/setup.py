@@ -172,6 +172,25 @@ def _make_dynamics_prior(cfg):
     if mode == "identity":
         return lambda prev, act: prev.float()          # obs_next = prev + head(token); env supplies no physics
     e = cfg.get("environments", {}) or {}
+    if mode in ("kinematic", "kinematic_posvel"):
+        # VELOCITY-COMMANDED vehicle (cave quadrotor): p'=p+v*dt, v'=v_cmd; the action is a velocity setpoint
+        # not a force, so owm's a=R(q)F/m does not apply (see velocity_kinematics). 'kinematic' (A) also
+        # integrates attitude from the observed body rate; 'kinematic_posvel' (B) leaves the quaternion to the
+        # black-box decode (no attitude prior).
+        from ..environments.prospector_physics import velocity_kinematics as _vk
+        pos = list(e.position_idx)
+        vel = list(e.velocity_idx) if e.get("velocity_idx", None) is not None else [i + len(pos) for i in pos]
+        quat = list(e.quat_idx)
+        # Model-step dt = subsample * per-recorded-step dt (= subsample / fps). Exact position/attitude
+        # integration is only correct at the true step duration, so derive it rather than hardcode.
+        sub = int(cfg.data.get("subsample", 1) or 1)
+        dt = sub * float(e.get("dt", 1.0 / 30.0))
+        if mode == "kinematic_posvel":                 # variant B: no attitude prior
+            return lambda prev, act: _vk(prev, act, pos, vel, quat, bodyrate_idx=None, dt=dt)
+        bodyrate = (list(e.bodyrate_idx) if e.get("bodyrate_idx", None) is not None
+                    else [quat[-1] + 1 + i for i in range(3)])
+        rate_clamp = float(e.get("rate_clamp", 1.0))   # bound the persisted body-rate channel (owm RATE_CLAMP)
+        return lambda prev, act: _vk(prev, act, pos, vel, quat, bodyrate_idx=bodyrate, dt=dt, rate_clamp=rate_clamp)
     from ..environments.owm_physics import dynamics_prior as _dp
     pos = list(e.position_idx)
     vel = list(e.velocity_idx) if e.get("velocity_idx", None) is not None else [i + len(pos) for i in pos]
@@ -196,6 +215,21 @@ def _make_dynamics_prior(cfg):
     return lambda prev, act: _dp(prev, act, pos, vel, quat, bodyrate_idx=bodyrate,
                                  torque_idx=torque, inertia_diag=inertia, rate_clamp=rate_clamp,
                                  mass=mass, raw_dt=raw_dt, dt_eff=dt_eff)
+
+
+def _make_integrate_position(cfg):
+    """Config for the velocity-integral position override (post-decode), or None (off, byte-identical). Enabled by
+    model.integrate_position_from_velocity=true; reads the env pos/vel indices + the model-step dt (subsample*dt).
+    The black-box decodes velocity well but its absolute position decode accumulates rollout drift, so the rollout
+    integrates the decoded velocity for position instead. Orthogonal to the dynamics_prior (don't set both)."""
+    if not bool(cfg.model.get("integrate_position_from_velocity", False)):
+        return None
+    e = cfg.get("environments", {}) or {}
+    pos = list(e.position_idx)
+    vel = list(e.velocity_idx) if e.get("velocity_idx", None) is not None else [i + len(pos) for i in pos]
+    sub = int(cfg.data.get("subsample", 1) or 1)
+    dt = sub * float(e.get("dt", 1.0 / 30.0))
+    return {"pos_idx": pos, "vel_idx": vel, "dt": dt}
 
 
 def build_model(cfg):
@@ -263,7 +297,8 @@ def build_model(cfg):
                       relative_position=bool(m.get("relative_position", False)),
                       position_idx=(cfg.environments.get("position_idx", None) if m.get("relative_position", False) else None),
                       relative_scale=(list(m.get("relative_scale")) if m.get("relative_scale", None) is not None else None),
-                      dynamics_prior=_make_dynamics_prior(cfg))
+                      dynamics_prior=_make_dynamics_prior(cfg),
+                      integrate_position=_make_integrate_position(cfg))
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}
