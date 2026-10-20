@@ -44,6 +44,10 @@ def _load_parts():
         return trimesh.Trimesh(vertices=d["verts"].astype(np.float64) * MM, faces=d["faces"],
                                vertex_colors=(d["colors"] * 255).astype(np.uint8), process=False)
     body = load_colored("drone_body.npz")
+    # drop the untextured pure-white gimbal CAMERA block (the one part that rendered as a white box)
+    db = np.load(os.path.join(ASSETS, "drone_body.npz"))
+    keep_face = (~(db["colors"] > 0.9).all(1))[db["faces"]].all(1)
+    body.update_faces(keep_face); body.remove_unreferenced_vertices()
     blade = load_colored("drone_blade0.npz")        # all 4 are identical; place copies at the arm tips
     dl = np.load(os.path.join(ASSETS, "drone_logo.npz"))
     tex = Image.open(LOGO_TEX).convert("RGB")
@@ -75,9 +79,10 @@ def _load_cave():
         m = trimesh.util.concatenate(tuple(m.geometry.values()))
     z = m.vertices[:, 2]                                                # grapevine z (UP = -z)
     t = (z - z.min()) / (np.ptp(z) + 1e-9)                              # 0 low .. 1 high
-    brown = np.array([0.60, 0.49, 0.38]); grey = np.array([0.72, 0.70, 0.67])
-    col = (1 - t)[:, None] * grey + t[:, None] * brown                 # ceiling greyer, floor browner
-    col += (np.random.default_rng(0).random((len(z), 1)) - 0.5) * 0.05  # faint grain so flats aren't dead
+    brown = np.array([0.42, 0.37, 0.32]); grey = np.array([0.46, 0.46, 0.46])   # muted rock, not tan/yellow
+    col = (1 - t)[:, None] * grey + t[:, None] * brown                 # ceiling greyer, floor a touch browner
+    rng = np.random.default_rng(0)
+    col = col * (0.8 + 0.4 * rng.random((len(z), 1)))                  # strong per-vertex mottling (rock, not a slab)
     vc = np.clip(col, 0, 1)
     m.visual.vertex_colors = (np.concatenate([vc, np.ones((len(z), 1))], 1) * 255).astype(np.uint8)
     _CACHE["cave"] = m
@@ -119,10 +124,10 @@ def _mk_drone(green):
     import pyrender
 
     def green_mesh(tm):
-        c = tm.copy()
-        vc = np.zeros((len(c.vertices), 4), np.uint8); vc[:, 1] = 230; vc[:, 3] = 255
-        c.visual.vertex_colors = vc
-        return pyrender.Mesh.from_trimesh(c, smooth=False)
+        import trimesh
+        vc = np.tile([0, 210, 40, 255], (len(tm.vertices), 1)).astype(np.uint8)   # SOLID green, no texture
+        g = trimesh.Trimesh(vertices=tm.vertices, faces=tm.faces, vertex_colors=vc, process=False)
+        return pyrender.Mesh.from_trimesh(g, smooth=False)
     P = _load_parts()
     if green:                                          # ghost: solid green, logo untextured (just geometry)
         body = green_mesh(P["body"]); logo = green_mesh(P["logo"])
@@ -148,16 +153,14 @@ def _scenes(W, H, hfov_deg):
     def new_scene(amb):
         return pyrender.Scene(bg_color=[0, 0, 0, 0], ambient_light=[amb, amb, amb])
 
-    # cave: strong ambient + several FIXED directional lights (directional light does not fall off with distance,
-    # so the whole cavern reads, not just the patch a headlamp hits) from varied angles for relief. One extra light
-    # follows the camera as a headlamp for local contrast.
-    cave_sc = new_scene(0.55)
+    # cave: LOW ambient + a dominant camera headlamp + one off-axis fill, so faces shade by their normal (relief /
+    # depth) instead of washing flat. Flat shading (smooth=False) on the 1.6M-face scan reads as rock facets.
+    cave_sc = new_scene(0.28)
     cave_node = cave_sc.add(pyrender.Mesh.from_trimesh(_load_cave(), smooth=False))
     cave_cam = cave_sc.add(pyrender.PerspectiveCamera(yfov=yf, aspectRatio=W / H, znear=0.05))
-    for d in ([0.3, 0.3, 1.0], [-0.6, 0.2, -0.8], [0.5, -0.7, 0.3]):     # fixed fills (direction = -z of pose)
-        cave_sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=2.2),
-                    pose=_look_at(-np.array(d) * 5, [0, 0, 0], [0, 0, 1]))
-    cave_light = cave_sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=2.0))   # camera headlamp
+    cave_sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=2.0),                # fixed off-axis fill
+                pose=_look_at(np.array([3.0, -2.0, -4.0]), [0, 0, 0], [0, 0, 1]))
+    cave_light = cave_sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=3.5))   # camera headlamp (dominant)
 
     def drone_scene(green, amb):
         sc = new_scene(amb)

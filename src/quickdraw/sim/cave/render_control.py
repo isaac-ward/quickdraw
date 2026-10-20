@@ -85,7 +85,7 @@ def render_compare(scene, dyn, learned_fn, true_fn, pr, out_mp4, steps=360, seed
             s = tr[min(i, len(tr) - 1)]
             for v, img in enumerate(_views(scene, s, pr["goal_p"], pr["goal_yaw"], i)):
                 streams[tag][v].append(img)
-    titles = ["FPV", "Chase", "Top-down (ceiling sliced)"]
+    titles = ["FPV", "Chase", "Top-down"]
     canvas_rows = []
     for tag in ("learned", "true"):
         panels = [np.asarray(streams[tag][v]) for v in range(3)]
