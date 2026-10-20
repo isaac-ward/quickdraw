@@ -232,7 +232,7 @@ def _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall=W_CRASH):
 
 def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma=0.5,
          temp=0.35, seed=0, prev=None, repeat=6, fan=None,
-         w_att=1.2, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02, mean_decay=0.7):
+         w_att=0.3, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02, mean_decay=0.7):
     """One MPPI step -> (action, planned_mean), THROUGH `controller.mppi`.
 
     This used to be a bespoke forty-line sampler, which was a mistake: the shared module's core
@@ -277,26 +277,32 @@ def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma
     return plan[0].copy(), nxt
 
 
-# TWO PLANNING MODES, SWITCHED ON RANGE. Far from the goal the problem is reach: you need seconds
-# of lookahead, which `repeat` buys cheaply by holding each planned action for 6 control steps.
-# Close in, that same coarseness is the error floor -- the finest correction the planner can command
-# is one 0.2 s impulse, and with perfect dynamics the true-dynamics arm still settled at 0.16 m
-# mean. Inside NEAR the planner drops to one-step actions, a longer horizon in steps (but shorter in
-# seconds) and a third of the action noise, so it can place the vehicle rather than lob it.
+# ONE SCHEDULE, SWEPT AND LOCKED. This was two modes switched on range to the goal -- coarse
+# 6-step actions far out for lookahead, one-step actions inside NEAR so the planner could place
+# the vehicle rather than lob it. The fine mode existed because a 0.2 s impulse is too blunt to
+# settle with, and it did not work: `control_study` measured coarse-only and coarse+fine at the
+# SAME 0.173 m, which turned out to be the episode step budget rather than either schedule (the
+# vehicle was still in transit when the episode ended). The real fixes were elsewhere -- retiring
+# the warm start, and `exec_n`.
 #
-# This costs less per call than it looks: a fine call is 48 x 18 x 17 = 14,688 mj_steps against the
-# coarse 24 x 12 x 6 x 17 = 29,376, so roughly half. It is called six times as often during the
-# final approach, so the net is about 1.7x -- and only over the last metre.
-# `exec_n` DECOUPLES the action hold from the replan cadence. They were the same number because
-# run_episode executed exactly what it planned, but they answer different questions: `repeat` is
-# how coarse the ACTIONS are, `exec_n` is how much of a plan is spent before replanning. Dropping
-# the hold to 1 while lengthening the horizon to 72 keeps both the lookahead (2.4 s) and the cost
-# (samples x horizon x repeat x substeps = 29,376 mj_steps, identical) -- what it actually spends
-# is SEARCH, because the plan now has 72 free parameters per axis instead of 12 for the same 24
-# samples. Whether that trade is worth it is measured in scratch/_ceiling.py, not assumed.
+# `exec_n` DECOUPLES the action hold from the replan cadence, which is what the fine mode was
+# reaching for and could not express. `repeat` is how coarse the ACTIONS are; `exec_n` is how much
+# of a plan is SPENT before replanning. They were the same number only because run_episode
+# executed exactly what it planned. Holding 6-step actions but replanning every 2 steps keeps the
+# cheap lookahead AND corrects three times as often:
+#
+#     w_att 0.3         0.021 m   1.5 deg   wander 0.024      (attitude weight, swept)
+#     exec_n 2          0.016 m   1.0 deg   wander 0.021      (replan period, swept)
+#     both              pending   -- control_study sweep combined
+#
+# Reproduce: `python -m quickdraw.sim.mbari.control_study sweep attitude`. The numbers above are
+# 3-trial means on TrueDynamics at seeds 100/101/102.
+#
+# NEAR is kept, and FINE is kept pointing at the same dict, so the range switch stays available
+# without silently being a second schedule nobody swept.
 NEAR = 1.2
-COARSE = dict(repeat=6, horizon=12, samples=24, sigma=0.50)
-FINE = dict(repeat=1, horizon=18, samples=48, sigma=0.18)
+COARSE = dict(repeat=6, horizon=12, samples=96, sigma=0.20, exec_n=2)
+FINE = COARSE
 
 
 def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0, log=None,

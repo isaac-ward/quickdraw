@@ -455,7 +455,32 @@ is SPENT before replanning. They were the same number only because `run_episode`
 what it planned. Separating them and halving the spend takes final error 0.035 -> 0.016 and wander
 0.037 -> 0.021. `exec_n 1` is no better than 2 at twice the cost.
 
-The corner — `w_att 0.3` AND `exec_n 2` — is `sweep combined`, rendering as of 2026-10-20 19:00.
+**Locked in as the default** (`control.py`): `w_att=0.3`, and one schedule
+`dict(repeat=6, horizon=12, samples=96, sigma=0.20, exec_n=2)` with `FINE = COARSE`. The two-mode
+range switch is kept but both modes now point at the swept schedule, so there is no second
+schedule in the codebase that nobody measured. Both benchmark arms inherit it, so item 16 still
+compares only the dynamics.
+
+COST NOTE: `exec_n 2` replans three times as often. On TrueDynamics that is CPU and free; on the
+LEARNED arm every replan is a batch of latent rollouts, so item 16 gets ~3x more expensive.
+
+### A caution on the first combined render: three trials, one noise realization
+
+The first render of the combined config returned 0.006 m / 0.4 deg / wander 0.011 on **all three
+trials, identical to three decimals**, from three different starts (4.35, 3.64, 5.09 m) and three
+different goals. Different episodes — the mp4s differ in size and content — and identical
+settling.
+
+The cause is a seed, not a bug in the controller: the render passed `seed=100` for every trial
+where the sweep passes `seed=100 + i`, and `run_episode` seeds the planner as `seed + k`. So all
+three drew the IDENTICAL noise sequence at every step index. Once the warm start has decayed near
+the goal the plan mean is ~0 and the candidate set is essentially that noise, so the residual
+jitter is one realization reported three times. The episodes are independent; **the settling
+statistics are n=1**.
+
+This is the same signature as the 0.173 m "ceiling" (two schedules, one number, and the number
+belonged to the harness). Identical numbers from nominally independent runs are a seed or a
+budget, never a result. `control_study sweep combined` re-measures it at seeds 100/101/102.
 
 ### Collisions are now a first-class object, in the planner AND the plant
 
