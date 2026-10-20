@@ -47,6 +47,150 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+# ---- TERMS ------------------------------------------------------------------------------------
+# ONE declaration per term, used by BOTH reductions. Before this, `forward()` and `temporal()` each
+# carried their own `if self.w_*:` chain, so a term added to one and not the other was silently
+# absent from half the objective and nothing failed.
+#
+# A term never sees HOW frames were chosen. `_subsample` (randperm over flattened rows) and `_pairs`
+# (contiguous pairs) are genuinely different and both load-bearing -- `_subsample` would hand back
+# (b=3,t=17), (b=0,t=52)..., useless for differencing -- so that choice stays in VisualLoss.
+#
+# `difference` returning None means "no temporal form", which is how w_l2's absence from the
+# derivative term became greppable instead of an undocumented divergence a reader had to notice.
+
+
+class _Term:
+    """One loss term. `pointwise` compares frames; `difference` compares temporal differences."""
+
+    name: str = ""
+
+    def weight(self, vl: "VisualLoss") -> float:
+        raise NotImplementedError
+
+    def pointwise(self, vl: "VisualLoss", p: Tensor, t: Tensor, w: Tensor | None = None) -> Tensor | None:
+        raise NotImplementedError
+
+    def difference(self, vl: "VisualLoss", p0: Tensor, p1: Tensor, g0: Tensor, g1: Tensor) -> Tensor | None:
+        """Terms difference THEMSELVES, so a feature term can difference EMBEDDINGS rather than embed
+        a difference -- see LpipsTerm.difference. None = this term has no temporal form.
+
+        MAY RETURN A LIST, and LpipsTerm does. The caller then folds each element into the running
+        total separately, as `total = total + w * part`. That is not cosmetic: the pre-refactor code
+        multiplied w_lpips into the total ONCE PER VGG LAYER, and summing the five layers first and
+        multiplying once is mathematically identical but differs in fp32 by ~1e-7 -- which the parity
+        golden catches, correctly, because a 1e-7 drift in `visual_lpips` silently makes 25+ historical
+        runs incomparable."""
+        raise NotImplementedError
+
+
+def _weighted_mean(err: Tensor, w: Tensor | None) -> Tensor:
+    """Mean of per-element `err`, optionally weighted by a per-pixel map `w=1+K·mask` (M,H,W,1) broadcast
+    over channels. `w is None` -> plain `.mean()`, BIT-IDENTICAL to the unweighted term.
+
+    NOT renormalized (`(w·err).mean()`, not `Σwε/Σw`): with `w=1` off the cube, background error is scored
+    EXACTLY as before (existing signal untouched), and cube error gets K× ADDITIONAL gradient on top. A
+    renormalized mean would instead dilute background error through the denominator, quietly weakening it --
+    the opposite of 'defend the cube without dropping everything else'. The only effect is a mild scale rise
+    (~1 + K·cube_fraction) on this term, which is decode-loss-internal."""
+    if w is None:
+        return err.mean()
+    return (w * err).mean()
+
+
+class L2Term(_Term):
+    name = "l2"
+    full_sequence = True
+
+    def weight(self, vl): return vl.w_l2
+
+    def pointwise(self, vl, p, t, w=None):
+        return F.mse_loss(p, t) if w is None else _weighted_mean((p - t) ** 2, w)
+
+    def difference(self, vl, p0, p1, g0, g1):
+        """NO temporal form, deliberately. A temporal difference image is SPARSE -- almost all zero
+        with a blob where something moved -- and L2 squares, so the single biggest change swamps the
+        rest. L1 does not let a few large values dominate and its constant gradient keeps small
+        motions visible. `temporal()` has always skipped L2; now it says so."""
+        return None
+
+
+class L1Term(_Term):
+    name = "l1"
+    full_sequence = True
+
+    def weight(self, vl): return vl.w_l1
+
+    def pointwise(self, vl, p, t, w=None):
+        return F.l1_loss(p, t) if w is None else _weighted_mean((p - t).abs(), w)
+
+    def difference(self, vl, p0, p1, g0, g1): return F.l1_loss(p1 - p0, g1 - g0)
+
+
+class LpipsTerm(_Term):
+    """The two reductions compute DIFFERENT functions of the same VGG features, deliberately.
+
+    `pointwise` calls the torchmetrics metric as a BLACK BOX, learned per-layer weights included --
+    that is the number the historical runs are ranked on, and reproducing its internals to "share
+    code" would change it. `difference` uses raw unit-normalised features and does NOT apply those
+    learned weights, which were fitted to human judgements of IMAGE similarity with nothing
+    calibrating them for the similarity of temporal DIFFERENCES.
+
+    They share the NETWORK (one process-level cache) and the `_sanitise` guard -- not the distance.
+    """
+
+    name = "lpips"
+    full_sequence = False            # sampled contiguous pairs -- the net is the cost
+
+    def weight(self, vl): return vl.w_lpips
+
+    def pointwise(self, vl, p, t, w=None): return vl._lpips_term(p, t)   # feature-space: no per-pixel weight
+
+    def difference(self, vl, p0, p1, g0, g1):
+        fp0, fp1 = vl._layer_features(vl._sanitise(p0)), vl._layer_features(vl._sanitise(p1))
+        fg0, fg1 = vl._layer_features(g0.clamp(0, 1)), vl._layer_features(g1.clamp(0, 1))
+        if not fp0:                       # weights unavailable -> fail soft, as _lpips_term does
+            return None
+        # ONE ELEMENT PER LAYER, not a pre-summed scalar -- see _Term.difference on fp32 ordering.
+        return [((a1 - a0) - (b1 - b0)).pow(2).mean()
+                for a0, a1, b0, b1 in zip(fp0, fp1, fg0, fg1)]
+
+
+class DinoV3Term(_Term):
+    """DINOv3 per-patch cosine. LOCAL BY CONSTRUCTION -- see models/dino_loss.py for the why.
+
+    Sampled pairs like LPIPS (`full_sequence = False`): the backbone is the cost. Fails SOFT when the
+    weights are unavailable (the repo is gated), contributing nothing rather than crashing a run.
+    """
+
+    name = "dino_v3"
+    full_sequence = False
+
+    def weight(self, vl): return vl.w_dino_v3
+
+    def _tok(self, vl, x):
+        from .dino_loss import get_net, patch_tokens
+        return patch_tokens(get_net(vl.dino_v3_net, x.device), x, vl.dino_v3_layer)
+
+    def pointwise(self, vl, p, t, w=None):         # feature-space: no per-pixel weight
+        from .dino_loss import patch_cosine
+        p, t = vl._subsample(p, t)                 # the same frame budget LPIPS gets
+        fp, fg = self._tok(vl, vl._sanitise(p)), self._tok(vl, t.clamp(0, 1))
+        # PLAIN MEAN here, never the weight: f_p is never near zero, so the weight would only
+        # re-introduce the magnitude bias the cosine exists to remove.
+        return None if fp is None else patch_cosine(fp, fg)
+
+    def difference(self, vl, p0, p1, g0, g1):
+        """DIFFERENCE OF EMBEDDINGS, never the embedding of a difference -- a ViT handed a signed,
+        near-zero tensor it never saw in training produces meaningless features."""
+        from .dino_loss import weighted_patch_cosine
+        fp0, fp1 = self._tok(vl, vl._sanitise(p0)), self._tok(vl, vl._sanitise(p1))
+        if fp0 is None:
+            return None
+        fg0, fg1 = self._tok(vl, g0.clamp(0, 1)), self._tok(vl, g1.clamp(0, 1))
+        return weighted_patch_cosine(fp1 - fp0, fg1 - fg0, vl.dino_v3_patch_weight)
+
+
 class VisualLoss(nn.Module):
     """w_l2*L2 + w_l1*L1 + w_lpips*LPIPS(net). Inputs (M,H,W,C) in [0,1].
 
@@ -56,13 +200,34 @@ class VisualLoss(nn.Module):
     """
 
     def __init__(self, *, w_l2: float = 1.0, w_l1: float = 0.0, w_lpips: float = 0.0,
-                 lpips_net: str = "vgg", frames: int = 128):
+                 lpips_net: str = "vgg", frames: int = 128,
+                 w_dino_v3: float = 0.0, dino_v3_net: str = "vits16",
+                 dino_v3_layer: int = -1, dino_v3_patch_weight: str = "none",
+                 saliency: str = "none", saliency_weight: float = 0.0, saliency_dilate: int = 2):
         super().__init__()
         self.w_l2, self.w_l1, self.w_lpips = float(w_l2), float(w_l1), float(w_lpips)
+        # SALIENCY (2026-09-28): a per-pixel weight on the DECODE pixel terms (L1/L2), up-weighting where
+        # cubes are so a faded small cube actually costs gradient (it is ~2% of scene pixels, drowned under
+        # uniform L1). "none"/weight 0 -> w is None -> bit-identical. Applied ONLY at site=="decode" (the
+        # rolled-latent render); the codec roundtrip anchor stays uniform (Ceiling A, already fixed).
+        self.saliency, self.saliency_weight = str(saliency), float(saliency_weight)
+        # dilate the cube mask by this many pixels so the weight covers the cube AND its boundary RING --
+        # anti-aliased/blurred edges fall below the saturation threshold, yet the edge is exactly where the
+        # decoder smears. 0 = no dilation (interior only).
+        self.saliency_dilate = int(saliency_dilate)
         self.lpips_net, self.frames = str(lpips_net), int(frames)
+        # TWO WEIGHTS, not a mode switch: `w_lpips=0, w_dino_v3=1` swaps them, but leaving both
+        # nonzero runs both, which is what PixelGen found best (LPIPS for local texture, DINO for
+        # semantics). An enum could not express that.
+        self.w_dino_v3 = float(w_dino_v3)
+        self.dino_v3_net, self.dino_v3_layer = str(dino_v3_net), int(dino_v3_layer)
+        self.dino_v3_patch_weight = str(dino_v3_patch_weight)
         self._net = None                      # built lazily on first use: it needs a device, and constructing
         #                                       it in __init__ would download weights during a --help.
         self._diag: dict = {}                 # per-site RAW output range, drained per epoch -- see range_stats
+        # ONE list, both reductions. Adding a term here makes it apply to the decode loss, the
+        # roundtrip anchor AND the derivative term, for every modality that owns a VisualLoss.
+        self._terms: list[_Term] = [L2Term(), L1Term(), LpipsTerm(), DinoV3Term()]
 
     # ---- diagnostics ----
     # WHY THIS EXISTS (2026-09-03). The decoder head is an unbounded nn.Conv2d and NOTHING here reads its raw
@@ -230,17 +395,56 @@ class VisualLoss(nn.Module):
             return pred.reshape(-1, *pred.shape[-3:]), target.reshape(-1, *target.shape[-3:])
         return pred, target
 
+    def _assemble(self, zero: Tensor, mode: str, *args, wmap: Tensor | None = None) -> Tensor:
+        """Sum w * term over the registry. `mode` picks which reduction each term contributes. `wmap` is the
+        optional per-pixel saliency weight, passed ONLY to the pointwise pixel terms (L1/L2 use it; feature
+        terms ignore it); the difference reduction never gets it."""
+        total = zero
+        for term in self._terms:
+            w = float(term.weight(self) or 0.0)
+            if not w:
+                continue
+            part = (term.pointwise(self, *args, w=wmap) if mode == "pointwise"
+                    else term.difference(self, *args))
+            if part is None:
+                continue
+            for sub in (part if isinstance(part, list) else [part]):
+                total = total + w * sub
+        return total
+
+    @torch.no_grad()
+    def _saliency_map(self, target: Tensor) -> Tensor:
+        """(M,H,W,C) target in [0,1] -> per-pixel weight (M,H,W,1) = 1 + K on cube pixels. Cube mask =
+        the CANONICAL extractor threshold (logs/oneoffs/extract_cube_state.candidate): saturated,
+        bright, NON-table hue -> `observation.objects.cube` and this loss agree by construction. Derived
+        from the TARGET (clean GT), so it is reliable even when the prediction has already faded."""
+        t = target.detach().float()
+        r, g, b = t[..., 0], t[..., 1], t[..., 2]
+        mx = t.max(-1).values
+        df = (mx - t.min(-1).values).clamp_min(1e-6)
+        s = (mx - t.min(-1).values) / mx.clamp_min(1e-6)
+        rm = mx == r
+        gm = (mx == g) & ~rm
+        bm = (mx == b) & ~rm & ~gm
+        h = torch.zeros_like(mx)
+        h = torch.where(rm, ((g - b) / df) % 6, h)
+        h = torch.where(gm, ((b - r) / df) + 2, h)
+        h = torch.where(bm, ((r - g) / df) + 4, h)
+        h = (h * 60) % 360
+        table = (h >= 18) & (h <= 55)
+        cube = ((s > 0.45) & (mx > 0.2) & (~table)).float()      # (M,H,W)
+        if self.saliency_dilate > 0:                              # grow to cover the boundary ring the threshold misses
+            k = 2 * self.saliency_dilate + 1
+            cube = F.max_pool2d(cube.unsqueeze(1), kernel_size=k, stride=1, padding=self.saliency_dilate).squeeze(1)
+        return (1.0 + self.saliency_weight * cube).unsqueeze(-1)
+
     def forward(self, pred: Tensor, target: Tensor, site: str = "decode") -> Tensor:
         pred, target = self._flatten(pred, target)     # (B,F,H,W,C) from the anchor -> (B*F,H,W,C)
         self._record(site, pred)                       # RAW range, before any term clamps -- see pop_diagnostics
-        loss = pred.new_zeros(())
-        if self.w_l2:
-            loss = loss + self.w_l2 * F.mse_loss(pred, target)
-        if self.w_l1:
-            loss = loss + self.w_l1 * F.l1_loss(pred, target)
-        if self.w_lpips:
-            loss = loss + self.w_lpips * self._lpips_term(pred, target)
-        return loss
+        wmap = None
+        if self.saliency != "none" and self.saliency_weight > 0.0 and site == "decode":
+            wmap = self._saliency_map(target)          # cube-weighted pixel loss (decode site only)
+        return self._assemble(pred.new_zeros(()), "pointwise", pred, target, wmap=wmap)
 
     # ---- the FIRST-ORDER term (design/derivative_loss.md) ------------------------------------------
     def _pairs(self, pred: Tensor, target: Tensor, stride: int):
@@ -295,20 +499,26 @@ class VisualLoss(nn.Module):
             k = int(k)
             if k < 1 or k >= pred.shape[1]:
                 continue
-            if self.w_l1:                                      # PIXEL part: all frames, a subtraction + L1
-                dp = pred[:, k:] - pred[:, :-k]
-                dg = target[:, k:] - target[:, :-k]
-                total = total + self.w_l1 * F.l1_loss(dp, dg)
-            if self.w_lpips:                                   # FEATURE part: sampled contiguous pairs
-                got = self._pairs(pred, target, k)
-                if got is None:
+            # TWO PAIRINGS, and the split is not arbitrary. The PIXEL terms are cheap, so they see
+            # ALL frames via a plain slice. The FEATURE terms are not, so they see `_pairs`' sampled
+            # contiguous pairs. Terms declare which they want with `full_sequence`.
+            for term in self._terms:
+                w = float(term.weight(self) or 0.0)
+                if not w:
                     continue
-                p0, p1, g0, g1 = got
-                fp0, fp1 = self._layer_features(self._sanitise(p0)), self._layer_features(self._sanitise(p1))
-                fg0 = self._layer_features(g0.clamp(0, 1))
-                fg1 = self._layer_features(g1.clamp(0, 1))
-                for a0, a1, b0, b1 in zip(fp0, fp1, fg0, fg1):
-                    total = total + self.w_lpips * ((a1 - a0) - (b1 - b0)).pow(2).mean()
+                if getattr(term, "full_sequence", False):
+                    args = (pred[:, :-k], pred[:, k:], target[:, :-k], target[:, k:])
+                else:
+                    got = self._pairs(pred, target, k)
+                    if got is None:
+                        continue
+                    p0, p1, g0, g1 = got
+                    args = (p0, p1, g0, g1)
+                part = term.difference(self, *args)
+                if part is None:
+                    continue
+                for sub in (part if isinstance(part, list) else [part]):
+                    total = total + w * sub
         return total
 
     @torch.no_grad()
@@ -325,4 +535,5 @@ class VisualLoss(nn.Module):
 
     def extra_repr(self) -> str:
         return (f"w_l2={self.w_l2}, w_l1={self.w_l1}, w_lpips={self.w_lpips}, "
+                f"w_dino_v3={self.w_dino_v3}, "
                 f"lpips_net={self.lpips_net!r}, frames={self.frames}")

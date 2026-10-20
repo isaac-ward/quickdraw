@@ -32,6 +32,7 @@ from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate,
 from quickdraw.data.ood_windows import kept, window_steps
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes, load_checkpoint,
                                       normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 COVERAGE = 0.90   # conformal coverage: the threshold is the COVERAGE quantile of the
 #                   calibration set's non-conformity scores, so the false-positive rate on
@@ -54,7 +55,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     # ---- gather every episode's per-step errors first; thresholds come later, per calibration rule ----
     per_ep = {}
     for sp in OOD:
-        eps = load_split_episodes_mm(root, sp, **kw)
+        eps = load_split_episodes_mm(root, sp, **kw, dcfg=DataConfig.legacy())
         per_ep[sp] = {}
         for i in kept(sp):
             o, a, fr = eps[i]
@@ -64,7 +65,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
             per_ep[sp][i] = {k: (np.asarray(r[k])[inw], np.asarray(r[k])[~inw]) for k in METRICS}
 
     # ---- CALIBRATION RULE 1: val. Reported because it FAILS, and the failure is the point ----
-    veps = load_split_episodes_mm(root, "val", **kw)
+    veps = load_split_episodes_mm(root, "val", **kw, dcfg=DataConfig.legacy())
     vals = {k: [] for k in METRICS}
     CAP = 120
     for o, a, fr in veps:

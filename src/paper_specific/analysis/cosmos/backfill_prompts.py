@@ -18,9 +18,10 @@ it = OmegaConf.load("/app/conf/interpret/block_stack.yaml")
 axes = OmegaConf.to_container(it.action_axes)
 kw = dict(scene=str(it.get("scene_prompt", "")), subject=str(it.get("prose_subject", "")), max_phases=4)
 eps = load_split_episodes(snapshot_download(repo_id="isaac-ronald-ward/block-stack",
-                                            repo_type="dataset"), "val", repo_id="block-stack")
+                                            repo_type="dataset"), "val", repo_id="block-stack", dcfg=DataConfig.legacy())
 
 import os
+from quickdraw.data.dataset import DataConfig
 d = os.path.join(run, "logs/epoch_0000/eval_ood_horizon/open_loop/action")
 os.makedirs(d, exist_ok=True)
 for i in range(2):

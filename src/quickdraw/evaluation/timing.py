@@ -28,6 +28,7 @@ import time
 from contextlib import contextmanager
 
 import torch
+from ..data.dataset import DataConfig
 
 
 def _sync():
@@ -111,7 +112,7 @@ def eval_timing(cfg, model, norm, ecfg, writer, device, step=0):
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
                                  img_size=image_head_sizes(cfg) or 128,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
-                                 repo_id=cfg.data.get("repo_id", "torus"))
+                                 repo_id=cfg.data.get("repo_id", "torus"), dcfg=DataConfig.from_cfg(cfg))
     o, a, fr = eps[0]
     if len(o) < P + H + 1:
         H = max(8, len(o) - P - 1)

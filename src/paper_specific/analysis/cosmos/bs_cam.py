@@ -6,11 +6,12 @@ import numpy as np
 sys.path.insert(0, "/app/src")
 from huggingface_hub import snapshot_download
 from quickdraw.data.dataset import load_split_episodes_mm, set_subsample
+from quickdraw.data.dataset import DataConfig
 
 set_subsample(1)
 root = snapshot_download(repo_id="isaac-ronald-ward/block-stack", repo_type="dataset")
 o, a, fr = load_split_episodes_mm(root, "val", img_size=(144, 192), cam="scene_left",
-                                  repo_id="block-stack")[0]
+                                  repo_id="block-stack", dcfg=DataConfig.legacy())[0]
 img = fr["scene_left"].astype(np.float32).mean(-1) / 255.0
 T, Hh, Ww = img.shape
 print(f"episode: {T} frames {Hh}x{Ww}")

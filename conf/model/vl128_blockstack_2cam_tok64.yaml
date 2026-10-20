@@ -1,0 +1,20 @@
+# vl128_blockstack_2cam_tok64 — capacity arm: num_tokens 32 -> 64 on both image heads. Everything else verbatim.
+# Tests whether more latent tokens raises the participation ratio + shrinks the rolled-clean gap (Ceiling A
+# capacity vs the drift). See design/mechanistic_interpretability.md. NOTE full-bag PR was 0.3% at tok32, so
+# the bag is already underused -- this arm tests capacity as a HYPOTHESIS, expecting possible overfit (rec 8.21).
+defaults:
+  - vl128_blockstack_2cam
+  - _self_
+
+modalities:
+  - {name: proprio, kind: vector, dim: 17, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  - {name: cam_scene, kind: image, cam: scene_right, weight: 1.0,
+     img_size: [96, 128], ae_bottleneck: 6, pretrained: false, num_tokens: 64,
+     encode_arch: conv, encode_base: 32, decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128, latent_loss_weight: 10}
+  - {name: cam_wrist, kind: image, cam: gripper_right_top, weight: 1.0,
+     img_size: [96, 128], ae_bottleneck: 6, pretrained: false, num_tokens: 64,
+     encode_arch: conv, encode_base: 32, decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128, latent_loss_weight: 10}

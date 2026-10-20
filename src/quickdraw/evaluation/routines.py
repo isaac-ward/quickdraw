@@ -189,7 +189,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     (proprio/trajectory_*, image <head>/filmstrip_i + rollout_i). n_ep=8 with an image head (decode cost)."""
     import numpy as _np
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     # THE SPLIT AND THE PRODUCT PREFIX ARE THE ONLY THINGS THAT WERE EVER SPLIT-SPECIFIC HERE. Everything
     # downstream -- the rollout, per-head psnr/ssim/lpips, the proprio obs/manifold/pointwise/tangent
     # error, the filmstrips, the rollout mp4s, the error-vs-step curves -- reads the episodes it is handed.
@@ -218,6 +218,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), split,
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -309,6 +311,50 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
             out[h] = torch.cat([v[:, s, :min(every, Hm - s * every)] for s in range(n_seg)], dim=1)  # (n_ep,Hm,...)
         return (out, bag_out) if want_bag else out
 
+    def rollout_xstep_ahead(X, Hm):
+        """TARGET-TIME sliding X-steps-ahead forecast (replaces the old segment-and-reset 'closed loop', which
+        averaged horizons 1..X -- a sawtooth, optimistically biased). out[:, j] (n_ep, Hm, ...) is the X-ahead
+        forecast OF future-frame j (== absolute frame P+j): ground on the P GT frames ENDING at frame P+j-X, roll
+        X steps, and decode ONLY the last frame. So out[:, j] and the GT at future-frame j are the SAME world
+        moment -> a perfect model makes them identical. Valid for j in [X-1, Hm-1]; out[:, :X-1] is BLACK (no
+        X-ahead forecast exists yet -> masked from the metric via `valid_from`, rendered black in the filmstrip).
+        decode_last -> 1 decode/start (not X), so cost ~ open-loop. Only a START drop (X-1); no end drop, since
+        Hm <= L-P already bounds the targets inside the episode."""
+        X = min(int(X), Hm)
+        C = {"proprio": []}
+        C.update({h: [] for h in img_heads})
+        A = []
+        for o, a, fr in eps:                                               # rows ordered (episode, target j)
+            for j in range(X - 1, Hm):
+                cs = j - X + 1                                             # context start (abs); P frames end at grounding P+j-X
+                C["proprio"].append(norm.norm_obs(torch.from_numpy(o[cs:cs + P])))
+                for h in img_heads:
+                    C[h].append(torch.from_numpy(fr[h][cs:cs + P]))
+                idx = _np.clip(_np.arange(cs, cs + P + X - 1), 0, len(a) - 1)
+                A.append(norm.norm_act(torch.from_numpy(a[idx])))
+        ctx = {"proprio": torch.stack(C["proprio"]).float().to(device)}
+        for h in img_heads:
+            ctx[h] = torch.stack(C[h]).float().div(255.0).to(device)
+        acts = torch.stack(A).float().to(device)
+        n_j = Hm - (X - 1)                                                 # valid targets per episode
+        rows = n_ep * n_j
+        cap = max(n_ep, 64)
+        segs = {h: [] for h in heads}
+        for r0 in range(0, rows, cap):
+            sub = {k: v[r0:r0 + cap] for k, v in ctx.items()}
+            o_c = m.imagine_eval(sub, acts[r0:r0 + cap], X, heads=heads, decode_chunk=dc, norm=norm, decode_last=True)
+            for h in heads:
+                segs[h].append(o_c[h][:, -1])                              # (chunk, ...) the single X-ahead frame
+        out = {}
+        for h in heads:
+            vv = torch.cat(segs[h], 0).reshape(n_ep, n_j, *torch.cat(segs[h], 0).shape[1:])
+            if X > 1:
+                black = torch.zeros(n_ep, X - 1, *vv.shape[2:], device=vv.device, dtype=vv.dtype)
+                out[h] = torch.cat([black, vv], dim=1)                     # (n_ep, Hm, ...) black lead-in + forecasts
+            else:
+                out[h] = vv
+        return out
+
     def latent_pass(Hm, bag):
         """LATENT-space curves for the OPEN-LOOP mode, computed from THE ROLLOUT THAT WAS ALREADY RUN.
 
@@ -342,10 +388,14 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
                           f"the decoded-image products are unaffected")
             return {}
 
-    def score_and_emit(out, subroutine, desc, Hm, lat=None):
+    def score_and_emit(out, subroutine, desc, Hm, lat=None, valid_from=0):
         """Score (image_curves per head + proprio_curves) + emit (emit_openloop) a completed rollout under the
         `subroutine` tag (e.g. eval_ood_horizon/open_loop). Head nesting rides under it via product_tag. `Hm`
-        is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H)."""
+        is this mode's horizon; the precomputed full-H GT (p_true/itrue) is sliced to Hm (open_loop: Hm==H).
+
+        `valid_from` (sliding X-ahead mode): the first `valid_from` frames carry no valid forecast -> their
+        per-step curve entries are NaN'd (dropped from the nanmean headline + shown as a gap on the error-vs-step
+        plot) and the filmstrip prediction is blacked. 0 for open-loop (everything valid)."""
         # THE PROPRIO BLOCK IS SKIPPED WHOLESALE without that head. The error curves, the trajectory
         # plots and the xyz overlays are all derived from proprio, so an image-only model emits its
         # per-head image readouts (the loop below) and nothing else. Computed BEFORE the image loop, as
@@ -358,16 +408,25 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
             per_step = proprio_curves(pred, norm.norm_obs(pt), p_hat, pt, env,
                                       pos_slice=(pos if pos_explicit else None))  # position-L2 pointwise iff explicit
             curves = {k: v.mean(0).cpu().numpy() for k, v in per_step.items()}
+            if valid_from:                                                     # drop the X-ahead lead-in from the metric
+                for k in curves:
+                    curves[k][:valid_from] = _np.nan
         images = {}
         for head in img_heads:
             ipred = out[head].clamp(0, 1)
             with tm.phase("metrics"):
                 ic = image_curves(ipred, itrue[head][:, :Hm])
+            if valid_from:
+                for k in ic:
+                    ic[k][:valid_from] = _np.nan                              # lead-in has no X-ahead forecast
             ic.update(lat or {})            # latent_motion_ratio / latent_cos ride the head's curve dict, so they
             #                                 reach the SAME panel + the same @+x scalar readouts as motion_ratio
+            ipred_film = ipred[:n_plot].cpu().numpy()
+            if valid_from:
+                ipred_film[:, :valid_from] = 0.0                              # black lead-in (no X-ahead forecast yet)
             images[head] = {"icurves": ic,
                             "full_true": _np.stack([eps[i][2][head][:P + Hm].astype(_np.float32) / 255.0 for i in range(n_plot)]),
-                            "ipred": ipred[:n_plot].cpu().numpy()}
+                            "ipred": ipred_film}
             emit_horizon_readouts(writer, subroutine, head, images[head]["icurves"], Hm, step)
         # EMITTED FOR EVERY MODEL, proprio or not. `emit_openloop` skips each proprio product whose input
         # is None and still writes the image rollouts and filmstrips -- which for an image-only model are
@@ -394,14 +453,21 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         prog(int(5 + 90 * k / len(modes)), f"mode {name} (re-ground every {every} steps, H={Hm})"
              if every < Hm else f"mode {name} (open-loop, no re-grounding, H={Hm})")
         open_loop = every >= Hm
-        out = rollout_regrounded(every, Hm, want_bag=open_loop)
-        out, bag = out if open_loop else (out, None)
-        desc = (f"Open-loop long-horizon rollout: a BLACK agent on the TRUE path and a GREY agent on the model's "
-                f"PREDICTED path, sharing the context then diverging at the fork." if every >= Hm else
-                f"Closed-loop rollout: the GROUND-TRUTH observation is re-injected as context every {every} steps "
-                f"(over a {Hm}-step horizon), so error resets each re-grounding instead of compounding.")
+        if open_loop:
+            out, bag = rollout_regrounded(every, Hm, want_bag=True)
+            valid_from = 0
+            desc = ("Open-loop long-horizon rollout: a BLACK agent on the TRUE path and a GREY agent on the "
+                    "model's PREDICTED path, sharing the context then diverging at the fork.")
+        else:
+            X = int(every)
+            out, bag = rollout_xstep_ahead(X, Hm), None
+            valid_from = X - 1                                  # first X-1 frames have no X-ahead forecast (black)
+            desc = (f"Sliding {X}-step-ahead forecast (target-time aligned): at frame j the prediction is the "
+                    f"{X}-step-ahead forecast OF frame j (grounded {X} steps earlier on GT), so a perfect model "
+                    f"matches GT frame-for-frame. First {valid_from} frames black (no forecast yet); metric is the "
+                    f"uniform {X}-ahead error over valid frames.")
         lat = latent_pass(Hm, bag) if open_loop else None      # open-loop only (see latent_pass)
-        summary.update(score_and_emit(out, f"{tag}/{name}", desc, Hm, lat=lat))
+        summary.update(score_and_emit(out, f"{tag}/{name}", desc, Hm, lat=lat, valid_from=valid_from))
 
     tm.emit(writer, tag, step, horizon=H, n_ep=n_ep, n_heads=max(1, len(img_heads)))
     _plog(writer, f"[{tag} @ep{step}] timing: {tm.summary()}")
@@ -424,7 +490,7 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
     constant across epochs (a cheap "is something training that shouldn't be" detector — #12 §4)."""
     import numpy as _np
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
     was = m.training
@@ -438,6 +504,8 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -607,7 +675,7 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     over many VAL contexts, then project the latent to 3D + 2D with THREE reducers — PCA (linear, global-
     geometry-faithful), UMAP (nonlinear neighborhoods), t-SNE (local clusters) — each under eval_manifold/<method>/.
     The 3D still is a 6-view (fig_points_6view). Data-space (6D proprio) plots dropped — it's just the torus."""
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from .manifold import manifold_predictions, pad_lims, reduce_dims
     m = getattr(model, "_orig_mod", model)
     was = m.training
@@ -615,6 +683,8 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     t0 = time.perf_counter()
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))   # decodes proprio; latent = flattened bag
@@ -666,7 +736,7 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     import numpy as _np
     import torch.nn.functional as F
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from ..models.multimodal import MultiModalFlow
     m = getattr(model, "_orig_mod", model)
     if not isinstance(m, MultiModalFlow):
@@ -688,6 +758,8 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -808,7 +880,7 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     (default: the epoch step; cfg.eval.denoising_seed pins it) fixes the sampled contexts + noise."""
     import numpy as _np
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from ..models.multimodal import MultiModalFlow
     from .manifold import manifold_clouds
     m = getattr(model, "_orig_mod", model)
@@ -827,6 +899,8 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     pos, _ = _pos_idx(cfg); K, P = m.sampling_steps, cfg.data.P
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -894,7 +968,7 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     import numpy as _np
     import torch.nn.functional as F
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from ..models.multimodal import MultiModalFlow
     m = getattr(model, "_orig_mod", model)
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
@@ -909,6 +983,8 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     hz = sorted({int(h) for h in hz if int(h) >= 1})
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -1059,7 +1135,7 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
 
     from omegaconf import OmegaConf
 
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     from . import interpret as I
     m = getattr(model, "_orig_mod", model)
     if not _is_mm(model):
@@ -1086,6 +1162,8 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -1431,7 +1509,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
     m = getattr(model, "_orig_mod", model)
     if not getattr(m, "action_head_enabled", False):
         return {}                                                # no action head -> skip
-    from ..data.dataset import load_split_episodes_mm
+    from ..data.dataset import DataConfig, load_split_episodes_mm
     was = m.training; m.eval()
     t0 = time.perf_counter()
     def prog(p, w): _plog(writer, f"[eval_action_distribution @ep{step}] {p:3d}% — {w}")
@@ -1467,6 +1545,8 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
         action_names = [f"{n}·t+{j}" for j in range(_sub) for n in base]
     a_max = getattr(ecfg, "a_max", None)   # torus-only histogram x-limit knob; None -> viz derives it from the data
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+        dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
+        #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
@@ -1661,7 +1741,7 @@ def eval_steer(cfg, model, norm, ecfg, writer, device, step=0):
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
-                                 repo_id=cfg.data.get("repo_id", "torus"))
+                                 repo_id=cfg.data.get("repo_id", "torus"), dcfg=DataConfig.from_cfg(cfg))
     _pk = str(sc.get("proposal", "prior"))
     if _pk == "prior":
         prop = S.PriorProposal(m, prefix_guidance=bool(sc.get("prefix_guidance", True)),
@@ -1677,7 +1757,7 @@ def eval_steer(cfg, model, norm, ecfg, writer, device, step=0):
         _K = int(getattr(m, "action_head_chunk", 1))
         _bs = int(sc.get("bank_stride", 1) or 1)
         _be = load_split_episodes(resolve_data_root(cfg), str(sc.get("bank_split", "train")),
-                                  repo_id=cfg.data.get("repo_id", "torus"))
+                                  repo_id=cfg.data.get("repo_id", "torus"), dcfg=DataConfig.from_cfg(cfg))
         _ch = [torch.from_numpy(a[i:i + _K]).float()
                for _, a in _be for i in range(0, len(a) - _K, _bs)]
         assert _ch, f"no chunks of {_K} in the bank split -- episodes too short?"

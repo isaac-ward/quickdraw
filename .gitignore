@@ -150,3 +150,11 @@ scratch/
 # every run -- unlike the named scenes beside them, which are committed as the canonical variants.
 src/quickdraw/sim/mbari/assets/tank_clip*.xml
 src/quickdraw/sim/mbari/assets/tank_best*.xml
+
+/oneoffs/
+
+# logs/ is ignored above, but longhand committed its cube-experiment one-offs under logs/oneoffs/.
+# Tracked files stay tracked regardless of an ignore rule; this negation makes that state deliberate
+# rather than accidental.
+!logs/oneoffs/
+!logs/oneoffs/**

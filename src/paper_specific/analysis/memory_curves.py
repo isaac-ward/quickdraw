@@ -36,6 +36,7 @@ from quickdraw.data.ood_windows import kept
 from quickdraw.evaluation.openloop import image_curves
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes, load_checkpoint,
                                       normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 
 @torch.no_grad()
@@ -69,7 +70,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     kw = dict(img_size=image_head_sizes(cfg), cam=image_head_cams(cfg), repo_id="starling-2")
     summary = {}
     for sp in MEM:
-        eps = load_split_episodes_mm(root, sp, **kw)
+        eps = load_split_episodes_mm(root, sp, **kw, dcfg=DataConfig.legacy())
         recs = []
         for i in [x for x in kept(sp) if x < len(eps)]:
             o, a, fr = eps[i]

@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 from quickdraw.data.dataset import load_split_episodes, set_action_aggregate, set_subsample
 from quickdraw.data.ood_windows import EXCLUDE_EPISODES, FPS, WINDOWS
 from quickdraw.training.setup import resolve_data_root
+from quickdraw.data.dataset import DataConfig
 
 REPO = "isaac-ronald-ward/starling-2"
 NAME = "ood_anomaly_windows.json"
@@ -47,7 +48,7 @@ def main(*args: str) -> int:
     root = resolve_data_root(cfg)
     doc = {"how_to_use": HOW, "fps": FPS, "reviewed": "2026-09-15", "splits": {}}
     for sp in ("eval_ood_noodle", "eval_ood_leafblower", "eval_memory_backwall1", "eval_memory_backwall2"):
-        eps = load_split_episodes(root, sp, repo_id="starling-2")
+        eps = load_split_episodes(root, sp, repo_id="starling-2", dcfg=DataConfig.legacy())
         w = WINDOWS.get(sp, {})
         rows = []
         for i, (o, _) in enumerate(eps):

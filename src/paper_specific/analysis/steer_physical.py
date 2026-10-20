@@ -30,6 +30,7 @@ import sys
 
 import numpy as np
 import yaml
+from quickdraw.data.dataset import DataConfig
 
 AXES = [a["name"] for a in yaml.safe_load(open("conf/interpret/starling.yaml"))["action_axes"]]
 NA = len(AXES)
@@ -118,7 +119,7 @@ def calibrate(span: int = 128):
         "logs/paper_icra_2027/model_backups/train_action_2026_09_14_04_41_17_s2_ah_chunk32_full/logs/config.json")))
     set_subsample(4); set_action_aggregate("concat")
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
     rows, sticks = [], []
     for o, a, _ in eps:
         for i in range(0, len(o) - span, span // 2):

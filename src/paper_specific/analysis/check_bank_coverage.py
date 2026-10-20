@@ -20,6 +20,7 @@ import sys
 import numpy as np
 import yaml
 from omegaconf import OmegaConf
+from quickdraw.data.dataset import DataConfig
 
 AXES = [a["name"] for a in yaml.safe_load(open("conf/interpret/starling.yaml"))["action_axes"]]
 NA = len(AXES)
@@ -32,12 +33,12 @@ def main(run: str, split: str = "train", stride: int = 1, k_keep: int = 64) -> i
         "logs/train_action_2026_09_14_04_41_17_s2_ah_chunk32_full/logs/config.json")))
     set_subsample(4); set_action_aggregate("concat")
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
     K = 32
     # the bank exactly as DataProposal builds it, folded to per-axis stick values
     from quickdraw.data.dataset import load_split_episodes
     stride = int(stride)
-    be = load_split_episodes(resolve_data_root(cfg), split, repo_id="starling-2")
+    be = load_split_episodes(resolve_data_root(cfg), split, repo_id="starling-2", dcfg=DataConfig.legacy())
     bank = np.stack([a[i:i + K] for _, a in be for i in range(0, len(a) - K, stride)])
     print(f"  bank split {split!r} stride {stride}")
     bank = bank.reshape(len(bank), K, -1, NA).mean(axis=2)          # (n, K, NA)

@@ -38,6 +38,7 @@ from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate,
 from quickdraw.evaluation.steering import PriorProposal
 from quickdraw.training.setup import (build_model, effective_action_dim, image_head_cams,
                                       image_head_sizes, load_checkpoint, normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 RUN = "logs/paper_icra_2027/model_backups/train_action_2026_09_14_04_41_17_s2_ah_chunk32_full"
 OUT = "/app/logs/paper_icra_2027/marginals.png"
@@ -58,7 +59,7 @@ def main(run: str = RUN) -> int:
     K = int(core.action_head_chunk)
     img = next((n for n, _ in core.layout if n != "proprio"), None)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
 
     # RECORDED: every chunk in val, folded over the concat sub-steps the same way every other readout
     # folds them, so `real[:, k, j]` is stick j at lead k

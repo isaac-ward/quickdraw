@@ -32,6 +32,7 @@ from quickdraw.evaluation.openloop import image_curves
 from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate, set_subsample
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes, load_checkpoint,
                                       normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 WM = "logs/paper_icra_2027/model_backups/train_world_model_2026_09_11_03_17_47_s2_sub4_concat"
 CKPT = WM + "/checkpoints/ah_base_ep38.ckpt"
@@ -63,7 +64,7 @@ def longhorizon(paper, dev="cuda", n_show=8):
     PLAN = [(0, H_SHORT, 40), (2, H_LONG, T0)]
     cfg, core, norm, P, key = _model(dev)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
     rows = []
     for ei, H, t0 in PLAN:
         o, a, fr = eps[ei]
@@ -209,7 +210,7 @@ def ood(paper, dev="cuda"):
         noodle window touches an edge anyway and starting inside it shows the anomaly before the baseline.
         `prefer="central"` wants a window with clean flight either side, which the blower has."""
         eps = load_split_episodes_mm(resolve_data_root(cfg), split, img_size=image_head_sizes(cfg),
-                                     cam=image_head_cams(cfg), repo_id="starling-2")
+                                     cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
         cands = []
         for ep in kept(split):
             o = eps[ep][0]

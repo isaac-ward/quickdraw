@@ -18,7 +18,11 @@
 #
 #  2. `img_size: [96, 128]` -- NON-SQUARE, 3:4, matching the source 144x192 exactly. NEVER an int:
 #     an int squashes the frame to square, which is the mistake `vl128_starling` calls out and which
-#     cost a whole lego run. `ae_bottleneck: 6` is PAIRED with it (96/16), giving an exact 6x8 grid.
+#     cost a whole lego run. `ae_bottleneck: 12` is PAIRED with it (96/8), giving an exact 12x16 grid.
+#     (Was 6 -> 6x8 until 2026-09-28: at 6x8 each 16x16 readout cell was ~one whole cube, so the codec
+#     smeared/shifted the small scene cubes even with NO dynamics. 12 -> 12x16 gives a cube ~4 cells and
+#     cut the cube-only codec L1 by ~38% on cam_scene, 0.0385 -> 0.0237. num_tokens stayed 32: doubling it
+#     did nothing (buys latent menu, not readout cells). See design + the g12 run.)
 #
 #  3. The cameras. `cam_scene: scene_right` is the fixed third-person view; `cam_wrist:
 #     gripper_right_top` is the gripper-mounted analogue of robocasa's `robot0_eye_in_hand`.
@@ -86,15 +90,34 @@ defaults:
 
 action_dim: 5
 
+# DEFAULT (2026-09-30): proprio carries the cube object-state (17 state + 32 cube = 49) and the dynamics is
+# conditioned on it (concat_proprio_embedding). Cube state is a low-dim, well-predicted signal the WM can't
+# "drop" the way it drops the few latent tokens a cube occupies -- it directly attacks the cube DISPLACEMENT +
+# DROPPING seen in the rollout (logs/oracle_cube/plots/rolled_zoom.png). Pair with the data default
+# obs_fields=[observation.state, observation.objects.cube] + environments.obs_dim=49. Plain 17-dim: override
+# proprio dim=17, concat_proprio_embedding=false, obs_fields=[observation.state], obs_dim=17.
+concat_proprio_embedding: true
+
+# DEFAULT (2026-10-02): the LATENT ROLLOUT loss (attached latent twin of the decode loss -- scores the rolled
+# latent vs the true latent directly, MSE, committing the rollout onto the true trajectory). EXPERIMENT that set
+# this: bs_ss10_lr{03,10} vs g12 @ ep33 -- weight 1.0 ~DOUBLED early cube-survival (0.69 vs 0.37 @h16, cube-L1
+# halved), clean dose-response (w1.0 > w0.3 > baseline), NO codec cost (floor 0.019-0.027 = baseline), no freeze
+# /blow-up. First lever to beat baseline on cube survival after z0/wiredhue/saliency + 14 dynamics levers flatlined.
+# Weight 1.0 derived from the measured raw MSE(rolled,true)=1.37 -> contrib 1.37 (the dominant term). See
+# design/combatting_drift.md + logs/oracle_cube/plots/rolled_zoom_lr10.png. Higher doses (w=2,5) under test.
+latent_rollout:
+  weight: 1.0
+  metric: mse
+
 modalities:
   # Restated in full: OmegaConf REPLACES lists rather than merging them.
-  - {name: proprio, kind: vector, dim: 17, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+  - {name: proprio, kind: vector, dim: 49, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
 
   # ---- camera 1: the fixed third-person scene view ----
   - {name: cam_scene, kind: image, cam: scene_right,
      weight: 1.0,
      img_size: [96, 128],     # (H, W) -- 3:4, matches the 144x192 source. NEVER an int.
-     ae_bottleneck: 6,        # PAIRED with img_size -> an exact 6x8 bottleneck grid
+     ae_bottleneck: 12,       # PAIRED with img_size (96/8) -> an exact 12x16 readout grid (cube ~4 cells)
      pretrained: false, num_tokens: 32,
      encode_arch: conv, encode_base: 32,
      decode_kind: mse, decode_arch: up, decode_base: 64,
@@ -106,7 +129,7 @@ modalities:
   - {name: cam_wrist, kind: image, cam: gripper_right_top,
      weight: 1.0,
      img_size: [96, 128],
-     ae_bottleneck: 6,
+     ae_bottleneck: 12,
      pretrained: false, num_tokens: 32,
      encode_arch: conv, encode_base: 32,
      decode_kind: mse, decode_arch: up, decode_base: 64,

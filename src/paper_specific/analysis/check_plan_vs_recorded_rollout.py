@@ -26,6 +26,7 @@ from PIL import Image
 from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate, set_subsample
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes, load_checkpoint,
                                       normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 
 def main(run: str, plan_dir: str, out: str = "logs/paper_icra_2027/_actions_control.png") -> int:
@@ -38,7 +39,7 @@ def main(run: str, plan_dir: str, out: str = "logs/paper_icra_2027/_actions_cont
     P = int(cfg.data.P)
     img = next((n for n, _ in core.layout if n != "proprio"), None)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id=cfg.data.get("repo_id", "torus"))
+                                 cam=image_head_cams(cfg), repo_id=cfg.data.get("repo_id", "torus"), dcfg=DataConfig.legacy())
     o, a, fr = eps[ei]
     H = min(H, len(o) - t - 1)
     ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[t - P:t])).float()[None].cuda(),

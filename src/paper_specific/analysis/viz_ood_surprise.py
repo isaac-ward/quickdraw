@@ -43,6 +43,7 @@ from quickdraw.data.ood_windows import kept, window_steps
 from quickdraw.logging import viz
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes, load_checkpoint,
                                       normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 FPS_OUT = 4.0                 # model steps are 0.27 s apart, so 4 fps is close to real time
 PATCH_VIZ = 4          # 4x4, at the user's request. The AUC sweep prefers larger (4x4 0.944,
@@ -76,7 +77,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027", n_samp: str = "32") 
     P = int(cfg.data.P)
     key = next((n for n, _ in core.layout if n != "proprio"))
     eps = load_split_episodes_mm(resolve_data_root(cfg), SPLIT, img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
     d = os.path.join(out_root, "eval_ood", SPLIT, "viz"); os.makedirs(d, exist_ok=True)
     rep = {}
     print(f"  {SPLIT} -> {d}   one video per episode, {N} ensemble samples/step, all methods side by side")

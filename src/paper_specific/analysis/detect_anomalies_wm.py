@@ -42,6 +42,7 @@ from quickdraw.data.ood_windows import WINDOWS, kept, window_steps
 from quickdraw.evaluation.openloop import image_curves
 from quickdraw.training.setup import (build_model, env_cfg, image_head_cams, image_head_sizes,
                                       load_checkpoint, normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 SUB = 4
 METRIC_DOC = {
@@ -158,7 +159,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
 
     METRICS = ["lpips", "l1", "l2", "pos_err", "vel_err", "rot_err", "angvel_err", "latent_cos"]
     for sp, kind in OOD.items():
-        eps = load_split_episodes_mm(root, sp, **kw)
+        eps = load_split_episodes_mm(root, sp, **kw, dcfg=DataConfig.legacy())
         d = os.path.join(out_root, "eval_ood", sp); os.makedirs(d, exist_ok=True)
         print(f"\n=== {sp}  ({kind} anomaly)  one-step-ahead detection, {len(kept(sp))} kept episodes")
         print(f"  {'ep':>3s} {'in/out steps':>13s} " + " ".join(f"{k:>11s}" for k in METRICS))
@@ -202,7 +203,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
                       "pooled_mean_out": {k: float(np.mean(pooled[k][1])) for k in METRICS}}
 
     for sp in MEM:
-        eps = load_split_episodes_mm(root, sp, **kw)
+        eps = load_split_episodes_mm(root, sp, **kw, dcfg=DataConfig.legacy())
         d = os.path.join(out_root, "eval_memory", sp); os.makedirs(d, exist_ok=True)
         keep_m = [x for x in kept(sp) if x < len(eps)]
         print(f"\n=== {sp}  one-step-ahead error across the turn, {len(keep_m)} of {len(eps)} episodes")

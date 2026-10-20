@@ -22,6 +22,7 @@ import sys
 import numpy as np
 import yaml
 from omegaconf import OmegaConf
+from quickdraw.data.dataset import DataConfig
 
 AXES = yaml.safe_load(open("conf/interpret/starling.yaml"))["action_axes"]
 NA = len(AXES)
@@ -35,7 +36,7 @@ def recorded_baseline() -> tuple:
         "logs/train_action_2026_09_14_04_41_17_s2_ah_chunk32_full/logs/config.json")))
     set_subsample(int(cfg.data.get("subsample", 1) or 1)); set_action_aggregate("concat")
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
     d = []
     for _, a, _ in eps:
         f = a.reshape(len(a), -1, NA).mean(axis=1)          # same fold the readouts use

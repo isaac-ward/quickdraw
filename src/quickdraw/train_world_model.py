@@ -127,17 +127,11 @@ def main(cfg):
     summary_text = _run_summary_text(cfg)   # fail if the run note is missing (present on resume via the
     if not resume:                          # resolved config). A resume is a CONTINUATION, so skip the unique
         _assert_summary_unique(summary_text, cfg)   # run-note gate + the config.resolved.yaml re-write below.
-    # Frame stride, set ONCE before anything loads episodes (autobatch below loads data too). Applied inside
-    # the loaders so the training windows and every eval routine cannot end up at different rates.
-    from .data.dataset import set_action_aggregate, set_obs_keep, set_subsample, set_train_episodes, set_train_steps, set_subsample_all_phases
-    set_subsample(int(cfg.data.get("subsample", 1) or 1))
-    set_train_episodes(cfg.data.get("train_episodes", None))   # data-volume ablation: cap TRAIN only
-    set_train_steps(cfg.data.get("train_steps", None))         # ...by steps, for variable-length episodes
-    set_action_aggregate(str(cfg.data.get("action_aggregate", "sum")))   # beside the stride: same one-shot rule
-    # Emit all `subsample` phase offsets as separate TRAIN episodes -- ~s x the windows at the SAME frame rate,
-    # using the frames the decimation otherwise throws away. Off = bit-identical. See set_subsample_all_phases.
-    set_subsample_all_phases(bool(cfg.data.get("subsample_all_phases", False)))
-    set_obs_keep(cfg.data.get("obs_keep", None))   # process-wide obs subset -> applied inside every loader + normalizer
+    # Data-loading config (subsample / action_aggregate / obs_keep / all_phases) is carried EXPLICITLY as a
+    # DataConfig into every loader now (2026-09-21) -- there is NO process-global to set up here, deliberately.
+    # normalizer / window_loaders below each build it from cfg via DataConfig.from_cfg; a loader cannot be
+    # called without it (keyword-only, no default), which is what makes the old "forgot to set subsample ->
+    # silent subsample=1" bug impossible. Do not reintroduce a set_* call here. See dataset.DataConfig.
     if not data_exists(cfg):
         raise FileNotFoundError(
             "No dataset found. Run `python -m quickdraw.data_generation` first, then pass its run "

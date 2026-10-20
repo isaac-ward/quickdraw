@@ -10,10 +10,11 @@ import numpy as np
 sys.path.insert(0, "/app/src")
 from huggingface_hub import snapshot_download
 from quickdraw.data.dataset import load_split_episodes, set_subsample
+from quickdraw.data.dataset import DataConfig
 
 set_subsample(1)
 root = snapshot_download(repo_id="isaac-ronald-ward/block-stack", repo_type="dataset")
-eps = load_split_episodes(root, "train", repo_id="block-stack")
+eps = load_split_episodes(root, "train", repo_id="block-stack", dcfg=DataConfig.legacy())
 print(f"{len(eps)} episodes, obs {eps[0][0].shape}, act {eps[0][1].shape}")
 
 A = np.concatenate([a[:-1] for _, a in eps], 0)

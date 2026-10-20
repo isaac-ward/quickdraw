@@ -34,6 +34,7 @@ from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate,
 from quickdraw.evaluation.steering import PriorProposal
 from quickdraw.training.setup import (build_model, effective_action_dim, image_head_cams, image_head_sizes,
                                       load_checkpoint, normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 AXES = [a["name"] for a in yaml.safe_load(open("conf/interpret/starling.yaml"))["action_axes"]]
 NA = len(AXES)
@@ -60,7 +61,7 @@ def main(run: str) -> int:
     P, A, K = int(cfg.data.P), effective_action_dim(cfg), int(core.action_head_chunk)
     img = next((n for n, _ in core.layout if n != "proprio"), None)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
     real = np.stack([a[i:i + K] for _, a, _ in eps for i in range(0, len(a) - K, 8)])
     real = real.reshape(len(real), K, -1, NA).mean(axis=2)
     # the atom = the most common value on each axis, which is what PIT's slab inverts to

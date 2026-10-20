@@ -46,7 +46,9 @@ def log_error_curves(writer, routine, curves, step, *, head=None, split_top=None
         writer.figure(product_tag(routine, f"{name}_{ys}", head=head), f, step)
         plt.close(f)
     if scalars:
-        writer.scalars({product_tag(routine, f"{k}_mean", head=head): float(np.mean(v))
+        # nanmean: the sliding X-ahead mode masks its invalid lead-in frames (first X-1) as NaN, so the headline
+        # mean is over the VALID X-ahead frames only. No-NaN curves (open-loop, ae_floor) are unaffected.
+        writer.scalars({product_tag(routine, f"{k}_mean", head=head): float(np.nanmean(v))
                         for k, v in curves.items()}, step)
 
 

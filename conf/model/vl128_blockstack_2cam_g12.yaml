@@ -1,0 +1,33 @@
+# vl128_blockstack_2cam + FINER READOUT GRID (Ceiling-A codec fix, 2026-09-27).
+# ae_bottleneck 6 -> 12 makes the up-decoder query grid 6x8 (48 cells) -> 12x16 (192 cells): a cube
+# (~10-15px) now spans ~4 cells instead of ~1, buying the sub-cell placement the codec smears today.
+# 96/12 = 8 = 2^3 -> a clean power-of-2 ratio (the ae_bottleneck trap). num_tokens UNCHANGED at 32.
+# OmegaConf REPLACES lists, so the modalities are restated in full (only ae_bottleneck differs).
+defaults:
+  - vl128_blockstack_2cam
+  - _self_
+
+modalities:
+  - {name: proprio, kind: vector, dim: 17, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+
+  - {name: cam_scene, kind: image, cam: scene_right,
+     weight: 1.0,
+     img_size: [96, 128],
+     ae_bottleneck: 12,       # 6 -> 12: readout grid 6x8 -> 12x16
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}
+
+  - {name: cam_wrist, kind: image, cam: gripper_right_top,
+     weight: 1.0,
+     img_size: [96, 128],
+     ae_bottleneck: 12,
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}

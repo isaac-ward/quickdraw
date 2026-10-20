@@ -67,6 +67,9 @@ variations:
     observations_encoded_pre_fusion:              #  ("corrupt-and-tell") = DIFFUSION FORCING: noise the pre-fusion context
       scale: 0.0                                  #    tokens at independent per-timestep levels + a backbone level-embedding.
       granularity: timestep                       #    FLOW models only (gated). 0 -> off (bit-identical). fraction of full noise.
+      rollout_level: 0.0                           #    DF ROLLOUT (Chen 2024): hold the fed-back past at this fixed level ε
+      #                                                 every rollout step (train + eval) so the model treats its own
+      #                                                 prediction as a level-ε obs and denoises drift. Needs scale>0; use <= scale.
       # EMPIRICAL (2026-07-17, bimodal data): scale controls ENCODER-latent collapse. IWS uses 0.1
       # (their prev_frame_noise_scale). At 0.1 the encoder stayed stable (encode_image grad ~0.001, no spike)
       # and the HARD collapse that 0.25/1.0 caused (encode_image grad spiked to 4.34 ~ep13, latent val 4-8)
@@ -75,6 +78,8 @@ variations:
   physical_loss:   { weight: 0.0, continuity: 0.0, warmup_epochs: 10 }  # weight: on-surface+tangent; continuity:
   #                  kinematic v=dp/dt; warmup_epochs: ramp the physical weight 0->1 over N epochs (schedules/)
   contraction:     { weight: 0.0, target: 1.02, power_iters: 2, n_sample_steps: 4 }  # hinge on sigma_max(one-step J)
+  latent_straightness: { weight: 0.0 }             # curvature penalty 1-cos(dz_t,dz_{t+1}) on the ROLLED latent
+  #                  (LSAR/flow only) -- attacks random-walk rollout drift (record s18). 0 -> off (bit-identical).
 
 # REQUIRED before any training run (train.py asserts all 5 are set): a 5-point experiment note,
 # written to <run_dir>/auto_run_summary.txt and printed to the logs (so it's in the wandb console).

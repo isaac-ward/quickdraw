@@ -36,6 +36,7 @@ from quickdraw.data.dataset import (load_split_episodes_mm, set_action_aggregate
                                     set_obs_keep, set_subsample)
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes,  # noqa: E402
                                       load_checkpoint, normalizer, resolve_data_root)
+from ..data.dataset import DataConfig
 
 FIT_SPLIT = os.environ.get("PROBE_FIT_SPLIT", "")   # "" -> time blocks within val; "train" -> the honest one
 N_FIT_EP = int(os.environ.get("PROBE_FIT_EPS", "20"))
@@ -84,7 +85,7 @@ def main(path, K) -> int:
         es = load_split_episodes_mm(resolve_data_root(cfg), split,
                                     img_size=image_head_sizes(cfg) or 128,
                                     cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
-                                    repo_id=cfg.data.get("repo_id", "torus"))
+                                    repo_id=cfg.data.get("repo_id", "torus"), dcfg=DataConfig.from_cfg(cfg))
         es = es[:n_ep] if n_ep else es
         Ls = min(len(o) for o, _, _ in es)
         Ls = min(Ls, cap) if cap else Ls

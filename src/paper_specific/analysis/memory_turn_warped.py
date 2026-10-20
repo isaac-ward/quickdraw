@@ -43,6 +43,7 @@ from quickdraw.evaluation.openloop import image_curves
 from quickdraw.data.ood_windows import kept
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes, load_checkpoint,
                                       normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 PRE, POST = 10, 14          # real steps kept either side of the warped turn
 FS = 6.4                    # ONE font size for every label; the figure is ONE COLUMN wide
@@ -133,7 +134,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
     root = resolve_data_root(cfg)
     kw = dict(img_size=image_head_sizes(cfg), cam=image_head_cams(cfg), repo_id="starling-2")
 
-    veps = load_split_episodes_mm(root, "val", **kw)
+    veps = load_split_episodes_mm(root, "val", **kw, dcfg=DataConfig.legacy())
     CAP = 48
     cur = [open_loop(core, norm, o[:CAP], a[:CAP], fr[key][:CAP], key, P, dev)[1] for o, a, fr in veps]
     n = min(len(c) for c in cur)
@@ -142,7 +143,7 @@ def main(ckpt: str, out_root: str = "logs/paper_icra_2027") -> int:
 
     allsp, summary = {}, {}
     for sp in MEM:
-        eps = load_split_episodes_mm(root, sp, **kw)
+        eps = load_split_episodes_mm(root, sp, **kw, dcfg=DataConfig.legacy())
         recs = []
         for i in [x for x in kept(sp) if x < len(eps)]:
             o, a, fr = eps[i]

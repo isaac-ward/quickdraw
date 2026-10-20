@@ -210,6 +210,35 @@ class Contraction(Variation):
         return self.weight * L, {"sigma_max": sigma_max.detach()}
 
 
+class LatentStraightness(Variation):
+    """Curvature penalty on the ROLLED latent trajectory: 1 - cos(dz_t, dz_{t+1}), per token, meaned.
+
+    Attacks the RANDOM-WALK component of open-loop drift (robocasa record section 18: the rolled latent goes
+    orthogonal to truth, ~11 degrees per step compounding). Forcing consecutive step-vectors to align means
+    the model cannot inject a fresh random error each step, so the trajectory must move coherently instead of
+    wandering. Runs on the model's OWN rollout (`ctx.preds`), so unlike the teacher-forced flow loss it sees
+    the compounding regime -- but it constrains the trajectory's SHAPE (curvature), not the target, so it
+    cannot positive-feedback-blow-up the way p_tf_dynamics<1 does (which re-bases the target to a magnitude
+    that grows with the model's own error). Its ceiling: it kills jitter, not a coherent wrong-direction drift.
+
+    LSAR/flow only -- `ctx.preds` must be the latent bag (B, F, n_state, d). Skips otherwise (e.g. DSAR obs).
+    No warmup: a bounded [0,2] penalty needs none, and reusing physical_loss's ramp would wrongly couple two
+    unrelated losses. If a warmup is ever wanted it gets its OWN schedule, never physical's."""
+    name = "latent_straightness"
+    loss_name = "straightness"
+
+    def __init__(self, weight: float):
+        self.weight = float(weight)
+
+    def loss(self, ctx: VarContext) -> tuple[Tensor | None, dict]:
+        z = ctx.preds
+        if self.weight <= 0.0 or z.dim() < 4 or z.shape[1] < 3:   # need >=3 frames for two consecutive steps
+            return None, {}
+        v = z[:, 1:] - z[:, :-1]                                  # (B, F-1, n_state, d) per-step velocity
+        cos = F.cosine_similarity(v[:, :-1], v[:, 1:], dim=-1)    # (B, F-2, n_state) consecutive-velocity align
+        return self.weight * (1.0 - cos).mean(), {"cos_mean": cos.mean().detach()}
+
+
 class VariationSuite:
     """Holds the enabled variations; the single seam the LightningModule talks to. Chains input
     transforms, sums loss terms, and namespaces every log under `{variation.name}/`."""
@@ -265,4 +294,8 @@ def make_variation_suite(cfg) -> VariationSuite:
     if ctw > 0.0:
         cg = (lambda k, d: ct.get(k, d)) if hasattr(ct, "get") else (lambda k, d: getattr(ct, k, d))
         out.append(Contraction(ctw, cg("target", 1.02), cg("power_iters", 2), cg("n_sample_steps", 4)))
+    ls = get("latent_straightness") or {}
+    lsw = float((ls.get("weight", 0.0) if hasattr(ls, "get") else getattr(ls, "weight", 0.0)) or 0.0)
+    if lsw > 0.0:
+        out.append(LatentStraightness(lsw))
     return VariationSuite(out)

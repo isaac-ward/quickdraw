@@ -95,16 +95,14 @@ def main(cfg):
 
     _t = time.perf_counter()
     _startup_log(run_dir, "[startup] loading dataset (GPU-resident windows) + normalizer...")
-    from .data.dataset import set_action_aggregate, set_obs_keep, set_subsample
-    set_subsample(int(cfg.data.get("subsample", 1) or 1))          # match the rate + obs layout the WM trained on
-    set_action_aggregate(str(cfg.data.get("action_aggregate", "sum")))   # beside the stride: same one-shot rule
-    set_obs_keep(cfg.data.get("obs_keep", None))                   # applied inside every loader + the normalizer
+    # (2026-09-21) No data-globals to set: normalizer(cfg) + window_loaders(cfg) build a DataConfig from cfg
+    # and hand it to every loader explicitly, so this matches the rate + obs layout the WM trained on by
+    # construction (was a trio of set_* calls that a new entrypoint could partially forget). See DataConfig.
     # Size the batch the SAME way train_world_model does -- same budget, same resident-frame-store estimate,
     # same linear fit + bisect -- with only the STEP swapped for this entrypoint's. Without this the batch fell
     # through to the inherited default of 1024, which OOMs on contact (1024 x (P+F) frames through the image
-    # encoder), so every launch had to pin data.batch by hand. Must run BEFORE window_loaders, exactly as in
-    # train_world_model: the probe budgets against a card the GPU-resident frame store has not been parked on
-    # yet, and set_subsample() above is what makes that estimate right.
+    # encoder), so every launch had to pin data.batch by hand. Must run BEFORE window_loaders: the probe
+    # budgets against a card the GPU-resident frame store has not been parked on yet.
     _ab_on = bool(cfg.data.get("autobatch", True)) and torch.cuda.is_available()
     if _ab_on:
         cfg.data.batch = int(autobatch_find(cfg, torch.device("cuda"),

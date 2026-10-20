@@ -23,6 +23,7 @@ from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate,
 from quickdraw.evaluation.steering import GaussianProposal, PriorProposal
 from quickdraw.training.setup import (build_model, env_cfg, image_head_cams, image_head_sizes,
                                       load_checkpoint, normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 
 # --- determinism of the seeded draw (appended check) ---
@@ -80,7 +81,7 @@ def main(run: str) -> int:
     A = effective_action_dim(cfg)
     img_head = next((n for n, _ in core.layout if n != "proprio"), None)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id=cfg.data.get("repo_id", "torus"))
+                                 cam=image_head_cams(cfg), repo_id=cfg.data.get("repo_id", "torus"), dcfg=DataConfig.legacy())
     o, a, fr = eps[0]
     t, B, K = 120, 2, 32
     obs_win = torch.from_numpy(o[t - P:t]).float()[None].expand(B, -1, -1).to(dev)          # (B,P,obs) RAW

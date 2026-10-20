@@ -25,6 +25,7 @@ from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate,
 from quickdraw.evaluation.steering import PriorProposal
 from quickdraw.training.setup import (build_model, effective_action_dim, image_head_cams, image_head_sizes,
                                       load_checkpoint, normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 NA = 4
 
@@ -38,7 +39,7 @@ def main(*runs: str) -> int:
         P, A, K = int(cfg.data.P), effective_action_dim(cfg), int(core.action_head_chunk)
         img = next((n for n, _ in core.layout if n != "proprio"), None)
         eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                     cam=image_head_cams(cfg), repo_id="starling-2")
+                                     cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
         ctxs = [(e, t) for e in range(len(eps)) for t in range(40, 380, 40)]
         with torch.no_grad():
             h = torch.cat([_h_ctx(core, norm,

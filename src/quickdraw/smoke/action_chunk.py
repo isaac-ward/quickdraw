@@ -38,8 +38,10 @@ def _eps(n_ep=3, T=41, a=4, seed=0):
 
 
 def _run(eps, s, mode):
-    D._SUBSAMPLE, D._ACTION_AGGREGATE, D._SUBSAMPLE_USED = s, mode, False
-    return D._subsample_episodes([tuple(e) for e in eps], "smoke/train")
+    # (2026-10-20 merge) was: poke D._SUBSAMPLE / D._ACTION_AGGREGATE directly. Those globals are gone;
+    # the stride and aggregation now ride on the DataConfig the function is handed.
+    return D._subsample_episodes([tuple(e) for e in eps], "smoke/train",
+                                 dcfg=D.DataConfig(subsample=s, action_aggregate=mode))
 
 
 def _old_sum(eps, s):

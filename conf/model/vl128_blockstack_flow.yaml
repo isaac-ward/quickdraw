@@ -1,0 +1,46 @@
+# =============================================================================================
+# vl128_blockstack_flow — vl128_blockstack_2cam with the two IMAGE heads on the up-backed FLOW decoder
+# (decode_kind=flow, decode_arch=up -> UpFlowDecoder: the SAME up backend + a mimics-up analysis path).
+# Select with `model=vl128_blockstack_flow`. Everything else is vl128_blockstack_2cam verbatim, so the ONLY
+# variable vs the up-mse baseline is the decode head. See design/up_flow_decoder.md.
+#
+# STOCHASTIC x0 by default (decode_stochastic=true). Record §8.29: the deterministic x0 decode is the
+# CONDITIONAL MEAN of p(frame|latent), and a mean over a multimodal codec is a BLEND of valid block configs
+# = the "mungey half-block". A SAMPLE lands on the data manifold = a coherent, valid, sharp set of blocks.
+# The earlier "sampling loses in open loop" (old §19.3) was a subsample=1 eval_checkpoint CONFOUND; the clean
+# redo at subsample=10 has stochastic NEUTRAL on cam_scene (0.092 vs 0.094 lpips) and BETTER on cam_wrist
+# (0.270 vs 0.362). So sample by default. Checkpoint selection stays on the DETERMINISTIC mean (lit.py forces
+# commit=True on the val metric — MSE-of-a-sample is bias^2+variance), so this changes the eval RENDERS +
+# LPIPS, not the monitor. Residual: samples flicker (independent per-frame noise); shared/warped rollout
+# noise is the temporal-coherence follow-up (§8.29, still open).
+#
+# WARM-START from an up-mse checkpoint's backend (UpFlowDecoder is a superset at init) for a fast, fair A/B.
+#
+#   python -m quickdraw.train model=vl128_blockstack_flow environments=recorded \
+#       data.repo_id=block-stack data.subsample=10 data.F=64 data.autobatch=false data.batch=<pinned> \
+#       trainer.checkpoint_monitor=val/metric/cam_scene/mse
+# =============================================================================================
+defaults:
+  - vl128_blockstack_2cam
+  - _self_
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them. Only decode_kind changes on the
+  # image heads (mse -> flow); every other value is vl128_blockstack_2cam verbatim.
+  - {name: proprio, kind: vector, dim: 17, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}
+
+  - {name: cam_scene, kind: image, cam: scene_right, weight: 1.0,
+     img_size: [96, 128], ae_bottleneck: 6, pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: flow, decode_arch: up, decode_base: 64, decode_param: x0, decode_stochastic: true, decode_shared_noise: true,
+     patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}
+
+  - {name: cam_wrist, kind: image, cam: gripper_right_top, weight: 1.0,
+     img_size: [96, 128], ae_bottleneck: 6, pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: flow, decode_arch: up, decode_base: 64, decode_param: x0, decode_stochastic: true, decode_shared_noise: true,
+     patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}

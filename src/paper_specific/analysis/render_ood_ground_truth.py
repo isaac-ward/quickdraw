@@ -29,6 +29,7 @@ from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate,
 from quickdraw.data.ood_windows import FPS, WINDOWS, kept
 from quickdraw.logging import viz
 from quickdraw.training.setup import image_head_cams, image_head_sizes, resolve_data_root
+from quickdraw.data.dataset import DataConfig
 
 KIND = {"eval_ood_noodle": "visual", "eval_ood_leafblower": "dynamic"}
 
@@ -40,7 +41,7 @@ def main(out_root: str = "logs/paper_icra_2027") -> int:
     root = resolve_data_root(cfg)
     for sp, kind in KIND.items():
         eps = load_split_episodes_mm(root, sp, img_size=image_head_sizes(cfg),
-                                     cam=image_head_cams(cfg), repo_id="starling-2")
+                                     cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
         key = list(eps[0][2])[0]
         d = os.path.join(out_root, "eval_ood", sp)
         keep = kept(sp)

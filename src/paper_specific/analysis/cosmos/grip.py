@@ -5,10 +5,11 @@ sys.path.insert(0, "/app/src")
 from huggingface_hub import snapshot_download
 from quickdraw.data.dataset import load_split_episodes, set_action_aggregate, set_subsample
 from scipy.ndimage import median_filter
+from quickdraw.data.dataset import DataConfig
 
 set_subsample(2); set_action_aggregate("concat")
 a = load_split_episodes(snapshot_download(repo_id="isaac-ronald-ward/block-stack",
-                                          repo_type="dataset"), "val", repo_id="block-stack")[0][1]
+                                          repo_type="dataset"), "val", repo_id="block-stack", dcfg=DataConfig.legacy())[0][1]
 g = a[:, 4::5].mean(1)                                   # gripper, concat sub-steps folded
 raw = g > 0.5
 print(f"  {len(g)} steps at 15 Hz. closed {100*raw.mean():.0f}% of the time")
