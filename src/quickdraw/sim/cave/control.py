@@ -192,6 +192,7 @@ def mppi_step(model, s12, goal_p, goal_yaw, scene, mean, rng,
 # with no hydrodynamic drag (unlike the AUV the recipe came from) a one-step plan either freezes short of the goal
 # (decay bleeds the creep) or cannot arrest the approach momentum. COARSE's chunky held actions give the reach
 # authority to close the last metre; the smooth near-goal velocity damping (w_vel, r_settle) settles the residual.
+SMOOTH = 0.6             # executed-action low-pass: a_exec = SMOOTH*a_mppi + (1-SMOOTH)*a_prev (de-jitter the motion)
 NEAR = 0.0               # FINE disabled: COARSE (with the warm-start fix) does the whole reach-and-hold
 NEAR_EXIT = 0.6          # (hysteresis bound; unused while NEAR=0)
 V_SETTLE = 0.15          # m/s; "settled" = speed below this (velocity-settling requirement)
@@ -225,6 +226,7 @@ def run_episode(plant, model, s0_12, goal_p, goal_yaw, scene, geodesic,
     done = False
     k = 0
     mode, mean = None, None
+    a_prev = np.zeros(4, np.float32)                     # for the executed-action low-pass (de-jitter)
     while k < steps and not done:
         # COARSE far = reach (long coherent lookahead); FINE within NEAR = station-keep (one-step + decay settle).
         # Hysteresis: enter FINE under NEAR, leave only past NEAR_EXIT -- jitter around NEAR keeps the settle plan.
@@ -241,6 +243,7 @@ def run_episode(plant, model, s0_12, goal_p, goal_yaw, scene, geodesic,
                             horizon=mode["horizon"], repeat=mode["repeat"],
                             samples=mode["samples"], sigma=mode["sigma"], w_vel=mode["w_vel"],
                             w_term=mode["w_term"], r_settle=mode["r_settle"], mean_decay=mode["mean_decay"])
+        a = (SMOOTH * a + (1 - SMOOTH) * a_prev).astype(np.float32); a_prev = a   # low-pass the executed command
         for _ in range(min(mode["exec_n"], steps - k)):
             c = scene.clearance(s[:3])
             traj.append(s.copy()); acts.append(a); clrs.append(c)

@@ -1,11 +1,11 @@
 """Cave control rendering: HYBRID splat cave + crisp drone + goal ghost, depth-composited.
 
-The CAVE is the real scene from `CaveScene.render_rgbd` -- the Gaussian SPLAT reconstruction where we have
-coverage, with the grapevine mesh (rock browns/greys, slightly darker) as the baked-lit fallback everywhere
-else. The DRONE and GHOST are the real SISL quadrotor MESH (body + 4 separable props at the arm tips, spinning;
-translucent solid-green ghost at the goal), rendered crisply in pyrender and composited OVER the cave by DEPTH
-(both depths in grapevine metres), so walls occlude the drone correctly. The FPV is the drone's own camera, so
-it sees the splat cave exactly as the world model was trained on it.
+The CAVE is a crisp grapevine surface MESH (pyrender, rock browns/greys) with the real Gaussian SPLAT composited
+OVER it by the splat's alpha: where the splat has coverage the real reconstruction shows, where it has none the
+mesh shows (NOT a low-res splat -- the mesh is real triangles). The DRONE and GHOST are the real SISL quadrotor
+MESH (body + 4 separable props at the arm tips, spinning; translucent solid-green ghost at the goal), rendered
+crisply in pyrender and composited OVER the cave by DEPTH (grapevine metres, from the mesh), so walls occlude the
+drone correctly. `CaveScene.render_splat_rgba` supplies the splat layer; `_load_cave` the mesh fallback.
 
 Drone meshes are extracted from cave-maps.blend to .npz (extract_drone_mesh.py). The 4 blade objects in the blend
 are identical geometry stacked at the origin (identity transforms), so we load ONE blade and place 4 copies at
@@ -68,6 +68,27 @@ def _load_parts():
             tips.append(c)
     _CACHE.update(body=body, logo=logo, blade=blade, tips=np.array(tips))
     return _CACHE
+
+
+def _load_cave():
+    """grapevine cave surface MESH (crisp triangles), flat rock browns/greys (height-tinted + mottled). This is the
+    FALLBACK everywhere the splat has no coverage; the real splat is composited over it by its alpha. Cached."""
+    if "cave" in _CACHE:
+        return _CACHE["cave"]
+    import trimesh
+    m = trimesh.load(CAVE_PLY, process=False)
+    if isinstance(m, trimesh.Scene):
+        m = trimesh.util.concatenate(tuple(m.geometry.values()))
+    z = m.vertices[:, 2]                                                # grapevine z (UP = -z)
+    t = (z - z.min()) / (np.ptp(z) + 1e-9)                              # 0 low .. 1 high
+    brown = np.array([0.42, 0.37, 0.32]); grey = np.array([0.46, 0.46, 0.46])   # muted rock, not tan/yellow
+    col = (1 - t)[:, None] * grey + t[:, None] * brown                 # ceiling greyer, floor a touch browner
+    rng = np.random.default_rng(0)
+    col = col * (0.8 + 0.4 * rng.random((len(z), 1)))                  # strong per-vertex mottling (rock, not a slab)
+    vc = np.clip(col, 0, 1)
+    m.visual.vertex_colors = (np.concatenate([vc, np.ones((len(z), 1))], 1) * 255).astype(np.uint8)
+    _CACHE["cave"] = m
+    return m
 
 
 def _spin_T(center, angle):
@@ -134,6 +155,15 @@ def _scenes(W, H, hfov_deg):
     def new_scene(amb):
         return pyrender.Scene(bg_color=[0, 0, 0, 0], ambient_light=[amb, amb, amb])
 
+    # cave MESH (fallback): LOW ambient + a dominant camera headlamp + one off-axis fill, so faces shade by their
+    # normal (relief/depth) rather than washing flat. Flat shading (smooth=False) on the scan reads as rock facets.
+    cave_sc = new_scene(0.28)
+    cave_node = cave_sc.add(pyrender.Mesh.from_trimesh(_load_cave(), smooth=False))
+    cave_cam = cave_sc.add(pyrender.PerspectiveCamera(yfov=yf, aspectRatio=W / H, znear=0.05))
+    cave_sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=2.0),                # fixed off-axis fill
+                pose=_look_at(np.array([3.0, -2.0, -4.0]), [0, 0, 0], [0, 0, 1]))
+    cave_light = cave_sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=3.5))   # camera headlamp (dominant)
+
     def drone_scene(green, amb):
         sc = new_scene(amb)
         body, logo, blades, tips = _mk_drone(green)
@@ -142,8 +172,8 @@ def _scenes(W, H, hfov_deg):
         light = sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=4.0))
         return dict(sc=sc, body=bn, logo=ln_, blades=bl, tips=tips, cam=cam, light=light)
 
-    # Only the drone + ghost are pyrender meshes now; the cave comes from the splat (scene.render_rgbd).
-    scn = dict(drone=drone_scene(False, 0.55), ghost=drone_scene(True, 0.7),
+    scn = dict(cave=dict(sc=cave_sc, node=cave_node, cam=cave_cam, light=cave_light),
+               drone=drone_scene(False, 0.55), ghost=drone_scene(True, 0.7),
                rend=pyrender.OffscreenRenderer(int(W), int(H)))
     _CACHE["scn"] = scn; _CACHE["scn_key"] = key
     return scn
@@ -171,12 +201,23 @@ def render_view(scene, eye, fwd, up, W, H, hfov_deg, p, R, blade_angle, goal_p, 
     scn = _scenes(W, H, hfov_deg)
     rend = scn["rend"]
     cp = _cam_pose(eye, fwd, up)
+    # SKIP_CULL_FACES: the cave is a one-sided surface whose normals face OUT, so from inside the cavern the walls
+    # are back-faces and would cull to black; render double-sided so the walls show.
     flags = pyrender.RenderFlags.RGBA | pyrender.RenderFlags.SKIP_CULL_FACES
 
-    # cave from the splat+mesh hybrid; depth in grapevine metres (inf where no geometry). ceil_cut slices the roof.
-    c_rgb, c_depth = scene.render_rgbd(eye, fwd, up, W=W, H=H, hfov=hfov_deg, ceil_cut=ceil_cut)
-    out = c_rgb.astype(np.float32)
-    has_cave = np.isfinite(c_depth)
+    # CAVE = crisp grapevine MESH (pyrender) with the real SPLAT composited over it by the splat's alpha. The mesh is
+    # the fallback everywhere; where the splat has coverage (alpha~1) the real reconstruction shows through, where it
+    # has none (alpha~0) the mesh shows. c_depth (grape metres, from the mesh) occludes the drone. ceil_cut slices
+    # the ceiling for the top-down (mesh via near-plane; splat via its own ceil_cut).
+    cav = scn["cave"]
+    cav["cam"].camera.znear = float(ceil_cut) if ceil_cut else 0.05
+    cav["sc"].set_pose(cav["cam"], cp); cav["sc"].set_pose(cav["light"], cp)
+    m_rgb, m_depth = rend.render(cav["sc"], flags=flags)
+    s_rgb, s_a, _ = scene.render_splat_rgba(eye, fwd, up, W=W, H=H, hfov=hfov_deg, ceil_cut=ceil_cut)
+    a = np.clip((s_a - 0.15) / 0.6, 0.0, 1.0)[..., None]                  # sharpen: ignore faint splat floaters
+    out = m_rgb[..., :3].astype(np.float32) * (1 - a) + s_rgb.astype(np.float32) * a
+    c_depth = np.where(m_depth > 0, m_depth, np.inf).astype(np.float32)   # mesh is the reliable occluder
+    has_cave = m_depth > 0
 
     # ghost at the goal (translucent), then drone over it (opaque)
     if show_ghost:

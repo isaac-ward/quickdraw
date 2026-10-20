@@ -103,10 +103,13 @@ def run(ckpt, root, out, points_npz, pairs, steps=360, dev="cuda", log=print):
     import jax.numpy as jnp  # noqa
     from prospector.cave_wm.record import build_dynamics
     from .control import TrueDyn, LearnedDyn
-    from .run_control import load_wm, sample_pose_pairs
+    from .run_control import load_wm, sample_pose_pairs, _patch_scene_render
 
+    # Skip the mesh-as-gaussians bake (_palette/_bake): the cave mesh is now drawn crisply by pyrender in
+    # drone_render, and only the real SPLAT gaussians + the clearance SDF are needed from CaveScene here.
+    _patch_scene_render()
     from prospector.cave_wm.scene import CaveScene
-    log("[setup] CaveScene (FULL: splat + rock mesh fallback, rendered for the video) ...")
+    log("[setup] CaveScene (splat gaussians + clearance; crisp grapevine mesh drawn by pyrender) ...")
     scene = CaveScene(log=lambda *a: None)
     dyn = build_dynamics(dt=1.0 / 30.0)
     core, norm, P = load_wm(ckpt, root, dev)
