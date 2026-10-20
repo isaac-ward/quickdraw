@@ -81,10 +81,16 @@ def _load_cave():
         m = trimesh.util.concatenate(tuple(m.geometry.values()))
     z = m.vertices[:, 2]                                                # grapevine z (UP = -z)
     t = (z - z.min()) / (np.ptp(z) + 1e-9)                              # 0 low .. 1 high
-    brown = np.array([0.42, 0.37, 0.32]); grey = np.array([0.46, 0.46, 0.46])   # muted rock, not tan/yellow
-    col = (1 - t)[:, None] * grey + t[:, None] * brown                 # ceiling greyer, floor a touch browner
+    brown = np.array([0.47, 0.36, 0.27]); grey = np.array([0.48, 0.42, 0.35])   # browner muted rock
+    col = (1 - t)[:, None] * grey + t[:, None] * brown                 # ceiling browner-grey, floor browner
     rng = np.random.default_rng(0)
-    col = col * (0.8 + 0.4 * rng.random((len(z), 1)))                  # strong per-vertex mottling (rock, not a slab)
+    # COARSE spatial mottle: one random shade per ~L cube so patches are ~5x coarser than per-vertex speckle; a
+    # faint per-vertex grain on top keeps it from looking perfectly blocky.
+    L = 0.20
+    cell = np.floor(m.vertices / L).astype(np.int64)
+    hsh = (cell[:, 0] * 73856093) ^ (cell[:, 1] * 19349663) ^ (cell[:, 2] * 83492791)
+    u = np.abs(np.sin(hsh.astype(np.float64) * 12.9898) * 43758.5453); u = u - np.floor(u)   # per-cell [0,1)
+    col = col * (0.72 + 0.56 * u[:, None]) * (1.0 + 0.04 * (rng.random((len(z), 1)) - 0.5))
     vc = np.clip(col, 0, 1)
     m.visual.vertex_colors = (np.concatenate([vc, np.ones((len(z), 1))], 1) * 255).astype(np.uint8)
     _CACHE["cave"] = m
