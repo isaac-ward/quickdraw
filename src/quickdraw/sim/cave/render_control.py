@@ -38,13 +38,16 @@ def _safe_eye(scene, eye, target, min_clear=0.3):
 
 
 def _cams(scene, p, R):
-    """(eye, fwd, ceil_cut) for fpv / chase / top. ceil_cut = cave near-plane for the overhead ceiling slice."""
-    fwd = R @ np.array([1, 0, 0.0])
-    fwd_h = fwd - (fwd @ UP) * UP; fwd_h /= np.linalg.norm(fwd_h) + 1e-9
-    fpv = (p, fwd, None)
-    chase_eye = _safe_eye(scene, p - 0.9 * fwd_h + 0.45 * UP, p)        # behind + above, close enough to read SISL
-    chase = (chase_eye, (p + 0.02 * UP) - chase_eye, None)
-    top = (p + TOP_H * UP, -UP + 0.12 * fwd_h, TOP_H - CEIL_SLICE)
+    """(eye, fwd, up, ceil_cut) for fpv / chase / top. ceil_cut = cave near-plane for the overhead ceiling slice.
+    The SISL logo on the drone top reads upright from the drone's LEFT side, so the chase camera sits off the left
+    (slightly behind + above) with up = body-up -> the logo is readable left-to-right."""
+    body_fwd = R @ np.array([1, 0, 0.0]); body_right = R @ np.array([0, 1, 0.0]); body_up = R @ np.array([0, 0, -1.0])
+    fwd_h = body_fwd - (body_fwd @ UP) * UP; fwd_h /= np.linalg.norm(fwd_h) + 1e-9
+    fpv = (p, body_fwd, UP, None)
+    off = -0.18 * body_fwd - 0.72 * body_right + 0.38 * body_up         # behind, LEFT, above (logo side); close
+    chase_eye = _safe_eye(scene, p + off, p)
+    chase = (chase_eye, p - chase_eye, body_up, None)
+    top = (p + TOP_H * UP, -UP + 0.12 * fwd_h, fwd_h, TOP_H - CEIL_SLICE)
     return fpv, chase, top
 
 
@@ -58,8 +61,8 @@ def _views(scene, s, goal_p, goal_yaw, fi):
     W, H = PANEL_WH
     fpv, chase, top = _cams(scene, p, R)
     out = []
-    for (eye, fwd, cut), show in ((fpv, False), (chase, True), (top, True)):      # FPV shows no drone (it IS the drone)
-        out.append(DR.render_view(eye, fwd, UP, W, H, HFOV, p, R, ang, goal_p, Rg,
+    for (eye, fwd, up, cut), show in ((fpv, False), (chase, True), (top, True)):   # FPV shows no drone (it IS the drone)
+        out.append(DR.render_view(eye, fwd, up, W, H, HFOV, p, R, ang, goal_p, Rg,
                                   show_drone=show, show_ghost=show, ghost_a=GHOST_A, ceil_cut=cut))
     return out
 

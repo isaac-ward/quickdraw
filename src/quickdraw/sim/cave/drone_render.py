@@ -22,6 +22,7 @@ import numpy as np
 
 ASSETS = "/home/ubuntu/user_irw/prospector/src/prospector/cave_wm/assets"
 CAVE_PLY = "/home/ubuntu/user_irw/prospector/src/assets/point_clouds/grapevine-exped-3.ply"
+LOGO_TEX = "/home/ubuntu/user_irw/prospector/src/assets/textures/droneBody_diffuse_SISL_Stanford.png"
 MM = 0.001                                         # mesh units (mm) -> meters
 PROP_LIFT = 0.012                                  # m: raise props slightly above the motor tops
 # mesh-local (x,z rotor plane, +y up) -> body (x forward, y right, z DOWN): swap y<->z and flip for z-down.
@@ -31,32 +32,36 @@ _CACHE = {}
 
 
 def _load_parts():
-    """body trimesh (centered), ONE blade trimesh (origin-centered), and 4 arm-tip offsets (m, local frame)."""
+    """body (paint colors), logo (UV-TEXTURED SISL shell), ONE blade (origin-centered), and 4 arm-tip offsets.
+    body/logo/blade share one center (the whole-drone centroid) so world placement puts the body centre at p."""
     if "body" in _CACHE:
         return _CACHE
     import trimesh
+    from PIL import Image
 
-    def load(npz):
+    def load_colored(npz):
         d = np.load(os.path.join(ASSETS, npz))
-        v = d["verts"].astype(np.float64) * MM
-        return trimesh.Trimesh(vertices=v, faces=d["faces"],
+        return trimesh.Trimesh(vertices=d["verts"].astype(np.float64) * MM, faces=d["faces"],
                                vertex_colors=(d["colors"] * 255).astype(np.uint8), process=False)
-    body = load("drone_body.npz")
-    blade = load("drone_blade0.npz")               # all 4 are identical; place copies at the arm tips
-    center = body.vertices.mean(0)
-    body.vertices -= center
-    # 4 motor arm-tips: per x-z quadrant, the outer ring of the body (max radius), lifted slightly up (+y local)
-    v = body.vertices
+    body = load_colored("drone_body.npz")
+    blade = load_colored("drone_blade0.npz")        # all 4 are identical; place copies at the arm tips
+    dl = np.load(os.path.join(ASSETS, "drone_logo.npz"))
+    tex = Image.open(LOGO_TEX).convert("RGB")
+    logo = trimesh.Trimesh(vertices=dl["verts"].astype(np.float64) * MM, faces=dl["faces"],
+                           visual=trimesh.visual.TextureVisuals(uv=dl["uv"], image=tex), process=False)
+    allv = np.concatenate([body.vertices, logo.vertices], 0)
+    center = allv.mean(0)
+    body.vertices -= center; logo.vertices -= center
+    # 4 motor arm-tips: per x-z quadrant, the outer ring (max radius) of the whole drone, lifted up (+y local)
+    v = np.concatenate([body.vertices, logo.vertices], 0)
     tips = []
     for sx in (+1, -1):
         for sz in (+1, -1):
-            m = (np.sign(v[:, 0]) == sx) & (np.sign(v[:, 2]) == sz)
-            sub = v[m]
+            sub = v[(np.sign(v[:, 0]) == sx) & (np.sign(v[:, 2]) == sz)]
             rr = np.linalg.norm(sub[:, [0, 2]], axis=1)
-            c = sub[rr > np.quantile(rr, 0.995)].mean(0)
-            c[1] += PROP_LIFT
+            c = sub[rr > np.quantile(rr, 0.995)].mean(0); c[1] += PROP_LIFT
             tips.append(c)
-    _CACHE.update(body=body, blade=blade, tips=np.array(tips))
+    _CACHE.update(body=body, logo=logo, blade=blade, tips=np.array(tips))
     return _CACHE
 
 
@@ -110,17 +115,22 @@ def _world(p, R, extra=None):
 
 
 def _mk_drone(green):
-    """pyrender Mesh list [body, blade x4-markers] for the drone (real) or green ghost."""
+    """(body_mesh, logo_mesh, [blade x4], tips) for the real drone, or all solid green for the ghost."""
     import pyrender
-    P = _load_parts()
 
-    def col(tm):
+    def green_mesh(tm):
         c = tm.copy()
-        if green:
-            vc = np.zeros((len(c.vertices), 4), np.uint8); vc[:, 1] = 230; vc[:, 3] = 255
-            c.visual.vertex_colors = vc
+        vc = np.zeros((len(c.vertices), 4), np.uint8); vc[:, 1] = 230; vc[:, 3] = 255
+        c.visual.vertex_colors = vc
         return pyrender.Mesh.from_trimesh(c, smooth=False)
-    return col(P["body"]), [col(P["blade"]) for _ in range(4)], P["tips"]
+    P = _load_parts()
+    if green:                                          # ghost: solid green, logo untextured (just geometry)
+        body = green_mesh(P["body"]); logo = green_mesh(P["logo"])
+    else:
+        body = pyrender.Mesh.from_trimesh(P["body"], smooth=False)
+        logo = pyrender.Mesh.from_trimesh(P["logo"], smooth=False)     # carries the SISL UV texture
+    blades = [pyrender.Mesh.from_trimesh(P["blade"], smooth=False) for _ in range(4)]
+    return body, logo, blades, P["tips"]
 
 
 def _scenes(W, H, hfov_deg):
@@ -151,11 +161,11 @@ def _scenes(W, H, hfov_deg):
 
     def drone_scene(green, amb):
         sc = new_scene(amb)
-        body, blades, tips = _mk_drone(green)
-        bn = sc.add(body); bl = [sc.add(b) for b in blades]
+        body, logo, blades, tips = _mk_drone(green)
+        bn = sc.add(body); ln_ = sc.add(logo); bl = [sc.add(b) for b in blades]
         cam = sc.add(pyrender.PerspectiveCamera(yfov=yf, aspectRatio=W / H, znear=0.02))
         light = sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=4.0))
-        return dict(sc=sc, body=bn, blades=bl, tips=tips, cam=cam, light=light)
+        return dict(sc=sc, body=bn, logo=ln_, blades=bl, tips=tips, cam=cam, light=light)
 
     scn = dict(cave=dict(sc=cave_sc, node=cave_node, cam=cave_cam, light=cave_light),
                drone=drone_scene(False, 0.55), ghost=drone_scene(True, 0.7),
@@ -167,6 +177,7 @@ def _scenes(W, H, hfov_deg):
 def _set_drone(d, p, R, blade_angle):
     sc = d["sc"]
     sc.set_pose(d["body"], _world(p, R))
+    sc.set_pose(d["logo"], _world(p, R))
     for i, bn in enumerate(d["blades"]):
         sc.set_pose(bn, _world(p, R, _spin_T(d["tips"][i], blade_angle)))
 
@@ -217,14 +228,15 @@ def inspect(out_path, size=512):
     import trimesh, pyrender
     from PIL import Image, ImageDraw
     P = _load_parts()
-    parts = [P["body"]]
-    for tip in P["tips"]:
-        b = P["blade"].copy(); b.vertices += tip; parts.append(b)
-    full = trimesh.util.concatenate(parts)
-    ext = full.extents; diag = float(np.linalg.norm(ext))
+    ext = np.ptp(np.concatenate([P["body"].vertices, P["logo"].vertices], 0), axis=0)
+    diag = float(np.linalg.norm(ext))
     axis = trimesh.creation.axis(origin_size=0.004, axis_length=0.12, axis_radius=0.0025)
-    sc = pyrender.Scene(bg_color=[18, 18, 22, 255], ambient_light=[0.5, 0.5, 0.5])
-    sc.add(pyrender.Mesh.from_trimesh(full, smooth=False))
+    sc = pyrender.Scene(bg_color=[18, 18, 22, 255], ambient_light=[0.6, 0.6, 0.6])
+    sc.add(pyrender.Mesh.from_trimesh(P["body"], smooth=False))
+    sc.add(pyrender.Mesh.from_trimesh(P["logo"], smooth=False))          # UV-textured SISL shell
+    for tip in P["tips"]:
+        b = P["blade"].copy(); b.vertices += tip
+        sc.add(pyrender.Mesh.from_trimesh(b, smooth=False))
     sc.add(pyrender.Mesh.from_trimesh(axis, smooth=False))
     cam = pyrender.PerspectiveCamera(yfov=np.pi / 4)
     light = pyrender.DirectionalLight(color=[1, 1, 1], intensity=4.0)
