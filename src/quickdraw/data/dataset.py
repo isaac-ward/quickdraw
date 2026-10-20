@@ -111,6 +111,7 @@ class Normalizer:
 # 20 Hz while training runs at 4 Hz -- the metrics would be measuring a different problem and would look
 # like the model failing. One source of truth makes that inconsistency impossible to write.
 _TRAIN_EPISODES = None     # cap on TRAIN episodes; None = all. See set_train_episodes.
+_TRAIN_STEPS = None        # cap on TRAIN *steps*; None = all. See set_train_steps.
 LOCK_STALE_S = 1800.0      # a frame-cache build lock older than this with no cache = a dead builder
 LOCK_WAIT_S = 5400.0       # how long to wait for another process's build before doing it ourselves
 _SUBSAMPLE = 1
@@ -212,10 +213,31 @@ def set_train_episodes(n) -> None:
     _TRAIN_EPISODES = None if n in (None, 0) else int(n)
 
 
+def set_train_steps(n) -> None:
+    """Cap TRAIN by cumulative STEPS (None = all). Val and other splits untouched.
+
+    Episodes are variable length once they end on contact, so an episode-count cap no longer means
+    a fixed amount of data: at a mean of 618 steps, 240 episodes is anywhere between 1.0 and 2.0
+    hours depending on which episodes they are. A data-volume ablation has to hold DATA constant,
+    so the small arm is capped by steps and "2.00 h" is literally true."""
+    global _TRAIN_STEPS
+    _TRAIN_STEPS = None if n in (None, 0) else int(n)
+
+
 def _cap_train(eps, split):
-    if _TRAIN_EPISODES is None or split != "train":
+    if split != "train":
         return eps
-    return eps[:_TRAIN_EPISODES]
+    if _TRAIN_EPISODES is not None:
+        eps = eps[:_TRAIN_EPISODES]
+    if _TRAIN_STEPS is not None:
+        out, tot = [], 0
+        for e in eps:
+            if tot >= _TRAIN_STEPS:
+                break
+            out.append(e)
+            tot += len(e[0])
+        eps = out
+    return eps
 
 
 def set_obs_keep(idx) -> None:
@@ -477,8 +499,16 @@ def load_split_episodes_mm(root: str, split: str, img_size=128, cam="fpv", repo_
         assert len(fr) == len(obs_all), f"{c}/row count mismatch: {len(fr)} vs {len(obs_all)}"
         per_key[k] = fr
     ids = np.unique(ep_idx)
-    if _TRAIN_EPISODES is not None and split == "train":
-        ids = ids[:_TRAIN_EPISODES]
+    if split == "train" and (_TRAIN_EPISODES is not None or _TRAIN_STEPS is not None):
+        keep, tot = [], 0
+        for n_i, e in enumerate(ids):
+            if _TRAIN_EPISODES is not None and n_i >= _TRAIN_EPISODES:
+                break
+            if _TRAIN_STEPS is not None and tot >= _TRAIN_STEPS:
+                break
+            keep.append(e)
+            tot += int((ep_idx == e).sum())
+        ids = np.array(keep)
     return _subsample_episodes(
         [(obs_all[ep_idx == e], act_all[ep_idx == e],
           {k: np.asarray(fr[ep_idx == e]) for k, fr in per_key.items()}) for e in ids],

@@ -43,11 +43,11 @@
 # batches is 2,400 windows: ample to rank checkpoints, and the heavyweight open-loop and
 # 16-step-ahead evals run on their own cadence regardless of this number.
 cd /app
-R=/app/logs/recording_2026_10_19_00_30_50_mbari-tank
+R=logs/recording_2026_10_20_01_59_08_mbari-tank
 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -u -m quickdraw.train_world_model \
   model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
-  data.root=$R data.repo_id=mbari-tank data.cam=fpv data.subsample=1 data.action_aggregate=concat data.autobatch=false data.batch=6 +data.train_episodes=240 \
+  data.root=$R data.repo_id=mbari-tank data.cam=fpv data.subsample=1 data.action_aggregate=concat data.autobatch=false data.batch=6 +data.train_steps=173000 \
   trainer.max_epochs=10 +trainer.limit_train_batches=8000 +trainer.limit_val_batches=400 trainer.check_val_every_n_epoch=1 \
   trainer.checkpoint_monitor=val/metric/fpv/mse \
   eval.during_train.evals.manifold=false \
@@ -57,8 +57,8 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python -u -m quickdraw.train_world_model \
   eval.during_train.every_epochs=2 \
   eval.decode_chunk=32 eval.closed_loop_horizon=64 \
   +run_summary.problem="No world model exists for the MBARI tank underwater domain so we cannot do uncertainty based OOD detection or model based control there" \
-  +run_summary.tried="An uncapped schedule on this data was launched three times tonight and abandoned - autobatch gave the two arms different batch sizes which breaks the comparison and epoch 0 alone ran over six hours because p_tf ramps inside it so neither the parallel teacher forced path nor the compiled autoregressive path applies" \
+  +run_summary.tried="Earlier attempts on the v6 data were abandoned for three reasons now fixed - autobatch handed the two arms different batch sizes which breaks the comparison - validation was left uncapped at 19896 batches so one epoch cycle took 13.5 hours - and 6 percent of frames had the vehicle outside the tank because nothing stopped it leaving" \
   +run_summary.trying="vl128_blockstack_2cam transplanted to one fpv image head at 144x192 plus a 13 dim proprio head on 2 hours of 30 Hz AUV data" \
-  +run_summary.trying_detail="Data volume ablation arm on 240 train episodes of one shared pack so both arms see identical val episodes and identical norm stats. Epochs capped at 8000 batches x 10 is 80000 matched gradient steps at batch 6 because an uncapped epoch measured over 2.8 s per batch and the first checkpoint would have been a day away. Only dataset forced fields changed - proprio 13 action 6 one image head bottleneck 9" \
+  +run_summary.trying_detail="Data volume ablation 2 hour control arm on the v7 dataset where episodes end on contact with walls buoys ladder or hook and generation tops up to a STEP target so all three behaviour classes get two hours each. This arm reads the 173000 step prefix of one shared pack so both arms see identical val episodes and identical norm stats. Batch pinned at 6 and epochs capped at 8000 batches with validation capped at 400" \
   +run_summary.rationale="That recipe holds the open loop records on robocasa and block-stack and every inherited value was bought with an experiment so a minimal transplant isolates the new domain as the only variable. This is the 2 h CONTROL arm of the data-volume ablation - 40 epochs on a third of the data is 477480 steps against the 6 h arm 501368 so the two differ in DATA not compute" \
   experiment=mbari_fpv_2h
