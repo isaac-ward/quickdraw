@@ -15,7 +15,10 @@ mkdir -p /app/logs/mbari/data/shardlogs
 
 run_shards () {   # $1 = extra args
   for k in $(seq 0 $((N-1))); do
-    CUDA_VISIBLE_DEVICES=$((k % 2)) MUJOCO_GL=egl \
+    # MUJOCO_EGL_DEVICE_ID is what picks the GPU for an EGL context -- CUDA_VISIBLE_DEVICES does
+    # NOT, so without this every shard renders on device 0 and the second card sits idle (observed:
+    # GPU0 99%, GPU1 0%). Both are set: the first for EGL, the second for anything torch-side.
+    MUJOCO_EGL_DEVICE_ID=$((k % 2)) CUDA_VISIBLE_DEVICES=$((k % 2)) MUJOCO_GL=egl \
     .venv/bin/python -u -m quickdraw.sim.mbari.generate \
         --out $OUT --shard $k --shards $N --per-class $PER_CLASS --ood-per-class $OOD_PER_CLASS \
         $1 > /app/logs/mbari/data/shardlogs/shard_$k.log 2>&1 &

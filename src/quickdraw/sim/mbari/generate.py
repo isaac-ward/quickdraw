@@ -13,8 +13,11 @@ Each episode lands as its own `.npz` so a crashed worker costs one episode, not 
 """
 from __future__ import annotations
 
+import ast
+import collections
 import glob
 import os
+import re
 import pathlib
 import time
 
@@ -109,27 +112,48 @@ def steps_by_class(out, split):
 def plan_topup(out, split, target_steps, steps, glitch_p, intruder, seed_base, max_jobs=4000):
     """Jobs that fill each behaviour class up to `target_steps`, counting what is ALREADY on disk.
 
-    WHY THIS EXISTS. Episodes now end on contact, so a 900-step job does not necessarily yield 900
-    steps -- measured on v6, the random class keeps about half. Generating a fixed episode COUNT
-    therefore silently delivers less data than asked for, and unevenly: the random class truncates
-    far more than the planned circles, so an episode-balanced set is no longer a STEP-balanced one.
-    The spec was a third of the time in each class, so the target is expressed in STEPS and each
-    class is topped up until it gets there.
+    WHY THIS EXISTS. Episodes end on contact, so a 900-step job does not reliably yield 900 steps --
+    the random class keeps about a third. Generating a fixed episode COUNT therefore delivers less
+    data than asked for, and unevenly: planned circles rarely truncate while random usually does, so
+    an episode-balanced set is not the STEP-balanced one the spec asked for.
 
-    Seeds come from a reserved band per split so a top-up can never collide with the base plan.
+    TWO THINGS THIS HAS TO GET RIGHT, both of which it got wrong first time round:
+
+      INDICES MUST BE FRESH. Numbering from a fixed base meant round 2 proposed exactly the files
+      round 1 had written, run_serial skipped them all as already-on-disk, and rounds 2-6 were
+      silent no-ops -- the shortfall printed identically five times while nothing generated.
+      The next index now continues past whatever is already in that class's band.
+
+      THE ESTIMATE MUST USE THE OBSERVED YIELD. Assuming a job returns `steps` under-provisions
+      every round by the truncation factor, so the deficit shrinks geometrically instead of
+      closing. The mean length actually achieved per class is measured and used.
     """
     from .trajectories import CLASSES
 
-    got = steps_by_class(out, split)
+    got, lens = collections.Counter(), collections.defaultdict(list)
+    for f in glob.glob(str(pathlib.Path(out) / split / "ep_*.npz")):
+        if ".tmp." in f:
+            continue
+        try:
+            m = ast.literal_eval(str(np.load(f)["meta"]))
+        except Exception:                                      # noqa: BLE001 - partial file
+            continue
+        got[m["kind"]] += int(m["steps"])
+        lens[m["kind"]].append(int(m["steps"]))
+    used = {int(re.search(r"ep_(\d+)", f).group(1))
+            for f in glob.glob(str(pathlib.Path(out) / split / "ep_*.npz")) if ".tmp." not in f}
     have = {c: int(got.get(c, 0)) for c in CLASSES}
-    jobs, k = [], 0
+
+    jobs = []
     for ci, c in enumerate(CLASSES):
-        deficit = target_steps - have[c]
-        while deficit > 0 and k < max_jobs:
-            idx = 900000 + ci * 100000 + k                    # episode index, well clear of the plan
-            jobs.append((split, idx, c, seed_base + ci * 100000 + k, steps, None, glitch_p, intruder))
-            deficit -= steps                                   # assume full length; a short one is
-            k += 1                                             # caught on the next pass
+        lo = 900000 + ci * 100000
+        nxt = max([i for i in used if lo <= i < lo + 100000], default=lo - 1) + 1
+        yield_ = float(np.mean(lens[c])) if lens[c] else float(steps)   # observed, not assumed
+        need = target_steps - have[c]
+        n = min(max_jobs, int(np.ceil(need / max(1.0, yield_))))
+        for k in range(max(0, n)):
+            jobs.append((split, nxt + k, c, seed_base + ci * 100000 + nxt + k - lo,
+                         steps, None, glitch_p, intruder))
     return jobs, have
 
 
