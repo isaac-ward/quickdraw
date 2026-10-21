@@ -467,7 +467,10 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         _emit_prompt_log(writer, prompts, subroutine, n_plot, step)
         if not has_pro:
             return {}                       # the image products are emitted; the SCALAR here is proprio
-        return {f"{subroutine}/proprio/pointwise_error": float(curves["pointwise_error"].mean())}
+        # nanmean, like log_error_curves: the sliding X-ahead mode masks its invalid lead-in
+        # (the first X-1 frames have no X-ahead forecast) as NaN, and a plain mean propagates that
+        # straight into the headline -- ahead_16_steps/proprio/pointwise_error reported NaN.
+        return {f"{subroutine}/proprio/pointwise_error": float(_np.nanmean(curves["pointwise_error"]))}
 
     modes = _modes               # from ood_horizon_shapes above -- ONE definition, shared with probe_eval
     prog(0, f"start: {n_ep} eps, H={H} (closed-loop H={cl_h}), heads={heads}, modes={[mn for mn, _, _ in modes]}")
