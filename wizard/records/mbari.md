@@ -569,6 +569,64 @@ A quadrotor must decay toward HOVER thrust, not zero; must penalise `||a - a_hov
 and cannot treat the attitude weight as optional, because attitude IS its lateral force — the
 `w_att` result above is a six-actuated-DOF result and does not transfer.
 
+## Session update (2026-10-21) — the ablation ends early, and three bugs that only a real run finds
+
+### The 2 h arm DIVERGED at epoch 4. The ablation is truncated, deliberately.
+
+| | ep 3 | ep 4 | ep 5 |
+|---|---|---|---|
+| 2h train / val | 3.4688 / 3.6864 | **8.8620 / 8.5816** | 8.8677 / 8.5787 |
+| 6h train / val | 3.9522 / 3.4531 | 3.2786 / 3.1763 | 3.1271 / 3.1672 |
+
+Loss more than doubled in one epoch and sat there. The eval agrees: OL LPIPS @+1 went
+0.1281 -> **0.4675** and the whole curve flattened to ~0.48-0.50, which is what a model that has
+stopped tracking the target looks like. Killed at 05:5x.
+
+**What the ablation can still claim, and what it cannot.** Through epoch 3 both arms were healthy
+and the comparison is honest:
+
+| OL LPIPS | @+1 | @+16 | @+32 | @+64 | @+100 | @+203 |
+|---|---|---|---|---|---|---|
+| 6h ep3 | 0.1053 | 0.2408 | 0.3008 | 0.4067 | 0.4306 | 0.4700 |
+| 2h ep3 | 0.1281 | 0.2764 | 0.3199 | 0.4110 | 0.4331 | 0.4723 |
+| gap | -17.8% | -12.9% | -6.0% | **-1.0%** | -0.6% | -0.5% |
+
+So: **at matched compute, 3x the data buys 13-18% at short horizon and ~1% at long horizon.** It
+cannot claim a 10-epoch result, and it cannot claim the 2 h arm would have stayed competitive.
+USER DECISION 2026-10-21: do NOT re-run the 2 h arm. A day of GPU to sharpen a secondary number is
+worth less than items 14-16, which had not started. The truncation is reported, not hidden.
+
+One observation worth a sentence, not a claim: the arm with a third of the data destabilised and
+the other did not, at identical hyperparameters. n=1, no seed repeat, so it is a thing to watch
+rather than a finding.
+
+### The 6 h arm OOMed mid-eval and was resumed
+
+CUDA OOM at 04:43 inside LPIPS during the epoch-5 eval, at 93.07 of 93.10 GiB. The epoch-5
+checkpoint and the full `epoch_0005/` eval tree were already written, so only the process was lost.
+Resumed from `last.ckpt` into the SAME run dir (so epochs 0-5 and `best_model_score` survive), with
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and `ahead_horizon` 64 -> 32 for headroom.
+
+Launched from an immutable copy in `scratch/`, NOT by editing `train_mbari.sh` -- bash reads a
+running script lazily by byte offset, and that script was still live at the time.
+
+### Three bugs, all found by running the pipeline at epoch 5 instead of waiting for epoch 10
+
+1. **Pre-merge checkpoints would not load at all** (94 missing tensors). The `decoders/` package
+   nested the image decoder under `.back`. Fixed with a key migration in BOTH load paths -- see
+   `migrate_decoder_keys`. The package's "byte-identical to the pre-package decoder" note is about
+   NUMERICS and says nothing about state_dict keys.
+2. **Resuming any image run was ALREADY broken before the merge**, on 36 unexpected `visual._net.*`
+   keys -- the frozen LPIPS net is written into the checkpoint but not registered on the
+   resume-side build. Verified by reproducing it on pre-merge code. The migration drops them.
+3. **`ahead_16_steps/proprio/pointwise_error` reported NaN.** The sliding mode masks its lead-in as
+   NaN and that one summary scalar used a plain `.mean()`. `log_error_curves` already nanmeans.
+
+THE GENERAL LESSON, which is the reason this section exists: all three were invisible to the merge,
+to the smoke suite, and to `compileall`. They appeared the first time a real checkpoint met the
+real pipeline. Run the post-training pipeline against an EARLY checkpoint, while there is still
+training time left to absorb the fix.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
