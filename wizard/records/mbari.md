@@ -600,6 +600,57 @@ One observation worth a sentence, not a claim: the arm with a third of the data 
 the other did not, at identical hyperparameters. n=1, no seed repeat, so it is a thing to watch
 rather than a finding.
 
+### BOTH ARMS DIVERGED. This recipe is unstable on this dataset after 4-7 epochs.
+
+The 6 h arm blew up at epoch 7, exactly as the 2 h arm did at epoch 4 -- same recipe, different data
+volume, so this is the RECIPE, not bad luck with one run.
+
+| | ep 5 | ep 6 | ep 7 |
+|---|---|---|---|
+| 6h train / val | 3.1271 / 3.1672 | 3.2030 / 2.9979 | **12.5716 / 12.1275** |
+
+Every loss component moved at once, which is what makes it look like one shared cause rather than a
+single term running away:
+
+| component | ep 6 | ep 7 | x |
+|---|---|---|---|
+| dynamics/latent | 0.064 | 1.604 | **25x** |
+| codec/roundtrip_proprio | 0.005 | 0.249 | **50x** |
+| decode/proprio | 0.059 | 0.622 | 10x |
+| codec/roundtrip_fpv | 0.248 | 0.919 | 3.7x |
+| decode/fpv | 0.593 | 0.909 | 1.5x |
+| total | 3.203 | 12.572 | 3.9x |
+
+The latent terms move hardest and the pixel terms least, which reads as a latent-space blow-up
+propagating outward through the codec roundtrip and the decoders rather than a decoder fault.
+
+The eval agrees, and in the same shape the 2 h arm showed: open-loop LPIPS goes FLAT at ~0.47
+across every horizon, which is a model no longer tracking its target at all, not a model that is
+merely worse.
+
+| 6h open-loop LPIPS | @+1 | @+16 | @+64 | @+203 |
+|---|---|---|---|---|
+| eval 3 | 0.1053 | 0.2408 | **0.4067** | 0.4700 |
+| eval 5 | 0.0879 | 0.2539 | 0.4190 | 0.4605 |
+| eval 7 | 0.4631 | 0.4681 | 0.4665 | 0.4757 |
+
+NOT CAUSED BY THE RESUME. The 6 h arm diverged one epoch after being resumed, which is suspicious
+until you remember the 2 h arm diverged at epoch 4 having never been resumed at all. The resume
+restored epoch, optimizer and scheduler correctly (`[ep 6]`, loss continuous at 3.20 across the
+boundary); the blow-up is one epoch later and matches the other arm's pattern.
+
+**WHAT THIS MEANS FOR THE RESULT.** The best long-horizon quality this transplant ever reached is
+**OL LPIPS @+64 = 0.4067 at epoch 3**, against the historical best of 0.2783. It was still improving
+at short horizon through epoch 5 (@+1 0.1053 -> 0.0879) while already flat-to-worse at long horizon
+(@+64 0.4067 -> 0.4190), so there is no reading of the curve where more epochs of this recipe were
+going to reach the record. `best.ckpt` is pinned at `epoch=4-step=40000.ckpt` (monitor 0.00709) and
+survived both later epochs, so the usable weights are safe.
+
+OPEN QUESTION, not yet investigated: what actually destabilises it. `latent_loss_weight=10` is
+LOCKED by the user and was not touched. Gradient clipping, the codec/dynamics interaction, and the
+LR schedule at the 4-7 epoch mark are the obvious suspects, in that order. Diagnosing this is the
+next real piece of work on item 13 -- more epochs of the same recipe is not.
+
 ### The 6 h arm OOMed mid-eval and was resumed
 
 CUDA OOM at 04:43 inside LPIPS during the epoch-5 eval, at 93.07 of 93.10 GiB. The epoch-5
