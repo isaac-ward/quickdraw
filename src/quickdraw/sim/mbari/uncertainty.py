@@ -97,20 +97,41 @@ def confusion_3way(scores_by_class: dict[str, dict[str, np.ndarray]], channels=C
             "balanced_acc": float(per_class.mean())}
 
 
-def surprise_map(samples, obs, eps=1e-3, pool=8):
+def surprise_map(samples, obs, eps=1e-3, pool=8, smooth=False):
     """|obs - mean| / (std + eps) per pixel, mean-pooled over `pool` x `pool` patches.
 
     `samples` (K,H,W,3) decoded draws of the SAME next latent; `obs` (H,W,3) what actually happened.
     Both in [0,1]. Returns (H,W) float -- the pooling is why 8x8 scored 0.961 against raw absdiff's
-    0.909 on starling: a single-pixel disagreement is noise, a patch of them is an object."""
+    0.909 on starling: a single-pixel disagreement is noise, a patch of them is an object.
+
+    `smooth` separates the DENOISING from the BLOCKINESS (2026-10-22). The 0.961 came from averaging
+    over a patch; nothing in that result requires the output to be a staircase of 8x8 tiles, which is
+    purely an artefact of expanding the pooled grid back with np.kron. With smooth=True the same patch
+    average is applied as a moving window at full resolution, so the map denoises identically but reads
+    as a continuous heat map instead of a chunky grid. Scoring keeps the blocky default so the measured
+    AUC still describes the thing that produced it; the VIDEO asks for smooth.
+    """
     s = np.asarray(samples, np.float32)
     mu, sd = s.mean(0), s.std(0)
     z = np.abs(np.asarray(obs, np.float32) - mu) / (sd + eps)
     z = z.mean(-1)
     if pool > 1:
         H, W = z.shape
-        ph, pw = H // pool * pool, W // pool * pool
-        blocks = z[:ph, :pw].reshape(ph // pool, pool, pw // pool, pool).mean((1, 3))
-        z = np.kron(blocks, np.ones((pool, pool), np.float32))
-        z = np.pad(z, ((0, H - z.shape[0]), (0, W - z.shape[1])), mode="edge")
+        if smooth:                                   # box filter at full resolution, same window
+            # float64 SAT: the running sum reaches ~H*W*max(z), and in float32 a window difference of
+            # ~z against a total of ~1e4 loses most of its significant digits -- a constant field came
+            # back non-constant. The table is one array, so the cost of f64 here is noise.
+            c = np.cumsum(np.cumsum(np.pad(z.astype(np.float64), ((1, 0), (1, 0))), 0), 1)
+            r = pool // 2
+            y0 = np.clip(np.arange(H) - r, 0, H); y1 = np.clip(np.arange(H) - r + pool, 0, H)
+            x0 = np.clip(np.arange(W) - r, 0, W); x1 = np.clip(np.arange(W) - r + pool, 0, W)
+            area = np.maximum(1, (y1 - y0)[:, None] * (x1 - x0)[None, :])
+            z = (c[np.ix_(y1, x1)] - c[np.ix_(y0, x1)]
+                 - c[np.ix_(y1, x0)] + c[np.ix_(y0, x0)]) / area
+            z = z.astype(np.float32)
+        else:
+            ph, pw = H // pool * pool, W // pool * pool
+            blocks = z[:ph, :pw].reshape(ph // pool, pool, pw // pool, pool).mean((1, 3))
+            z = np.kron(blocks, np.ones((pool, pool), np.float32))
+            z = np.pad(z, ((0, H - z.shape[0]), (0, W - z.shape[1])), mode="edge")
     return z

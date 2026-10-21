@@ -678,6 +678,34 @@ to the smoke suite, and to `compileall`. They appeared the first time a real che
 real pipeline. Run the post-training pipeline against an EARLY checkpoint, while there is still
 training time left to absorb the fix.
 
+### Pixel-surprise rendering: the blockiness was a scoring choice leaking into a picture (2026-10-22)
+
+The surprise panel read as a chunky ~18x24 grid because `surprise_map` mean-pools the per-pixel
+z-map into 8x8 blocks and then expands it back with `np.kron` -- nearest neighbour, so the tiles are
+literally visible.
+
+The POOLING is earned: starling measured pixel AUC **0.961** at 8x8 against **0.909** for raw
+`|absdiff|` and **0.530** for bare `std`, on the reasoning that one disagreeing pixel is noise and a
+patch of them is an object. What is NOT earned is the staircase: nothing in that result requires the
+output to be piecewise-constant. It was an artefact of how the pooled grid got expanded.
+
+Split the two:
+
+- `surprise_map(..., smooth=True)` applies the SAME patch average as a moving window at full
+  resolution -- identical denoising, continuous heat map. Scoring keeps the blocky default so the
+  measured 0.961 still describes the thing that produced it.
+- the VIDEO now also drops `pool` 8 -> 4. Even smoothed, an 8-wide window is coarse on a 144x192
+  frame for localising something buoy-sized.
+- measured on a real-shaped frame: 372 distinct values -> 4918, same overall level.
+
+A numerical bug fell out of writing it, worth keeping: the box filter's summed-area table in float32
+returned a NON-CONSTANT map for a constant input. The running sum reaches ~H*W*max(z), so a window
+difference of ~z against a total of ~1e4 loses most of its significant digits. The table is now
+float64 -- one array, so the cost is noise, and a constant field now comes back exactly constant.
+
+Panel headings are now plain **Observed / Predicted / Surprise**. The middle one said "Predicted
+mean of 32", which described the implementation rather than the thing a reader is looking at.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)

@@ -139,12 +139,26 @@ if __name__ == "__main__":
     ap.add_argument("--ckpt", default=None, help="training run dir or .ckpt; adds the learned arm")
     ap.add_argument("--out", default="/app/logs/mbari/control")
     ap.add_argument("--trials", type=int, default=6)
+    # One arm at a time, because the arms cost wildly different amounts and an A/B of the LEARNED one
+    # should not re-pay for true+analytic every time -- those two are a fixed reference, not a variable.
+    ap.add_argument("--arms", default="true,analytic,learned",
+                    help="comma-separated subset of true,analytic,learned")
+    ap.add_argument("--no-integrate", action="store_true",
+                    help="learned arm: use the model's RAW absolute pose instead of integrating its "
+                         "predicted velocities from the true state (see control._integrate_from_true)")
     a = ap.parse_args()
 
     from . import control as C, record
 
+    if a.no_integrate:
+        C.LEARNED_INTEGRATE = False
+    want = [x.strip() for x in a.arms.split(",") if x.strip()]
     m = record.load_model()
-    dyns = [C.TrueDynamics(m), C.AnalyticDynamics()]
-    if a.ckpt:
+    dyns = []
+    if "true" in want:
+        dyns.append(C.TrueDynamics(m))
+    if "analytic" in want:
+        dyns.append(C.AnalyticDynamics())
+    if "learned" in want and a.ckpt:
         dyns.append(learned_from(a.ckpt, m))
     run(dyns, out=a.out, n_trials=a.trials, log=lambda s: print(s, flush=True))

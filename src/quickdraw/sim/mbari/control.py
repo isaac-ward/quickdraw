@@ -168,7 +168,60 @@ class LearnedDynamics:
         with torch.no_grad():
             out = self.core.imagine_shared(ctx, seq, H * repeat, K, heads=["proprio"], norm=self.norm)
         pro = self.norm.denorm_obs(out["proprio"].cpu()).numpy()     # (K,H*repeat,13)
+        if LEARNED_INTEGRATE:
+            pro = _integrate_from_true(pro, np.asarray(self.o[-1], np.float64))
         return pro[:, repeat - 1::repeat][:, :H]
+
+
+# ----------------------------------------------------------------- learned-model state anchoring
+LEARNED_INTEGRATE = True      # see _integrate_from_true; False restores the raw absolute prediction
+
+
+def _integrate_from_true(pro, s0):
+    """Rebuild position and attitude by INTEGRATING the model's predicted velocities from the TRUE state.
+
+    WHY. The proprio head emits all 13 dims directly, absolute position and quaternion included, and the
+    MPPI cost is distance-to-goal computed on those. Absolute position in tank coordinates is the hardest
+    thing in the vector -- it asks the model to globally self-localise from an FPV frame -- while linear and
+    angular velocity are LOCAL quantities readable from recent frames plus the commanded action. So the
+    planner was scoring candidates in a frame that could sit metres from the vehicle's real one, which is
+    what the first learned benchmark looked like: 3.974 m final, 0% reaching the goal, several trials
+    closing in and then diverging.
+
+    This keeps the model's velocities and throws its pose away, integrating instead from `s0`, the true
+    state the plant just handed us through `observe`:
+
+        p[k+1] = p[k] + dt * v_hat[k]                       v_hat WORLD  (mola.state dims 7:10)
+        q[k+1] = normalise(q[k] + dt * 0.5 * q[k] (x) w_hat) w_hat BODY   (dims 10:13)
+
+    Same integrator and the same body-frame quaternion convention as AnalyticDynamics, so the two arms
+    differ only in where the velocities come from.
+
+    THE TRADE, stated because it is not free: integration accumulates bias LINEARLY, so a small constant
+    velocity error becomes metres of drift over a 72-step horizon, where the direct prediction does not
+    drift at all -- it is merely unanchored. This swaps an offset failure for a drift failure, and which is
+    smaller is an empirical question. `LEARNED_INTEGRATE = False` runs the other arm for comparison.
+    """
+    K, T, _ = pro.shape
+    out = pro.copy()
+    dt = 1.0 / FPS
+    p = np.repeat(s0[None, :3], K, 0).astype(np.float64)
+    q = np.repeat(s0[None, 3:7], K, 0).astype(np.float64)
+    for k in range(T):
+        v = pro[:, k, 7:10].astype(np.float64)
+        w = pro[:, k, 10:13].astype(np.float64)
+        p = p + dt * v
+        q0, q1, q2, q3 = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        w0, w1, w2 = w[:, 0], w[:, 1], w[:, 2]
+        dq = 0.5 * np.stack([-q1 * w0 - q2 * w1 - q3 * w2,
+                             q0 * w0 + q2 * w2 - q3 * w1,
+                             q0 * w1 - q1 * w2 + q3 * w0,
+                             q0 * w2 + q1 * w1 - q2 * w0], 1)
+        q = q + dt * dq
+        q = q / np.maximum(1e-9, np.linalg.norm(q, axis=1, keepdims=True))
+        out[:, k, :3] = p
+        out[:, k, 3:7] = q
+    return out
 
 
 # ----------------------------------------------------------------- planner

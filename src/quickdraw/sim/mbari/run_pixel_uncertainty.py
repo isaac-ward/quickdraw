@@ -34,7 +34,7 @@ def _heat(x, lo=None, hi=None):
 
 
 @torch.no_grad()
-def episode_maps(core, norm, o, a, fr, key="fpv", P=8, dev="cuda", K=32, stride=2, pool=8,
+def episode_maps(core, norm, o, a, fr, key="fpv", P=8, dev="cuda", K=32, stride=2, pool=4,
                  max_frames=150):
     """-> (obs, pred_mean, surprise) each (N,H,W,3)/(N,H,W), subsampled by `stride`."""
     T = len(o)
@@ -53,7 +53,10 @@ def episode_maps(core, norm, o, a, fr, key="fpv", P=8, dev="cuda", K=32, stride=
         truth = fr[t].astype(np.float32) / 255.0
         obs_out.append((truth * 255).astype(np.uint8))
         mu_out.append((s.mean(0) * 255).astype(np.uint8))
-        sur_out.append(surprise_map(s, truth, pool=pool))
+        # smooth=True: same patch average, rendered at full resolution instead of as 8x8 tiles.
+        # pool 8 -> 4 as well: the staircase was doing most of the damage, but 8 is also coarse
+        # on a 144x192 frame (an 18x24 grid) for localising something the size of a buoy.
+        sur_out.append(surprise_map(s, truth, pool=pool, smooth=True))
     return np.stack(obs_out), np.stack(mu_out), np.stack(sur_out)
 
 
@@ -67,7 +70,7 @@ def render(core, norm, root, split, ep_idx, out_dir, key="fpv", P=8, dev="cuda",
                                 key=key, P=P, dev=dev, K=K)
     lo, hi = float(np.percentile(sur, 2)), float(np.percentile(sur, 99))
     heat = np.stack([_heat(s, lo, hi) for s in sur])
-    canvas = viz.label_panels([obs, mu, heat], ["Observed", f"Predicted mean of {K}", "Surprise"],
+    canvas = viz.label_panels([obs, mu, heat], ["Observed", "Predicted", "Surprise"],
                               panel_wh=(288, 216), header_px=49, font_px=30)
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
