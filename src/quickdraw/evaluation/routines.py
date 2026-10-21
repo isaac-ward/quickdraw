@@ -476,7 +476,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     prog(0, f"start: {n_ep} eps, H={H} (closed-loop H={cl_h}), heads={heads}, modes={[mn for mn, _, _ in modes]}")
     summary = {}
     for k, (name, every, Hm) in enumerate(modes):
-        prog(int(5 + 90 * k / len(modes)), f"mode {name} (re-ground every {every} steps, H={Hm})"
+        prog(int(5 + 90 * k / len(modes)),
+             f"mode {name} (sliding {every}-steps-ahead forecast, H={Hm})"
              if every < Hm else f"mode {name} (open-loop, no re-grounding, H={Hm})")
         open_loop = every >= Hm
         if open_loop:
