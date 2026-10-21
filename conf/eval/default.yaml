@@ -36,13 +36,21 @@ horizon_split: val         # which split eval_ood_horizon reads when it is calle
 horizon_n_episodes: null   # null -> 8 with an image head, a DECODE cap sized for val's ~1785-step
 #                             episodes. The OOD/memory clips are ~31 model steps, so 12 scores every
 #                             episode in those splits instead of discarding a fifth of a 10-episode one.
-closed_loop_steps: [1, 16] # eval_ood_horizon extra modes: re-inject the GROUND-TRUTH obs as context every X steps
-#                            (X in this list) -> products under eval_ood_horizon/closed_loop_<X>_steps/ alongside
-#                            eval_ood_horizon/open_loop/. Env-agnostic.
-closed_loop_horizon: 256   # caps the rollout horizon for the CLOSED-LOOP modes ONLY (open_loop keeps the full
-#                            `horizon`). The closed-loop error-vs-step signal is stationary/periodic (it resets every
-#                            X steps), so a shorter horizon captures it; and cl_1 at full H is n_ep*H context-encodes
-#                            = slow. Set null/0 to use the full `horizon` for closed-loop too.
+ahead_steps: [1, 16]       # eval_ood_horizon extra modes: the SLIDING X-steps-ahead forecast, one X per entry
+#                            -> products under eval_ood_horizon/ahead_<X>_steps/ beside eval_ood_horizon/open_loop/.
+#                            At every valid target frame j the prediction is grounded on the P GT frames ending X
+#                            steps earlier, so the reported lead is X UNIFORMLY. RENAMED from closed_loop_steps
+#                            2026-10-20, when the rollout changed from segment-and-reset (ground, roll X,
+#                            concatenate) whose lead sawtoothed 1..X and so flattered the number it was labelled
+#                            with. The old key is a hard error, not an alias -- numbers are not comparable.
+#                            Env-agnostic.
+ahead_horizon: 256         # caps the horizon for the SLIDING modes ONLY (open_loop keeps the full `horizon`).
+#                            The X-ahead error is stationary in the lead -- every valid frame is the same
+#                            prediction problem -- so a shorter horizon buys the same signal with fewer anchors.
+#                            COST NOTE: anchors are one per valid target, rows = n_ep*(Hm-X+1), NOT n_ep*ceil(Hm/X)
+#                            as under the old rollout; each rolls X steps but decodes only ONE frame
+#                            (imagine_eval decode_last), so decode cost is ~flat and the latent rollout is ~Xx.
+#                            Set null/0 to use the full `horizon`.
 n_episodes: 64             # episodes averaged per OOD open-loop eval (proprio-only; image heads use 8, decode cost)
 manifold_max_steps: 1024   # cap on the per-episode length eval_manifold FORWARDS. Its cost scales with
 #                            EPISODE LENGTH, not with the 8000-point sample cap: manifold_predictions runs

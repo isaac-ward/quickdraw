@@ -702,7 +702,7 @@ def autobatch_find(cfg, device, log=print, step_probe=None) -> int:
     #
     # KEY PROPERTY that makes this a REPORT rather than a subtraction: eval memory does NOT depend on data.batch.
     # It is fixed by the eval config (ood_horizon hardcodes n_ep=8 at routines.py:133, plus eval.horizon,
-    # ae_floor_episodes, closed_loop_steps) and by the model. Training activations are freed before eval and the
+    # ae_floor_episodes, ahead_steps) and by the model. Training activations are freed before eval and the
     # allocator reuses those blocks, so the two phases do not add -- each must independently fit the budget.
     def _synth_eval(B, T_ctx, H):
         obs = {}
@@ -765,7 +765,7 @@ def autobatch_find(cfg, device, log=print, step_probe=None) -> int:
     if _ev == -1.0:
         log("[autobatch] WARNING: the eval phase OOM'd on its own, INDEPENDENT of data.batch. Training will "
             "still be sized (correctly -- eval cost does not depend on the batch), but expect eval routines to "
-            "fail and self-disable. Shrink eval.horizon / eval.closed_loop_steps / eval.ae_floor_episodes, or "
+            "fail and self-disable. Shrink eval.horizon / eval.ahead_steps / eval.ae_floor_episodes, or "
             "turn off manifold.")
     elif _ev is not None and _ev > budget:
         # WARN, never raise: eval routines self-disable after two failures, so refusing to start a run on an

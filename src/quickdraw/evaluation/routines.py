@@ -45,7 +45,7 @@ def _emit_prompt_log(writer, prompts, subroutine, n_plot, step):
     it survives nowhere else — the mp4 beside this file cannot be read back into the words that produced
     it. Models that take actions as numbers log nothing and no file is written.
 
-    `prompts` comes from rollout_regrounded, already re-indexed to GLOBAL rows. Rows are
+    `prompts` comes from the rollout, already re-indexed to GLOBAL rows. Rows are
     (episode, segment), so a closed-loop mode contributes n_seg entries per episode and the step ranges
     below are made ABSOLUTE by adding the segment's own offset — otherwise every segment of a cl_16 run
     would claim to cover steps +1..+16.
@@ -150,11 +150,11 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int, n_ep_overrid
     default -- was under-modelled 8x), capped the horizon at an arbitrary 256 instead of applying the
     episode-length clamp (on robocasa val, min length 128 means H is 119 for ANY configured horizon, so the
     probe rolled 256 steps for a routine that can only ever roll 119 -- the whole "91GB" false alarm), and
-    modelled only open_loop when the real memory peak is closed_loop_16.
+    modelled only open_loop when the real memory peak is ahead_16.
 
     Returns (n_ep, H, cl_h, modes, calls) where modes = [(name, every, horizon)] and calls =
     [(name, rows, horizon)] is the per-imagine_eval-call shape, i.e. the memory-relevant unit (see
-    rollout_regrounded's `cap`)."""
+    rollout_open_loop's / the sliding rollout's `cap`)."""
     # 8 with an image head is a DECODE-COST cap on val's ~1785-step episodes. The OOD/memory splits are
     # ~31 model steps, so decoding all 10-12 of them costs less than 8 of val's -- and with only 10 episodes
     # in a split, throwing 2 away for no reason weakens the only measurement they exist for. The override
@@ -162,14 +162,34 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int, n_ep_overrid
     n_ep = min(int(n_ep_override) if n_ep_override else
                (8 if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32)), len(ep_lens))
     H = min(int(cfg.eval.get("horizon", 2048)), min(ep_lens[:n_ep]) - P - 1)
-    cl_steps = [int(x) for x in cfg.eval.get("closed_loop_steps", [1, 16])]
-    cl_h = min(H, int(cfg.eval.get("closed_loop_horizon", 256) or H))
-    modes = [("open_loop", H, H)] + [(f"closed_loop_{x}_steps", x, cl_h) for x in cl_steps]
+    # RENAMED 2026-10-20, and the old names are a HARD ERROR rather than an alias. `closed_loop_{X}_steps`
+    # used to mean segment-and-reset -- ground on GT, roll X, concatenate -- whose reported lead at step h
+    # was ((h-1) mod X)+1, a sawtooth that averages short leads into a number labelled X. That rollout is
+    # gone; every non-open-loop mode is now the uniform sliding X-ahead forecast. Accepting the old key
+    # would hand new semantics to a config that asked for the old ones, and silently make a run's numbers
+    # incomparable to the ones beside it -- so a stale key stops the run instead.
+    for old, new in (("closed_loop_steps", "ahead_steps"), ("closed_loop_horizon", "ahead_horizon")):
+        if cfg.eval.get(old, None) is not None:
+            raise ValueError(
+                f"eval.{old} was renamed to eval.{new} (2026-10-20) because the mode it configures changed "
+                f"MEANING: closed_loop_{{X}}_steps was a segment-and-reset rollout whose lead sawtoothed "
+                f"from 1 to X; it is now a uniform sliding X-steps-ahead forecast. Rename the key. Numbers "
+                f"produced under the old name are NOT comparable to the new ones -- see "
+                f"wizard/records/longhand.md.")
+    cl_steps = [int(x) for x in cfg.eval.get("ahead_steps", [1, 16])]
+    cl_h = min(H, int(cfg.eval.get("ahead_horizon", 256) or H))
+    modes = [("open_loop", H, H)] + [(f"ahead_{x}_steps", x, cl_h) for x in cl_steps]
     calls = []
     for name, every, Hm in modes:
         e = min(int(every), Hm)
-        n_seg = -(-Hm // e)                                   # ceil
-        calls.append((name, min(max(n_ep, 64), n_ep * n_seg), e))   # `cap = max(n_ep, 64)` in rollout_regrounded
+        if e >= Hm:                                           # open loop: ONE rollout of the full horizon
+            calls.append((name, n_ep, Hm))
+            continue
+        # SLIDING: one anchor per valid target, not one per segment. rows = n_ep * (Hm - X + 1), each
+        # rolling X steps and decoding ONE frame. The old math was n_ep * ceil(Hm/X), which for Hm=64,
+        # X=16 said 32 rows where the truth is 392 -- an eval-memory probe reading the old number would
+        # under-budget by an order of magnitude and OOM the way the 52 GB eval did.
+        calls.append((name, min(max(n_ep, 64), n_ep * (Hm - e + 1)), e))   # `cap = max(n_ep, 64)` below
     return n_ep, H, cl_h, modes, calls
 
 
@@ -181,9 +201,12 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     proprio (always) + any image head; the code generalizes over arbitrary trunks. Products are nested under
     a MODE sub-path, one full product set per mode:
       - eval_ood_horizon/open_loop/*                — pure open-loop rollout (context = the first P frames).
-      - eval_ood_horizon/closed_loop_{X}_steps/*    — re-inject the GROUND-TRUTH observation as context every X
-        steps (one sub-tree per X in eval.closed_loop_steps, default [1, 16]). open_loop IS re-grounding with
-        every=H (one segment) — so all modes share ONE rollout fn + ONE emit fn.
+      - eval_ood_horizon/ahead_{X}_steps/*          — the SLIDING X-steps-ahead forecast (one sub-tree per X
+        in eval.ahead_steps, default [1, 16]): at every valid target frame j the prediction is grounded on the
+        P GT frames ending X steps earlier, so the reported lead is X UNIFORMLY and a perfect model matches GT
+        frame for frame. The first X-1 frames carry no forecast (masked via valid_from, black in the
+        filmstrip). This replaced a segment-and-reset rollout whose lead sawtoothed 1..X and was therefore
+        optimistically biased; see wizard/records/longhand.md.
     Within each mode, one block per head under <head>/: AVERAGED error_vs_step_avg_{linear,log} + *_mean scalars
     (proprio/ obs_error/manifold/pointwise/tangent, each image <head>/ psnr/ssim/mse/l1) + per-episode visuals
     (proprio/trajectory_*, image <head>/filmstrip_i + rollout_i). n_ep=8 with an image head (decode cost)."""
@@ -251,17 +274,17 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     itrue = {h: torch.stack([torch.from_numpy(fr[h][P:P + H]) for _, _, fr in eps]).float().div(255.0).to(device)
              for h in img_heads}
 
-    # What a text-conditioned model was told, filled by rollout_regrounded and drained by score_and_emit.
+    # What a text-conditioned model was told, filled by the rollout and drained by score_and_emit.
     # Shared state rather than a return value so the rollout's signature is unchanged for every other model.
     prompts: dict = {}
 
-    def rollout_regrounded(every, Hm, want_bag=False):
+    def rollout_open_loop(every, Hm, want_bag=False):
         """Hm-step predicted obs (dict per head, (n_ep,Hm,...)), re-grounding on GT every `every` steps. Segment
         the horizon into ceil(Hm/every) chunks; segment s uses GT context obs[s*every:s*every+P] and actions
         a[s*every:s*every+P+every-1], rolls `every` steps via imagine_eval, keeps min(every, Hm-s*every), then
         concatenates the segments in time. Segments are batched over (episode, segment); the batch is chunked
         (context encode is NOT decode_chunk'd) so cl_1 doesn't OOM. every=Hm -> ONE segment == pure open-loop.
-        Hm = this mode's horizon (open_loop uses the full H; closed-loop uses min(H, eval.closed_loop_horizon))."""
+        Hm = this mode's horizon (open_loop uses the full H; sliding modes use min(H, eval.ahead_horizon))."""
         every = min(int(every), Hm)
         n_seg = -(-Hm // every)                                             # ceil(Hm/every)
         C = {"proprio": []} if has_pro else {}
@@ -454,7 +477,7 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
              if every < Hm else f"mode {name} (open-loop, no re-grounding, H={Hm})")
         open_loop = every >= Hm
         if open_loop:
-            out, bag = rollout_regrounded(every, Hm, want_bag=True)
+            out, bag = rollout_open_loop(every, Hm, want_bag=True)
             valid_from = 0
             desc = ("Open-loop long-horizon rollout: a BLACK agent on the TRUE path and a GREY agent on the "
                     "model's PREDICTED path, sharing the context then diverging at the fork.")

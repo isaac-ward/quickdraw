@@ -1163,6 +1163,31 @@ shutdown: WM arc src/conf + all oneoff/smoke scripts"` — a bulk dump before a 
 isolated, never reviewed. Replaying that commit onto main would have reverted three weeks of main's
 work in `routines.py` alone (main was ~915 lines ahead there).
 
+### The old behaviour is GONE, and the key was renamed with it (2026-10-21)
+
+`closed_loop_{X}_steps` -> **`ahead_{X}_steps`**, and `eval.closed_loop_steps` / `closed_loop_horizon`
+-> **`eval.ahead_steps` / `ahead_horizon`**. The old keys are a HARD ERROR, not an alias: the mode
+they configure changed MEANING, so accepting them would hand new semantics to a config that asked
+for the old ones and silently make a run's numbers incomparable to the ones beside it.
+
+Two things went with the rename:
+
+- `rollout_regrounded` is now `rollout_open_loop`. It is reachable only as the single-segment
+  open-loop rollout; the multi-segment path that produced the sawtooth has no caller.
+- **The row math in `ood_horizon_shapes` was wrong for the sliding rollout and is fixed.** Anchors
+  are one per valid TARGET, so `rows = n_ep * (Hm - X + 1)`, not `n_ep * ceil(Hm/X)`. At Hm=64,
+  X=16 the old expression said 32 rows where the truth is 392 (capped to 64 per call). An eval
+  memory probe reading the old number under-budgets by an order of magnitude -- which is how the
+  52 GB eval OOM happened the first time, so this one is worth not re-learning.
+
+CONSEQUENCE FOR THE RUNNING ARMS: both started 03:08/03:11 on 2026-10-20, hours before this landed,
+and Python binds its imports at start. **They are still running the OLD segment-and-reset rollout**,
+so their `closed_loop_16_steps` numbers at every epoch are old semantics. Only a new run gets
+sliding. `train_mbari.sh` / `train_mbari_2h.sh` still pass `eval.closed_loop_horizon=64` and were
+NOT edited, because bash reads a running script lazily by byte offset and both are still live --
+the next launch from them will stop with the rename error, which is the intended guardrail. Their
+eval-memory comments also reason in `n_seg`, which no longer exists; re-derive before the next run.
+
 ### The metric-key trap, now fixed
 
 On this branch `rollout_xstep_ahead` replaced the segment-and-reset rollout but the mode kept the

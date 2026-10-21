@@ -25,7 +25,7 @@ CUDA_VISIBLE_DEVICES=$GPU .venv/bin/python -u -m quickdraw.eval_ood_horizon \
   checkpoint=$R model=mbari_fpv data=mbari environments=recorded \
   environments.obs_dim=13 environments.action_dim=6 environments.dt=0.0333333 \
   data.subsample=1 data.action_aggregate=concat \
-  eval.horizon=900 "eval.closed_loop_steps=[16]" \
+  eval.horizon=900 "eval.ahead_steps=[16]" \
   experiment=mbari_openloop_$TAG > $L/worldmodel/openloop_$TAG.log 2>&1
 grep -iE "lpips|psnr|wrote|run dir" $L/worldmodel/openloop_$TAG.log | tail -12
 
