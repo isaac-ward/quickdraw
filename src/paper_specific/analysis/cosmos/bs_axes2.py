@@ -15,7 +15,8 @@ root = snapshot_download(repo_id="isaac-ronald-ward/block-stack", repo_type="dat
 
 # ---- 1. rot6 layout: which flattening makes the two 3-vectors orthonormal? -------------------------
 from quickdraw.data.dataset import load_split_episodes
-eps = load_split_episodes(root, "train", repo_id="block-stack")
+from quickdraw.data.dataset import DataConfig
+eps = load_split_episodes(root, "train", repo_id="block-stack", dcfg=DataConfig.legacy())
 R6 = np.concatenate([o[:, 3:9] for o, _ in eps], 0)
 for label, (u, v) in {"col-major [c0|c1]": (R6[:, 0:3], R6[:, 3:6]),
                       "row-major [r0|r1]": (R6[:, 0::2], R6[:, 1::2])}.items():
@@ -34,7 +35,7 @@ for label, sl in {"col-major": (0, 1), "row-major": (0, 2)}.items():
           f"(+ stick -> {'CCW seen from +z' if r > 0 else 'CW seen from +z'})")
 
 # ---- 3. apparent motion in scene_left, for the prompt wording ---------------------------------------
-mm = load_split_episodes_mm(root, "val", img_size=(72, 96), cam="scene_left", repo_id="block-stack")
+mm = load_split_episodes_mm(root, "val", img_size=(72, 96), cam="scene_left", repo_id="block-stack", dcfg=DataConfig.legacy())
 o, a, fr = mm[0]
 img = fr["scene_left"].astype(np.float32).mean(-1) / 255.0        # (T,72,96) grey
 K = 24                                                            # frames apart: ~0.8 s at 30 Hz

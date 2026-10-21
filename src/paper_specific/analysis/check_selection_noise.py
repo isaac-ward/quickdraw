@@ -29,6 +29,7 @@ from quickdraw.evaluation.steering import PriorProposal
 from quickdraw.language.reward import LanguageReward
 from quickdraw.training.setup import (build_model, effective_action_dim, image_head_cams, image_head_sizes,
                                       load_checkpoint, normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 REQ = "climb"
 
@@ -43,7 +44,7 @@ def main(run: str, head: str) -> int:
     lang = LanguageReward(head, device="cuda")
     t_e = lang.text_embedding(REQ).reshape(-1)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id=cfg.data.get("repo_id", "torus"))
+                                 cam=image_head_cams(cfg), repo_id=cfg.data.get("repo_id", "torus"), dcfg=DataConfig.legacy())
     o, a, fr = eps[4]
     t = 55
     ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[t - P:t])).float()[None].cuda(),

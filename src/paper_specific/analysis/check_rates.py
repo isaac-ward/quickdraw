@@ -25,6 +25,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))   # sibling analyses in this package
 from steer_physical import WANTS, physical, yaw_of                          # noqa: E402
+from quickdraw.data.dataset import DataConfig
 
 DT = 4.0 / 15.0                     # subsample 4 on a 15 Hz dataset
 
@@ -47,7 +48,7 @@ def recorded(span: int = 128):
         "logs/paper_icra_2027/model_backups/train_action_2026_09_14_04_41_17_s2_ah_chunk32_full/logs/config.json")))
     set_subsample(4); set_action_aggregate("concat")
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
     nets, rr = [], {k: [] for k in ("yaw", "altitude", "horizontal")}
     for o, _, _ in eps:
         for i in range(0, len(o) - span, span // 2):

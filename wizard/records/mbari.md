@@ -249,6 +249,326 @@ Plus: attribute the docking fix (`scratch/_attrib.py`, queued), and dock videos
 - Val is **20%**, not the house 10%, because val is both the checkpoint monitor AND that nominal
   reference, and a 90th-percentile threshold from 72 episodes rests on about 7 in the tail.
 
+## Session update (2026-10-19 02:00) — control, cameras, and two loader fixes
+
+### The control benchmark now scores POSE, not position
+`goals()` returned only the dock entry POSITION and `run_episode` was called with `goal_q=None`, so
+even the task named "reach a random POSE" was scoring position alone — and an AUV that arrives at
+the dock entry pointing the wrong way has not docked. Both tasks now carry a target quaternion:
+the dock's is the DOCK BODY'S OWN orientation, so the vehicle ends aligned with the entry axis.
+
+Scoring it needed care after the MPPI port. `controller.mppi._score` builds its observation as
+`cat(p_xyz, v_xyz)` — six dims, no quaternion — so a `reward_fn` physically cannot see attitude.
+The shared module's other path takes a per-step `dist` (G,K,H) override, which is what language
+steering uses, so attitude rides there:
+
+    dist = ||p - p*||  +  w_att * angle(q, q*)  +  wall barrier        w_att = 1.2 rad^-1
+
+The benchmark reports final attitude in degrees beside final distance, so a position-only
+"success" cannot hide. First pose-targeted results, TRUE dynamics:
+
+| trial | start | final | attitude |
+|---|---|---|---|
+| dock 0 | 7.86 m | 0.093 m | 12.5 deg |
+| dock 1 | 9.03 m | 0.154 m | 8.2 deg |
+| random pose 0 | 2.92 m | 0.172 m | 12.7 deg |
+
+### Cameras for watching a control episode
+`run_episode` takes a `render=` and captures frames from the PLANT's own MjData each executed
+step, so an episode can be watched in the tank rather than read off a plot.
+
+- **The chase camera is useless at the moment that matters.** It is body-mounted 4.2 m astern, and
+  the dock sits 1.1 m from a corner, so at arrival the camera is inside the concrete.
+- **A GOAL camera was added, and it does NOT orbit.** First attempt circled the target, which looks
+  better for one second and then sweeps straight through a tank wall. It is now fixed, aimed once
+  at the goal, and placed on the tank-centre side of it: MuJoCo puts a free camera at
+  `lookat - d*(cos az, sin az)`, so setting the azimuth to the target's own bearing from the origin
+  guarantees the camera sits between the goal and the middle of the tank, which is always water.
+  `UnderwaterRenderer.look_at(target, dist=4.6, elev=-18)`, addressed as camera `dockcam`.
+- **Playback is REAL TIME.** Every frame at the 30 Hz sim rate written at 30 fps. The first version
+  kept every 4th frame and wrote 15 fps, so a 20 s approach played in 10 and looked hurried.
+- Five panels: FPV, Chase, Top-down, Side-on, Goal cam.
+- A second `UnderwaterRenderer` in one process returns an UNINITIALISED buffer — every episode
+  after the first rendered as pure noise. One renderer, reused. (Hit once before on the MOLA
+  material A/B, solved there with separate processes, and walked straight back into here.)
+
+### Two loader inefficiencies, fixed at the general layer (`data/dataset.py`, not MBARI)
+- **Reading more than you keep.** A run capped to 240 of 576 train episodes called `np.load` on the
+  whole 43 GB frame cache and discarded 25 GB, because the cap was applied after episodes were
+  built. `load_fpv_frames(mmap=True)` + filtering ids BEFORE indexing -> ~18 GB touched.
+- **Two processes decoding the same video.** The cache write was already atomic (per-pid temp then
+  rename), but atomicity protects the FILE, not the WORK: two runs started together each decoded
+  all 648k frames. Now one builder holds `<cache>.building` and the rest wait and mmap the result;
+  a lock older than 30 min with no cache is treated as a crashed builder and stolen. Verified with
+  three concurrent workers: one build, two waiters.
+- Deliberately NOT fixed: a capped run still builds the FULL cache. The cache is keyed only by
+  camera and size, so a partial one could be silently reused by a run that needs all of it.
+
+### The ablation, as actually launched
+Both arms read ONE dataset (`recording_2026_10_19_00_30_50_mbari-tank`, 576/144 at **20% val**),
+with run B capped by `+data.train_episodes=240` in the loader. Packing a second smaller dataset —
+the first attempt — gave it its own val split and its own normalization stats, so two things moved
+at once.
+
+| | run A | run B |
+|---|---|---|
+| train | 576 eps (6.00 h) | 240 eps (2.00 h) |
+| batch | 6 | 6 |
+| epochs | 6 | 14 |
+| steps | 477,504 | 464,240 |
+
+**Batch is PINNED at 6.** Autobatch sizes per-arm from `card - reserve - resident frame store`, and
+6 h of frames is ~43 GB resident, so it offered run A batch 6 and run B batch 12 — different
+gradient noise, and step counts diverging to 1.11 M vs 663 k.
+
+**OPEN RISK: epoch wall-clock is unmeasured.** 79,584 steps/epoch for run A, and this harness logs
+nothing between epoch boundaries, so there is no step rate until the first `[ep 0]` line. If an
+epoch is ~11 h then 6 epochs is 66 h and the epoch counts need cutting. A cleaner design if it has
+to be redone: `trainer.limit_train_batches=20000` on both arms, 4 epochs each = 80,000 steps
+exactly equal, with identical val cadence.
+
+### What is automatic and what is not
+- **Automatic**, during training, every 2 epochs: `eval.during_train.evals.ood_horizon` writes
+  open-loop AND both closed-loop modes (1-step and **16-step-ahead**) with filmstrips, mp4s and
+  curves. That is checklist item 13.
+- **Not automatic**: items 14 (uncertainty + 3-way OOD), 15 (pixel-uncertainty videos) and 16 (the
+  control benchmark's learned arm). They need a checkpoint AND the raw npz episodes, which no
+  training hook knows about — `run_after_train.sh <run_dir>` runs all three.
+
+### Published
+`https://huggingface.co/datasets/isaac-ronald-ward/mbari-tank` — 576 train / 144 val / 3 x 50 OOD,
+plus **870 per-trajectory preview mp4s** (one per episode, four cameras, 3.0 GB) embedded in the
+dataset card so they play on the page.
+
+## Known mismatch: the published dataset shows a SILVER hull, the code now renders YELLOW
+
+The MOLA's large pressure-hull group ships from the source model as flat grey (0.4, 0.4, 0.4) and
+is recoloured to yellow in `tank._recolour`, matched BY COLOUR rather than group index so a mesh
+reconversion cannot silently break it. The change was made after the dataset was generated, so:
+
+- `huggingface.co/datasets/isaac-ronald-ward/mbari-tank` — all 870 preview videos, and the
+  chase / top-down / side-on streams inside the LeRobot splits, show the **silver** hull.
+- Anything rendered from here — control videos, new previews — shows the **yellow** hull.
+
+**Training is unaffected.** The only stream the model sees is `fpv`, the vehicle's own forward
+camera, and the vehicle does not appear in its own FPV. The mismatch is cosmetic and confined to
+the third-person views.
+
+TO FIX: regenerate and re-push when the dataset is next rebuilt for any other reason. Not worth a
+65-minute regeneration plus a re-upload on its own.
+
+Two other scene changes made at the same time, both AFTER the dataset was built, so they carry the
+same caveat:
+- **The dock is a procedural white cradle**, flush and square against the -X wall (`DOCK_YAW=0.0`,
+  entry facing +X), replacing the Sketchfab mesh. Two reasons, and the second is not cosmetic.
+  The mesh's geometry is NOT aligned to its own body frame, so even with the body square the dock
+  rendered visibly skewed; and because the body quaternion is the control benchmark's ATTITUDE
+  TARGET, the translucent ghost marking that target could never line up with the structure the eye
+  reads as the dock. `_dock_geoms` builds a 0.90 x 0.72 m entry hoop with 1.30 m of rail behind it
+  and a pair of guide vanes, axis-aligned by construction -- so "square in the dock" and "matches
+  the target quaternion" are the same statement.
+- **A translucent green ghost of the vehicle** can be placed at the goal pose (`mjcf(ghost=True)`,
+  a mocap body, 25% alpha). OPT-IN and off by default, and never built for data generation -- a
+  goal marker in the training frames would be a feature the model could read instead of learning
+  the dynamics. NOTE: the alpha must be set on the GEOM, not only on the material. A geom's own
+  rgba defaults to (0.5, 0.5, 0.5, 1) and that default OVERRIDES the material's alpha, so the first
+  version rendered fully opaque while the material said 0.25.
+
+## Session update (2026-10-20) — the warm start that never retired, v7, and the restart
+
+### The controller arrived and then shook. The bug was three lines of warm start.
+
+The docking record below says 0.173 m -> 0.006 m and calls it done. Watching the videos said
+otherwise: the vehicle reaches the goal and then vibrates on it indefinitely. `final_dist` could not
+see this, which is the methodological point — **a single terminal frame cannot distinguish "stopped"
+from "passing through"**, and every number reported up to this point was a terminal frame.
+
+The diagnostic (`control_study probe`) dumps `dist`, `|v|`, `|w|`, `|a|` and `|da|` for the last
+seconds. The answer was immediate and unambiguous: at 5 cm from the target the planner was commanding
+**|a| = 0.33 of full thrust on all six axes, continuously**, with `|da|` near zero. High command,
+low command-CHANGE — not search noise, a stuck constant. That names the mechanism: the warm start.
+
+Near the goal the cost landscape is nearly flat. Every candidate scores alike, the softmax weights go
+uniform, the update barely moves `mean` — so whatever thrust the plan carried on approach keeps
+firing forever, because nothing ever takes it away. Two separate faults kept it alive:
+
+1. **`np.roll` WRAPS.** The last action of a plan became the first action of the next one. Stale
+   thrust was not merely retained, it was recycled in a loop.
+2. **`mean_decay` was never applied at all.** It lives in `MPPIConfig` and `controller/mppi.py`'s own
+   loop applies it, but `_mppi_step` leaves it to the caller — and this caller did not.
+
+Fixed to shift, zero-pad, decay:
+
+```python
+nxt = np.concatenate([plan[1:], np.zeros((1, plan.shape[1]), plan.dtype)], 0) * mean_decay
+```
+
+`python -m quickdraw.sim.mbari.control_study sweep decay`
+
+| mean_decay | final_m | att | \|v\| | \|a\| | \|da\| |
+|---|---|---|---|---|---|
+| 1.0 (the bug) | 0.031 | 1.4 | 0.180 | **0.170** | 0.042 |
+| **0.7** | 0.035 | 1.1 | 0.084 | **0.072** | 0.016 |
+| 0.4 | 0.060 | 1.7 | 0.124 | 0.069 | 0.013 |
+| 0.0 (cold start) | **0.867** | 3.1 | 0.148 | 0.073 | 0.015 |
+
+The lesson is NOT that warm starts are bad. A cold start is catastrophic — 96 draws of pure noise
+cannot find the approach without a sensible centre to sample around. The warm start has to exist AND
+has to bleed away. 0.7.
+
+### Penalise effort, not speed
+
+`sweep effort` and `sweep settle`. Two candidate cures for terminal speed, and only one works.
+
+| config | final_m | att | v_end |
+|---|---|---|---|
+| bctrl 0.02 bvel 0.00 | **0.143** | 10.6 | 0.512 |
+| bctrl 0.20 bvel 0.00 | 0.183 | 10.1 | 0.562 |
+| bctrl 1.00 bvel 0.00 | 0.309 | 13.4 | 0.583 |
+| bctrl 0.02 bvel 0.50 | 0.233 | 12.1 | 0.491 |
+
+A small cost on command magnitude damps the settling jitter; a large one simply prevents arrival. The
+gated near-goal VELOCITY penalty is worse than useless (0.233 against 0.143) — which is exactly what
+`controller/mppi.py` already said in the comment next to `beta_vel = 0`: *"it made the controller
+stall at the gate boundary"*. The shared module had measured this before we re-measured it. Reading
+the comment would have been cheaper than the sweep.
+
+### Attitude weight is almost pure cost, and the replan period is the real lever
+
+`python -m quickdraw.sim.mbari.control_study sweep attitude`
+
+| config | final_m | att° | wander | \|v\| | \|a\| | cost |
+|---|---|---|---|---|---|---|
+| w_att 0.3 | **0.021** | 1.5 | 0.024 | 0.045 | 0.041 | 1x |
+| w_att 1.2 (shipped) | 0.035 | 1.1 | 0.037 | 0.084 | 0.072 | 1x |
+| w_att 4.0 | 0.083 | 1.3 | 0.134 | 0.185 | 0.133 | 1x |
+| **exec_n 2** | **0.016** | **1.0** | **0.021** | 0.056 | 0.064 | 3x |
+| exec_n 1 | 0.020 | 1.0 | 0.018 | 0.044 | 0.067 | 6x |
+
+**`w_att` buys nothing above ~0.3.** Position error scales 4x from 0.021 to 0.083 as the weight
+rises, while attitude error does NOT improve — 1.5°, 1.1°, 1.3°, no trend. Attitude has its own floor
+near 1° set by the sampling noise, and weighting it harder only spends position. Tune it DOWN until
+attitude starts to degrade, rather than up until it feels important.
+
+**`exec_n` is the knee at 2.** `repeat` is how coarse the ACTIONS are; `exec_n` is how much of a plan
+is SPENT before replanning. They were the same number only because `run_episode` executed exactly
+what it planned. Separating them and halving the spend takes final error 0.035 -> 0.016 and wander
+0.037 -> 0.021. `exec_n 1` is no better than 2 at twice the cost.
+
+**Locked in as the default** (`control.py`): `w_att=0.3`, and one schedule
+`dict(repeat=6, horizon=12, samples=96, sigma=0.20, exec_n=2)` with `FINE = COARSE`. The two-mode
+range switch is kept but both modes now point at the swept schedule, so there is no second
+schedule in the codebase that nobody measured. Both benchmark arms inherit it, so item 16 still
+compares only the dynamics.
+
+COST NOTE: `exec_n 2` replans three times as often. On TrueDynamics that is CPU and free; on the
+LEARNED arm every replan is a batch of latent rollouts, so item 16 gets ~3x more expensive.
+
+### A caution on the first combined render: three trials, one noise realization
+
+The first render of the combined config returned 0.006 m / 0.4 deg / wander 0.011 on **all three
+trials, identical to three decimals**, from three different starts (4.35, 3.64, 5.09 m) and three
+different goals. Different episodes — the mp4s differ in size and content — and identical
+settling.
+
+The cause is a seed, not a bug in the controller: the render passed `seed=100` for every trial
+where the sweep passes `seed=100 + i`, and `run_episode` seeds the planner as `seed + k`. So all
+three drew the IDENTICAL noise sequence at every step index. Once the warm start has decayed near
+the goal the plan mean is ~0 and the candidate set is essentially that noise, so the residual
+jitter is one realization reported three times. The episodes are independent; **the settling
+statistics are n=1**.
+
+This is the same signature as the 0.173 m "ceiling" (two schedules, one number, and the number
+belonged to the harness). Identical numbers from nominally independent runs are a seed or a
+budget, never a result. `control_study sweep combined` re-measures it at seeds 100/101/102.
+
+### Collisions are now a first-class object, in the planner AND the plant
+
+Previously the barrier covered the four walls only, at a weight comparable to a metre of distance —
+so a plan that clipped a buoy to save two metres of travel **scored well**, and did it. Now:
+
+- `W_CRASH = 50.0` per step inside any solid. No amount of saved distance can buy that back.
+- The barrier covers the same `KEEPOUT` volumes `trajectories.clear` uses, so **planner and plant
+  agree on what a collision IS**. One predicate, two consumers; they cannot drift apart.
+- `run_episode` terminates with `crashed=True` on contact, and the recorder truncates the episode.
+- Target poses that would require a collision to reach are rejected at sampling time.
+
+### v7: 6.01 h, collision-free, balanced, on HF
+
+Regenerated with collisions active and the hook halved. Episodes now vary in length (they end on
+contact), which needed `data.dataset.set_train_steps` alongside `set_train_episodes`, and a
+`MIN_STEPS = 80` floor because a 0-frame episode cannot be encoded to mp4 and crashed the packer.
+25 zero-length episodes got through the first time: `_start_pose` tested `inside()` when it should
+have tested `clear()`.
+
+`python -m quickdraw.sim.mbari.verify logs/mbari/data/v7` is the acceptance check, and it says:
+
+```
+  1147 episodes, 715945 steps = 6.63 h
+  episodes containing a COLLIDING frame :    0   (want 0)
+  zero-length episodes                  :    0   (want 0)
+  ended on contact                      :  433 (38%)
+  train  circle      244  mean_len 891  2.01 h   ended_on_contact   3/244
+  train  circle_yaw  248  mean_len 886  2.03 h   ended_on_contact   6/248
+  train  random      489  mean_len 455  2.06 h   ended_on_contact 400/489
+```
+
+**The 1/3-1/3-1/3 balance is in HOURS, not in episodes, and it has to be.** 82% of `random`
+episodes end on contact against 1% of `circle` — a piecewise-constant random wrench walks into a
+wall, a fitted circle by construction does not. So random episodes are half the length (455 steps
+against ~890) and it takes twice as many of them (489 against 244) to buy the same 2 h. Anything
+that counts EPISODES per class will read this dataset as 2:1 imbalanced when it is balanced to
+within 2.5% on the axis that matters. Train total: 6.10 h.
+
+Top-up rounds to fill the full 6 h rather than accepting the shortfall. Two bugs there, both
+arithmetic rather than physics: fixed episode indices collided with prior rounds (so later rounds
+silently overwrote earlier ones), and the deficit was computed from ASSUMED yield rather than
+OBSERVED, so the top-ups were systematically too small.
+
+### The 13.5 h epoch was `limit_val_batches`, never set
+
+Training was cycling at 13.5 h per epoch against an estimated 2.9. Cause: `limit_train_batches=8000`
+was set and `limit_val_batches` was not, so validation ran its full **19,896 batches** — two and a
+half times the training it was validating. Both arms were killed (with permission) and relaunched
+from scratch with `+trainer.limit_val_batches=400`. 135 h -> 29 h for the full schedule.
+
+### The two arms, as restarted 2026-10-20 03:08
+
+Same compute, different data volume — the ablation is unchanged, only the schedule is fixed.
+
+| | runA | runB |
+|---|---|---|
+| dir | `logs/train_world_model_2026_10_20_03_08_59_mbari_fpv_v1` | `..._03_11_07_mbari_fpv_2h` |
+| data | 6.11 h (all 785 train episodes) | 2 h (`+data.train_steps=173000`) |
+| batch | 6, pinned | 6, pinned |
+
+`data.autobatch=false data.batch=6` is deliberate: autobatch chose 6 for one arm and 12 for the
+other because the resident frame store differs with dataset size, which would have confounded the
+data-volume comparison with a batch-size comparison.
+
+### Why the sweeps are committed now (`control_study.py`)
+
+Every table above was produced by a separate throwaway in `scratch/`, which is gitignored. Four
+copies of the same twenty lines, none of them reproducible by anyone else, and a record full of
+numbers nobody can re-check. They are now one module where the grids are data and the loop is
+written once; each table above names the command that regenerates it. `scratch/` keeps only genuine
+one-offs — asset conversion probes, render-setup screenshots, the yield arithmetic.
+
+### Transferring this to a different vehicle
+
+Asked for, so written down. Structural and portable: retire the warm start; two planning modes
+switched on range; decouple hold from replan period; make sure the cost actually SEES orientation
+(ours silently did not — `_score` builds its observation as `cat(p_xyz, v_xyz)`, six dims, no
+quaternion, so a `reward_fn` physically cannot read attitude and it has to ride in the per-step
+`dist` override); collisions catastrophic; measure settling not arrival; dump the distance curve
+before tuning anything.
+
+NOT portable, and all three invert for an underactuated airframe: our plant is neutrally buoyant
+with heavy drag, so thrust-to-zero is a valid resting state and drag does much of the settling work.
+A quadrotor must decay toward HOVER thrust, not zero; must penalise `||a - a_hover||`, not `||a||`;
+and cannot treat the attitude weight as optional, because attitude IS its lateral force — the
+`w_att` result above is a six-actuated-DOF result and does not transfer.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
@@ -266,7 +586,13 @@ Plus: attribute the docking fix (`scratch/_attrib.py`, queued), and dock videos
 - [x] 12b. Review round 3 fixes (see below); dataset regenerated as **v4**
 - [x] 12c. Review rounds 4 and 5; dataset regenerated as **v6**; an mp4 per trajectory
 - [x] 12d. MPPI deduplicated onto `controller/mppi.py`; docking 0.173 m -> 0.006 m
-- [ ] 13. Train BOTH ablation arms; log full open-loop and 16-step-ahead predictions
+      (that 0.006 is a TERMINAL-FRAME number and overstates it -- see 12e)
+- [x] 12e. Controller actually settles: warm start retired, collisions catastrophic, schedule
+      swept. 0.035 m / 1.1 deg with |a| 0.33 -> 0.072 of full thrust at the goal; `exec_n 2`
+      reaches 0.016 m. All tables reproducible via `control_study.py`
+- [x] 12f. Dataset v7 regenerated collision-free (6.01 h) and pushed to HF
+- [x] 12g. `limit_val_batches` fix; both ablation arms relaunched from scratch 2026-10-20 03:08
+- [ ] 13. Train BOTH ablation arms; log full open-loop and 16-step-ahead predictions (IN PROGRESS: epoch 3/10 as of 2026-10-20 19:00, ~4.5 h/epoch)
 - [ ] 14. Uncertainty: classify the three OOD types against nominal
 - [ ] 15. Pixel-level uncertainty videos
 - [ ] 16. Control benchmark: reach the dock, and reach a random pose, under TRUE dynamics vs the LEARNED world model
@@ -282,6 +608,10 @@ Plus: attribute the docking fix (`scratch/_attrib.py`, queued), and dock videos
 | dataset | 720 x 900 = **648,000 steps = exactly 6.00 h at 30 Hz**, plus 3 x 50 x 360 = 10 min per OOD set |
 | on disk | 50 GB of npz -> 1.4 GB of mp4 after packaging |
 | `delta_k` (fpv) | 0.1124 at stride 1 = 1.76x a 0.064 codec floor -> **no subsampling** |
+| control, shipped schedule | 0.035 m, 1.1 deg, wander 0.037, \|a\| 0.072 of full thrust at the goal |
+| control, `exec_n 2` | **0.016 m, 1.0 deg**, wander 0.021, at 3x the planning cost |
+| control, before the warm-start fix | 0.040 m terminal, but \|a\| **0.33** continuous on all six axes |
+| planner cost | coarse call 24 x 12 x 6 x 17 = 29,376 mj_steps; fine call 48 x 18 x 17 = 14,688 |
 
 ## Decisions made while the user was asleep
 

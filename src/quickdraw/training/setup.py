@@ -8,10 +8,11 @@ import os
 import torch
 
 from ..data.dataset import (
-    MMWindowLoader, Normalizer, TrajectoryDataset,
+    DataConfig, MMWindowLoader, Normalizer, TrajectoryDataset,
     load_split_episodes, load_split_episodes_mm,
 )
 from ..environments.torus_utils import TorusConfig
+from ..data.dataset import DataConfig
 
 
 def _recorded_dt(cfg, fallback: float) -> float:
@@ -284,6 +285,38 @@ def build_model(cfg):
                     f"FlexAttention kernel (head_dim=24 fails to compile), but d={m.d}/heads={m.heads} -> "
                     f"head_dim={head_dim}. Pick d/heads giving head_dim in {{16,32,64}} (e.g. d=192/heads=12 -> 16), "
                     f"or disable compile_rollout (eager has no such constraint).")
+        # positional encoding + attention sink (StreamingLLM). Default rope/0 -> bit-identical. The sink pins
+        # the first `attention_sink` timesteps as always-attendable; it REQUIRES pos_encoding='nope' because
+        # under RoPE a query would see the pinned sink at a q-k distance far beyond `window`, untrained
+        # (StreamingLLM re-indexes to avoid this; NoPE sidesteps it). Enforced here, loud.
+        _pos_enc = str(m.get("pos_encoding", "rope"))
+        _sink = int(m.get("attention_sink", 0) or 0)
+        if _pos_enc not in ("rope", "nope"):
+            raise ValueError(f"model.pos_encoding must be 'rope' or 'nope'; got {_pos_enc!r}.")
+        if _sink < 0:
+            raise ValueError(f"model.attention_sink must be >= 0; got {_sink}.")
+        if _sink > 0 and _pos_enc != "nope":
+            raise ValueError(
+                f"model.attention_sink={_sink}>0 requires model.pos_encoding='nope' (got {_pos_enc!r}). Under "
+                f"RoPE a query attends the pinned sink at a q-k distance far larger than the window ever trained "
+                f"on; StreamingLLM re-indexing is not implemented. Set model.pos_encoding=nope.")
+        if _sink > 0 and int(cfg.data.get("P", 0) or 0) and _sink >= int(cfg.data.P):
+            raise ValueError(f"model.attention_sink={_sink} must be < the context length data.P={cfg.data.P}: the "
+                             f"sink pins the first S grounded frames and the sliding window covers the rest, so at "
+                             f"least one non-sink context frame is required (S < P).")
+        # LATENT ROLLOUT LOSS (design/combatting_drift.md): the latent-space twin of the decode rollout loss --
+        # scores the ATTACHED rolled latent vs the true latent directly. Replaces the removed detached one-step
+        # `overshoot`. model.latent_rollout.{weight, metric}. weight 0 -> off, bit-identical.
+        if m.get("overshoot_weight", None) is not None or m.get("overshoot_max_depth", None) is not None:
+            raise ValueError("model.overshoot_weight/overshoot_max_depth were REMOVED (2026-09-30): the detached "
+                             "one-step overshoot scored a fresh correction, not the rolled latent. Use "
+                             "model.latent_rollout.weight (+ .metric=mse|cosine) -- the attached latent twin of the "
+                             "decode rollout loss. See design/combatting_drift.md.")
+        _lr = m.get("latent_rollout", {}) or {}
+        _lr_w = float((_lr.get("weight", 0.0) if hasattr(_lr, "get") else getattr(_lr, "weight", 0.0)) or 0.0)
+        _lr_metric = str((_lr.get("metric", "mse") if hasattr(_lr, "get") else getattr(_lr, "metric", "mse")))
+        if _lr_w > 0.0 and _lr_metric not in ("mse", "cosine"):
+            raise ValueError(f"model.latent_rollout.metric must be 'mse' or 'cosine'; got {_lr_metric!r}.")
         common = dict(specs=specs, d=m.d, depth=m.depth, heads=m.heads, window=m.window,
                       mlp_ratio=m.mlp_ratio, rope_theta=m.rope_theta, action_dim=effective_action_dim(cfg),
                       grad_checkpoint=bool(m.get("grad_checkpoint", False)),
@@ -298,7 +331,9 @@ def build_model(cfg):
                       position_idx=(cfg.environments.get("position_idx", None) if m.get("relative_position", False) else None),
                       relative_scale=(list(m.get("relative_scale")) if m.get("relative_scale", None) is not None else None),
                       dynamics_prior=_make_dynamics_prior(cfg),
-                      integrate_position=_make_integrate_position(cfg))
+                      integrate_position=_make_integrate_position(cfg),
+                      pos_encoding=_pos_enc, attention_sink=_sink,
+                      latent_rollout_weight=_lr_w, latent_rollout_metric=_lr_metric)
         # diffusion forcing (variations.noise_injection.observations_encoded_pre_fusion) — "corrupt-and-tell"
         # noise on the pre-fusion context tokens. Flow models ONLY (needs the backbone level embedding) -> gate.
         ni = (cfg.get("variations") or {}).get("noise_injection", {}) or {}
@@ -306,9 +341,15 @@ def build_model(cfg):
         oeg = (lambda k, v: oe.get(k, v)) if hasattr(oe, "get") else (lambda k, v: getattr(oe, k, v))
         df_scale = float(oeg("scale", 0.0) or 0.0)
         df_granularity = str(oeg("granularity", "timestep"))
+        df_rollout_level = float(oeg("rollout_level", 0.0) or 0.0)   # DF rollout: hold the fed-back past at this ε
         if df_scale > 0.0 and name not in ("mm_flow", "flow"):
             raise ValueError(f"variations.noise_injection.observations_encoded_pre_fusion (diffusion forcing) "
                              f"requires a flow model (model.name in mm_flow/flow); got {name!r}.")
+        if _sink > 0 and df_rollout_level > 0.0:
+            raise ValueError(
+                f"model.attention_sink={_sink}>0 is incompatible with the DF ROLLOUT (df_rollout_level="
+                f"{df_rollout_level}): both restructure the rollout window and whether the pinned sink should be "
+                f"noised is untested. Run them as separate arms.")
         # dynamics_follows_p_tf: meaningful only where the dynamics loss CONDITIONS ON a context it can swap.
         # RAISE rather than silently ignore -- a user who sets this believes they changed the training regime
         # (same rule as the fail-fast block just below). See design/flow.md.
@@ -411,9 +452,11 @@ def build_model(cfg):
                                        # rebuilding it with True doubles the flow's h_dim and the checkpoint
                                        # fails to load with a size mismatch. New runs get True from mm_flow.yaml.
                                        concat_action_embedding=bool(dfg("concat_action_embedding", False)),
+                                       concat_proprio_embedding=bool(m.get("concat_proprio_embedding", False)),
                                        lambda_flow=m.get("lambda_flow", 1.0),
                                        lambda_consistency=m.get("lambda_consistency", 1.0),
                                        df_scale=df_scale, df_granularity=df_granularity,
+                                       df_rollout_level=df_rollout_level,
                                        action_head_enabled=bool(ahg("enabled", False)),
                                        action_head_weight=float(ahg("weight", 1.0)),
                                        action_head_shortcut=bool(ahg("shortcut", True)),
@@ -434,7 +477,8 @@ def build_model(cfg):
                                        dynamics_detach_encoder=bool(m.get("dynamics_detach_encoder", False)),
                                        # default 1.0 (always-clean) so an old config adopted by
                                        # run_standalone rebuilds the behaviour it TRAINED under.
-                                       p_tf_dynamics=_p_tf_dyn)
+                                       p_tf_dynamics=_p_tf_dyn,
+                                       anchor_init=bool(m.get("anchor_init", False)))
         raise ValueError(f"unknown model.name: {name!r}")
 
 
@@ -490,22 +534,17 @@ def autobatch_find(cfg, device, log=print, step_probe=None) -> int:
         FIXED reserve cannot cover it: at 20h/256px it is tens of GB while the knob stays put. Frames only (the
         dominant term, 2.87 of 3.17GB); the ~0.3GB of window/index tensors stays inside the blind reserve."""
         try:
-            from ..data.dataset import get_subsample, load_split_episodes
-            # This estimate rides on the PROCESS-GLOBAL frame stride, because the loader applies it. If the
-            # caller has not called set_subsample() yet, the lengths come back unsubsampled and the estimate is
-            # off by exactly that factor -- measured: 14.18GB instead of 2.83GB at subsample=5, i.e. the
-            # verification harness silently shrank the batch. Over-estimating is the SAFE direction, but say so.
-            _want, _have = int(cfg.data.get("subsample", 1) or 1), get_subsample()
-            if _have != _want:
-                log(f"[autobatch] WARNING: data.subsample={_want} but the process frame stride is {_have} "
-                    f"(set_subsample() not called yet) -- the resident frame-store estimate below is {_want/_have:.0f}x "
-                    f"too LARGE, so the chosen batch will be conservative. Call set_subsample() before sizing.")
+            # dcfg (2026-09-21): the loader takes the data config EXPLICITLY now, so the resident-frame estimate
+            # always sizes at the correct stride. This replaced a process-global frame stride whose whole
+            # failure mode was the caller forgetting to set it -- the estimate then ran unsubsampled and the
+            # old get_subsample()!=cfg warning existed only to detect that. With DataConfig it cannot happen.
+            dcfg = DataConfig.from_cfg(cfg)
             imgs = [sp for sp in specs if getattr(sp, "kind", "vector") == "image"]
             if not imgs:
                 return 0
             n = 0
             for split in ("train", "val"):
-                eps_ = load_split_episodes(resolve_data_root(cfg), split,
+                eps_ = load_split_episodes(resolve_data_root(cfg), split, dcfg=dcfg,
                                            repo_id=cfg.data.get("repo_id", "torus"))
                 n += sum(len(o) for o, _ in eps_)          # subsampling is applied inside the loader
             b = 0
@@ -698,7 +737,7 @@ def autobatch_find(cfg, device, log=print, step_probe=None) -> int:
     #
     # KEY PROPERTY that makes this a REPORT rather than a subtraction: eval memory does NOT depend on data.batch.
     # It is fixed by the eval config (ood_horizon hardcodes n_ep=8 at routines.py:133, plus eval.horizon,
-    # ae_floor_episodes, closed_loop_steps) and by the model. Training activations are freed before eval and the
+    # ae_floor_episodes, ahead_steps) and by the model. Training activations are freed before eval and the
     # allocator reuses those blocks, so the two phases do not add -- each must independently fit the budget.
     def _synth_eval(B, T_ctx, H):
         obs = {}
@@ -726,7 +765,8 @@ def autobatch_find(cfg, device, log=print, step_probe=None) -> int:
             from .setup import resolve_data_root                                    # noqa: F401 (same module)
             img_heads = [sp.name for sp in specs if getattr(sp, "kind", "vector") == "image"]
             # episode LENGTHS only -- the proprio loader reads no frames, so this is cheap (seconds)
-            ep_lens = [len(o) for o, _ in load_split_episodes(resolve_data_root(cfg), "val",
+            # dcfg (2026-09-21): loader takes the data config explicitly (was module globals) -- see DataConfig
+            ep_lens = [len(o) for o, _ in load_split_episodes(resolve_data_root(cfg), "val", dcfg=DataConfig.from_cfg(cfg),
                                                              repo_id=cfg.data.get("repo_id", "torus"))]
             n_ep, H, _cl_h, modes, calls = ood_horizon_shapes(cfg, bool(img_heads), ep_lens, P)
             dc = int(cfg.eval.get("decode_chunk", 64) or 0) or None
@@ -760,7 +800,7 @@ def autobatch_find(cfg, device, log=print, step_probe=None) -> int:
     if _ev == -1.0:
         log("[autobatch] WARNING: the eval phase OOM'd on its own, INDEPENDENT of data.batch. Training will "
             "still be sized (correctly -- eval cost does not depend on the batch), but expect eval routines to "
-            "fail and self-disable. Shrink eval.horizon / eval.closed_loop_steps / eval.ae_floor_episodes, or "
+            "fail and self-disable. Shrink eval.horizon / eval.ahead_steps / eval.ae_floor_episodes, or "
             "turn off manifold.")
     elif _ev is not None and _ev > budget:
         # WARN, never raise: eval routines self-disable after two failures, so refusing to start a run on an
@@ -903,7 +943,10 @@ def effective_action_dim(cfg) -> int:
 
 
 def normalizer(cfg) -> Normalizer:
-    n = Normalizer.from_file(resolve_data_root(cfg)).subset_obs()   # subset via the process-wide set_obs_keep
+    # obs_keep (2026-09-21): passed EXPLICITLY to from_file (was the module global _OBS_KEEP + a .subset_obs()
+    # call). The stats are subset to the same obs layout the loaders apply -- see DataConfig.
+    _dc = DataConfig.from_cfg(cfg)
+    n = Normalizer.from_file(resolve_data_root(cfg), obs_keep=_dc.obs_keep, obs_fields=_dc.obs_fields)
     if str(cfg.data.get("action_aggregate", "sum")) == "concat":    # one step carries `subsample` raw actions
         n = n.tile_act(int(cfg.data.get("subsample", 1) or 1))
     return n
@@ -951,21 +994,23 @@ def window_loaders(cfg, norm: Normalizer):
     head_sizes = image_head_sizes(cfg)
     repo = str(cfg.data.get("repo_id", "torus"))
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dcfg = DataConfig.from_cfg(cfg)   # (2026-09-21) explicit data config -> the loaders; was module globals
     loaders = {}
     for split, shuffle in (("train", True), ("val", False)):
         stride = int(cfg.data.get("window_stride", 1)) if split == "train" else 1   # subsample TRAIN windows only; val stays dense
         if head_cams:
-            eps = load_split_episodes_mm(root, split, img_size=head_sizes, cam=head_cams, repo_id=repo)
+            eps = load_split_episodes_mm(root, split, dcfg=dcfg, img_size=head_sizes, cam=head_cams, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev,
                                             image_head=list(head_cams), stride=stride)
         else:                                                    # proprio-only: (obs, act) pairs, no camera frames
-            eps = load_split_episodes(root, split, repo_id=repo)
+            eps = load_split_episodes(root, split, dcfg=dcfg, repo_id=repo)
             loaders[split] = MMWindowLoader(eps, P, F, norm, cfg.data.batch, shuffle, dev, stride=stride)
     return loaders
 
 
 def eval_episodes(cfg, norm: Normalizer, split: str):
-    return TrajectoryDataset(load_split_episodes(resolve_data_root(cfg), split,
+    # dcfg (2026-09-21): loader takes the data config explicitly (was module globals) -- see DataConfig
+    return TrajectoryDataset(load_split_episodes(resolve_data_root(cfg), split, dcfg=DataConfig.from_cfg(cfg),
                                                  repo_id=str(cfg.data.get("repo_id", "torus"))), norm)
 
 
@@ -1005,7 +1050,7 @@ def _action_delta_pit_knots(cfg, mode: str, n_knots: int = 1024):
     set_subsample(int(cfg.data.get("subsample", 1) or 1))
     set_action_aggregate(agg)
     n = normalizer(cfg)
-    eps = load_split_episodes(resolve_data_root(cfg), "train", repo_id=cfg.data.get("repo_id", "torus"))
+    eps = load_split_episodes(resolve_data_root(cfg), "train", repo_id=cfg.data.get("repo_id", "torus"), dcfg=DataConfig.from_cfg(cfg))
     d = np.concatenate([np.diff(n.norm_act(torch.from_numpy(a).float()).numpy(), axis=0) for _, a in eps])
     if len(d) < n_knots:
         raise ValueError(f"only {len(d)} increments in train; need >= {n_knots} to fit stable knots")

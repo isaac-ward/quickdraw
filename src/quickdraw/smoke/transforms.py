@@ -185,7 +185,7 @@ def main() -> int:
           abs(float(t1.mean())) < 0.15 and 0.85 < float(t1.std()) < 1.15)
 
     class _FakeFlow:                                     # returns z; sample_action must invert it
-        def sample(self_, h_ctx, steps, deterministic=False, eps=None):
+        def sample(self_, h_ctx, steps, deterministic=False, eps=None, **kw):   # **kw: hook / share_noise_over
             return torch.randn(*h_ctx.shape[:-1], K * kn.shape[0], generator=g)
 
     out = _Head(K, "pit", kn, _FakeFlow()).sample_action(h)

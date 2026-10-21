@@ -44,10 +44,17 @@ def _start_pose(rng, spec=None):
         p = np.array([rng.uniform(-1, 1) * (tj.TANK_L / 2 - tj.MARGIN),
                       rng.uniform(-1, 1) * (tj.TANK_W / 2 - tj.MARGIN),
                       -rng.uniform(tj.MARGIN, tj.TANK_D - tj.MARGIN)])
-        if tj.inside(p[None])[0]:
+        # `clear`, not just `inside`: a start inside a buoy or the hook makes the collision test
+        # fail at step 0 and the episode comes out EMPTY. 25 of 1051 did exactly that, and an mp4
+        # cannot be encoded from zero frames, so packaging died on the first missing clip.
+        if tj.inside(p[None])[0] and tj.clear(p[None], tj.VEHICLE_R + tj.PLAN_SLACK)[0]:
             break
     ax = rng.normal(size=3)
     return p, tj.mat_to_quat(tj.rot_from_axis_angle(ax / np.linalg.norm(ax), rng.uniform(0, 2 * np.pi)))
+
+
+MIN_STEPS = 80        # below P+F+1 = 73 an episode yields NO training windows at all, so a shorter
+#                       one is pure cost: storage, encode time, and a clip the packer must handle.
 
 
 def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=None,
@@ -84,10 +91,19 @@ def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=N
     act = np.zeros((steps, 6), np.float32)
     frames = {c: np.zeros((steps, size[0], size[1], 3), np.uint8) for c in cams}
     try:
+        n_done = steps
         for k in range(steps):
             s = mola.state(data)
             if not np.isfinite(s).all():
                 return None                                   # drop rather than ship a NaN episode
+            # COLLISION ENDS THE EPISODE. The AUV's geoms are contype=0 -- it has no contact
+            # physics, deliberately, so the dynamics stay the analytic ones the trajectories are
+            # solved against. Without a check, nothing stopped it leaving: measured on v6, 6% of
+            # all steps were outside the tank and one episode reached |x| = 9.18 m in a tank that
+            # ends at 7.5. Frames of the vehicle flying through concrete are not data.
+            if not bool(tj.clear(s[None, :3])[0]):
+                n_done = k
+                break
             a_cmd = np.asarray(policy(k * dt, s), np.float32)
             obs[k], act[k] = s, a_cmd
             for c in cams:
@@ -102,7 +118,12 @@ def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=N
         if own:
             r.close()
 
-    meta = {"kind": kind, "seed": int(seed), "steps": int(steps), "glitch_p": float(glitch_p)}
+    if n_done < MIN_STEPS:
+        return None                                   # too short to be a training window at all
+    obs, act = obs[:n_done], act[:n_done]
+    frames = {c: v[:n_done] for c, v in frames.items()}
+    meta = {"kind": kind, "seed": int(seed), "steps": int(n_done), "glitch_p": float(glitch_p),
+            "ended_on_contact": bool(n_done < steps)}
     if spec is not None:
         meta.update(radius=float(spec["rad"]), speed=float(spec["speed"]),
                     centre=[float(v) for v in spec["centre"]])

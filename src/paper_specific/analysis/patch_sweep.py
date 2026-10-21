@@ -8,6 +8,7 @@ from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate,
 from quickdraw.data.ood_windows import kept, window_steps
 from quickdraw.training.setup import (build_model, image_head_cams, image_head_sizes, load_checkpoint,
                                       normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 PS = [1, 2, 4, 6, 8, 12, 16]
 ckpt = sys.argv[1]
 run = os.path.dirname(os.path.dirname(ckpt))
@@ -17,7 +18,7 @@ m = build_model(cfg).cuda(); load_checkpoint(m, ckpt); m.eval()
 core = getattr(m, "_orig_mod", m); norm = normalizer(cfg); P = int(cfg.data.P)
 key = next((n for n, _ in core.layout if n != "proprio"))
 eps = load_split_episodes_mm(resolve_data_root(cfg), SPLIT, img_size=image_head_sizes(cfg),
-                             cam=image_head_cams(cfg), repo_id="starling-2")
+                             cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
 pool = {p: ([], []) for p in PS}
 n = 0
 for i in kept(SPLIT):

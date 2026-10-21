@@ -37,12 +37,37 @@ class UnderwaterRenderer:
     built once. On 864,000 renders that is the difference between an 8-hour pass and a 2-hour one.
     """
 
-    def __init__(self, model, height=144, width=192):
+    def __init__(self, model, height=144, width=192, cams=()):
         import mujoco
 
         self.r = mujoco.Renderer(model, height, width)
+        self.cams = tuple(cams)      # which cameras a caller should capture; see control.run_episode
+
+    def look_at(self, target, dist=4.6, elev=-18.0, name="dockcam"):
+        """Register a FIXED free camera aimed at `target`, addressed by `name`.
+
+        A body-mounted chase camera is useless at exactly the moment worth watching: it sits a
+        fixed distance behind the vehicle, so when the vehicle reaches a goal in a corner the
+        camera is inside the wall. This one is anchored to the GOAL, so the approach is in frame
+        the whole way in.
+
+        IT DOES NOT ORBIT. A circling camera looks better for one second and then sweeps straight
+        through a tank wall. The azimuth is chosen ONCE so the camera sits on the tank-centre side
+        of the target -- MuJoCo places a free camera at lookat - d*(cos az, sin az), so pointing
+        az along the target's own bearing from the origin puts the camera between the target and
+        the middle of the tank, which is always water."""
+        import mujoco
+
+        t = np.asarray(target, float)
+        cam = mujoco.MjvCamera()
+        cam.lookat[:] = t
+        cam.distance, cam.elevation = float(dist), float(elev)
+        cam.azimuth = float(np.degrees(np.arctan2(t[1], t[0])))
+        self._free = {name: cam}
+        self.cams = tuple(self.cams) + ((name,) if name not in self.cams else ())
 
     def render(self, data, camera):
+        camera = getattr(self, "_free", {}).get(camera, camera)
         self.r.update_scene(data, camera=camera)
         self.r.disable_depth_rendering()
         rgb = self.r.render()

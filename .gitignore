@@ -144,3 +144,17 @@ wizard/scripts/*
 # scratch/ — big downloaded datasets and other working data. Sits beside logs/ rather than inside
 # it because a dataset is not a log. Mounted into the container at /app/scratch (docker-compose.yml).
 scratch/
+
+# Per-trial MBARI scene files written by `control_study clips --trial N`: one scene per process so
+# concurrent renders cannot race on a single path. Build outputs of tank.build(), regenerated on
+# every run -- unlike the named scenes beside them, which are committed as the canonical variants.
+src/quickdraw/sim/mbari/assets/tank_clip*.xml
+src/quickdraw/sim/mbari/assets/tank_best*.xml
+
+/oneoffs/
+
+# logs/ is ignored above, but longhand committed its cube-experiment one-offs under logs/oneoffs/.
+# Tracked files stay tracked regardless of an ignore rule; this negation makes that state deliberate
+# rather than accidental.
+!logs/oneoffs/
+!logs/oneoffs/**

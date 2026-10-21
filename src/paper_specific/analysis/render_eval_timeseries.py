@@ -29,6 +29,7 @@ from omegaconf import OmegaConf
 
 from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate, set_subsample
 from quickdraw.training.setup import image_head_cams, image_head_sizes, resolve_data_root
+from quickdraw.data.dataset import DataConfig
 
 SPLITS = {"eval_ood": ["eval_ood_noodle", "eval_ood_leafblower"],
           "eval_memory": ["eval_memory_backwall1", "eval_memory_backwall2"]}
@@ -62,7 +63,7 @@ def main(out_root: str = "logs/paper_icra_2027") -> int:
     for group, splits in SPLITS.items():
         for sp in splits:
             eps = load_split_episodes_mm(root, sp, img_size=image_head_sizes(cfg),
-                                         cam=image_head_cams(cfg), repo_id="starling-2")
+                                         cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
             d = os.path.join(out_root, group, sp)
             os.makedirs(d, exist_ok=True)
             spans = []

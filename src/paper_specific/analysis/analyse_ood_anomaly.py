@@ -33,6 +33,7 @@ from omegaconf import OmegaConf
 from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate, set_subsample
 from quickdraw.logging import viz
 from quickdraw.training.setup import image_head_cams, image_head_sizes, resolve_data_root
+from quickdraw.data.dataset import DataConfig
 
 FPS, SUB, P = 15.0, 4, 8
 AX = ["yaw", "vertical", "lateral", "fore/aft"]
@@ -162,7 +163,7 @@ def main(out_root: str = "logs/paper_icra_2027") -> int:
     # ---------- the OOD splits: detect, annotate, re-render ----------
     for sp, kind in (("eval_ood_noodle", "visual"), ("eval_ood_leafblower", "dynamic")):
         eps = load_split_episodes_mm(root, sp, img_size=image_head_sizes(cfg),
-                                     cam=image_head_cams(cfg), repo_id="starling-2")
+                                     cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
         key = list(eps[0][2])[0]
         d = os.path.join(out_root, "eval_ood", sp)
         rows = []
@@ -221,7 +222,7 @@ def main(out_root: str = "logs/paper_icra_2027") -> int:
     # ---------- the memory splits: does the away-and-back fit in the rollout? ----------
     for sp in ("eval_memory_backwall1", "eval_memory_backwall2"):
         eps = load_split_episodes_mm(root, sp, img_size=image_head_sizes(cfg),
-                                     cam=image_head_cams(cfg), repo_id="starling-2")
+                                     cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
         lens = [len(o) // SUB for o, _, _ in eps]
         H_now = min(lens) - P - 1
         print(f"\n  {sp}: model steps per episode {sorted(lens)} -> H = min-1-P = {H_now}")

@@ -21,6 +21,10 @@ from __future__ import annotations
 import numpy as np
 
 from . import mola, trajectories as tj
+from .tank import KEEPOUT, VEHICLE_R as VEH_R
+
+W_CRASH = 50.0        # per-step cost of being inside anything solid. Large on purpose:
+#                       a plan that clips a buoy to save travel must never score well.
 from .record import FPS
 
 
@@ -185,34 +189,18 @@ def pose_cost(states, goal_p, goal_q=None, w_pos=1.0, w_att=0.35, w_vel=0.08, w_
     return float(c)
 
 
-def _mbari_reward(goal_p, goal_q, w_att, w_wall, w_vel, r_settle):
-    """Per-step reward for `controller.mppi._score`, carrying this task's terms.
+def _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall=W_CRASH):
+    """Adapt a dynamics object to controller.mppi's rollout_fn: (G,K,H,A) -> (p_xyz, v_xyz, dist).
 
-    _score sums a per-step reward over the horizon, so the terminal-weighted cost this module used
-    to apply is expressed as a sum of -distance instead. That is the same shape as the mean-path
-    term it already had, and it removes the terminal weighting that -- together with the velocity
-    penalty -- is the prime suspect for the error floor.
+    ATTITUDE RIDES IN `dist`, and it has to. `_score` builds its observation as cat(p_xyz, v_xyz)
+    -- six dims, no quaternion -- so a reward_fn physically cannot see orientation. The shared
+    module's other scoring path takes a per-step `dist` (G,K,H) override, which is what language
+    steering uses, and `_score` then applies the same velocity gating and control cost to it. So
+    `dist` here is the full per-step POSE error: position + w_att * angle + a wall barrier.
 
-    `obs` arrives as cat(p_xyz, v_xyz) (...,6), which is what _score builds; the quaternion is not
-    in it, so the attitude term is applied by the caller's rollout wrapper when a goal attitude is
-    asked for. Wall barrier and velocity gating are per-step and live here."""
-    import torch
-
-    def reward(obs, goal):
-        p, v = obs[..., :3], obs[..., 3:6]
-        d = (p - goal).norm(dim=-1)
-        r = -d
-        if w_vel > 0.0:                       # gated near-goal velocity penalty, as controller/mppi
-            r = r - w_vel * (d < r_settle).float() * v.norm(dim=-1)
-        lim = torch.tensor([tj.TANK_L / 2 - 0.8, tj.TANK_W / 2 - 0.8], device=p.device, dtype=p.dtype)
-        out = ((p[..., :2].abs() > lim).any(-1) |
-               (p[..., 2] > -0.8) | (p[..., 2] < -(tj.TANK_D - 0.8)))
-        return r - w_wall * out.float()
-    return reward
-
-
-def _rollout_fn(dyn, state, repeat):
-    """Adapt a dynamics object to controller.mppi's rollout_fn: (G,K,H,A) -> (p_xyz, v_xyz, None)."""
+    Without this the benchmark was position-only on both tasks -- including "reach a random POSE",
+    which is then not the task that was asked for, and including docking, where an AUV that arrives
+    at the entry pointing the wrong way has not docked."""
     import torch
 
     def fn(cand):
@@ -220,13 +208,31 @@ def _rollout_fn(dyn, state, repeat):
         preds = (dyn.rollout_batch(state, c, repeat=repeat) if hasattr(dyn, "rollout_batch")
                  else np.stack([dyn.rollout(state, x, repeat=repeat) for x in c]))
         t = torch.as_tensor(preds, dtype=cand.dtype, device=cand.device)[None]   # (1,K,H,13)
-        return t[..., :3], t[..., 7:10], None
+        p, v, q = t[..., :3], t[..., 7:10], t[..., 3:7]
+        d = (p - torch.as_tensor(goal_p, dtype=p.dtype, device=p.device)).norm(dim=-1)
+        if goal_q is not None:
+            gq = torch.as_tensor(np.asarray(goal_q), dtype=q.dtype, device=q.device)
+            qn = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            ang = 2.0 * torch.arccos((qn * gq).sum(-1).abs().clamp(max=1.0))     # radians, 0..pi
+            d = d + w_att * ang
+        # COLLISION IS CATASTROPHIC, NOT A NUDGE. The barrier used to cover the four walls only,
+        # at a weight comparable to a metre of distance -- so a plan that clipped a buoy to save
+        # two metres of travel scored WELL. It now covers every solid in the tank (the same
+        # KEEPOUT volumes `trajectories.clear` uses, so planner and plant agree on what a
+        # collision IS) and costs W_CRASH per step, which no amount of saved distance can buy back.
+        out = ((p[..., :2].abs() > torch.tensor([tj.TANK_L / 2 - VEH_R, tj.TANK_W / 2 - VEH_R],
+                                                device=p.device, dtype=p.dtype)).any(-1)
+               | (p[..., 2] > tj.WATER_Z - VEH_R) | (p[..., 2] < -tj.TANK_D + VEH_R))
+        for cx, cy, cr, z0, z1 in KEEPOUT:
+            out = out | ((torch.hypot(p[..., 0] - cx, p[..., 1] - cy) < cr + VEH_R)
+                         & (p[..., 2] > z0 - VEH_R) & (p[..., 2] < z1 + VEH_R))
+        return p, v, d + W_CRASH * out.to(d.dtype)
     return fn
 
 
 def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma=0.5,
          temp=0.35, seed=0, prev=None, repeat=6, fan=None,
-         w_att=0.35, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02):
+         w_att=0.3, w_vel=0.0, w_wall=4.0, r_settle=0.5, beta_ctrl=0.02, mean_decay=0.7):
     """One MPPI step -> (action, planned_mean), THROUGH `controller.mppi`.
 
     This used to be a bespoke forty-line sampler, which was a mistake: the shared module's core
@@ -249,39 +255,58 @@ def mppi(dyn, state, goal_p, goal_q=None, horizon=15, samples=48, iters=1, sigma
             else torch.as_tensor(prev, dtype=torch.float32)[None].clone())
     g = torch.Generator().manual_seed(int(seed))
     plan, a0, p_xyz, ret = _mppi_step(
-        _rollout_fn(dyn, state, repeat), mean, torch.as_tensor(goal_p, dtype=torch.float32)[None],
-        cfg, GaussianProposal(sigma), g,
-        reward_fn=_mbari_reward(goal_p, goal_q, w_att, w_wall, w_vel, r_settle))
+        _rollout_fn(dyn, state, repeat, goal_p, goal_q, w_att, w_wall), mean,
+        torch.as_tensor(goal_p, dtype=torch.float32)[None], cfg, GaussianProposal(sigma), g)
     if fan is not None:
         fan.append({"pts": p_xyz[0].numpy(), "ret": ret[0].numpy()})
     plan = plan[0].numpy()
-    return plan[0].copy(), np.roll(plan, -1, axis=0)
+    # WARM START: SHIFT, ZERO-PAD, DECAY -- the three things the bespoke version got wrong.
+    # `np.roll` WRAPPED, so the last action of a plan became the first action of the next one:
+    # stale thrust recycled in a loop rather than retired. And mean_decay was never applied at all
+    # (it lives in MPPIConfig and controller/mppi.py's own loop applies it; _mppi_step leaves it to
+    # the caller, and this caller did not). Together they meant the warm start could never bleed
+    # away: near the goal the cost landscape is almost flat, every candidate scores alike, the
+    # softmax weights go uniform, the update barely moves `mean` -- so whatever thrust the plan
+    # carried on approach kept firing forever. Measured at the goal before this fix: |a| = 0.33 of
+    # full thrust on all six axes, continuously, at 5 cm from the target.
+    # 0.7 measured best: 1.0 (no decay) leaves |a|=0.170 of full thrust at the goal, 0.7 takes it
+    # to 0.072, and 0.0 -- a cold start every replan -- is CATASTROPHIC at 0.867 m final. The warm
+    # start was never the problem; failing to RETIRE it was. It still has to give MPPI a sensible
+    # centre to sample around, and 96 draws of pure noise cannot find the approach without one.
+    nxt = np.concatenate([plan[1:], np.zeros((1, plan.shape[1]), plan.dtype)], 0) * mean_decay
+    return plan[0].copy(), nxt
 
 
-# TWO PLANNING MODES, SWITCHED ON RANGE. Far from the goal the problem is reach: you need seconds
-# of lookahead, which `repeat` buys cheaply by holding each planned action for 6 control steps.
-# Close in, that same coarseness is the error floor -- the finest correction the planner can command
-# is one 0.2 s impulse, and with perfect dynamics the true-dynamics arm still settled at 0.16 m
-# mean. Inside NEAR the planner drops to one-step actions, a longer horizon in steps (but shorter in
-# seconds) and a third of the action noise, so it can place the vehicle rather than lob it.
+# ONE SCHEDULE, SWEPT AND LOCKED. This was two modes switched on range to the goal -- coarse
+# 6-step actions far out for lookahead, one-step actions inside NEAR so the planner could place
+# the vehicle rather than lob it. The fine mode existed because a 0.2 s impulse is too blunt to
+# settle with, and it did not work: `control_study` measured coarse-only and coarse+fine at the
+# SAME 0.173 m, which turned out to be the episode step budget rather than either schedule (the
+# vehicle was still in transit when the episode ended). The real fixes were elsewhere -- retiring
+# the warm start, and `exec_n`.
 #
-# This costs less per call than it looks: a fine call is 48 x 18 x 17 = 14,688 mj_steps against the
-# coarse 24 x 12 x 6 x 17 = 29,376, so roughly half. It is called six times as often during the
-# final approach, so the net is about 1.7x -- and only over the last metre.
-# `exec_n` DECOUPLES the action hold from the replan cadence. They were the same number because
-# run_episode executed exactly what it planned, but they answer different questions: `repeat` is
-# how coarse the ACTIONS are, `exec_n` is how much of a plan is spent before replanning. Dropping
-# the hold to 1 while lengthening the horizon to 72 keeps both the lookahead (2.4 s) and the cost
-# (samples x horizon x repeat x substeps = 29,376 mj_steps, identical) -- what it actually spends
-# is SEARCH, because the plan now has 72 free parameters per axis instead of 12 for the same 24
-# samples. Whether that trade is worth it is measured in scratch/_ceiling.py, not assumed.
+# `exec_n` DECOUPLES the action hold from the replan cadence, which is what the fine mode was
+# reaching for and could not express. `repeat` is how coarse the ACTIONS are; `exec_n` is how much
+# of a plan is SPENT before replanning. They were the same number only because run_episode
+# executed exactly what it planned. Holding 6-step actions but replanning every 2 steps keeps the
+# cheap lookahead AND corrects three times as often:
+#
+#     w_att 0.3         0.021 m   1.5 deg   wander 0.024      (attitude weight, swept)
+#     exec_n 2          0.016 m   1.0 deg   wander 0.021      (replan period, swept)
+#     both              pending   -- control_study sweep combined
+#
+# Reproduce: `python -m quickdraw.sim.mbari.control_study sweep attitude`. The numbers above are
+# 3-trial means on TrueDynamics at seeds 100/101/102.
+#
+# NEAR is kept, and FINE is kept pointing at the same dict, so the range switch stays available
+# without silently being a second schedule nobody swept.
 NEAR = 1.2
-COARSE = dict(repeat=6, horizon=12, samples=24, sigma=0.50)
-FINE = dict(repeat=1, horizon=18, samples=48, sigma=0.18)
+COARSE = dict(repeat=6, horizon=12, samples=96, sigma=0.20, exec_n=2)
+FINE = COARSE
 
 
 def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0, log=None,
-                repeat=6, samples=24, horizon=12, fan=None):
+                repeat=6, samples=24, horizon=12, fan=None, render=None, ghost=None):
     """Closed loop: `dyn` plans, the MuJoCo `plant_model` executes. Returns a trace dict.
 
     EACH PLANNED ACTION IS EXECUTED FOR `repeat` CONTROL STEPS, which is what it was costed as: the
@@ -297,12 +322,20 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     d = mujoco.MjData(plant_model)
     d.qpos[:3], d.qpos[3:7] = start[:3], start[3:7]
     mujoco.mj_forward(plant_model, d)
+    if ghost is not None:                        # (mocap_id, pos, quat) -> the translucent goal pose
+        gid, gpos, gquat = ghost
+        d.mocap_pos[gid], d.mocap_quat[gid] = gpos, gquat
+        mujoco.mj_forward(plant_model, d)
     observe = getattr(dyn, "observe", None)      # the learned model needs the plant's own stream
     if observe is not None:
         observe(d)
     sub = int(round((1.0 / FPS) / plant_model.opt.timestep))
+    # `render` = an UnderwaterRenderer; frames are captured from the PLANT's own MjData each
+    # executed step, so a control episode can be watched in the tank from every camera rather than
+    # read off a plot.
+    frames = {c: [] for c in (render.cams if render is not None else ())}
     traj, acts, prev = [], [], None
-    k, mode = 0, None
+    k, mode, crashed = 0, None, False
     while k < steps:
         s = mola.state(d)
         if not np.isfinite(s).all():
@@ -310,15 +343,23 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
         want = FINE if np.linalg.norm(s[:3] - goal_p) < NEAR else COARSE
         if want is not mode:                  # the warm start has the old horizon; drop it
             mode, prev = want, None
+        if crashed:
+            break
         a, prev = mppi(dyn, s, goal_p, goal_q, seed=seed + k, prev=prev,
                        samples=mode["samples"], horizon=mode["horizon"],
                        sigma=mode["sigma"], repeat=mode["repeat"], fan=fan)
         for _ in range(min(mode.get("exec_n", mode["repeat"]), steps - k)):
             s = mola.state(d)
+            if not bool(tj.clear(s[None, :3])[0]):
+                crashed = True
+                break
             traj.append(s)
             acts.append(a)
             if observe is not None:
                 observe(d, a)
+            if render is not None:
+                for c in render.cams:
+                    frames[c].append(render.render(d, c))
             for _ in range(sub):
                 mola.apply(plant_model, d, a)
                 mujoco.mj_step(plant_model, d)
@@ -328,5 +369,7 @@ def run_episode(plant_model, dyn, start, goal_p, goal_q=None, steps=240, seed=0,
     traj = np.asarray(traj, np.float32)
     dist = np.linalg.norm(traj[:, :3] - goal_p, axis=1)
     return {"traj": traj, "act": np.asarray(acts, np.float32), "dist": dist, "fan": fan,
+            "crashed": bool(crashed),
+            "frames": {c: np.stack(v) for c, v in frames.items() if v},
             "final_dist": float(dist[-1]), "best_dist": float(dist.min()),
             "steps_to_0p5m": int(np.argmax(dist < 0.5)) if (dist < 0.5).any() else -1}

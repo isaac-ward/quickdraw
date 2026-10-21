@@ -17,7 +17,7 @@ import torch
 from diffusers import AutoencoderTiny
 from huggingface_hub import snapshot_download
 
-from quickdraw.data.dataset import load_fpv_frames, load_split_episodes_mm
+from quickdraw.data.dataset import DataConfig, load_fpv_frames, load_split_episodes_mm
 
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 ae = AutoencoderTiny.from_pretrained("madebyollin/taesd").to(dev).eval()
@@ -70,7 +70,7 @@ tf = load_fpv_frames(root, "val", size=128, cam=cam, max_frames=384, cache=False
 tr, tdb = codec_rmse(torch.from_numpy(tf).float().div(255.0))
 print(f"[torus] TAESD recon: RMSE {tr:.4f} = {tdb:.2f} dB   <-- torus's OWN codec floor\n")
 
-eps = load_split_episodes_mm(root, "val", img_size=128, cam=cam, repo_id="torus")  # frames keyed by cam
+eps = load_split_episodes_mm(root, "val", dcfg=DataConfig(subsample=1), img_size=128, cam=cam, repo_id="torus")  # dcfg (2026-09-21): explicit data config, no module globals; frames keyed by cam
 print(f"[torus] {len(eps)} val eps, first T={len(eps[0][0])}")
 print("\n=== TORUS: per-step motion vs its own codec floor ===")
 deltas(eps, tr, (1, 2, 4, 8))

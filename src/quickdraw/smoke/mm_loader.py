@@ -7,7 +7,7 @@ import sys
 
 import torch
 
-from quickdraw.data.dataset import MMWindowLoader, Normalizer, load_split_episodes_mm
+from quickdraw.data.dataset import DataConfig, MMWindowLoader, Normalizer, load_split_episodes_mm
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 R = []
@@ -23,8 +23,9 @@ def main():
     P, Fh, B = 8, 6, 4
     L = P + Fh
     print(f"[mm_loader] loading VAL episodes (obs+act+FPV128) from {root} ...")
-    eps = load_split_episodes_mm(root, "val", img_size=128, cam={"image": "fpv"})  # key by HEAD name
-    norm = Normalizer.from_file(root)
+    # dcfg / obs_keep (2026-09-21): loader + Normalizer take the data config explicitly now (no module globals)
+    eps = load_split_episodes_mm(root, "val", dcfg=DataConfig(subsample=1), img_size=128, cam={"image": "fpv"})  # key by HEAD name
+    norm = Normalizer.from_file(root, obs_keep=None)
     check("episodes loaded with frames", len(eps) > 0 and eps[0][2]["image"].ndim == 4,
           f"{len(eps)} eps, frame shape {tuple(eps[0][2]['image'].shape)}")
     check("per-episode obs/frame counts aligned", all(len(o) == len(fr["image"]) for o, _, fr in eps))

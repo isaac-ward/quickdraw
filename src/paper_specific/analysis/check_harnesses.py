@@ -27,6 +27,7 @@ from quickdraw.data.dataset import load_split_episodes_mm, set_action_aggregate,
 from quickdraw.evaluation import steering as S
 from quickdraw.training.setup import (build_model, effective_action_dim, image_head_cams, image_head_sizes,
                                       load_checkpoint, normalizer, resolve_data_root)
+from quickdraw.data.dataset import DataConfig
 
 AXES = [a["name"] for a in yaml.safe_load(open("conf/interpret/starling.yaml"))["action_axes"]]
 NA = len(AXES)
@@ -44,7 +45,7 @@ def main(run: str) -> int:
     P, A, K = int(cfg.data.P), effective_action_dim(cfg), int(core.action_head_chunk)
     img = next((n for n, _ in core.layout if n != "proprio"), None)
     eps = load_split_episodes_mm(resolve_data_root(cfg), "val", img_size=image_head_sizes(cfg),
-                                 cam=image_head_cams(cfg), repo_id="starling-2")
+                                 cam=image_head_cams(cfg), repo_id="starling-2", dcfg=DataConfig.legacy())
     p_over = K // 2                      # commit half the chunk -> half of the next one is prefixed
     ctxs = [(4, 55), (5, 200), (3, 259), (3, 367), (0, 120), (1, 300), (2, 200), (6, 150)]
     hs, prefixes = [], []
@@ -104,7 +105,7 @@ def main(run: str) -> int:
         grade("prior + prefix guidance + held", S.Held(pri_on, 0.02), pre)
         # the REAL bank (train at stride 1), not the 365-chunk val slice the first verdict was based on
         from quickdraw.data.dataset import load_split_episodes
-        be = load_split_episodes(resolve_data_root(cfg), "train", repo_id="starling-2")
+        be = load_split_episodes(resolve_data_root(cfg), "train", repo_id="starling-2", dcfg=DataConfig.legacy())
         big = torch.stack([torch.from_numpy(a[i:i + K]).float() for _, a in be
                            for i in range(0, len(a) - K, 1)])
         print(f"  (data bank: {len(big)} chunks from train at stride 1)")

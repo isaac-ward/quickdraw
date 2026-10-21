@@ -1,4 +1,4 @@
-"""The MBARI test tank as MuJoCo MJCF: 15 x 10 x 10 m, concrete, windows, ArUco, crane hook, dock.
+"""The MBARI test tank as MuJoCo MJCF: 15 x 10 x 10 m, concrete, windows, ArUco, crane hook.
 
 WALLS ARE BAKED TEXTURES, NOT GEOMETRY. Concrete, the two window rows and the ArUco grid are drawn into
 one RGB image per surface and applied to a single plane geom. A grid of tag geoms would be ~100 extra
@@ -58,6 +58,20 @@ def _tags(img, nx, ny, px=72, margin=0.06, first_id=0):
 # way to tell from a frame whether the camera is pointing at +x or -y, which makes a wrong pose or a
 # mirrored texture invisible in review. The spread is large enough to read at a glance.
 SHADE = {"wall_x+": 1.30, "wall_x-": 0.70, "wall_y+": 1.08, "wall_y-": 0.86, "floor": 0.55}
+# KEEP-OUT VOLUMES, as upright cylinders (x, y, radius, z_lo, z_hi) covering every solid object a
+# vehicle could fly into. Defined HERE, beside the geometry that draws them, so the two cannot
+# drift: change a buoy's position and the keep-out moves with it.
+KEEPOUT = (
+    # Each tether runs from its buoy UP to the surface and no further, so the z span stops at the
+    # buoy -- an earlier version ran them to the floor and excluded two full-depth columns of open
+    # water, which would have truncated 69% of episodes instead of 7%.
+    (3.375, 2.5, 0.38, -5.38, -0.52),      # orange buoy + tether above it
+    (-3.0, -2.25, 0.34, -5.94, -0.52),     # neon-green buoy + tether above it
+    (7.28, -4.25, 0.32, -3.60, -0.52),     # entry ladder on the +X wall
+    (1.2, 0.0, 0.34, -2.95, -0.52),        # crane cable and the hook block (halved)
+)
+VEHICLE_R = 0.55                            # bounding radius of the 1.0 m AUV, generous on purpose
+
 TEX_N = 512                   # cube faces must be square; see build_textures
 WATER_Z = -0.52               # the water line, 50 cm below the tank rim, so the rim shows above it
 PX_PER_M = 70
@@ -154,6 +168,17 @@ def build_textures(out=BUILD, res=1024, seed=0):
 
 
 MIN_RGB, SPEC, SHIN = 0.09, 0.55, 0.65
+# THE HULL IS YELLOW, NOT SILVER. The source model's large pressure-hull group ships as a flat grey
+# (0.4, 0.4, 0.4); recoloured here, at the single place every MOLA geom is emitted, so the change
+# reaches the tank, the intruder scenes and the control videos alike rather than being patched per
+# caller. Matched by colour, not by group index, because the index moves if the mesh is reconverted.
+HULL_GREY = (0.4, 0.4, 0.4)
+HULL_YELLOW = (0.88, 0.72, 0.06)
+GHOST_RGBA = "0.10 0.95 0.25 0.125"     # the translucent goal-pose marker; see `ghost` in mjcf()
+
+
+def _recolour(rgb):
+    return HULL_YELLOW if tuple(round(float(c), 2) for c in rgb[:3]) == HULL_GREY else rgb
 # The frame group's baseColorFactor is literally (0,0,0), so it rendered as a hole in the water
 # whatever the lighting. A floor of 0.09 plus real specular is what dark anodised aluminium looks
 # like underwater.
@@ -168,11 +193,12 @@ def _mola_geoms(scale):
     import json
 
     meta = json.loads((ASSETS / "mola_groups.json").read_text())
+    cols = [_recolour(row[1]) for row in meta]
     a = "".join(
         f'<mesh name="mola{k}" file="mola/{row[0]}" scale="{scale} {scale} {scale}"/>'
-        f'<material name="mola_c{k}" rgba="{max(MIN_RGB, row[1][0]):.3f} {max(MIN_RGB, row[1][1]):.3f} '
-        f'{max(MIN_RGB, row[1][2]):.3f} 1" specular="{SPEC}" shininess="{SHIN}"/>'
-        for k, row in enumerate(meta))
+        f'<material name="mola_c{k}" rgba="{max(MIN_RGB, c[0]):.3f} {max(MIN_RGB, c[1]):.3f} '
+        f'{max(MIN_RGB, c[2]):.3f} 1" specular="{SPEC}" shininess="{SHIN}"/>'
+        for k, (row, c) in enumerate(zip(meta, cols)))
     # the whole 60 kg sits on the first group: MuJoCo SUMS geom masses, and six geoms at 60 kg each
     # would give a 360 kg vehicle whose inertia no longer matches the constants in mola.py
     # ROLLED +90 DEG ABOUT X. The source mesh's cross-section is 0.477 m across by 0.561 m tall --
@@ -231,25 +257,38 @@ def _walls_and_rooms(hl, hw, seed=4242):
     return ("\n    ".join(walls), "".join(wall_assets), "".join(mats), "".join(bodies))
 
 
-def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> str:
+def mjcf(mola_scale=1.24, n_fish=0, buoy_purple=False, ghost=False) -> str:
     """The tank MJCF. `mola_scale` 1.24 makes the AUV 1.0 m long (0.807 x 1.24), half its first size."""
     hl, hw = TANK_L / 2, TANK_W / 2
-    dx, dy = dock_corner
-    HOOK_S = 0.28                       # the mesh is 5.53 m tall raw -> 1.55 m, a crane hook's size
+    HOOK_S = 0.14                       # the mesh is 5.53 m tall raw -> 0.77 m (halved: 1.55 m
+    #                                     read as oversized against a 1.0 m vehicle)
     HOOK_H = 5.53 * HOOK_S
     # NEON GREEN normally; PURPLE is the appearance OOD. The diver OOD was dropped for this at the
     # user's instruction -- the source diver is a T-pose and the vertex-sweep posing attempt did not
     # read as a dive pose when rendered.
     BUOY_RGB = "0.72 0.18 0.92" if buoy_purple else "0.18 1.00 0.25"
-    dock_pos = (dx * (hl - 1.1), dy * (hw - 1.1), -1.4)   # tucked into the corner
     mola_assets, mola_geoms = _mola_geoms(mola_scale)
+    # GHOST: a translucent green copy of the vehicle marking the GOAL POSE, as a mocap body so a
+    # caller can place it per episode. OFF by default and never built for data generation -- a
+    # target marker in the training frames would be a feature the model could read instead of
+    # learning the dynamics.
+    ghost_assets, ghost_body = ("", "")
+    if ghost:
+        import json as _json
+        n_g = len(_json.loads((ASSETS / "mola_groups.json").read_text()))
+        ghost_assets = f'<material name="m_ghost" rgba="{GHOST_RGBA}" specular="0.1"/>'
+        # rgba ON THE GEOM, not only on the material: a geom's own rgba defaults to
+        # (0.5, 0.5, 0.5, 1) and that default WINS over the material's alpha, so the ghost
+        # rendered fully opaque while the material said 0.25.
+        ghost_body = ("\n    <body name=\"ghost\" mocap=\"true\" pos=\"0 0 -40\">"
+                      + "".join(f'<geom type="mesh" mesh="mola{k}" material="m_ghost" '
+                                f'rgba="{GHOST_RGBA}" euler="1.5708 0 0" '
+                                f'contype="0" conaffinity="0" group="2"/>'
+                                for k in range(n_g)) + "</body>")
     wall_xml, wall_assets, room_mats, room_xml = _walls_and_rooms(hl, hw)
 
-    # ENTRY LADDER. Asked for "the corner opposite the dock, but not the corner with the orange
-    # buoy" -- which are the same corner: the dock is at (-x,-y) and the orange buoy sits in
-    # (+x,+y). The green buoy shares the dock's quadrant, so the only free corners are (+x,-y) and
-    # (-x,+y); this takes (+x,-y), diagonally across the tank's long axis from the dock and clear of
-    # both buoys. It hangs on the +X wall at y=-4.25, which clears the nearest window rim by 0.24 m.
+    # ENTRY LADDER on the +X wall at y=-4.25, clear of both buoys and clearing the nearest window
+    # rim by 0.24 m. (It was originally sited relative to the dock, which no longer exists.)
     # Starts 0.55 m above the water and runs down to the centre of the UPPER window ring.
     lad_y, lad_bot = -4.25, -TANK_D * RING_Z[0]
     lad_rungs = "".join(
@@ -312,13 +351,11 @@ def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
     <material name="m_room" rgba="0.085 0.085 0.095 1" specular="0.02"/>
     <material name="m_lamp" rgba="1.0 0.92 0.45 1" emission="0.95" specular="0.1"/>
     <material name="m_gantry" rgba="0.93 0.74 0.05 1" specular="0.5" shininess="0.5"/>
-    <material name="m_dock" rgba="0.72 0.74 0.78 1" specular="0.3"/>
     <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.1"/>
     <material name="m_buoy_g" rgba="{BUOY_RGB} 1" specular="0.6" shininess="0.6" emission="0.18"/>
     <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
     <material name="m_cable" rgba="0.26 0.26 0.28 1" specular="0.5" shininess="0.6"/>
-    {mola_assets}{extra_assets}{room_mats}
-    <mesh name="dock" file="dock/dock_g0.obj" scale="1 1 1"/>
+    {mola_assets}{ghost_assets}{extra_assets}{room_mats}
     <mesh name="hook" file="hook/hook_g0.obj" scale="{HOOK_S} {HOOK_S} {HOOK_S}"/>
     <texture name="t_hook" type="2d" file="hook.png"/>
     <material name="m_hook" texture="t_hook" texuniform="false" specular="0.4" shininess="0.5"/>
@@ -384,10 +421,6 @@ def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
       <geom name="buoy_g" type="sphere" material="m_buoy_g" size="0.34"/>
     </body>
 
-    <body name="dock" pos="{dock_pos[0]} {dock_pos[1]} {dock_pos[2]}" euler="0 0 {np.arctan2(-dy, -dx):.4f}">
-      <geom name="dock_g" type="mesh" mesh="dock" material="m_dock" contype="0" conaffinity="0"/>
-      <site name="dock_entry" pos="1.6 0 0.2" size="0.08" rgba="0 1 0 0"/>
-    </body>
 
     <body name="mola" pos="0 0 -5">
       <freejoint name="mola_free"/>
@@ -403,7 +436,7 @@ def mjcf(mola_scale=1.24, dock_corner=(-1, -1), n_fish=0, buoy_purple=False) -> 
       <camera name="chase" pos="-4.2 0 1.5" xyaxes="0 -1 0 0.33 0 0.944" fovy="58"/>
       <site name="mola_c" pos="0 0 0" size="0.05" rgba="1 0 0 0"/>
     </body>
-    {fish}{room_xml}
+    {fish}{ghost_body}{room_xml}
 
     <!-- TOP-DOWN SITS UNDER THE GANTRY. From 3.2 m it was shooting straight through the beams,
          which cut the tank in half in every frame. Just below the water line it sees the whole pool

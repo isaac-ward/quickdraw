@@ -13,7 +13,11 @@ Each episode lands as its own `.npz` so a crashed worker costs one episode, not 
 """
 from __future__ import annotations
 
+import ast
+import collections
+import glob
 import os
+import re
 import pathlib
 import time
 
@@ -88,6 +92,71 @@ def plan_ood(n_per=50, steps=360, seed0=50000):
     return jobs
 
 
+def steps_by_class(out, split):
+    """{class: total steps on disk} for one split, read from each episode's own meta."""
+    import ast
+    import collections
+
+    got = collections.Counter()
+    for f in glob.glob(str(pathlib.Path(out) / split / "ep_*.npz")):
+        if ".tmp." in f:
+            continue
+        try:
+            m = ast.literal_eval(str(np.load(f)["meta"]))
+        except Exception:                                      # noqa: BLE001 - a partial file
+            continue
+        got[m["kind"]] += int(m["steps"])
+    return got
+
+
+def plan_topup(out, split, target_steps, steps, glitch_p, intruder, seed_base, max_jobs=4000):
+    """Jobs that fill each behaviour class up to `target_steps`, counting what is ALREADY on disk.
+
+    WHY THIS EXISTS. Episodes end on contact, so a 900-step job does not reliably yield 900 steps --
+    the random class keeps about a third. Generating a fixed episode COUNT therefore delivers less
+    data than asked for, and unevenly: planned circles rarely truncate while random usually does, so
+    an episode-balanced set is not the STEP-balanced one the spec asked for.
+
+    TWO THINGS THIS HAS TO GET RIGHT, both of which it got wrong first time round:
+
+      INDICES MUST BE FRESH. Numbering from a fixed base meant round 2 proposed exactly the files
+      round 1 had written, run_serial skipped them all as already-on-disk, and rounds 2-6 were
+      silent no-ops -- the shortfall printed identically five times while nothing generated.
+      The next index now continues past whatever is already in that class's band.
+
+      THE ESTIMATE MUST USE THE OBSERVED YIELD. Assuming a job returns `steps` under-provisions
+      every round by the truncation factor, so the deficit shrinks geometrically instead of
+      closing. The mean length actually achieved per class is measured and used.
+    """
+    from .trajectories import CLASSES
+
+    got, lens = collections.Counter(), collections.defaultdict(list)
+    for f in glob.glob(str(pathlib.Path(out) / split / "ep_*.npz")):
+        if ".tmp." in f:
+            continue
+        try:
+            m = ast.literal_eval(str(np.load(f)["meta"]))
+        except Exception:                                      # noqa: BLE001 - partial file
+            continue
+        got[m["kind"]] += int(m["steps"])
+        lens[m["kind"]].append(int(m["steps"]))
+    used = {int(re.search(r"ep_(\d+)", f).group(1))
+            for f in glob.glob(str(pathlib.Path(out) / split / "ep_*.npz")) if ".tmp." not in f}
+    have = {c: int(got.get(c, 0)) for c in CLASSES}
+
+    jobs = []
+    for ci, c in enumerate(CLASSES):
+        lo = 900000 + ci * 100000
+        nxt = max([i for i in used if lo <= i < lo + 100000], default=lo - 1) + 1
+        yield_ = float(np.mean(lens[c])) if lens[c] else float(steps)   # observed, not assumed
+        need = target_steps - have[c]
+        n = min(max_jobs, int(np.ceil(need / max(1.0, yield_))))
+        for k in range(max(0, n)):
+            jobs.append((split, nxt + k, c, seed_base + ci * 100000 + nxt + k - lo,
+                         steps, None, glitch_p, intruder))
+    return jobs, have
+
+
 def run_serial(jobs, out, size=(144, 192), log=print, every=5):
     """Run `jobs` in THIS process, skipping episodes already on disk.
 
@@ -109,15 +178,36 @@ def run_serial(jobs, out, size=(144, 192), log=print, every=5):
                                          else intruders.load_model(intruder))
             model = model_cache[intruder]
             extra = intruders.mover(model, intruder, seed) if intruder else None
-            ep = record.rollout(model, kind, seed, steps=steps, size=size,
-                                glitch_p=glitch_p, extra=extra)
+            # RETRY ONCE ON AN EGL FAULT. "Offscreen framebuffer is not complete" is GPU memory
+            # pressure, not a bad episode -- it happened 24 shards deep while two training runs
+            # held 160 GB across both cards. Dropping the episode silently is the wrong response:
+            # rebuild the renderer and try again, and only then give up.
+            try:
+                ep = record.rollout(model, kind, seed, steps=steps, size=size,
+                                    glitch_p=glitch_p, extra=extra)
+            except Exception as exc:                          # noqa: BLE001
+                if "framebuffer" not in str(exc).lower():
+                    raise
+                model_cache.pop(intruder, None)
+                time.sleep(5.0)
+                model = (record.load_model() if intruder is None
+                         else intruders.load_model(intruder))
+                model_cache[intruder] = model
+                extra = intruders.mover(model, intruder, seed) if intruder else None
+                ep = record.rollout(model, kind, seed, steps=steps, size=size,
+                                    glitch_p=glitch_p, extra=extra)
             if ep is None:
                 fails.append((split, idx, "rollout returned None")); continue
             p = _ep_path(out, split, idx)
             p.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(p, obs=ep["obs"], act=ep["act"],
+            # ATOMIC, for the same reason tank.xml is: a reader (the packer, a progress check, the
+            # top-up planner counting steps) must never see a half-written episode. np.savez writes
+            # straight to the path, so a concurrent reader gets `BadZipFile`.
+            tmp = p.with_suffix(f".{os.getpid()}.tmp.npz")
+            np.savez_compressed(tmp, obs=ep["obs"], act=ep["act"],
                                 **{f"frames_{c}": v for c, v in ep["frames"].items()},
                                 meta=np.array(str(ep["meta"])))
+            os.replace(tmp, p)
         except Exception as exc:                              # noqa: BLE001
             fails.append((split, idx, f"{type(exc).__name__}: {exc}"))
         if n % every == 0 or n == len(todo):
@@ -172,8 +262,28 @@ if __name__ == "__main__":
     ap.add_argument("--steps", type=int, default=900)
     ap.add_argument("--ood-per", type=int, default=50)
     ap.add_argument("--ood-steps", type=int, default=360)
+    ap.add_argument("--topup", action="store_true",
+                    help="emit only the jobs needed to reach the per-class STEP targets")
+    ap.add_argument("--per-class", type=int, default=216000,   # 2.00 h each -> 6.00 h nominal
+                    help="target steps per behaviour class in train")
+    ap.add_argument("--ood-per-class", type=int, default=6000,  # 3.33 min each -> 10 min per set
+                    help="target steps per behaviour class in each OOD split")
     a = ap.parse_args()
     os.environ.setdefault("MUJOCO_GL", "egl")
-    all_jobs = plan_nominal(n=a.nominal, steps=a.steps) + plan_ood(n_per=a.ood_per, steps=a.ood_steps)
+    if a.topup:
+        all_jobs = []
+        for split, gp, intr, st, tgt in (("train", 0.0, None, a.steps, a.per_class),
+                                         ("ood_thruster", 0.30, None, a.ood_steps, a.ood_per_class),
+                                         ("ood_fish", 0.0, "fish", a.ood_steps, a.ood_per_class),
+                                         ("ood_buoy", 0.0, "buoy", a.ood_steps, a.ood_per_class)):
+            j, have = plan_topup(a.out, split, tgt, st, gp, intr,
+                                 seed_base=5000000 + 1000000 * len(all_jobs) % 7000000)
+            all_jobs += j
+            if a.shard == 0:
+                short = {c: tgt - v for c, v in have.items()}
+                print(f"[topup] {split:13s} have {dict(have)}  short {short}", flush=True)
+    else:
+        all_jobs = plan_nominal(n=a.nominal, steps=a.steps) + plan_ood(n_per=a.ood_per,
+                                                                      steps=a.ood_steps)
     mine = shard(all_jobs, a.shard, a.shards)
     run_serial(mine, a.out, log=lambda m: print(f"[s{a.shard}] {m}", flush=True))

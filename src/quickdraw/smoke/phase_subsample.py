@@ -12,6 +12,7 @@ Run: uv run python -m quickdraw.smoke.phase_subsample
 import numpy as np
 
 import quickdraw.data.dataset as D
+from quickdraw.data.dataset import DataConfig
 
 OK = [0, 0]
 def check(name, cond, extra=""):
@@ -30,14 +31,10 @@ def make(n_eps=3, T=53):
         eps.append((o, a))
     return eps
 
-D.set_subsample(S)
-D._SUBSAMPLE_USED = False
-
-D.set_subsample_all_phases(False)
-off = D._subsample_episodes(make(), "repo/train")
-D.set_subsample_all_phases(True)
-on_tr = D._subsample_episodes(make(), "repo/train")
-on_va = D._subsample_episodes(make(), "repo/val")
+# (2026-09-21) the stride/phases are passed EXPLICITLY as a DataConfig now (no module globals to set).
+off = D._subsample_episodes(make(), "repo/train", dcfg=DataConfig(subsample=S, subsample_all_phases=False))
+on_tr = D._subsample_episodes(make(), "repo/train", dcfg=DataConfig(subsample=S, subsample_all_phases=True))
+on_va = D._subsample_episodes(make(), "repo/val", dcfg=DataConfig(subsample=S, subsample_all_phases=True))
 
 check("OFF gives 1 episode per input", len(off) == 3, f"{len(off)}")
 check("ON gives s episodes per input on TRAIN", len(on_tr) == 3 * S, f"{len(on_tr)} (expect {3*S})")

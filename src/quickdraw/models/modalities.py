@@ -56,6 +56,10 @@ class ModalitySpec:
     #                           per level, zero-init output. This is Stable Diffusion's multi-resolution
     #                           cross-attention pattern; see models/decoders.py:LevelCrossAttn for the caveat
     #                           that SD injects TEXT into a DENOISER, not a decoder re-reading its own latent.
+    decode_down_inject: bool = False   # decode_arch=up + decode_kind=flow ONLY. Feature 2 on the DOWN/analysis
+    #                           path (a denoiser conditions its down blocks too; SD U-Net pattern). zero-init.
+    decode_down_xattn_max_res: int = 0  # decode_arch=up + decode_kind=flow ONLY. Feature 3 on the DOWN path,
+    #                           resolution-gated exactly like decode_xattn_max_res. zero-init output.
     decode_out_act: str = "none"   # decode_arch=up ONLY. "none" (default, bit-identical to every historical
     #                           run) | "sigmoid" -> bound the decoder output to (0,1) BY CONSTRUCTION.
     #                           WHY IT EXISTS (2026-09-03). `out_conv` is a bare nn.Conv2d, so the output is
@@ -110,6 +114,26 @@ class ModalitySpec:
     #                           larger K would add (it IS being in the wrong place). Do not sweep it; the
     #                           plural form exists so a reader need not re-derive the generalisation to
     #                           learn it was considered. See design/derivative_loss.md §2.1.
+    visual_dino_v3: float = 0.0   # DINOv3 PER-PATCH COSINE, local by construction. 0.0 = OFF and
+    #                           byte-identical to not having it. LPIPS reduces with a spatial mean
+    #                           over frames that are 84.6% static here, diluting the moving region 5x;
+    #                           a per-patch cosine normalises WITHIN each patch, so a dim 4-pixel block
+    #                           counts as much as a bright table texture. Runs ALONGSIDE visual_lpips,
+    #                           not instead of it -- set visual_lpips=0 to swap. See models/dino_loss.py.
+    visual_dino_v3_net: str = "vits16"      # vits16 | vitsplus16 | vitb16 | vitl16. ViT-S/16 is 0.61x
+    #                           the FLOPs of the VGG16 LPIPS already pays for: a conv net pays per
+    #                           pixel, a ViT per patch, and 96x128 is only 48 patches.
+    visual_dino_v3_layer: int = -1          # -1 = the FINAL block. PixelGen found the last block best
+    #                           and MULTIPLE layers actively harmful ("conflicting supervision"), the
+    #                           opposite of LPIPS's 5-layer sum. Do not stack.
+    visual_dino_v3_patch_weight: str = "none"   # none = plain mean over patches (the published P-DINO
+    #                           form, and the default). true|max weight each patch by the motion in it,
+    #                           for the TEMPORAL form only, where 72.2% of patches are static and their
+    #                           cosine is noise (measured). Detached, so freezing cannot shrink its own
+    #                           weight. See design/dino_loss.md section 3.
+    visual_saliency: str = "none"      # "hue" -> up-weight the DECODE pixel loss on cube pixels (saturated non-table);
+    visual_saliency_weight: float = 0.0 #  cube is ~2% of scene pixels so uniform L1 barely defends it. 0/"none" = off.
+    visual_saliency_dilate: int = 2    # grow the cube mask by N px to cover the boundary ring the threshold misses
     visual_frames: int = 128   # visual_lpips>0: score LPIPS on a random subset of this many frames per step
     #                           instead of all B*F (2048 at batch 32 / F 64), which would dominate the step. A
     #                           random subset is an unbiased estimate of the same expectation. 0 -> all frames.
@@ -123,6 +147,17 @@ class ModalitySpec:
     #                           BOTH metrics -- a sample off a DRIFTED latent is a sharp WRONG frame, so PSNR
     #                           falls while LPIPS may improve. Ignored by decode_kind=mse (no_noise returns
     #                           before eps is ever drawn), so mse stays bit-identical.
+    decode_condition_on: tuple = ()   # (2026-09-24) extra head names whose token slices are APPENDED to this
+    #                           head's decode conditioning (e.g. [proprio] -> the image renderer sees the cube
+    #                           state directly, not only via backbone attention). Per-head, mirroring the other
+    #                           decode_* fields; the up-decoder reads cond by cross-attention so variable token
+    #                           count is fine. Empty -> bit-identical. See multimodal.to_obs.
+    decode_shared_noise: bool = False  # flow decode + decode_stochastic ONLY (2026-09-22): draw the sampling
+    #                           noise ONCE per episode and SHARE it across the rollout's time axis, instead of
+    #                           iid per frame. The per-frame sample is sharp either way; sharing removes the
+    #                           frame-to-frame SPARKLE (the decode-side flicker) so the rollout is temporally
+    #                           coherent. It does NOT touch the latent random-walk (the dominant flicker), only
+    #                           how that walk is rendered (record §8.29). No-op unless decode_stochastic is on.
     decode_param: str = "v"   # flow decode parameterization: "v" (velocity, integrate ODE — imprecise for images)
     #                           | "x0" (predict the clean obs directly — precise + in-range; use for image decode). See flow.py.
     decode_arch: str = "vit"  # IMAGE decoder architecture. "unet" (conv U-Net; serves BOTH decode_kinds) |
@@ -211,6 +246,16 @@ class Modality(nn.Module):
     def _decode_cond(self, flat_tok: Tensor) -> Tensor:   # (M, n_tokens, d) -> conditioning for the decode head
         raise NotImplementedError
 
+    @staticmethod
+    def _append_cond_extra(cond: Tensor, cond_extra: Tensor | None) -> Tensor:
+        """decode_condition_on: append extra conditioning tokens (already lead-flattened at the call site or
+        here) to this head's cond. The up-decoder reads cond by cross-attention, so a variable token count is
+        fine. None -> unchanged. Shared by decode() and decode_loss() so the two sites never drift."""
+        if cond_extra is None:
+            return cond
+        ce = cond_extra.reshape(-1, cond_extra.shape[-2], cond_extra.shape[-1])
+        return torch.cat([cond, ce], dim=-2)
+
     def encode(self, obs: Tensor) -> Tensor:
         """obs (B,[T,]*obs_shape) -> tokens (B,[T,]n_tokens,d)."""
         lead = obs.shape[: obs.ndim - self._obs_ndim]
@@ -218,7 +263,8 @@ class Modality(nn.Module):
         tok = self._encode(flat)
         return tok.reshape(*lead, self.n_tokens, tok.shape[-1])
 
-    def decode(self, tok: Tensor, *, commit: bool = False) -> Tensor:
+    def decode(self, tok: Tensor, *, commit: bool = False, eps: Tensor | None = None,
+               cond_extra: Tensor | None = None) -> Tensor:
         """tokens (B,[T,]n_tokens,d) -> obs (B,[T,]*obs_shape). mse/x0 -> 1 step; v+shortcut -> K=1; v plain ->
         decode_steps. Same output shape for every kind/arch.
 
@@ -226,18 +272,39 @@ class Modality(nn.Module):
         ROUND-TRIP anchor: it is an MSE against the target at weight 10, and E||x_hat - t||^2 =
         ||E x_hat - t||^2 + Var(x_hat), so scoring a SAMPLE there trains the sampler's variance toward zero --
         i.e. it would optimise away the very sharpness decode_stochastic exists to buy, at 10x the weight of
-        the decode loss. The anchor's job is to measure the codec, which is deterministic by definition."""
+        the decode loss. The anchor's job is to measure the codec, which is deterministic by definition.
+
+        `eps` (2026-09-22): externally-supplied starting noise, shape (prod(lead), *obs_shape) matching the
+        flattened batch. Only the warped-noise diagnostic (eval_warped_noise) uses it, to decode a frame with a
+        specific ∫-noise field; it forces a full-step stochastic sample from that eps. None -> normal path."""
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
+        # decode_condition_on (2026-09-24): APPEND extra conditioning tokens (e.g. the proprio/cube slice) to
+        # this head's own tokens, so the renderer conditions on them directly. The up-decoder reads `cond` by
+        # CROSS-ATTENTION (TokenGridReadout / TokenPool), so a variable token count is fine -- no arch change.
+        # None -> bit-identical.
+        cond = self._append_cond_extra(self._decode_cond(flat), cond_extra)
+        if eps is not None and not self.decode_head.no_noise and not commit:
+            obs = self.decode_head.sample(cond, steps=self.decode_steps, deterministic=False, eps=eps)
+            return obs.reshape(*lead, *obs.shape[1:])
         stoch = bool(getattr(self, "decode_stochastic", False)) and not self.decode_head.no_noise and not commit
         # x0 collapses to ONE step only when committing: the k-loop's renoise is what injects the sampling
         # noise, so a stochastic x0 decode needs the full decode_steps to be a sampler rather than one draw.
         steps = 1 if (self.decode_head.shortcut or (self.decode_head.param == "x0" and not stoch)) else self.decode_steps
-        obs = self.decode_head.sample(self._decode_cond(flat), steps=steps, deterministic=not stoch)
+        # decode_shared_noise (2026-09-22): when sampling a ROLLOUT (lead = (..., T)), draw the noise once per
+        # episode and share it across the T frames so the sparkle is temporally coherent (record §8.29). `lead`
+        # flattens time-contiguous (t fastest), so the share factor is exactly lead[-1]=T. Needs a time axis
+        # (len(lead)>=2) and stochastic sampling; otherwise 1 = iid, bit-identical to before.
+        share = int(lead[-1]) if (stoch and getattr(self, "decode_shared_noise", False) and len(lead) >= 2) else 1
+        obs = self.decode_head.sample(cond, steps=steps, deterministic=not stoch, share_noise_over=share)
         return obs.reshape(*lead, *obs.shape[1:])
 
-    def decode_loss(self, tok: Tensor, target: Tensor):
+    def decode_loss(self, tok: Tensor, target: Tensor, cond_extra: Tensor | None = None):
         """Per-head decode loss. Returns `(main, shortcut|None, derivative|None)`.
+
+        `cond_extra` (2026-09-24): extra conditioning tokens (decode_condition_on) APPENDED to this head's cond
+        at BOTH the train (here) and inference (decode) sites, so the decoder trains and infers on the same
+        conditioning. None -> bit-identical.
 
         The head scores its clean prediction with `self.recon_loss`, which is the SAME object the roundtrip
         anchor uses -- see recon_loss below. No second decoder forward, which matters because the decoder is
@@ -261,7 +328,7 @@ class Modality(nn.Module):
         lead = tok.shape[:-2]
         flat = tok.reshape(-1, tok.shape[-2], tok.shape[-1])
         tgt = target.reshape(-1, *target.shape[len(lead):])
-        cond = self._decode_cond(flat)
+        cond = self._append_cond_extra(self._decode_cond(flat), cond_extra)   # decode_condition_on: extra tokens
         want_d = float(getattr(self, "derivative_weight", 0.0) or 0.0) > 0.0
         if want_d and not self.decode_head.no_noise:
             raise ValueError(
@@ -331,6 +398,8 @@ class VectorModality(Modality):
         self.derivative_weight = float(getattr(spec, "derivative_weight", 0.0) or 0.0)
         self.derivative_strides = tuple(getattr(spec, "derivative_strides", (1,)) or (1,))
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
+        self.decode_shared_noise = bool(getattr(spec, "decode_shared_noise", False))  # (2026-09-22) time-shared decode noise; see decode()
+        self.decode_condition_on = tuple(getattr(spec, "decode_condition_on", ()) or ())  # (2026-09-24) extra heads appended to decode cond
         no_noise = self.decode_kind == "mse"      # mse = the DEGENERATE no-noise FlowField (unified net; cond = the token)
         self.decode_head = FlowField(dz=spec.dim, h_dim=d, hidden=hidden,
                                      chunk=int(getattr(spec, "decode_chunk_train", 0) or 0),
@@ -372,6 +441,8 @@ class ImageModality(Modality):
         self.derivative_strides = tuple(getattr(spec, "derivative_strides", (1,)) or (1,))
         no_noise = self.decode_kind == "mse"       # mse = the DEGENERATE no-noise head (unified net; cond = latent tokens)
         self.decode_stochastic = bool(getattr(spec, "decode_stochastic", False))
+        self.decode_shared_noise = bool(getattr(spec, "decode_shared_noise", False))  # (2026-09-22) time-shared decode noise; see decode()
+        self.decode_condition_on = tuple(getattr(spec, "decode_condition_on", ()) or ())  # (2026-09-24) extra heads appended to decode cond
         # ONE VisualLoss, registered ONCE here as a child of this modality. `recon_loss` below hands the SAME
         # object to both loss sites; registering it under two parents would duplicate the frozen LPIPS weights
         # in every checkpoint.
@@ -382,7 +453,14 @@ class ImageModality(Modality):
                                  w_l1=float(getattr(spec, "visual_l1", 0.0) or 0.0),
                                  w_lpips=float(getattr(spec, "visual_lpips", 0.0) or 0.0),
                                  lpips_net=str(getattr(spec, "visual_lpips_net", "vgg")),
-                                 frames=int(getattr(spec, "visual_frames", 128) or 0))
+                                 frames=int(getattr(spec, "visual_frames", 128) or 0),
+                                 w_dino_v3=float(getattr(spec, "visual_dino_v3", 0.0) or 0.0),
+                                 dino_v3_net=str(getattr(spec, "visual_dino_v3_net", "vits16")),
+                                 dino_v3_layer=int(getattr(spec, "visual_dino_v3_layer", -1)),
+                                 dino_v3_patch_weight=str(getattr(spec, "visual_dino_v3_patch_weight", "none")),
+                                 saliency=str(getattr(spec, "visual_saliency", "none")),
+                                 saliency_weight=float(getattr(spec, "visual_saliency_weight", 0.0) or 0.0),
+                                 saliency_dilate=int(getattr(spec, "visual_saliency_dilate", 2) or 0))
         param, sc = ("x0" if no_noise else spec.decode_param), (spec.decode_shortcut and not no_noise)
         # EXPLICIT dispatch with a RAISE on anything unknown. This used to be `if unet ... else vit`, so a
         # typo'd or newly-added decode_arch SILENTLY built the ViT head and the run "tested" nothing at all.
@@ -391,19 +469,24 @@ class ImageModality(Modality):
             self.decode_head = ImageUNetFlowHead(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
                                                  chunk=_chunk, param=param, shortcut=sc, no_noise=no_noise)
         elif self.decode_arch == "up":
-            # UP-ONLY decoder (models/decoders.py): no analysis path, query-grid readout. DECODER ONLY -- it
-            # has no mechanism to denoise an image, so it cannot serve decode_kind=flow.
-            if not no_noise:
-                raise ValueError(
-                    "decode_arch='up' is a DECODER (tokens->image) and cannot serve decode_kind='flow', which "
-                    "needs a denoiser with an analysis path over its own noised input. Use decode_arch='unet' "
-                    "for flow, or decode_kind='mse' for 'up'. See models/decoders.py.")
-            from .decoders import TokenGridDecoder
-            self.decode_head = TokenGridDecoder(self.ae.cfg, base=int(getattr(spec, "decode_base", 32)),
-                                                chunk=_chunk,
-                                                inject=bool(getattr(spec, "decode_inject", False)),
-                                                xattn_max_res=int(getattr(spec, "decode_xattn_max_res", 0) or 0),
-                                                out_act=self.decode_out_act)
+            # The UP backend serves BOTH kinds (models/decoders/): up-mse = TokenGridDecoder (no analysis
+            # path, query-grid readout); up-flow = UpFlowDecoder (the SAME backend + a mimics-up analysis
+            # path, all contributions zero-init so it starts == up-mse). `unet-mse` is unreachable from an
+            # `up` config by construction. See design/up_flow_decoder.md.
+            _base = int(getattr(spec, "decode_base", 32))
+            _inj = bool(getattr(spec, "decode_inject", False))
+            _xa = int(getattr(spec, "decode_xattn_max_res", 0) or 0)
+            if no_noise:
+                from .decoders import TokenGridDecoder
+                self.decode_head = TokenGridDecoder(self.ae.cfg, base=_base, chunk=_chunk,
+                                                    inject=_inj, xattn_max_res=_xa, out_act=self.decode_out_act)
+            else:
+                from .decoders import UpFlowDecoder
+                self.decode_head = UpFlowDecoder(
+                    self.ae.cfg, base=_base, chunk=_chunk, param=param, shortcut=sc, inject=_inj, xattn_max_res=_xa,
+                    down_inject=bool(getattr(spec, "decode_down_inject", False)),
+                    down_xattn_max_res=int(getattr(spec, "decode_down_xattn_max_res", 0) or 0),
+                    out_act=self.decode_out_act)
         elif self.decode_arch == "vit":
             self.decode_head = ImageFlowHead(self.ae.cfg, depth=spec.ae_depth, param=param, shortcut=sc,
                                              no_noise=no_noise, chunk=_chunk)
@@ -430,7 +513,7 @@ class ImageModality(Modality):
         latent = int(spec.num_tokens) * int(d)
         head = self.decode_head
         if self.decode_arch == "up":
-            gh, gw = head.readout.grid_hw
+            gh, gw = head.back.readout.grid_hw     # readout lives on the shared UpBackend (up-mse and up-flow)
             cap, how = gh * gw * d, f"query grid {gh}x{gw} = {gh * gw} cells x d{d}"
             over = "OVER the cap -- cross-attention still SELECTS from a richer menu, so this buys choice, not bandwidth"
         elif self.decode_arch == "unet":
@@ -503,10 +586,11 @@ class PretrainedImageHead(TransportHead):
             img = (img + 1) / 2                    # [-1,1] -> [0,1] (probe-confirmed TAESD convention)
         return img.permute(0, 2, 3, 1)             # (M, H, W, 3) in [0,1] — obs space
 
-    def sample(self, cond, *, steps, deterministic, eps=None, record_path=False):
+    def sample(self, cond, *, steps, deterministic, eps=None, record_path=False, share_noise_over: int = 1):
         H, W = img_hw(self.img_size)
         return self._sample(cond, event_shape=(H, W, self.channels), lead=cond.shape[:-2],
-                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path)
+                            steps=steps, deterministic=deterministic, eps=eps, record_path=record_path,
+                            share_noise_over=share_noise_over)   # (2026-09-22) time-shared noise render lever
 
 
 class PretrainedImageModality(Modality):
@@ -523,6 +607,7 @@ class PretrainedImageModality(Modality):
         self.decode_kind = "mse"                   # pretrained path = the deterministic no_noise decode
         self.decode_steps = 1
         self.decode_stochastic = False
+        self.decode_shared_noise = False
         H, W = img_hw(spec.img_size)
         if spec.pretrained_init:                   # load the HF weights (the pretrained pixel prior)
             taesd = AutoencoderTiny.from_pretrained(spec.pretrained_name)
