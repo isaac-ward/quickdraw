@@ -1058,6 +1058,46 @@ def _action_pit_knots(cfg, mode: str):
     return n.norm_act(n.act_pit.knots.T).T
 
 
+def migrate_decoder_keys(state: dict, expected=None, log=None) -> dict:
+    """Load PRE-2026-10-20 checkpoints into the post-longhand-merge decoder layout.
+
+    The `decoders/` package nested the IMAGE decoder's synthesis stack under a shared `UpBackend`, so
+    those parameters moved one level down -- `decode_head.<x>` -> `decode_head.back.<x>`. The MODULES
+    are unchanged (98 keys before, 98 after, identical shape multiset, and smoke/up_flow_parity still
+    matches its golden .pt): only the attribute path moved. Without this, every checkpoint trained
+    before the merge fails with ~94 missing tensors -- which is what killed the 6 h MBARI resume.
+
+    `expected` is the target model's state_dict keys. It matters: a VECTOR head's decoder (proprio's
+    plain MLP, `decode_head.net.*`) did NOT move, so a blind rewrite relocates it too and swaps one
+    set of missing tensors for another. With `expected` the rewrite is applied only where it actually
+    lands on a real parameter, which also makes the shim correct for heads that do not exist yet.
+
+    Also drops `visual._net.*` -- the frozen LPIPS/VGG net behind the perceptual loss, which used to
+    be registered as a submodule and written into the checkpoint. It is pretrained and rebuilt on
+    construction, so carrying it is noise, and the new layout rejects it as unexpected.
+
+    No-op on a checkpoint already in the new layout, so it is safe to call unconditionally.
+    """
+    exp = set(expected) if expected is not None else None
+    out, moved, dropped = {}, 0, 0
+    for k, v in state.items():
+        if "visual._net." in k:
+            dropped += 1
+            continue
+        if ".decode_head." in k and ".decode_head.back." not in k:
+            pre, post = k.split(".decode_head.", 1)
+            cand = f"{pre}.decode_head.back.{post}"
+            probe = cand[len("model."):] if cand.startswith("model.") else cand
+            if not post.startswith("tau_mlp") and (exp is None or probe in exp or cand in exp):
+                k, _ = cand, None
+                moved += 1
+        out[k] = v
+    if log and (moved or dropped):
+        log(f"[compat] pre-2026-10-20 checkpoint: {moved} decoder keys -> .back.*, "
+            f"{dropped} frozen visual._net dropped")
+    return out
+
+
 def load_checkpoint(model, path: str, allow_missing: tuple[str, ...] = ()):
     """Load a Lightning checkpoint into a bare BaseWorldModel, stripping wrapper prefixes.
 
@@ -1084,6 +1124,10 @@ def load_checkpoint(model, path: str, allow_missing: tuple[str, ...] = ()):
         for _pre in ("act_enc", "enc"):
             k = re.sub(rf"(^|\.)({_pre})\.(\d+)\.", rf"\1\2.net.\3.", k)
         clean[k] = v
+    # 2026-10-20: the decoders/ package moved the synthesis stack under `.back` -- see
+    # migrate_decoder_keys. No-op on checkpoints already in the new layout.
+    clean = migrate_decoder_keys(clean, expected=model.state_dict().keys(),
+                                 log=lambda m: print(m, flush=True))
     inc = model.load_state_dict(clean, strict=False)
     # strict=False is REQUIRED (buffers like lat_mean/lat_std are absent from older checkpoints), but silently
     # discarding IncompatibleKeys is how a partly-RANDOM model gets evaluated as if it were trained. Missing

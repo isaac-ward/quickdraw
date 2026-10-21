@@ -62,6 +62,19 @@ class LitWorldModel(L.LightningModule):
         self.physical_warmup = float((pl.get("warmup_epochs", 0) if hasattr(pl, "get")
                                       else getattr(pl, "warmup_epochs", 0)) or 0) if self.has_physical else 0.0
 
+    def on_load_checkpoint(self, checkpoint):
+        """Migrate pre-2026-10-20 decoder keys on RESUME, the same way load_checkpoint does for eval.
+
+        Lightning loads the state_dict itself via the checkpoint connector, so the eval-side migration
+        in setup.load_checkpoint never runs here -- which is how a resume of the 6 h MBARI run died with
+        94 missing tensors while the identical checkpoint was fine for inference. This hook is the one
+        place Lightning lets us touch the dict before it is applied."""
+        from .setup import migrate_decoder_keys
+        sd = checkpoint.get("state_dict")
+        if sd is not None:
+            checkpoint["state_dict"] = migrate_decoder_keys(
+                sd, expected=self.state_dict().keys(), log=lambda m: print(m, flush=True))
+
     def on_train_start(self):
         # TRIP-WIRE: full teacher-forcing (p_tf never drops) means NO in-rollout drift training. This produced
         # collapsed/drifting models (val rises, rollout predictions -> origin) on the flow model. Warn LOUDLY to
