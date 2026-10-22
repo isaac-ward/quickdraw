@@ -265,14 +265,20 @@ def _excursion(t, phase):
     return A * np.sin(w * t + phase), A * w * np.cos(w * t + phase)
 
 
-def policy_circle(spec, yaw_sweep=False, k_pos=1.1, k_att=2.6, v_cap=1.4):
+def policy_circle(spec, yaw_sweep=False, k_pos=1.1, k_att=2.6, v_cap=1.4, face="tangent"):
     """Returns f(t, state) -> action. `yaw_sweep` periodically rotates the body off the path frame
     about ALL THREE axes -- roll, pitch and yaw -- so the vehicle tumbles slowly while still
     thrusting along the circle. That is the third class.
 
     Both loops are first order (see `thrust_for`). The position term enters as a VELOCITY correction,
     capped, rather than as an acceleration, so a large excursion asks for a bounded speed back onto the
-    path instead of an unbounded force."""
+    path instead of an unbounded force.
+
+    `face` picks what the body +X -- and so the FPV camera -- points at. "tangent" is the flight
+    direction, which is what nominal data uses. "centre" aims it at the circle centre, which is the
+    only way a fixed object stays in frame for a whole lap: with a tangential heading the vehicle
+    yaws continuously and anything stationary sweeps through the view and out again. The controlled
+    OOD episodes need the object visible for a sustained window, not a glimpse."""
     n_hat = spec["R"][:, 2]
     w_path = spec["speed"] / spec["rad"]            # the desired frame's own rotation rate about n_hat
 
@@ -284,7 +290,11 @@ def policy_circle(spec, yaw_sweep=False, k_pos=1.1, k_att=2.6, v_cap=1.4):
         v_cmd = v_d + (corr if nc < v_cap else corr * (v_cap / nc))
         lin = thrust_for(v_cmd, v, q)
 
-        fwd = v_d / max(1e-6, np.linalg.norm(v_d))
+        if face == "centre":
+            radial = np.asarray(spec["centre"], np.float64) - p_d
+            fwd = radial / max(1e-6, np.linalg.norm(radial))
+        else:
+            fwd = v_d / max(1e-6, np.linalg.norm(v_d))
         R_des = frame_on_plane(fwd, n_hat)
         # FEEDFORWARD + correction. Without the feedforward the loop can only generate the path's own
         # turn rate by holding a standing error (w_des / k_att = 5.5 deg here), which is both sloppy

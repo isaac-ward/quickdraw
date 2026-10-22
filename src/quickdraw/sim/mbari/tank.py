@@ -257,7 +257,7 @@ def _walls_and_rooms(hl, hw, seed=4242):
     return ("\n    ".join(walls), "".join(wall_assets), "".join(mats), "".join(bodies))
 
 
-def mjcf(mola_scale=1.24, n_fish=0, buoy_purple=False, ghost=False) -> str:
+def mjcf(mola_scale=1.24, n_fish=0, buoy_purple=False, ghost=False, buoy_ood=False) -> str:
     """The tank MJCF. `mola_scale` 1.24 makes the AUV 1.0 m long (0.807 x 1.24), half its first size."""
     hl, hw = TANK_L / 2, TANK_W / 2
     HOOK_S = 0.14                       # the mesh is 5.53 m tall raw -> 0.77 m (halved: 1.55 m
@@ -268,6 +268,15 @@ def mjcf(mola_scale=1.24, n_fish=0, buoy_purple=False, ghost=False) -> str:
     # read as a dive pose when rendered.
     BUOY_RGB = "0.72 0.18 0.92" if buoy_purple else "0.18 1.00 0.25"
     mola_assets, mola_geoms = _mola_geoms(mola_scale)
+    # A PURPLE BUOY AS A MOCAP BODY, for the controlled OOD episodes (gen_ood_controlled.py).
+    # The `buoy_purple` condition above RECOLOURS an existing fixture, which cannot "come into
+    # frame" -- it is in the scene from step 0 and only the camera moves. An onset experiment needs
+    # an object that is genuinely absent and then present, so this is a separate body the caller
+    # parks below the floor and raises. It is off by default and never built for nominal data.
+    buoy_ood_body = ("\n    <body name=\"buoy_ood\" mocap=\"true\" pos=\"0 0 -40\">"
+                     "\n      <geom name=\"buoy_ood_g\" type=\"sphere\" material=\"m_buoy_p\" size=\"0.34\" "
+                     "contype=\"0\" conaffinity=\"0\"/>"
+                     "\n    </body>") if buoy_ood else ""
     # GHOST: a translucent green copy of the vehicle marking the GOAL POSE, as a mocap body so a
     # caller can place it per episode. OFF by default and never built for data generation -- a
     # target marker in the training frames would be a feature the model could read instead of
@@ -353,6 +362,7 @@ def mjcf(mola_scale=1.24, n_fish=0, buoy_purple=False, ghost=False) -> str:
     <material name="m_gantry" rgba="0.93 0.74 0.05 1" specular="0.5" shininess="0.5"/>
     <material name="m_buoy_o" rgba="0.98 0.42 0.03 1" specular="0.6" shininess="0.6" emission="0.1"/>
     <material name="m_buoy_g" rgba="{BUOY_RGB} 1" specular="0.6" shininess="0.6" emission="0.18"/>
+    <material name="m_buoy_p" rgba="0.72 0.18 0.92 1" specular="0.6" shininess="0.6" emission="0.18"/>
     <material name="m_rope" rgba="0.85 0.85 0.80 1"/>
     <material name="m_cable" rgba="0.26 0.26 0.28 1" specular="0.5" shininess="0.6"/>
     {mola_assets}{ghost_assets}{extra_assets}{room_mats}
@@ -420,6 +430,7 @@ def mjcf(mola_scale=1.24, n_fish=0, buoy_purple=False, ghost=False) -> str:
       <geom name="rope_g" type="capsule" material="m_rope" fromto="0 0 0 0 0 {5.6 + WATER_Z}" size="0.025"/>
       <geom name="buoy_g" type="sphere" material="m_buoy_g" size="0.34"/>
     </body>
+    {buoy_ood_body}
 
 
     <body name="mola" pos="0 0 -5">

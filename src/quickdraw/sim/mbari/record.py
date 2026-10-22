@@ -58,10 +58,18 @@ MIN_STEPS = 80        # below P+F+1 = 73 an episode yields NO training windows a
 
 
 def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=None,
-            glitch_p=0.0, extra=None):
+            glitch_p=0.0, extra=None, glitch_from=0, face="tangent"):
     """One episode. `kind` in trajectories.CLASSES. Returns dict(obs, act, frames, meta).
 
     `extra(model, data, k)` runs once per control step, for the OOD intruders that need to be moved.
+
+    `glitch_from` delays the thruster glitch to a step index. The controlled OOD episodes
+    (gen_ood_controlled.py) need every condition to share one onset structure -- clean for the first
+    10 s, anomalous for the next 30 -- and the thruster is the one condition with no object to bring
+    into frame, so its anomaly is switched on in TIME instead. 0 keeps the original behaviour.
+
+    `face` is passed through to the circle policy: "centre" aims the FPV camera at the circle centre
+    so a stationary object stays in frame for a whole lap. See trajectories.policy_circle.
     """
     import mujoco
 
@@ -75,7 +83,7 @@ def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=N
         spec = tj.fit_circle(rng, steps * dt, dt)
         if spec is None:
             return None
-        policy = tj.policy_circle(spec, yaw_sweep=(kind == "circle_yaw"))
+        policy = tj.policy_circle(spec, yaw_sweep=(kind == "circle_yaw"), face=face)
     elif kind == "random":
         policy = tj.policy_random(rng, dt)
     else:
@@ -106,11 +114,17 @@ def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=N
                 break
             a_cmd = np.asarray(policy(k * dt, s), np.float32)
             obs[k], act[k] = s, a_cmd
-            for c in cams:
-                frames[c][k] = r.render(data, c)
-            a_plant = tj.glitch(a_cmd, rng, glitch_p) if glitch_p > 0 else a_cmd
+            # EXTRA BEFORE THE RENDER. It used to run after, so an object placed at step k first
+            # appeared in frame k+1 -- a one-frame lag that is invisible for patrolling intruders
+            # but breaks an onset contract, where "frames from step 300 contain the anomaly" has to
+            # be exactly true for the surprise trace to be read against a known boundary.
             if extra is not None:
                 extra(model, data, k)
+                mujoco.mj_forward(model, data)       # propagate mocap to xpos before drawing
+            for c in cams:
+                frames[c][k] = r.render(data, c)
+            a_plant = (tj.glitch(a_cmd, rng, glitch_p)
+                       if (glitch_p > 0 and k >= glitch_from) else a_cmd)
             for _ in range(sub):
                 mola.apply(model, data, a_plant)
                 mujoco.mj_step(model, data)
@@ -123,6 +137,7 @@ def rollout(model, kind, seed, steps=900, size=(144, 192), cams=CAMS, renderer=N
     obs, act = obs[:n_done], act[:n_done]
     frames = {c: v[:n_done] for c, v in frames.items()}
     meta = {"kind": kind, "seed": int(seed), "steps": int(n_done), "glitch_p": float(glitch_p),
+            "glitch_from": int(glitch_from), "face": str(face),
             "ended_on_contact": bool(n_done < steps)}
     if spec is not None:
         meta.update(radius=float(spec["rad"]), speed=float(spec["speed"]),
