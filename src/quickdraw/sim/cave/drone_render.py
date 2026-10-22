@@ -29,6 +29,13 @@ PROP_LIFT = 0.012                                  # m: raise props slightly abo
 # mesh-local (x,z rotor plane, +y up) -> body (x forward, y right, z DOWN): swap y<->z and flip for z-down.
 ROT_L2B = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], np.float32)
 
+PERSON_GLB = os.path.join(ASSETS, "person.glb")    # red low-poly human (409 verts)
+PERSON_RGBA = np.array([204, 15, 13, 255], np.uint8)
+# person.glb (raw trimesh buffer, no scene-graph xform): +Y up (head at +Y, tallest axis Y). Rx(-90) maps local
+# +Y (head) -> grapevine up (-z); after it a pure translation stands the person feet-down at the placement point,
+# in the SAME frame as the cave mesh (grapevine z, UP = -z). det +1 (no mirror).
+ROT_P2G = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], np.float64)
+
 _CACHE = {}
 
 
@@ -119,6 +126,37 @@ def _load_cave():
     return m
 
 
+def _load_person(height=1.7):
+    """Red low-poly human MESH standing upright in the GRAPEVINE frame: feet at the ORIGIN, head toward grapevine
+    up (-z), `height` metres tall, solid red. Cached per height. The raw person.glb buffer is +Y-up (head +Y);
+    ROT_P2G = Rx(-90) rotates local +Y -> grapevine up (-z), so applying ONLY a translation to the placement point
+    stands it feet-down there (the same frame the cave mesh lives in)."""
+    key = f"person_{round(float(height), 4)}"
+    if key in _CACHE:
+        return _CACHE[key]
+    import trimesh
+    m = trimesh.load(PERSON_GLB, process=False)
+    if isinstance(m, trimesh.Scene):
+        m = trimesh.util.concatenate(tuple(m.geometry.values()))
+    v = m.vertices.astype(np.float64)
+    v *= height / np.ptp(v[:, 1])                            # raw tallest axis (Y = head) -> `height` m
+    v = (ROT_P2G @ v.T).T                                    # local +Y (head) -> grapevine up (-z)
+    v -= [v[:, 0].mean(), v[:, 1].mean(), v[:, 2].max()]    # centre x,y; feet (max world z = down) at origin
+    tm = trimesh.Trimesh(vertices=v, faces=m.faces,
+                         vertex_colors=np.tile(PERSON_RGBA, (len(v), 1)), process=False)
+    _CACHE[key] = tm
+    return tm
+
+
+def person_mesh(center_grape, height=1.7):
+    """Red person trimesh standing FEET-DOWN at the grapevine point `center_grape` (feet at the point, head toward
+    grapevine up -z), oriented in the SAME frame as the cave mesh. See `_load_person` for the transform."""
+    import trimesh
+    tm = _load_person(height)
+    return trimesh.Trimesh(vertices=tm.vertices + np.asarray(center_grape, float), faces=tm.faces,
+                           vertex_colors=tm.visual.vertex_colors, process=False)
+
+
 def _spin_T(center, angle):
     """4x4: translate origin-centered blade to `center` and spin by `angle` about the local up axis (+y)."""
     c, s = np.cos(angle), np.sin(angle)
@@ -168,6 +206,12 @@ def _mk_drone(green):
     return body, logo, blades, P["tips"]
 
 
+def _mk_person():
+    """The red person as a pyrender mesh (origin-standing, feet at origin), uploaded once into the person scene."""
+    import pyrender
+    return pyrender.Mesh.from_trimesh(_load_person(1.7), smooth=False)
+
+
 def _scenes(W, H, hfov_deg):
     """PERSISTENT pyrender scenes (meshes uploaded ONCE): `cave`, `drone`, `ghost`. One OffscreenRenderer. Per
     frame only node poses / camera change. Keyed by (W,H,hfov); full-resolution meshes (NO decimation)."""
@@ -177,6 +221,8 @@ def _scenes(W, H, hfov_deg):
         return _CACHE["scn"]
     if "scn" in _CACHE:
         _CACHE["scn"]["rend"].delete()
+        if _CACHE["scn"].get("person_rend") is not None:
+            _CACHE["scn"]["person_rend"].delete()
     fx = 0.5 * W / np.tan(0.5 * np.radians(hfov_deg))
     yf = 2 * np.arctan(0.5 * H / fx)
 
@@ -200,9 +246,18 @@ def _scenes(W, H, hfov_deg):
         light = sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=5.5))
         return dict(sc=sc, body=bn, logo=ln_, blades=bl, tips=tips, cam=cam, light=light)
 
+    def person_scene(amb):
+        sc = new_scene(amb)
+        node = sc.add(_mk_person())
+        cam = sc.add(pyrender.PerspectiveCamera(yfov=yf, aspectRatio=W / H, znear=0.02))
+        light = sc.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=4.0))
+        return dict(sc=sc, node=node, cam=cam, light=light)
+
     scn = dict(cave=dict(sc=cave_sc, node=cave_node, cam=cave_cam, light=cave_light),
                drone=drone_scene(False, 0.85), ghost=drone_scene(True, 0.7),   # drone ambient up -> brighter drone
-               rend=pyrender.OffscreenRenderer(int(W), int(H)))
+               person=person_scene(0.6),
+               rend=pyrender.OffscreenRenderer(int(W), int(H)),
+               person_rend=pyrender.OffscreenRenderer(int(W), int(H)))   # own renderer: avoid cave re-upload on switch
     _CACHE["scn"] = scn; _CACHE["scn_key"] = key
     return scn
 
@@ -215,8 +270,15 @@ def _set_drone(d, p, R, blade_angle):
         sc.set_pose(bn, _world(p, R, _spin_T(d["tips"][i], blade_angle)))
 
 
+def _set_person(d, place):
+    """Stand the (origin-built, feet-at-origin) person with feet at the grapevine point `place` (pure translation)."""
+    T = np.eye(4); T[:3, 3] = np.asarray(place, float)
+    d["sc"].set_pose(d["node"], T)
+
+
 def render_view(scene, eye, fwd, up, W, H, hfov_deg, p, R, blade_angle, goal_p, Rg,
-                show_drone=True, show_ghost=True, ghost_a=0.25, ceil_cut=None):
+                show_drone=True, show_ghost=True, ghost_a=0.25, ceil_cut=None,
+                show_person=False, person_place=None):
     """Render cave (splat) + goal-ghost + drone from (eye,fwd,up) and DEPTH-composite -> rgb (H,W,3) uint8.
 
     The cave comes from `scene.render_rgbd` (the splat+mesh hybrid, depth in grapevine metres); the drone/ghost
@@ -247,6 +309,15 @@ def render_view(scene, eye, fwd, up, W, H, hfov_deg, p, R, blade_angle, goal_p, 
     c_depth = np.where(m_depth > 0, m_depth, np.inf).astype(np.float32)   # mesh is the reliable occluder
     has_cave = m_depth > 0
 
+    # red person MESH (part of the WORLD, like the cave): composite OVER the cave where nearer (walls occlude it),
+    # BEFORE the ghost/drone so the vehicle draws over it. Same depth test as the drone. Off by default.
+    if show_person and person_place is not None:
+        _set_person(scn["person"], person_place)
+        scn["person"]["sc"].set_pose(scn["person"]["cam"], cp); scn["person"]["sc"].set_pose(scn["person"]["light"], cp)
+        p_rgb, p_depth = scn["person_rend"].render(scn["person"]["sc"], flags=flags)   # dedicated renderer
+        pvis = (p_depth > 0) & (~has_cave | (p_depth < c_depth))
+        out[pvis] = p_rgb[..., :3][pvis].astype(np.float32)
+
     # ghost at the goal (translucent), then drone over it (opaque)
     if show_ghost:
         _set_drone(scn["ghost"], goal_p, Rg, 0.0)
@@ -262,6 +333,14 @@ def render_view(scene, eye, fwd, up, W, H, hfov_deg, p, R, blade_angle, goal_p, 
         dvis = (d_depth > 0) & (~has_cave | (d_depth < c_depth))
         out[dvis] = d_rgb[..., :3][dvis].astype(np.float32)
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def render_fpv(scene, eye, fwd, up, W, H, hfov_deg, person_place=None):
+    """Drone's-eye FPV = cave (splat + noise mesh) + the red person MESH if `person_place` is given; NO drone, NO
+    ghost. This is the view re-recording / OOD consumes. Thin wrapper over `render_view` (drone/ghost args unused)."""
+    return render_view(scene, eye, fwd, up, W, H, hfov_deg, p=eye, R=np.eye(3), blade_angle=0.0,
+                       goal_p=eye, Rg=np.eye(3), show_drone=False, show_ghost=False,
+                       show_person=person_place is not None, person_place=person_place)
 
 
 def inspect(out_path, size=512):
