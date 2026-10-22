@@ -477,3 +477,27 @@ else fixed: FULL (default) · kinematics-only (integrate v→p & ω→q; WM lear
 "less") · identity (obs=prev+residual; pure delta) · none (absolute). **SKIP translation-only** (boring +
 quat-norm hazard). Needs small config flags on the physics fn (rotational_dynamics / attitude_kinematics on/off)
 to build the reduced priors — not yet wired.
+
+## 08-27 — DreamerV3 coop vs noncoop EVALS (logs/dreamer_evals/)
+
+Both runs completed 16ep (unified config: categorical, layernorm, proprio prior:physics llw0, image bespoke
+conv 32-tok prior:none decode/image+roundtrip). Evals on the best-FOR-IMAGE ckpt (coop ep3, noncoop ep7 — image
+PSNR flat ~10 dB across all epochs, so pick ~arbitrary). Artifacts: logs/dreamer_evals/COMPARISON.md + run dirs.
+
+| metric | coop | noncoop |
+|---|---|---|
+| proprio pointwise cl1 | **0.066** | **1.819** (~27x) |
+| proprio pointwise cl16 | 0.076 | 1.917 |
+| proprio pointwise open@128 | 2.401 | 2.929 |
+| ae_floor image PSNR | 11.11 dB | 11.17 dB |
+| roundtrip image PSNR | 10.28 | 10.42 |
+| rolled image tvar ratio | **0.0000** | **0.0000** |
+
+**PROPRIO+physics works (coop cl1 0.066); evasive noncoop ~27x harder.** **IMAGE FAILED in both:** (1) the
+decode/image collapse-fix did NOT hold — tvar 0.0000 (constant predicted frame), WORSE than the taesd A-run's
+0.018; (2) the bespoke conv AE codec floors at ~11 dB vs taesd ~22 dB, so the "no TAESD" call cost ~11 dB of
+fidelity. Weak codec AND collapsed dynamics stacked. HYPOTHESIS: the categorical bottleneck over the 32 image
+tokens quantizes away frame-to-frame change and the KL pins the image tokens ~constant; decode/image can't
+overcome it. Candidate fix: take the IMAGE OUT of the categorical bottleneck (decode image from CONTINUOUS
+tokens; keep only proprio under the prob head), or revert to taesd for the codec floor. tvar EXACTLY 0.0 (vs
+0.018 before) is worth a direct diagnostic if the image is pursued.

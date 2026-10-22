@@ -159,8 +159,9 @@ def ood_horizon_shapes(cfg, has_image_heads: bool, ep_lens, P: int, n_ep_overrid
     # ~31 model steps, so decoding all 10-12 of them costs less than 8 of val's -- and with only 10 episodes
     # in a split, throwing 2 away for no reason weakens the only measurement they exist for. The override
     # lets the split-driven routine ask for all of them; None keeps every existing run's shape untouched.
+    # (max(8, n_plot) preserved so a bigger n_plot -- e.g. 16 dock reconstructions -- actually evals that many.)
     n_ep = min(int(n_ep_override) if n_ep_override else
-               (8 if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32)), len(ep_lens))
+               (max(8, int(cfg.eval.get("n_plot", 2) or 2)) if has_image_heads else int(cfg.eval.get("n_episodes", 32) or 32)), len(ep_lens))
     H = min(int(cfg.eval.get("horizon", 2048)), min(ep_lens[:n_ep]) - P - 1)
     # RENAMED 2026-10-20, and the old names are a HARD ERROR rather than an alias. `closed_loop_{X}_steps`
     # used to mean segment-and-reset -- ground on GT, roll X, concatenate -- whose reported lead at step h
@@ -218,7 +219,12 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
     # error, the filmstrips, the rollout mp4s, the error-vs-step curves -- reads the episodes it is handed.
     # Parameterising these two makes the OOD and memory splits measurable with the IDENTICAL metric code
     # that produced the @+128 numbers, so they are comparable by construction rather than by argument.
-    split = str(split or cfg.eval.get("horizon_split", "val"))
+    # TWO KNOBS, ONE JOB (merged 2026-10-22). main had eval.horizon_split for this routine;
+    # caves added the more general eval.split, which its other eval paths also read. Rather
+    # than pick one and silently ignore the other config, the specific one wins where it is
+    # set and the general one is the fallback -- so existing horizon_split runs are unchanged
+    # and a run that only sets eval.split gets what it asked for.
+    split = str(split or cfg.eval.get("horizon_split", None) or cfg.eval.get("split", "val"))
     tag = str(tag or "eval_ood_horizon")
     m = getattr(model, "_orig_mod", model)
     img_heads = [n for n, _ in m.layout if n != "proprio"]
@@ -258,6 +264,8 @@ def eval_ood_horizon(cfg, model, norm, ecfg, writer, device, step=0, split=None,
         _plog(writer, f"[{tag} @ep{step}] reviewed exclusions: keeping {len(keep)}/{len(eps)} episodes "
                       f"({[i for i in range(len(eps)) if i not in keep]} dropped, see data/ood_windows.py)")
         eps = [eps[i] for i in keep]
+    if cfg.eval.get("longest", False):
+        eps = sorted(eps, key=lambda e: -len(e[0]))   # longest (full-dock) episodes first — presentation
     n_ep, H, cl_h, _modes, _calls = ood_horizon_shapes(cfg, bool(img_heads),
                                                       [len(o) for o, _, _ in eps], P,
                                                       n_ep_override=cfg.eval.get("horizon_n_episodes"))
@@ -530,12 +538,14 @@ def eval_ae_floor(cfg, model, norm, ecfg, writer, device, step=0):
         _plog(writer, f"[eval_ae_floor @ep{step}] {pct:3d}% — {what}")
 
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+    eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
         dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
         #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
                                  cam=image_head_cams(cfg) or cfg.data.get("cam", "fpv"),
                                  repo_id=cfg.data.get("repo_id", "torus"))
+    if cfg.eval.get("longest", False):
+        eps = sorted(eps, key=lambda e: -len(e[0]))   # longest (full-dock) episodes first — presentation
     n_ep = min(int(cfg.eval.get("ae_floor_episodes", 2) or 2), len(eps))
     eps = eps[:n_ep]
     H = min(int(cfg.eval.get("horizon", 2048)), min(len(o) for o, _, _ in eps) - P - 1)
@@ -709,7 +719,7 @@ def eval_manifold(cfg, model, norm, ecfg, writer, device, step=0):
     m.eval()
     t0 = time.perf_counter()
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+    mm_eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
         dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
         #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
@@ -784,7 +794,7 @@ def eval_denoising_multistep(cfg, model, norm, ecfg, writer, device, step=0):
     P, W, d, K, n_swarm = cfg.data.P, m.window, m.d, m.sampling_steps, 16
     img_head = next((n for n, _ in m.layout if n != "proprio"), None)
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
         dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
         #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
@@ -925,7 +935,7 @@ def eval_denoising_aggregate(cfg, model, norm, ecfg, writer, device, step=0):
     #                                       (RecordedConfig has inert R/r=1.0, so R-is-not-None can't gate this; #11)
     pos, _ = _pos_idx(cfg); K, P = m.sampling_steps, cfg.data.P
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
         dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
         #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
@@ -1009,7 +1019,7 @@ def eval_denoising_filmstrip(cfg, model, norm, ecfg, writer, device, step=0):
     hz = list(cfg.eval.get("denoising_filmstrip_horizons", None) or [1, 8, 16, 32, 64])
     hz = sorted({int(h) for h in hz if int(h) >= 1})
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), "val",
+    eps_ds = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
         dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
         #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
@@ -1188,7 +1198,7 @@ def eval_interpret(cfg, model, norm, ecfg, writer, device, step=0):
     P, H, fps = cfg.data.P, int(ic["clip_len"]), step_fps(cfg, ecfg)
     dev = device if isinstance(device, str) else device.type
     img_size = next((mod.ae.cfg.img_size for mod in m.modalities.values() if hasattr(mod, "ae")), 128)
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+    eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
         dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
         #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,
@@ -1571,7 +1581,7 @@ def eval_action_distribution(cfg, model, norm, ecfg, writer, device, step=0):
         base = list(action_names) if action_names and len(action_names) == _raw else [f"a{i}" for i in range(_raw)]
         action_names = [f"{n}·t+{j}" for j in range(_sub) for n in base]
     a_max = getattr(ecfg, "a_max", None)   # torus-only histogram x-limit knob; None -> viz derives it from the data
-    eps = load_split_episodes_mm(resolve_data_root(cfg), "val",
+    eps = load_split_episodes_mm(resolve_data_root(cfg), cfg.eval.get("split", "val"),
         dcfg=DataConfig.from_cfg(cfg),   # (2026-09-21) data config passed EXPLICITLY, not a module
         #                                  global -- a missed config is now a TypeError, see DataConfig
                                  img_size=image_head_sizes(cfg) or img_size,

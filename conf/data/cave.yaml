@@ -1,0 +1,31 @@
+# =============================================================================================
+# cave-grapevine -- quadrotor in the Grapevine Gaussian-splat cave (prospector Dynamics3D + gsplat
+# render). Select with `data=cave`.
+#
+# 30 Hz. observation_vector 13-dim, action 4-dim, one camera `fpv` at 144x192.
+#
+# OBSERVATION LAYOUT (prospector.cave_wm.record.state_to_obs):
+#   0:3    x, y, z            world frame (grapevine metric), metres
+#   3:7    qw, qx, qy, qz     body->world, from the dynamics' ZYX euler. NOT z-scored (obs_identity).
+#   7:10   vx, vy, vz         linear velocity, WORLD frame
+#   10:13  p, q, r            body angular rates
+# action = [vx, vy, vz (world m/s), yaw_rate (rad/s)] -- the commanded velocity setpoint.
+#
+# subsample 1 (native 30 Hz). Revisit if frame-delta RMSE (delta_k) measures too low (degenerate
+# near-zero-motion) -- a drone's egocentric view changes fast, so 1 is the expected answer.
+# =============================================================================================
+defaults:
+  - torus
+  - _self_
+
+root: null                # set at train time: data.root=<packaged lerobot run dir>
+repo_id: cave-grapevine
+cam: fpv
+
+P: 8
+F: 64
+window_stride: 1          # LOCKED -- see torus.yaml
+subsample: 1
+
+autobatch: true
+workers: 16

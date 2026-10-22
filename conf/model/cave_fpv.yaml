@@ -1,0 +1,46 @@
+# =============================================================================================
+# Quadrotor in the Grapevine Gaussian-splat cave. One image head (the drone's forward camera) +
+# proprio. Select with `model=cave_fpv`. This is the VISION world model.
+#
+# `vl128_blockstack_2cam` (the record-holding recipe) transplanted onto cave data, changing only what
+# the dataset forces -- every inherited value was bought with an experiment (decode_arch up, flow_hidden
+# 128, L1+LPIPS mix, window 32, detach_every 32, latent_loss_weight 10), so a minimal transplant
+# isolates the new domain.
+#
+# WHAT THE DATASET FORCES:
+#  1. proprio.dim 13: x y z | quaternion wxyz (body->world) | linear vel world | body rates. Dims 3:7
+#     are a UNIT quaternion, passed obs_identity at build so never per-component z-scored.
+#  2. action_dim 4: vx vy vz (world m/s) | yaw_rate (rad/s) -- the commanded velocity setpoint.
+#  3. img_size [144,192] with ae_bottleneck 9 (144/16 = 9): one fpv image head.
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+action_dim: 4
+
+# recon_frac 1.0 -> 0.25: decode (and LPIPS) only 1/4 of the F rollout frames per step. The 4.77M upsample
+# decoder + LPIPS-vgg is the dominant cost (~0.108 s/sample at batch 29 vs proprio's 0.0016) so this ~4x's
+# image throughput. 0.25 is the validated older mm_flow value. Still supervises enough frames across windows.
+recon_frac: 0.25
+
+modalities:
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0,
+     decode_arch: mlp}
+
+  - {name: fpv, kind: image, cam: fpv,
+     weight: 1.0,
+     img_size: [144, 192],
+     ae_bottleneck: 9,
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 16,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 32,
+     latent_loss_weight: 10}
+# THROUGHPUT (2026-10-19): the full vl128 image recipe (decode_chunk_train 64, visual_frames 128, F 64)
+# runs ~0.4 s/step at the autobatched batch 6 (the 54 GB resident frame store leaves only a 42 GB budget),
+# i.e. ~9 h/epoch on 576 episodes -- intractable. Real work is cut by visual_frames 128->32 (fewer frames
+# get the expensive LPIPS-vgg pixel loss) and, at launch, data.F 64->32 (half the autoregressive unroll);
+# decode_chunk_train 64->16 lowers peak memory so autobatch can pick a bigger, more efficient batch. 1 s
+# horizon at 30 Hz is ample for short-horizon OOD surprise and MPPI control. See wizard/records/cave.md.

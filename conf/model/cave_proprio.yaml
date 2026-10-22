@@ -1,0 +1,28 @@
+# =============================================================================================
+# Quadrotor cave DYNAMICS-ONLY world model: proprio head only, no image. Select `model=cave_proprio`.
+#
+# Models the closed-loop velocity-command response: given P past (proprio, action) it predicts the next
+# 13-D proprio (pos, quaternion, world velocity, body rates). Action is the commanded velocity setpoint,
+# so this learns quad inertia + drag + attitude dynamics + the onboard velocity controller together.
+#
+# VELOCITY-INTEGRAL POSITION (integrate_position_from_velocity: true). The plain black-box decodes velocity
+# and attitude excellently (val: 0.03 m/s, ~4 deg flat across a 3 s rollout) but its ABSOLUTE position decode
+# accumulates latent-rollout drift (0.60 m @ 3 s) and is visibly jittery. So the ROLLOUT replaces the decoded
+# position with the exact kinematic integral of the decoded velocity, p[t]=p_anchor+Σ v_decoded·dt, which
+# tracks ground truth to 0.075 m @ 3 s with attitude/velocity untouched (verified on val 2026-10-20).
+#   WHY NOT A PHYSICS PRIOR: an integration/persistence prior on a channel the black-box already predicts well
+#   in ABSOLUTE terms is strictly WORSE -- it turns a bounded per-step error into unbounded accumulated drift
+#   (the kinematic-prior A/B both ramped attitude to 100-140 deg). A prior helps ONLY where the absolute decode
+#   is weak, which here is position alone -- and the velocity integral fixes exactly that, nothing else.
+# The override needs the env pos/vel indices + dt; the train script passes position_idx + velocity_idx (the
+# cave obs layout is pos [0,1,2] | quat [3,4,5,6] | vel [7,8,9] | rate [10,11,12]).
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+action_dim: 4
+integrate_position_from_velocity: true
+
+modalities:
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}

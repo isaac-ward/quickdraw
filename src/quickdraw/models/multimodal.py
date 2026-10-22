@@ -112,7 +112,8 @@ class MultiModalSequenceModel(nn.Module):
                  action_fourier_freqs: int = 0, action_squash: str = "none",
                  relative_position: bool = False, position_idx=None, relative_scale=None,
                  dynamics_prior=None, pos_encoding: str = "rope", attention_sink: int = 0,
-                 latent_rollout_weight: float = 0.0, latent_rollout_metric: str = "mse"):
+                 latent_rollout_weight: float = 0.0, latent_rollout_metric: str = "mse",
+                 integrate_position=None):
         super().__init__()
         # LATENT ROLLOUT LOSS (2026-09-30): the latent-space twin of the decode rollout loss. The decode loss
         # scores decode(rolled_latent[t]) vs the true frame; this scores the SAME attached rolled_latent[t] vs
@@ -191,6 +192,17 @@ class MultiModalSequenceModel(nn.Module):
                 f"encode->decode round-trip the codec anchor needs. Set modalities.<proprio>.latent_loss_weight=0 "
                 f"(the encoder is grounded by the decode/proprio dynamics loss instead), or prior=none to keep the "
                 f"round-trip.")
+        # VELOCITY-INTEGRAL POSITION (default None -> off, byte-identical). When set, the proprio ROLLOUT replaces
+        # the decoded absolute position with the exact kinematic integral of the decoded velocity,
+        # p[t] = p_anchor + cumsum(v_decoded[t-1]*dt). The black-box decodes velocity/attitude excellently but its
+        # ABSOLUTE position decode accumulates latent-rollout drift; integrating the good velocity fixes only that
+        # channel (cave val: 0.075 m vs 0.60 m raw @ 3 s, attitude/velocity untouched). Post-decode, applies in the
+        # rollout only (so MPPI plans on corrected position); not a prior+residual (orthogonal to dynamics_prior).
+        self._intpos = None
+        if integrate_position is not None:
+            self._intpos = (list(int(i) for i in integrate_position["pos_idx"]),
+                            list(int(i) for i in integrate_position["vel_idx"]),
+                            float(integrate_position["dt"]))
         # action -> 1 token. action_fourier_freqs>0 prepends sin/cos features so SMALL action differences are
         # linearly separable (robocasa's 12-dim action is effectively ~4 dims and consecutive actions differ
         # slightly). 0 = off = bit-identical to a plain _mlp.
@@ -869,6 +881,16 @@ class MultiModalSequenceModel(nn.Module):
             if K != 1:
                 prev0 = prev0.repeat_interleave(K, dim=0)                       # per-context -> B*K
             out["proprio"] = self._physics_proprio_rollout(bag, prev0, actions, horizon, P, norm)
+        if self._intpos is not None and norm is not None and "proprio" in out:
+            pos_i, vel_i, dt = self._intpos
+            prev0 = norm.denorm_obs(ctx_obs["proprio"][:, -1])                   # (B,obs_dim) last context, ABSOLUTE
+            if K != 1:
+                prev0 = prev0.repeat_interleave(K, dim=0)                        # per-context -> B*K
+            dec = norm.denorm_obs(out["proprio"])                               # (B,H,obs_dim) decoded absolute
+            v = dec[:, :, vel_i]                                                 # decoded world velocity
+            vprev = torch.cat([prev0[:, None, vel_i], v[:, :-1]], dim=1)         # velocity ENTERING each step
+            dec[:, :, pos_i] = prev0[:, None, pos_i] + torch.cumsum(vprev, dim=1) * dt
+            out["proprio"] = norm.norm_obs(dec)
         if return_bag:
             out["_bag"] = bag.float()
         return out
