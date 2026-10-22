@@ -42,6 +42,37 @@ def wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
+def _euler_zyx_to_quat(yaw, pitch, roll):
+    """ZYX intrinsic euler -> quaternion [w,x,y,z]."""
+    cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
+    cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
+    cr, sr = np.cos(roll / 2), np.sin(roll / 2)
+    return np.array([cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+                     cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy], np.float64)
+
+
+def yaw_from_rates(s12, omega, dt=1.0 / 30.0):
+    """Integrate heading from predicted body-rates omega (K,H,3) starting from the attitude in s12 (12-D ZYX).
+    The learned WM's DECODED quaternion is noisy/biased on large turns, but its body-RATE predictions are accurate
+    (diag: ~50 deg decode error vs ~1-15 deg integrated), so integrating the rates -- exactly as the red model
+    integrates position from velocity -- recovers heading. Returns yaw (K,H)."""
+    K, H = omega.shape[:2]
+    q = np.tile(_euler_zyx_to_quat(s12[3], s12[4], s12[5]), (K, 1))        # (K,4)
+    yaw = np.empty((K, H), np.float64)
+    for t in range(H):
+        wx, wy, wz = omega[:, t, 0], omega[:, t, 1], omega[:, t, 2]
+        qw, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]               # dq = 0.5 * q (x) [0,w]
+        dq = 0.5 * np.stack([-(qx * wx + qy * wy + qz * wz),
+                             qw * wx + qy * wz - qz * wy,
+                             qw * wy - qx * wz + qz * wx,
+                             qw * wz + qx * wy - qy * wx], 1)
+        q = q + dq * dt
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+        yaw[:, t] = np.arctan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+                               1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2))
+    return yaw.astype(np.float32)
+
+
 def batch_clearance(scene, pts):
     """Vectorised clearance-field lookup, pts (...,3) grapevine -> (...,) distance-to-wall [m]."""
     idx = np.clip(np.floor((pts - scene.gmin) / VOX).astype(int), 0, np.array(scene.occ.shape) - 1)
@@ -124,7 +155,8 @@ class LearnedDyn:
         with torch.no_grad():
             out = self.core.imagine_shared(ctx, seq, H, K, heads=["proprio"], norm=self.norm)
         pro = self.norm.denorm_obs(out["proprio"].cpu()).numpy()             # (K,H,13)
-        return pro[..., :3], quat_to_yaw(pro[..., 3:7]), pro[..., 7:10]
+        yaw = yaw_from_rates(s12, pro[..., 10:13])                            # integrate heading from body-rates
+        return pro[..., :3], yaw, pro[..., 7:10]                              # (not the noisy decoded quaternion)
 
 
 # ------------------------------------------------------------------ planner
