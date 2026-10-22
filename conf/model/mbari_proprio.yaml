@@ -1,0 +1,33 @@
+# =============================================================================================
+# MOLA AUV DYNAMICS-ONLY world model: proprio head only, no image. Select `model=mbari_proprio`.
+#
+# WHY A SECOND MODEL. The FPV world model is what this project is about, but its proprio head has to
+# share capacity with a pixel decoder, and the control benchmark showed the cost: the learned arm
+# lands 3.2 m from the goal where true dynamics lands 0.009 m -- below even the hand-written analytic
+# model. The cave work hit the same wall on a quadrotor and solved it by training the dynamics
+# separately, which took their learned arm to 0.55 success against true dynamics' 0.60. This is that
+# model for the AUV. It does NOT replace the FPV arm in item 16; both get reported, because a model
+# that never sees a pixel is a different claim from "a world model trained on nominal AUV footage".
+#
+# VELOCITY-INTEGRAL POSITION (integrate_position_from_velocity: true). Measured on our own FPV
+# checkpoint: at the MPPI horizon the angular-rate channel is predicted to 11% of its data spread
+# while linear velocity sits at 63%, and absolute position carries 0.5 m of error that the planner
+# then optimises against. Integrating the decoded velocity for position instead is the cave fix
+# (0.60 m -> 0.075 m at 3 s there). Doing it IN THE MODEL beats the control-time version we currently
+# carry, because MPPI then sees corrected states through imagine_shared rather than a patched rollout.
+#
+# THE INDEX THAT MUST BE PASSED. `_make_integrate_position` defaults velocity_idx to
+# pos + len(pos) = [3,4,5], which in this obs layout is the QUATERNION, not the velocity. The launch
+# script therefore sets environments.velocity_idx=[7,8,9] explicitly. Our layout is
+# pos [0,1,2] | quat [3,4,5,6] | world vel [7,8,9] | body rate [10,11,12] -- the same as cave's, which
+# is why their config ports across with only action_dim changing.
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+action_dim: 6
+integrate_position_from_velocity: true
+
+modalities:
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0, decode_arch: mlp}

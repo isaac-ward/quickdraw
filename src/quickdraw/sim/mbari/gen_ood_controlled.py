@@ -52,6 +52,22 @@ HIDDEN_Z = -40.0             # parking depth, well below the tank floor
 # visible in a single frame. Camera-to-object is radius - 0.5, so 2.2 m puts it at 1.7 m, well
 # clear, and 3.4 m keeps it large enough to localise.
 RADIUS_RANGE = (2.2, 3.4)
+# WALL CLEARANCE FOR THE GLITCH CONDITIONS. The onset contract needs the FULL 1200 steps, but the
+# thruster glitch shoves the vehicle off its circle and a circle that merely fits inside the tank
+# gets walked into a wall -- the first run produced 19/30 and 25/30 before exhausting its tries,
+# every failure a truncated episode. Demanding extra clearance on the PATH costs a few rejected
+# circles and buys back the episodes.
+# MEASURED, after the first value was guessed and rejected EVERYTHING: of circles already inside
+# RADIUS_RANGE, the pass rate by extra clearance is 0.3 -> 98%, 0.6 -> 32%, 0.9 -> 8%, 1.2 -> 0%.
+# 1.2 produced 0/30 after 750 tries. 0.6 keeps a third of them, which is enough.
+GLITCH_CLEARANCE = 0.6
+# AND the full 1200 steps cannot be demanded of the glitch condition. A 30% action glitch sustained
+# over 30 s walks the vehicle into a wall often enough that insisting on a complete episode throws
+# most of them away -- and weakening the glitch would make this condition a different anomaly from
+# the v7 thruster split, which is the one thing it has to match. So episodes may end early, provided
+# they carry the clean window plus a usable anomaly window; `steps` is recorded per episode and the
+# common prefix is what any fixed-window analysis should use.
+MIN_STEPS = ONSET + 450
 COUNTS = {"nominal_calib": 30, "nominal_test": 30,
           "ood_fish": 30, "ood_buoy": 30, "ood_thruster": 30}
 SEED0 = {"nominal_calib": 300000, "nominal_test": 400000,
@@ -108,22 +124,34 @@ def generate(out, splits=tuple(COUNTS), size=(144, 192), log=print):
         model = _model_for(split)
         rend = UnderwaterRenderer(model, size[0], size[1], cams=record.CAMS)
         made, tries, seed = 0, 0, SEED0[split]
-        while made < n_want and tries < n_want * 8:
+        while made < n_want and tries < n_want * 60:
             tries += 1
             seed += 1
+            # RESUMABLE. Seeds advance deterministically, so an episode already on disk is the one
+            # this iteration would regenerate -- count it and move on. Without this, topping a split
+            # up from 22 to 30 re-runs the 22, which is ~15 min of rendering for nothing.
+            if (d / f"ep_{seed}.npz").exists():
+                made += 1
+                continue
             rng = np.random.default_rng(seed)
             spec = tj.fit_circle(rng, STEPS / FPS, 1.0 / FPS)
             if spec is None:
                 continue
             if not (RADIUS_RANGE[0] <= spec["rad"] <= RADIUS_RANGE[1]):
                 continue                                   # see RADIUS_RANGE: near-plane clipping
+            if split == "ood_thruster":                    # see GLITCH_CLEARANCE
+                th = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+                pts = tj.circle_at(spec, th / (spec["speed"] / spec["rad"]))[0]
+                if not bool(tj.clear(pts, tj.VEHICLE_R + GLITCH_CLEARANCE).all()):
+                    continue
             extra = _placer(model, split, spec["centre"])
             r = record.rollout(model, "circle", seed, steps=STEPS, size=size, renderer=rend,
                                glitch_p=(GLITCH_P if split == "ood_thruster" else 0.0),
                                glitch_from=ONSET, extra=extra, face="centre")
-            if r is None or len(r["obs"]) < STEPS:          # a short episode breaks the onset contract
+            if r is None or len(r["obs"]) < MIN_STEPS:      # too short to carry clean + anomaly windows
                 continue
             meta = dict(r["meta"], split=split, onset=ONSET, controlled=True,
+                        full_length=bool(len(r["obs"]) >= STEPS),
                         centre=[float(x) for x in spec["centre"]], radius=float(spec["rad"]),
                         cam_to_object=float(spec["rad"] - 0.5),
                         speed=float(spec["speed"]))
