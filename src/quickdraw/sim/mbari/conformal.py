@@ -47,8 +47,15 @@ def conformal_threshold(calib, alpha=ALPHA):
     quantile of n points under-covers for small n -- at n=30 it is the 27th value where the
     guarantee needs the 28th, which sounds like nothing and is the difference between a bound that
     holds and a number that usually looks fine."""
-    c = np.sort(np.asarray(calib, np.float64))
+    # DROP NON-FINITE FIRST. A dynamics-only model reports its image channels as NaN (it has no
+    # opinion, see one_step), and np.sort puts NaN LAST -- so the k-th smallest silently becomes NaN,
+    # every `score > NaN` is False, and the channel reports FPR 0 / TPR 0, which reads as a
+    # beautifully specific detector rather than as no measurement at all.
+    c = np.asarray(calib, np.float64)
+    c = np.sort(c[np.isfinite(c)])
     n = len(c)
+    if n == 0:
+        return float("nan"), 0
     k = math.ceil((n + 1) * (1.0 - alpha))
     if k > n:                      # too few calibration points to certify this alpha at all
         return float("inf"), k
@@ -113,8 +120,15 @@ def run(ckpt, root=ROOT, out="/app/logs/mbari/uncertainty/conformal", key="fpv",
     log(f"  {'channel':16s} {'thr':>9} {'k':>3}  {'FPR':>6} | " + "  ".join(f"{s.replace('ood_',''):>9}" for s in OOD))
     for c in CHANNELS:
         thr, k = conformal_threshold(scores[CALIB][1][c], alpha)
-        fpr = float((scores[TEST][1][c] > thr).mean())
-        tpr = {s: float((scores[s][1][c] > thr).mean()) for s in OOD if s in scores}
+        if not np.isfinite(thr):                      # no calibration signal on this channel
+            rep["detection"][c] = {"threshold": None, "k": k, "fpr_test": None, "tpr": {},
+                                   "note": "channel absent for this model (no image head)" if k == 0
+                                           else "too few calibration points to certify alpha"}
+            log(f"  {c:16s} {'--':>9} {k:3d}  {'--':>6} |      (no measurement)")
+            continue
+        fpr = float(np.mean(scores[TEST][1][c][np.isfinite(scores[TEST][1][c])] > thr))
+        tpr = {s: float(np.mean(scores[s][1][c][np.isfinite(scores[s][1][c])] > thr))
+               for s in OOD if s in scores}
         rep["detection"][c] = {"threshold": thr, "k": k, "fpr_test": fpr, "tpr": tpr}
         log(f"  {c:16s} {thr:9.4f} {k:3d}  {fpr:6.2f} | " + "  ".join(f"{tpr.get(s, float('nan')):9.2f}" for s in OOD))
 

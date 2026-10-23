@@ -246,6 +246,75 @@ def clips(schedule="best", trials=3, steps=840, out=None, trial=None, egl_device
     print("wrote", out)
 
 
+def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
+    """ONE trial, both arms, tiled -- true dynamics above, the learned world model below.
+
+    The point is that the numbers alone ("0.009 m vs 0.022 m") do not show whether the learned arm
+    is doing the same THING or getting there by luck. Same trial, same start, same goal, same
+    planner, same seed; the only difference between the rows is which dynamics model MPPI planned
+    against. If the two rows move together the model has learned the dynamics; if they diverge and
+    reconverge, it has not.
+
+    Three cameras per arm rather than five: ten panels is unreadable at any sensible size, and
+    FPV + chase + the goal camera are the three that answer "where is it, what is it looking at,
+    and did it arrive".
+    """
+    import os
+
+    import mujoco
+
+    from ...logging import viz
+    from . import run_control, tank as _tank
+    from .water import UnderwaterRenderer
+
+    if egl_device is not None:
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(egl_device)
+    cams = ("fpv", "chase")
+    out = out or "logs/mbari/control/compare"
+    os.makedirs(out, exist_ok=True)
+    path, _ = _tank.build(textures=False, name=f"tank_cmp{trial}.xml", ghost=True)
+    model = mujoco.MjModel.from_xml_path(str(path))
+    goals, starts = _task(model, max(trial + 1, 8))
+    gp, gq = goals[trial]
+    gid = int(model.body_mocapid[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "ghost")])
+
+    near, coarse, fine = C.NEAR, C.COARSE, C.FINE
+    C.NEAR, C.COARSE, C.FINE = 99.0, SCHEDULES["best"], SCHEDULES["best"]
+    orig = C.mppi
+    C.mppi = lambda *a, **k: orig(*a, **{**k, **MPPI_KW["best"]})
+    rend = UnderwaterRenderer(model, 288, 384, cams=cams + ("dockcam",))
+    rend.look_at(gp, dist=4.6, elev=-18.0)
+    rows, labels = [], []
+    try:
+        for name, dyn in (("TRUE DYNAMICS", C.TrueDynamics(model)),
+                          ("LEARNED (proprio WM)", run_control.learned_from(ckpt, model))):
+            t0 = time.time()
+            r = C.run_episode(model, dyn, starts[trial], gp, goal_q=gq, steps=steps, seed=100 + trial,
+                              render=rend, ghost=(gid, gp, gq))
+            m = metrics(r, gq)
+            dock = r["frames"].pop("dockcam")
+            panels = [r["frames"][c].astype(np.float32) / 255 for c in cams] + [
+                np.asarray(dock, np.float32) / 255]
+            rows.append(panels)
+            labels += [f"{name}  FPV", f"{name}  chase",
+                       f"{name}  goal  {m['final_m']:.3f} m / {m['att_deg']:.1f} deg"]
+            log(f"  trial {trial} {name:22s} {m['final_m']:.3f} m, {m['att_deg']:.1f} deg, "
+                f"wander {m['wander']:.3f}  [{(time.time()-t0)/60:.1f} min]")
+    finally:
+        C.NEAR, C.COARSE, C.FINE, C.mppi = near, coarse, fine, orig
+    # ONE STRIP PER ARM, STACKED. label_panels lays panels out in a single row and has no grid
+    # option, so the two arms are rendered as two strips and concatenated vertically -- which is
+    # better anyway: each arm keeps its own label band directly above its own footage, instead of
+    # six captions in one line that the eye has to re-associate.
+    n = min(len(p) for row in rows for p in row)              # arms can differ in length on a crash
+    strips = [viz.label_panels([p[:n] for p in row], labels[3 * i:3 * i + 3],
+                               panel_wh=(384, 288), header_px=58, font_px=26)
+              for i, row in enumerate(rows)]
+    canvas = np.concatenate(strips, axis=1)                   # (T, 2*H, W, 3): stack rows vertically
+    viz.save_mp4(f"{out}/compare_trial{trial}.mp4", canvas, 30, quality=8)
+    log(f"  wrote {out}/compare_trial{trial}.mp4")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -254,12 +323,18 @@ def main():
     s.add_argument("--out")
     p = sub.add_parser("probe"); p.add_argument("--schedule", default="tuned", choices=sorted(SCHEDULES))
     p.add_argument("--steps", type=int, default=600)
+    k = sub.add_parser("compare", help="one trial, true vs learned, tiled into one video")
+    k.add_argument("--ckpt", required=True); k.add_argument("--trial", type=int, required=True)
+    k.add_argument("--out"); k.add_argument("--steps", type=int, default=840)
+    k.add_argument("--egl-device", type=int)
     c = sub.add_parser("clips"); c.add_argument("--schedule", default="best", choices=sorted(SCHEDULES))
     c.add_argument("--trials", type=int, default=3); c.add_argument("--steps", type=int, default=840)
     c.add_argument("--trial", type=int, help="render only this index, for one-per-process parallelism")
     c.add_argument("--out"); c.add_argument("--egl-device", type=int)
     a = ap.parse_args()
-    if a.cmd == "sweep":
+    if a.cmd == "compare":
+        compare_clips(a.ckpt, a.trial, out=a.out, steps=a.steps, egl_device=a.egl_device)
+    elif a.cmd == "sweep":
         sweep(a.grid, trials=a.trials, steps=a.steps, out=a.out)
     elif a.cmd == "probe":
         probe(schedule=a.schedule, steps=a.steps)

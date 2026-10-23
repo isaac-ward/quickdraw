@@ -130,7 +130,13 @@ class LearnedDynamics:
         from .water import UnderwaterRenderer
 
         self.core, self.norm, self.key, self.P, self.dev = core, norm, key, P, dev
-        self.rend = UnderwaterRenderer(plant_model, *size)
+        # A DYNAMICS-ONLY MODEL HAS NO IMAGE MODALITY. Rendering for it is not merely wasted work --
+        # handing imagine_shared a modality the model does not declare is a KeyError, and the
+        # renderer itself is the single most expensive thing in the control loop. Decide from the
+        # model's own layout, not from the caller.
+        self.img_heads = [n for n, _ in getattr(core, "_orig_mod", core).layout if n != "proprio"]
+        self.vision = self.key in self.img_heads
+        self.rend = UnderwaterRenderer(plant_model, *size) if self.vision else None
         self.o = deque(maxlen=P)
         self.f = deque(maxlen=P)
         self.a = deque(maxlen=P - 1)
@@ -140,7 +146,7 @@ class LearnedDynamics:
         import numpy as _np
 
         s = mola.state(d)
-        fr = self.rend.render(d, self.key)
+        fr = self.rend.render(d, self.key) if self.vision else None
         if not self.o:                                   # warm start: hold the first observation
             for _ in range(self.P):
                 self.o.append(s); self.f.append(fr)
@@ -163,8 +169,9 @@ class LearnedDynamics:
         past = np.stack([np.asarray(self.a)] * K)        # (K,P-1,6)
         seq = torch.from_numpy(np.concatenate([past, fut], 1))
         seq = self.norm.norm_act(seq).float().to(self.dev)
-        ctx = {"proprio": self.norm.norm_obs(torch.from_numpy(np.stack(self.o))[None]).float().to(self.dev),
-               self.key: torch.from_numpy(np.stack(self.f))[None].float().div(255.0).to(self.dev)}
+        ctx = {"proprio": self.norm.norm_obs(torch.from_numpy(np.stack(self.o))[None]).float().to(self.dev)}
+        if self.vision:
+            ctx[self.key] = torch.from_numpy(np.stack(self.f))[None].float().div(255.0).to(self.dev)
         with torch.no_grad():
             out = self.core.imagine_shared(ctx, seq, H * repeat, K, heads=["proprio"], norm=self.norm)
         pro = self.norm.denorm_obs(out["proprio"].cpu()).numpy()     # (K,H*repeat,13)

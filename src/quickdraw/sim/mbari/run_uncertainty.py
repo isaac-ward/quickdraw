@@ -21,25 +21,40 @@ POS, QUAT, VEL, ANGVEL = slice(0, 3), slice(3, 7), slice(7, 10), slice(10, 13)
 
 
 def one_step(core, norm, o, a, fr, key, P, dev, chunk=64):
-    """Teacher-forced one-step prediction at every step -> per-step channel errors."""
+    """Teacher-forced one-step prediction at every step -> per-step channel errors.
+
+    WORKS FOR A DYNAMICS-ONLY MODEL TOO. A proprio-only world model declares no image modality, so
+    feeding it one is an error and asking it to decode `key` is meaningless. When the model has no
+    image head the image channels come back as NaN rather than 0 -- a zero would read as "the model
+    was not surprised", which is the opposite of "the model has no opinion", and every downstream
+    mean would quietly absorb it. NaN propagates into nanmean as an absent measurement, which is
+    what it is. The proprio channels are computed identically either way, so the two arms are
+    directly comparable on the channels they share."""
     from ...evaluation.openloop import image_curves
 
+    has_img = key in [n for n, _ in getattr(core, "_orig_mod", core).layout]
     T = len(o)
     ts = list(range(P, T))
     out_lp, out_l1, pro_p = [], [], []
     for i0 in range(0, len(ts), chunk):
         part = ts[i0:i0 + chunk]
-        ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(o[t - P:t])) for t in part]).float().to(dev),
-               key: torch.stack([torch.from_numpy(fr[t - P:t]) for t in part]).float().div(255.0).to(dev)}
+        ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(o[t - P:t])) for t in part]).float().to(dev)}
+        if has_img:
+            ctx[key] = torch.stack([torch.from_numpy(fr[t - P:t]) for t in part]).float().div(255.0).to(dev)
         acts = torch.stack([norm.norm_act(torch.from_numpy(a[t - P:t])) for t in part]).float().to(dev)
+        heads = ["proprio"] + ([key] if has_img else [])
         with torch.no_grad():
-            out = core.imagine_eval(ctx, acts, 1, heads=["proprio", key], norm=norm)
-        pred = out[key][:, 0].clamp(0, 1)
-        true = torch.stack([torch.from_numpy(fr[t]) for t in part]).float().div(255.0).to(dev)
-        for i in range(len(part)):
-            c = image_curves(pred[i:i + 1].unsqueeze(1), true[i:i + 1].unsqueeze(1))
-            out_lp.append(float(c["lpips"][0]))
-            out_l1.append(float(c["l1"][0]))
+            out = core.imagine_eval(ctx, acts, 1, heads=heads, norm=norm)
+        if has_img:
+            pred = out[key][:, 0].clamp(0, 1)
+            true = torch.stack([torch.from_numpy(fr[t]) for t in part]).float().div(255.0).to(dev)
+            for i in range(len(part)):
+                c = image_curves(pred[i:i + 1].unsqueeze(1), true[i:i + 1].unsqueeze(1))
+                out_lp.append(float(c["lpips"][0]))
+                out_l1.append(float(c["l1"][0]))
+        else:
+            out_lp.extend([float("nan")] * len(part))
+            out_l1.extend([float("nan")] * len(part))
         pro_p.append(norm.denorm_obs(out["proprio"][:, 0].cpu()).numpy())
     pro_p = np.concatenate(pro_p)
     pro_t = np.stack([o[t] for t in ts])

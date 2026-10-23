@@ -43,11 +43,17 @@ def measure(ckpt, horizon=72, episodes=8, stride=64, dev="cuda", log=print):
     log(f"  {len(eps)} held-out episodes, horizon {horizon}, context P={P}")
 
     err = []                                             # (n_windows, horizon, 13) signed error
+    # A DYNAMICS-ONLY MODEL HAS NO IMAGE MODALITY, and handing it one is a KeyError at best and a
+    # silently ignored tensor at worst. Condition the context on the model's own layout rather than
+    # on what the loader happened to return, so the same diagnostic serves both arms.
+    img_heads = [n for n, _ in getattr(core, "_orig_mod", core).layout if n != "proprio"]
+    log(f"  model image heads: {img_heads or 'NONE (dynamics-only)'}")
     for o, a, fr in eps:
-        key = next(iter(fr))
+        key = next((k for k in fr if k in img_heads), None)
         for st in range(0, len(o) - P - horizon, stride):
-            ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[st:st + P]))[None].float().to(dev),
-                   key: torch.from_numpy(fr[key][st:st + P])[None].float().div(255.0).to(dev)}
+            ctx = {"proprio": norm.norm_obs(torch.from_numpy(o[st:st + P]))[None].float().to(dev)}
+            if key is not None:
+                ctx[key] = torch.from_numpy(fr[key][st:st + P])[None].float().div(255.0).to(dev)
             acts = norm.norm_act(torch.from_numpy(a[st:st + P + horizon - 1]))[None].float().to(dev)
             with torch.no_grad():
                 out = core.imagine_shared(ctx, acts, horizon, 1, heads=["proprio"], norm=norm)
