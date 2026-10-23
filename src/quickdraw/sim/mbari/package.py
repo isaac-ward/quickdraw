@@ -82,6 +82,51 @@ def build(root="/app/logs/mbari/data/v6", name="mbari-tank", cams=CAMS, limit=No
                                   act_names=ACTION_NAMES, val_frac=VAL_FRAC)
 
 
+CONTROLLED_TASK = {"nominal_test": "nominal_circle_inward",
+                   "ood_thruster": "ood_thruster_glitch_onset",
+                   "ood_fish": "ood_object_shark_onset",
+                   "ood_buoy": "ood_appearance_buoy_onset"}
+
+
+def build_controlled(root="/app/logs/mbari/data/ood_controlled", name="mbari-tank-ood-controlled",
+                     cams=("fpv",), log=print):
+    """Pack the CONTROLLED onset set so its calibration/test boundary survives packing.
+
+    The normal packer draws train/val randomly out of the primary split. That is exactly wrong here:
+    the 60 nominal episodes are deliberately 30 CALIBRATION + 30 TEST so a conformal threshold can be
+    fitted on one half and the false-positive rate measured on the other half the fitting never saw.
+    A re-draw would mix them and destroy the one property the set was generated for.
+
+    So the two halves are handed over TOGETHER as the primary, with `val_ids` naming the test indices
+    exactly -- the packer's "random" split is thereby pinned to the boundary we want:
+
+        split `train` = the 30 nominal CALIBRATION episodes
+        split `val`   = the 30 nominal TEST episodes
+        splits ood_*  = 30 each, as generated
+
+    NOTHING IS TRAINED ON ANY OF IT. `train` and `val` are the packer's names, not a claim about use;
+    this dataset is for scoring a model trained elsewhere. (An earlier attempt passed `val_ids=set()`
+    to suppress the val split altogether and tripped an assertion that exists to stop a caller
+    silently shipping an empty val.)
+    """
+    from ...data.processors import build_recorded_dataset
+
+    calib = episodes_from(root, "nominal_calib", cams, log=log)
+    test = episodes_from(root, "nominal_test", cams, log=log)
+    if not calib or not test:
+        raise RuntimeError(f"need both nominal_calib and nominal_test under {root}")
+    nominal = calib + test
+    val_ids = set(range(len(calib), len(nominal)))        # the test half, pinned
+    extra = {s: episodes_from(root, s, cams, log=log) for s in CONTROLLED_TASK
+             if s != "nominal_test" and (pathlib.Path(root) / s).exists()}
+    extra = {k: v for k, v in extra.items() if v}
+    log(f"  train<-calib {len(calib)} | val<-test {len(test)} | extras " +
+        ", ".join(f"{k} {len(v)}" for k, v in extra.items()))
+    return build_recorded_dataset(name, nominal, FPS, list(cams), log=log, extra_splits=extra,
+                                  obs_identity=QUAT_DIMS, obs_names=STATE_NAMES,
+                                  act_names=ACTION_NAMES, val_ids=val_ids)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -90,5 +135,10 @@ if __name__ == "__main__":
     ap.add_argument("--name", default="mbari-tank")
     ap.add_argument("--cams", default=",".join(CAMS))
     ap.add_argument("--limit", type=int, default=None, help="cap nominal episodes (data ablation)")
+    ap.add_argument("--controlled", action="store_true",
+                    help="pack the controlled onset set, preserving its calibration/test split")
     a = ap.parse_args()
-    print("run_dir:", build(a.root, a.name, cams=tuple(a.cams.split(",")), limit=a.limit), flush=True)
+    if a.controlled:
+        print("run_dir:", build_controlled(a.root, a.name, cams=tuple(a.cams.split(","))), flush=True)
+    else:
+        print("run_dir:", build(a.root, a.name, cams=tuple(a.cams.split(",")), limit=a.limit), flush=True)
