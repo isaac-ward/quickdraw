@@ -19,7 +19,19 @@ import numpy as np
 
 CAMS = ("fpv", "chase", "topdown", "sideon")
 TITLES = ("FPV", "Chase", "Top-down", "Side-on")
+# DISCOVERED, NOT LISTED. This was a fixed tuple and the controlled onset set -- whose nominal
+# halves are `nominal_calib` and `nominal_test` -- silently got previews for its three ood_* splits
+# and none for its 60 nominal episodes. A hardcoded split list quietly skips any dataset that does
+# not use the names it was written for, and says nothing.
 SPLITS = ("train", "ood_thruster", "ood_fish", "ood_buoy")
+
+
+def _splits(root):
+    """Every subdirectory holding npz episodes, with the known names first for stable ordering."""
+    import os
+    found = sorted(d for d in os.listdir(root)
+                   if (pathlib.Path(root) / d).is_dir() and glob.glob(f"{root}/{d}/*.npz"))
+    return [s for s in SPLITS if s in found] + [s for s in found if s not in SPLITS]
 CAP = 900                         # 30 s at 30 Hz; the whole nominal episode
 
 
@@ -48,7 +60,7 @@ def main(root, out, n_per=None, gif=False, shard=0, shards=1, log=print):
     Episodes already on disk are skipped, so a re-run resumes."""
     out = pathlib.Path(out)
     jobs = []
-    for split in SPLITS:
+    for split in _splits(root):
         for i, f in enumerate(sorted(glob.glob(f"{root}/{split}/*.npz"))):
             if n_per is not None and i >= n_per:
                 break
