@@ -296,8 +296,11 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
             panels = [r["frames"][c].astype(np.float32) / 255 for c in cams] + [
                 np.asarray(dock, np.float32) / 255]
             rows.append(panels)
-            labels += [f"{name}  FPV", f"{name}  chase",
-                       f"{name}  goal  {m['final_m']:.3f} m / {m['att_deg']:.1f} deg"]
+            # SHORT LABELS, AND THE ARM NAMED ONCE. The first version repeated the arm name on all
+            # three captions at font 26 against a 384 px panel; they overlapped each other and ran
+            # off the right edge, which makes the one figure whose entire job is side-by-side
+            # comparison unreadable. The arm belongs on its row, not on every panel.
+            labels += [f"{name} - FPV", "chase", f"goal  {m['final_m']:.3f} m  {m['att_deg']:.1f} deg"]
             log(f"  trial {trial} {name:22s} {m['final_m']:.3f} m, {m['att_deg']:.1f} deg, "
                 f"wander {m['wander']:.3f}  [{(time.time()-t0)/60:.1f} min]")
     finally:
@@ -308,7 +311,7 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
     # six captions in one line that the eye has to re-associate.
     n = min(len(p) for row in rows for p in row)              # arms can differ in length on a crash
     strips = [viz.label_panels([p[:n] for p in row], labels[3 * i:3 * i + 3],
-                               panel_wh=(384, 288), header_px=58, font_px=26)
+                               panel_wh=(384, 288), header_px=44, font_px=20)
               for i, row in enumerate(rows)]
     canvas = np.concatenate(strips, axis=1)                   # (T, 2*H, W, 3): stack rows vertically
     viz.save_mp4(f"{out}/compare_trial{trial}.mp4", canvas, 30, quality=8)

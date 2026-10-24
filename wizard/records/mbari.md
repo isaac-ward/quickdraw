@@ -706,6 +706,103 @@ float64 -- one array, so the cost is noise, and a constant field now comes back 
 Panel headings are now plain **Observed / Predicted / Surprise**. The middle one said "Predicted
 mean of 32", which described the implementation rather than the thing a reader is looking at.
 
+## RESULTS (2026-10-24) — the campaign, measured
+
+### Item 16: control. The learned model drives the vehicle; the FPV model does not.
+
+32 trials, identical goals and starts across arms. Success = SUSTAINED HOLD: inside 0.10 m AND under
+0.05 m/s for 20 consecutive steps, no collision -- not a terminal snapshot, which once called a
+controller successful while it thrashed on the goal at a third of full thrust.
+
+| arm | n | success | final_m mean / med / p90 | att° mean / med | wander | \|a\| | crash |
+|---|---|---|---|---|---|---|---|
+| true dynamics | 32 | 100% | 0.012 / 0.012 / 0.015 | 0.8 / 0.7 | 0.011 | 0.041 | 0% |
+| analytic | 32 | 100% | 0.012 / 0.013 / 0.015 | 0.8 / 0.7 | 0.011 | 0.041 | 0% |
+| **learned (proprio WM)** | 32 | **94%** | 0.035 / **0.022** / 0.031 | 3.7 / 0.9 | 0.061 | 0.045 | 3% |
+| learned (FPV WM) | 3 | 0% | 3.21 | 39.4 | — | — | 33% |
+
+READ THE MEDIAN, AND THE FAILURES. 30 of 32 succeed at a median of 0.0219 m, and the worst SUCCESS is
+0.039 m -- the bulk sits at true-dynamics quality. The mean of 0.035 exceeds the p90 of 0.031, which
+is only possible with extreme outliers: trial 28 crashed (0.455 m, 90°) and trial 31 failed to hold.
+So the honest claim is "true-dynamics quality on 94% of trials, outright failure on 6%", not a mean.
+An earlier 3-trial run reported 0.022 m with no failures at all -- n=3 cannot see a 6% failure rate,
+which is the entire reason for running 32.
+
+TRUE AND ANALYTIC ARE IDENTICAL (0.012 m both), so the benchmark's model-class axis is clean: the
+learned arm's gap is the learned model, not the planner and not the integrator.
+
+### Item 14: OOD detection. Each anomaly is caught by its own modality, with calibrated FPR.
+
+Split conformal, alpha=0.1, threshold fitted on 30 CALIBRATION nominals with the finite-sample
+correction (k=28 of 30), false-positive rate measured on the 30 TEST nominals the threshold never saw.
+
+| channel | FPV: FPR / thruster / fish / buoy | proprio: FPR / thruster / fish / buoy |
+|---|---|---|
+| `image_lpips` | 0.13 | 0.07 | 1.00 | 1.00 | — | — | — | — |
+| `image_l1` | 0.03 | 0.13 | 1.00 | 1.00 | — | — | — | — |
+| `proprio_pos` | 0.13 | 0.17 | 0.10 | 0.17 | 0.03 | 1.00 | 0.13 | 0.13 |
+| `proprio_vel` | 0.10 | 1.00 | 0.07 | 0.13 | 0.07 | 1.00 | 0.07 | 0.00 |
+| `proprio_angvel` | 0.03 | 1.00 | 0.07 | 0.17 | 0.00 | 1.00 | 0.00 | 0.03 |
+| `proprio_rot_deg` | 0.17 | 0.23 | 0.10 | 0.17 | 0.03 | 0.10 | 0.10 | 0.13 |
+
+TWO CLEAN FINDINGS.
+
+**Each anomaly is perfectly detected by the channel that should see it.** The visual conditions
+(fish, buoy) hit TPR **1.00** on both image channels; the thruster glitch hits TPR **1.00** on
+proprio velocity and angular velocity. Off-modality TPRs sit at the false-positive rate, i.e. no
+signal -- which is correct, not a failure.
+
+**The dynamics-only model is the better detector for the action-space anomaly**: TPR 1.00 at FPR
+**0.00** on angular velocity, against the FPV model's 1.00 at 0.03-0.10. It is blind to the visual
+conditions by construction, and its image channels are reported as "no measurement" rather than as
+zero surprise -- zero would read as "not surprised", which is the opposite of "has no opinion".
+
+Measured FPRs land at 0.00-0.17 around a nominal alpha of 0.10, so the exchangeability the
+conformal bound assumes holds on this data.
+
+### The onset trace: the mechanism, on the same episodes
+
+Every episode is 10 s clean then 30 s anomalous, so each carries its own before/after contrast and
+no cross-episode confound can explain the separation (90th pct, PRE -> POST, FPV model):
+
+| split | image_lpips | proprio_vel | proprio_angvel |
+|---|---|---|---|
+| nominal (both halves) | 0.089 -> 0.085 | 0.073 -> 0.075 | 0.040 -> 0.036 |
+| ood_fish | 0.088 -> **0.161** | 0.073 -> 0.077 | 0.040 -> 0.035 |
+| ood_buoy | 0.089 -> **0.149** | 0.074 -> 0.079 | 0.039 -> 0.037 |
+| ood_thruster | 0.087 -> 0.085 | 0.071 -> **0.205** | 0.041 -> **0.163** |
+
+Nominals are FLAT across the onset, so the clock itself moves nothing. This also explains the OLD
+3-way confusion matrix (thruster 100%, fish/buoy confused at 12/30 both ways): fish and buoy excite
+the SAME channels and the thruster excites a disjoint set.
+
+### Item 13: the image arm will not train past epoch 7, and the reason is measurable
+
+THREE RUNS DIVERGED. The 2 h ablation arm at epoch 4; the 6 h arm at epoch 7 (lr 1e-3); the rerun at
+epoch 7 again (lr 3e-4). Same epoch at 3.3x lower step size, so it is NOT step size -- and the
+clip-ratio signal that motivated the LR cut was a red herring (36 at 3e-4 against 5-7 at 1e-3, yet
+the 3e-4 run trained better).
+
+`train/loss/dynamics/latent` is the precursor, rising monotonically while total loss falls:
+
+| run | dynamics/latent per epoch |
+|---|---|
+| v1 (lr 1e-3) | 0.029 0.048 0.040 0.048 0.048 0.059 0.064 -> **1.604** |
+| lr3e4 | 0.046 0.062 0.076 0.091 0.121 0.151 0.174 -> **0.800** |
+| proprio (never diverged) | 0.197 0.144 0.099 0.079 0.059 0.054 0.041 ... 0.032 |
+
+The dynamics-only model, with no image term, falls monotonically across all 10 epochs.
+
+HYPOTHESIS TESTED AND FALSIFIED. If the image objective were out-competing the latent one, reducing
+the image modality weight should slow the climb. `mbari_fpv_balanced` (fpv weight 1.0 -> 0.5,
+`latent_loss_weight: 10` being locked and bracketed on both sides) climbed FASTER -- 0.056 0.090
+0.115 0.131 against 0.046 0.062 0.076 0.091 -- and was WORSE on the metric that matters (@+64 0.3250
+vs 0.3151 at the same eval). Killed at its pre-registered epoch-3 criterion. So the rise is more
+likely intrinsic -- a richer latent is harder to predict forward -- than a tug-of-war to rebalance.
+
+BEST OPEN-LOOP ACHIEVED: **@+64 = 0.2906** (lr3e4, epoch 5), against the historical best of 0.2783.
+Within 5%, not taken, and capped by the instability rather than by compute.
+
 ## Checklist
 
 - [x] 1. Recon: network egress, Sketchfab API, MuJoCo EGL offscreen render (144x192 verified)
@@ -730,9 +827,9 @@ mean of 32", which described the implementation rather than the thing a reader i
 - [x] 12f. Dataset v7 regenerated collision-free (6.01 h) and pushed to HF
 - [x] 12g. `limit_val_batches` fix; both ablation arms relaunched from scratch 2026-10-20 03:08
 - [ ] 13. Train BOTH ablation arms; log full open-loop and 16-step-ahead predictions (IN PROGRESS: epoch 3/10 as of 2026-10-20 19:00, ~4.5 h/epoch)
-- [ ] 14. Uncertainty: classify the three OOD types against nominal
-- [ ] 15. Pixel-level uncertainty videos
-- [ ] 16. Control benchmark: reach the dock, and reach a random pose, under TRUE dynamics vs the LEARNED world model
+- [x] 14. Uncertainty: classify the three OOD types against nominal -- split conformal, TPR 1.00 per anomaly on its own modality
+- [x] 15. Pixel-level uncertainty videos -- on the controlled onset set, surprise map 13x finer
+- [x] 16. Control benchmark -- 32 trials, learned proprio WM 94% success at median 0.022 m vs true 0.012 m
 
 ## Measured, so far
 

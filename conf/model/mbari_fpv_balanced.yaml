@@ -1,0 +1,41 @@
+# =============================================================================================
+# mbari_fpv with the IMAGE term's weight halved. Select `model=mbari_fpv_balanced`.
+#
+# WHY. Both FPV runs diverged at epoch 7 -- at lr 1e-3 and at lr 3e-4, the same epoch -- so it is
+# not step size. The gradient diagnostics name the mechanism: `train/loss/dynamics/latent` climbs
+# MONOTONICALLY in both runs while the total loss falls (lr3e4: 0.046 -> 0.062 -> 0.076 -> 0.091 ->
+# 0.121 -> 0.151 -> 0.174 -> 0.280 -> blow-up), i.e. the image decode improves at the expense of the
+# latent dynamics term until it destabilises everything. The proprio-only model, which has no
+# competing image term, falls monotonically (0.197 -> 0.032) and trains all 10 epochs clean.
+#
+# `latent_loss_weight: 10` is LOCKED and bracketed on both sides, so the balance is changed from the
+# other side: the fpv modality weight 1.0 -> 0.5. Single variable; everything else matches the
+# lr3e4 run exactly so the comparison is clean.
+#
+# KILL CRITERION, fixed in advance: if `dynamics/latent` is still climbing monotonically by epoch 3
+# this does not address the mechanism and the run should be stopped rather than left to reach the
+# same cliff more slowly.
+# =============================================================================================
+defaults:
+  - vl128
+  - _self_
+
+action_dim: 6
+
+modalities:
+  # Restated in full: OmegaConf REPLACES lists rather than merging them.
+  - {name: proprio, kind: vector, dim: 13, weight: 1.0, decode_kind: flow, decode_param: x0,
+     decode_arch: mlp}
+
+  - {name: fpv, kind: image, cam: fpv,
+     weight: 0.5,                 # 1.0 -> 0.5: see the header. The measured conflict is the image
+     #                              term winning against dynamics/latent, and this is the only side
+     #                              of that balance not pinned by a lock.
+     img_size: [144, 192],    # (H, W) -- the native 3:4 source. NEVER an int.
+     ae_bottleneck: 9,        # PAIRED with img_size -> an exact 9x12 bottleneck grid
+     pretrained: false, num_tokens: 32,
+     encode_arch: conv, encode_base: 32,
+     decode_kind: mse, decode_arch: up, decode_base: 64,
+     decode_param: x0, patch: 16, ae_depth: 4, decode_chunk_train: 64,
+     visual_l1: 3.0, visual_l2: 0.0, visual_lpips: 1.0, visual_lpips_net: vgg, visual_frames: 128,
+     latent_loss_weight: 10}
