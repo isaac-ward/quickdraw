@@ -826,7 +826,13 @@ Within 5%, not taken, and capped by the instability rather than by compute.
       reaches 0.016 m. All tables reproducible via `control_study.py`
 - [x] 12f. Dataset v7 regenerated collision-free (6.01 h) and pushed to HF
 - [x] 12g. `limit_val_batches` fix; both ablation arms relaunched from scratch 2026-10-20 03:08
-- [ ] 13. Train BOTH ablation arms; log full open-loop and 16-step-ahead predictions (IN PROGRESS: epoch 3/10 as of 2026-10-20 19:00, ~4.5 h/epoch)
+- [~] 13. Train both arms; log open-loop and N-step predictions -- PARTIAL, and the limit is
+      understood rather than unexplored. The dynamics-only arm trained all 10 epochs clean. The
+      IMAGE arm cannot: three runs diverged at epochs 4, 7 and 7 across a 3.3x learning-rate range,
+      with `dynamics/latent` the measured precursor in every case. Best open-loop @+64 = 0.2906
+      (lr3e4 epoch 5) against the 0.2783 record -- within 5%, capped by the instability. The
+      data-volume ablation is unrecoverable: the 2 h arm diverged at epoch 4, so the comparison
+      stands only through epoch 3 (3x data bought 13-18% short-horizon, ~1% long-horizon).
 - [x] 14. Uncertainty: classify the three OOD types against nominal -- split conformal, TPR 1.00 per anomaly on its own modality
 - [x] 15. Pixel-level uncertainty videos -- on the controlled onset set, surprise map 13x finer
 - [x] 16. Control benchmark -- 32 trials, learned proprio WM 94% success at median 0.022 m vs true 0.012 m
