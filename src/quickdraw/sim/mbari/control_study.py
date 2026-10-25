@@ -286,8 +286,8 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
     rend.look_at(gp, dist=4.6, elev=-18.0)
     rows, labels = [], []
     try:
-        for name, dyn in (("TRUE DYNAMICS", C.TrueDynamics(model)),
-                          ("LEARNED (proprio WM)", run_control.learned_from(ckpt, model))):
+        for name, dyn in (("TRUE", C.TrueDynamics(model)),
+                          ("LEARNED", run_control.learned_from(ckpt, model))):
             t0 = time.time()
             r = C.run_episode(model, dyn, starts[trial], gp, goal_q=gq, steps=steps, seed=100 + trial,
                               render=rend, ghost=(gid, gp, gq))
@@ -300,7 +300,7 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
             # three captions at font 26 against a 384 px panel; they overlapped each other and ran
             # off the right edge, which makes the one figure whose entire job is side-by-side
             # comparison unreadable. The arm belongs on its row, not on every panel.
-            labels += [f"{name} - FPV", "chase", f"goal  {m['final_m']:.3f} m  {m['att_deg']:.1f} deg"]
+            labels += [name, "chase", f"{m['final_m']:.3f} m   {m['att_deg']:.1f} deg"]
             log(f"  trial {trial} {name:22s} {m['final_m']:.3f} m, {m['att_deg']:.1f} deg, "
                 f"wander {m['wander']:.3f}  [{(time.time()-t0)/60:.1f} min]")
     finally:

@@ -131,7 +131,16 @@ def slide1(out, n_fpv=6, steps=900, log=print):
 
     # FPV clips at presentation resolution rather than the dataset's 144x192 -- the stored frames
     # are training data, not figures, and upscaling them looks like upscaling them.
-    rend2 = UnderwaterRenderer(model, 544, 720, cams=("fpv",))   # 544: divisible by 16 for the codec
+    #
+    # EVERY CAMERA ON THE SAME ROLLOUT, so the views are frame-synced BY CONSTRUCTION rather than by
+    # re-running with a matching seed and hoping. Each trajectory is written three ways: the four
+    # views tiled into one clip (sync visible), and each view on its own (so a slide can show the
+    # chase alone, or cut FPV against chase at whatever size it likes).
+    cams4 = ("fpv", "chase", "topdown", "sideon")
+    (d / "multiview").mkdir(parents=True, exist_ok=True)
+    for c in cams4[1:]:
+        (d / c).mkdir(parents=True, exist_ok=True)
+    rend2 = UnderwaterRenderer(model, 544, 720, cams=cams4)   # 544: divisible by 16 for the codec
     made, seed = 0, 7000
     while made < n_fpv:
         seed += 1
@@ -140,12 +149,22 @@ def slide1(out, n_fpv=6, steps=900, log=print):
         if kind != "random" and tj.fit_circle(rng, steps / FPS, 1.0 / FPS) is None:
             continue
         r = record.rollout(model, kind, seed, steps=steps, size=(544, 720),
-                           cams=("fpv",), renderer=rend2)
+                           cams=cams4, renderer=rend2)
         if r is None or len(r["obs"]) < steps:
             continue
+        from ...logging import viz
         imageio.mimwrite(d / "fpv" / f"fpv_{kind}_{made}.mp4", r["frames"]["fpv"], fps=FPS, quality=8)
+        for c in cams4[1:]:
+            imageio.mimwrite(d / c / f"{c}_{kind}_{made}.mp4", r["frames"][c], fps=FPS, quality=8)
+        # ONE ROW, SHORT TITLES. label_panels lays out a row natively, which is also the shape that
+        # reads on a 16:9 slide -- a 2x2 grid wastes half the width and puts two panels where a
+        # viewer has to look down rather than across to compare them.
+        strip = viz.label_panels([r["frames"][c].astype(np.float32) / 255 for c in cams4],
+                                 ["FPV", "chase", "top-down", "side-on"],
+                                 panel_wh=(560, 424), header_px=38, font_px=24)
+        viz.save_mp4(str(d / "multiview" / f"multiview_{kind}_{made}.mp4"), strip, FPS, quality=8)
         made += 1
-        log(f"  fpv/{kind}_{made - 1}: {len(r['obs'])} steps")
+        log(f"  {kind}_{made - 1}: {len(r['obs'])} steps, 4 views + tiled")
     rend2.close()
     log(f"wrote {d}")
 
@@ -211,18 +230,21 @@ def slide2_predictions(ckpt, out, n=6, steps=900, lead=16, root=None, dev="cuda"
     P, key = int(cfg.data.P), str(cfg.data.cam)
     root = root or "/app/logs/mbari/data/ood_controlled"
     files = sorted(glob.glob(f"{root}/nominal_test/ep_*.npz"))[:n]
-    titles = ["ground truth", "AE floor (encode->decode, no dynamics)",
-              "1-step ahead", f"{lead}-step ahead"]
+    titles = ["GT", "AE", "1-step", f"{lead}-step"]
+    stems = ["gt", "ae", "pred1", f"pred{lead}"]
     for i, f in enumerate(files):
         z = np.load(f)
         T = min(steps, len(z["obs"]))
         rows = prediction_rows(core, norm, z["obs"], z["act"], z[f"frames_{key}"], key, P, T,
                                dev=dev, lead=lead)
-        strips = [viz.label_panels([r], [t], panel_wh=(768, 576), header_px=44, font_px=24)
-                  for r, t in zip(rows, titles)]
-        canvas = np.concatenate(strips, axis=1)
+        # The composite is ONE ROW so the four are compared across, not down.
+        canvas = viz.label_panels(list(rows), titles, panel_wh=(512, 384), header_px=38, font_px=24)
         viz.save_mp4(str(d / f"predict_{i}.mp4"), canvas, FPS, quality=8)
-        log(f"  prediction/predict_{i}: {len(rows[0])} frames from {pathlib.Path(f).name}")
+        # ...and each stream on its own, unlabelled, so a slide can place them at any size or
+        # animate them in one at a time. The composite is for reading; these are for building with.
+        for r, stem in zip(rows, stems):
+            viz.save_mp4(str(d / f"{stem}_{i}.mp4"), r, FPS, quality=8)
+        log(f"  prediction/predict_{i} (+4 separate): {len(rows[0])} frames from {pathlib.Path(f).name}")
     log(f"wrote {d}")
 
 
