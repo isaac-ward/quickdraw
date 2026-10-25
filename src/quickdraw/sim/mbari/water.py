@@ -66,6 +66,22 @@ class UnderwaterRenderer:
         self._free = {name: cam}
         self.cams = tuple(self.cams) + ((name,) if name not in self.cams else ())
 
+    def free_cam(self, name, lookat, dist, azim, elev):
+        """Register a free camera with an EXPLICIT azimuth, for figure framing.
+
+        `look_at` fixes the azimuth to the target's own bearing, which is the right rule for a
+        goal-anchored chase view (it guarantees the camera sits in water) and the wrong one for a
+        layout figure, where the whole point is choosing the angle. Caller owns the geometry here,
+        including keeping the eye inside the tank."""
+        import mujoco
+
+        cam = mujoco.MjvCamera()
+        cam.lookat[:] = np.asarray(lookat, float)
+        cam.distance, cam.azimuth, cam.elevation = float(dist), float(azim), float(elev)
+        self._free = getattr(self, "_free", {})
+        self._free[name] = cam
+        self.cams = tuple(self.cams) + ((name,) if name not in self.cams else ())
+
     def render(self, data, camera):
         camera = getattr(self, "_free", {}).get(camera, camera)
         self.r.update_scene(data, camera=camera)
