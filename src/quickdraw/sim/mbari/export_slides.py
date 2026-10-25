@@ -248,7 +248,7 @@ def slide2_predictions(ckpt, out, n=6, steps=900, lead=16, root=None, dev="cuda"
     log(f"wrote {d}")
 
 
-SPLIT_LABEL = {"nominal_test": "nominal", "ood_thruster": "OOD: thruster glitch",
+SPLIT_LABEL = {"nominal_test": "Nominal", "ood_thruster": "OOD: thruster glitch",
                "ood_fish": "OOD: shark", "ood_buoy": "OOD: purple buoy"}
 VISUAL = ("ood_fish", "ood_buoy")
 
@@ -265,6 +265,7 @@ def slide2_uncertainty(ckpt, out, n=6, onset=300, root=None, dev="cuda", log=pri
     image channels and the thruster moves proprio, so one shared y-axis would hide whichever is
     smaller. The non-visual case is exactly why the trace exists -- it has no pixel signature at all.
     """
+    import ast
     import glob
 
     import matplotlib
@@ -284,22 +285,43 @@ def slide2_uncertainty(ckpt, out, n=6, onset=300, root=None, dev="cuda", log=pri
         traces[split] = []
         for i, f in enumerate(files):
             z = np.load(f)
+            # MARKERS COME FROM THE EPISODE, NOT FROM A CONSTANT. The visual conditions now keep
+            # the object in the scene throughout and record `in_frame` per step, so the lines mark
+            # when it ENTERS and LEAVES the view -- which may happen more than once per lap. Only
+            # the thruster, whose anomaly really is switched on in time, keeps a single onset.
+            meta = ast.literal_eval(str(z["meta"]))
+            inf = meta.get("in_frame")
+            if inf:
+                inf = np.asarray(inf, bool)
+                edges = np.flatnonzero(np.diff(inf.astype(int)) != 0) + 1
+                marks = [float(x) / FPS for x in edges]
+            else:
+                marks = [onset / FPS]
             e = one_step(core, norm, z["obs"], z["act"], z[f"frames_{key}"], key, P, dev)
             traces[split].append(e)
             steps = np.asarray(e["steps"])
-            fig, ax = plt.subplots(2, 1, figsize=(9, 4.6), sharex=True)
-            for a_, chans, lab in ((ax[0], ("image_lpips", "image_l1"), "image channels"),
-                                   (ax[1], ("proprio_vel", "proprio_angvel"), "proprio channels")):
+            t = steps / FPS
+            # NO TITLES ANYWHERE -- the deck supplies them, and a baked title cannot be changed.
+            # NO ONSET LINE ON NOMINAL EITHER: there is no anomaly in a nominal episode, so a
+            # dashed "anomaly begins" marker there is simply false.
+            fig, ax = plt.subplots(2, 1, figsize=(9, 4.4), sharex=True)
+            legends = {"image_lpips": "LPIPS", "image_l1": "L1",
+                       "proprio_vel": "|v|", "proprio_angvel": "|$\\omega$|"}
+            for a_, chans, lab in ((ax[0], ("image_lpips", "image_l1"), "Image channels"),
+                                   (ax[1], ("proprio_vel", "proprio_angvel"), "Proprio channels")):
                 for c in chans:
                     v = np.asarray(e[c], float)
                     if np.isfinite(v).any():
-                        a_.plot(steps / FPS, v, lw=0.9, label=c.replace("image_", "").replace("proprio_", ""))
-                a_.axvline(onset / FPS, color="crimson", lw=1.6, ls="--")
-                a_.set_ylabel(lab, fontsize=8)
-                a_.legend(fontsize=7, loc="upper left", framealpha=0.6)
+                        a_.plot(t, v, lw=0.9, label=legends[c])
+                if split != "nominal_test":
+                    for xv in marks:
+                        a_.axvline(xv, color="crimson", lw=1.5, ls="--")
+                a_.set_ylabel(lab, fontsize=9)
+                a_.legend(fontsize=8, loc="upper left", framealpha=0.6)
                 a_.grid(alpha=0.25)
-            ax[0].set_title(f"{SPLIT_LABEL[split]} — anomaly begins at {onset / FPS:.0f} s (dashed)", fontsize=10)
-            ax[1].set_xlabel("time (s)")
+                a_.set_xlim(float(t[0]), float(t[-1]))      # data extents, no dead margin
+                a_.margins(x=0)
+            ax[1].set_xlabel("Time (s)", fontsize=9)
             fig.tight_layout()
             fig.savefig(d / "timeseries" / f"{split}_{i}.png", dpi=150)
             plt.close(fig)
@@ -329,8 +351,8 @@ def slide2_scores(out, fpv_report, proprio_report, log=print):
             det = rep["detection"].get(c, {})
             if det.get("threshold") is None:
                 continue
-            order = [("nominal_calib", "calibration"), ("nominal_test", "nominal (test)"),
-                     ("ood_thruster", "thruster"), ("ood_fish", "shark"), ("ood_buoy", "buoy")]
+            order = [("nominal_calib", "Calibration"), ("nominal_test", "Nominal (test)"),
+                     ("ood_thruster", "Thruster"), ("ood_fish", "Shark"), ("ood_buoy", "Buoy")]
             fig, ax = plt.subplots(figsize=(7.2, 4.0))
             for xi, (sp, lab) in enumerate(order):
                 v = np.asarray(sc[sp]["post"][c], float)
@@ -340,20 +362,20 @@ def slide2_scores(out, fpv_report, proprio_report, log=print):
                            v, s=22, alpha=0.75, color=col, edgecolors="none")
                 ax.scatter([xi], [np.median(v)], marker="_", s=900, color="k", lw=1.6, zorder=5)
             ax.axhline(det["threshold"], color="crimson", lw=1.5, ls="--",
-                       label=f"conformal threshold (alpha=0.1)  FPR={det['fpr_test']:.2f}")
+                       label=f"Conformal threshold ($\\alpha$=0.1), FPR={det['fpr_test']:.2f}")
             ax.set_xticks(range(len(order)))
-            ax.set_xticklabels([l for _, l in order], fontsize=9)
-            ax.set_ylabel(f"episode score — {c}", fontsize=9)
-            ax.set_title(f"{tag} model · {c} · green = nominal, purple = OOD", fontsize=10)
-            ax.legend(fontsize=8, loc="upper left")
+            ax.set_xticklabels([l for _, l in order], fontsize=10)
+            ax.set_ylabel(f"Episode score ({c})", fontsize=10)
+            ax.legend(fontsize=9, loc="upper left")
             ax.grid(alpha=0.25, axis="y")
+            ax.set_xlim(-0.6, len(order) - 0.4)
             fig.tight_layout()
             fig.savefig(d / f"scores_{tag}_{c}.png", dpi=160)
             plt.close(fig)
             log(f"  scores_{tag}_{c}.png  thr={det['threshold']:.4f} fpr={det['fpr_test']:.2f}")
 
 
-ARMS = [("true", "true dynamics"), ("analytic", "analytic model"), ("proprio", "learned world model")]
+ARMS = [("true", "True dynamics"), ("analytic", "Analytic model"), ("proprio", "Learned world model")]
 
 
 def slide3(out, bench="/app/logs/mbari/control/bench32",
@@ -392,12 +414,12 @@ def slide3(out, bench="/app/logs/mbari/control/bench32",
     # SIX PANELS, NOT ONE BAR CHART. These metrics have different units and wildly different scales
     # -- a 0.012 m distance beside a 94% rate beside 0.8 degrees on shared axes is unreadable, and
     # normalising them to a common scale would invent a comparison nobody asked for.
-    panels = [("success", "sustained-hold success", "rate", True),
-              ("final_m", "final distance (m)", "m", False),
-              ("att_deg", "final attitude error (deg)", "deg", False),
-              ("wander", "wander over last 2 s (m)", "m", False),
-              ("a_end", "command magnitude at rest", "frac of full thrust", False),
-              ("crashed", "collision rate", "rate", True)]
+    panels = [("success", "Sustained-hold success", "Rate", True),
+              ("final_m", "Final distance", "m", False),
+              ("att_deg", "Final attitude error", "deg", False),
+              ("wander", "Wander over last 2 s", "m", False),
+              ("a_end", "Command magnitude at rest", "Fraction of full thrust", False),
+              ("crashed", "Collision rate", "Rate", True)]
     fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.0))
     cols = {"true": "#2e8b57", "analytic": "#3b76c4", "proprio": "#7b2ff7"}
     for ax, (k, title, unit, is_rate) in zip(axes.ravel(), panels):
@@ -416,11 +438,12 @@ def slide3(out, bench="/app/logs/mbari/control/bench32",
                 ax.scatter([xi], [np.median(v)], marker="_", s=700, color="k", lw=1.6, zorder=5)
                 ax.set_yscale("log" if v.max() / max(1e-9, np.median(v)) > 25 else "linear")
             xs.append(xi)
-        ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=8)
-        ax.set_title(title, fontsize=10); ax.set_ylabel(unit, fontsize=8)
+        ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=9)
+        # Panel titles stay: these six are different quantities and the deck cannot label each
+        # subplot from outside. Only the figure-level title is dropped.
+        ax.set_title(title, fontsize=10); ax.set_ylabel(unit, fontsize=9)
         ax.grid(alpha=0.25, axis="y")
-    fig.suptitle("Pose-to-pose control, 32 trials per arm — dots are trials, bar is the median "
-                 "(log scale where one outlier dominates)", fontsize=11)
+        ax.set_xlim(-0.6, len(ARMS) - 0.4)
     fig.tight_layout()
     fig.savefig(d / "aggregate_metrics.png", dpi=160)
     plt.close(fig)
@@ -430,6 +453,52 @@ def slide3(out, bench="/app/logs/mbari/control/bench32",
                  "median": float(np.median([t[k] for t in ts]))}
              for k, *_ in panels} for a, ts in trials.items()}, indent=1))
     log(f"wrote {d}")
+
+
+def write_thresholds(out, reports=(("FPV world model", "conformal_fpv"),
+                                   ("Proprio (dynamics-only) world model", "conformal_proprio")),
+                     base="/app/logs/mbari/uncertainty", log=print):
+    """Spell out what each conformal threshold was fitted on, as text beside the figures.
+
+    A dashed line on a scatter plot does not say which episodes set it, how many, or what the
+    coverage correction was -- and those are exactly the questions a reviewer asks about a
+    threshold. Written as text rather than a caption so it can be quoted or pasted."""
+    import json
+
+    L = ["CONFORMAL THRESHOLDS", "=" * 68, "",
+         "Split conformal at alpha = 0.10.",
+         "",
+         "The threshold is the k-th smallest score among the 30 CALIBRATION nominals, with the",
+         "finite-sample correction k = ceil((n+1)(1-alpha)) = ceil(31 * 0.9) = 28 of 30. Using a",
+         "plain 90th-percentile of 30 points would take the 27th and under-cover.",
+         "",
+         "FPR is measured on the 30 TEST nominals, which the threshold never saw. TPR is the",
+         "fraction of that condition scoring above the same threshold. Scores are the 90th",
+         "percentile over the steps of an episode.", ""]
+    for tag, d in reports:
+        f = pathlib.Path(base) / d / "conformal.json"
+        if not f.exists():
+            continue
+        rep = json.loads(f.read_text())
+        L += [tag, "-" * len(tag),
+              "  {:18s} {:>10} {:>3} {:>6}   {:>9} {:>7} {:>7}".format(
+                  "channel", "threshold", "k", "FPR", "thruster", "shark", "buoy")]
+        for c, v in rep["detection"].items():
+            if v.get("threshold") is None:
+                L.append("  {:18s} {:>10} {:3d} {:>6}   (no measurement: model has no image head)"
+                         .format(c, "--", v.get("k", 0), "--"))
+                continue
+            t = v["tpr"]
+            L.append("  {:18s} {:10.4f} {:3d} {:6.2f}   {:9.2f} {:7.2f} {:7.2f}".format(
+                c, v["threshold"], v["k"], v["fpr_test"],
+                t.get("ood_thruster", float("nan")), t.get("ood_fish", float("nan")),
+                t.get("ood_buoy", float("nan"))))
+        L.append("")
+    p_out = pathlib.Path(out) / "slide3" / "conformal_thresholds.txt"
+    p_out.parent.mkdir(parents=True, exist_ok=True)
+    p_out.write_text("\n".join(L))
+    (pathlib.Path(out) / "slide2" / "conformal_thresholds.txt").write_text("\n".join(L))
+    log(f"  wrote {p_out} (and a copy in slide2/)")
 
 
 def main():
@@ -449,6 +518,7 @@ def main():
     a = ap.parse_args()
     if a.cmd == "slide3":
         slide3(a.out)
+        write_thresholds(a.out)
     elif a.cmd == "slide2-unc":
         slide2_uncertainty(a.ckpt, a.out, n=a.n)
     elif a.cmd == "slide2-scores":

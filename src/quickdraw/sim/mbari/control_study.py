@@ -255,9 +255,15 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
     against. If the two rows move together the model has learned the dynamics; if they diverge and
     reconverge, it has not.
 
-    Three cameras per arm rather than five: ten panels is unreadable at any sensible size, and
-    FPV + chase + the goal camera are the three that answer "where is it, what is it looking at,
-    and did it arrive".
+    TWO cameras per arm: FPV and the goal camera. Chase was dropped -- it shows the vehicle from
+    behind at a fixed offset, which duplicates what the goal camera already says about where it is
+    and adds nothing about whether it arrived.
+
+    THE WORLD MODEL IS THE TOP ROW. It is the thing being presented; true dynamics underneath is
+    the reference it is read against, and a reader scans down from the claim to the baseline.
+
+    NO STATS BAKED INTO THE FRAME. The per-trial numbers go to a text file beside the clips, so the
+    deck can quote them at whatever size it likes and a re-measure does not require a re-render.
     """
     import os
 
@@ -269,7 +275,7 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
 
     if egl_device is not None:
         os.environ["MUJOCO_EGL_DEVICE_ID"] = str(egl_device)
-    cams = ("fpv", "chase")
+    cams = ("fpv",)
     out = out or "logs/mbari/control/compare"
     os.makedirs(out, exist_ok=True)
     path, _ = _tank.build(textures=False, name=f"tank_cmp{trial}.xml", ghost=True)
@@ -282,12 +288,14 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
     C.NEAR, C.COARSE, C.FINE = 99.0, SCHEDULES["best"], SCHEDULES["best"]
     orig = C.mppi
     C.mppi = lambda *a, **k: orig(*a, **{**k, **MPPI_KW["best"]})
-    rend = UnderwaterRenderer(model, 288, 384, cams=cams + ("dockcam",))
+    # Two panels per row now, so render them at the size they are shown at rather
+    # than upscaling 288x384 into a 512-wide slot.
+    rend = UnderwaterRenderer(model, 384, 512, cams=cams + ("dockcam",))
     rend.look_at(gp, dist=4.6, elev=-18.0)
-    rows, labels = [], []
+    rows, labels, stats = [], [], []
     try:
-        for name, dyn in (("TRUE", C.TrueDynamics(model)),
-                          ("LEARNED", run_control.learned_from(ckpt, model))):
+        for name, dyn in (("WORLD MODEL", run_control.learned_from(ckpt, model)),
+                          ("TRUE DYNAMICS", C.TrueDynamics(model))):
             t0 = time.time()
             r = C.run_episode(model, dyn, starts[trial], gp, goal_q=gq, steps=steps, seed=100 + trial,
                               render=rend, ghost=(gid, gp, gq))
@@ -300,7 +308,8 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
             # three captions at font 26 against a 384 px panel; they overlapped each other and ran
             # off the right edge, which makes the one figure whose entire job is side-by-side
             # comparison unreadable. The arm belongs on its row, not on every panel.
-            labels += [name, "chase", f"{m['final_m']:.3f} m   {m['att_deg']:.1f} deg"]
+            labels += [f"{name} (FPV)", f"{name} (GOAL)"]
+            stats.append((name, m))
             log(f"  trial {trial} {name:22s} {m['final_m']:.3f} m, {m['att_deg']:.1f} deg, "
                 f"wander {m['wander']:.3f}  [{(time.time()-t0)/60:.1f} min]")
     finally:
@@ -310,12 +319,17 @@ def compare_clips(ckpt, trial, out=None, steps=840, egl_device=None, log=print):
     # better anyway: each arm keeps its own label band directly above its own footage, instead of
     # six captions in one line that the eye has to re-associate.
     n = min(len(p) for row in rows for p in row)              # arms can differ in length on a crash
-    strips = [viz.label_panels([p[:n] for p in row], labels[3 * i:3 * i + 3],
-                               panel_wh=(384, 288), header_px=44, font_px=20)
+    strips = [viz.label_panels([p[:n] for p in row], labels[2 * i:2 * i + 2],
+                               panel_wh=(512, 384), header_px=46, font_px=22)
               for i, row in enumerate(rows)]
     canvas = np.concatenate(strips, axis=1)                   # (T, 2*H, W, 3): stack rows vertically
     viz.save_mp4(f"{out}/compare_trial{trial}.mp4", canvas, 30, quality=8)
-    log(f"  wrote {out}/compare_trial{trial}.mp4")
+    with open(f"{out}/compare_trial{trial}.txt", "w") as fh:
+        fh.write(f"Trial {trial}\n")
+        for nm, m in stats:
+            fh.write(f"  {nm:14s} final {m['final_m']:.3f} m   attitude {m['att_deg']:.1f} deg   "
+                     f"wander {m['wander']:.3f} m   crashed {m['crashed']}\n")
+    log(f"  wrote {out}/compare_trial{trial}.mp4 (+ .txt)")
 
 
 def main():

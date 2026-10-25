@@ -88,28 +88,48 @@ def _model_for(split):
     return mujoco.MjModel.from_xml_path(str(p))
 
 
-def _placer(model, split, centre):
-    """extra(model, data, k): park the anomaly below the floor, raise it at ONSET.
+def _placer(model, split, centre, rng):
+    """extra(model, data, k): the anomaly is IN THE SCENE THROUGHOUT; the camera finds it.
 
-    The object sits AT the circle centre, so the inward-facing camera holds it in frame for the whole
-    remaining lap. It is given a slow spin rather than left frozen -- a statue reads as scenery."""
+    The first version parked the object below the floor and raised it at the onset, which made it
+    POP INTO EXISTENCE mid-episode -- an artefact no real anomaly has, and one a world model could
+    in principle learn to expect at t=10 s. The object now sits at a fixed point from frame 0 and
+    never moves. What changes is the VIEW: the vehicle flies an inward-facing circle, so an object
+    offset from the centre sweeps into and out of the field of view as the vehicle goes round, and
+    the episode records WHEN it is in frame rather than when it was created.
+
+    That also makes the detection question honest. "Surprise rises when the object appears" is
+    weaker than "surprise rises when the object becomes visible", because only the second is a
+    statement about perception rather than about the simulator.
+    """
     import mujoco
     name = {"ood_fish": "fish0", "ood_buoy": "buoy_ood"}.get(split)
     if name is None:
-        return None
+        return None, None
     bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
     if bid < 0:
-        return None
+        return None, None
     mid = int(model.body_mocapid[bid])
+    cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "fpv")
+    # OFFSET FROM THE CIRCLE CENTRE. At the centre the inward-facing camera would hold it in frame
+    # for the whole lap and there would be no entry to mark. Offset by most of the radius and it
+    # swings through the view once per lap.
+    th = rng.uniform(0, 2 * np.pi)
+    pos = np.asarray(centre, np.float64) + np.array([1.9 * np.cos(th), 1.9 * np.sin(th), 0.25])
+    seen = []
 
     def extra(_m, d, k):
-        if k < ONSET:
-            d.mocap_pos[mid] = np.array([0.0, 0.0, HIDDEN_Z])
-            return
-        d.mocap_pos[mid] = np.asarray(centre, np.float64)
-        th = 0.35 * (k - ONSET) / FPS                      # slow yaw so it is not a statue
-        d.mocap_quat[mid] = np.array([np.cos(th / 2), 0.0, 0.0, np.sin(th / 2)])
-    return extra
+        d.mocap_pos[mid] = pos
+        sp = 0.35 * k / FPS
+        d.mocap_quat[mid] = np.array([np.cos(sp / 2), 0.0, 0.0, np.sin(sp / 2)])
+        mujoco.mj_forward(_m, d)
+        eye, R = d.cam_xpos[cid], d.cam_xmat[cid].reshape(3, 3)
+        v = pos - eye
+        dist = float(np.linalg.norm(v))
+        ang = float(np.degrees(np.arccos(np.clip((-R[:, 2]) @ (v / max(1e-9, dist)), -1, 1))))
+        # fovy 70 -> 35 deg half-angle; 0.52 m is the near clipping plane in this scene.
+        seen.append(bool(ang < 32.0 and dist > 0.6))
+    return extra, seen
 
 
 def generate(out, splits=tuple(COUNTS), size=(144, 192), log=print):
@@ -144,13 +164,20 @@ def generate(out, splits=tuple(COUNTS), size=(144, 192), log=print):
                 pts = tj.circle_at(spec, th / (spec["speed"] / spec["rad"]))[0]
                 if not bool(tj.clear(pts, tj.VEHICLE_R + GLITCH_CLEARANCE).all()):
                     continue
-            extra = _placer(model, split, spec["centre"])
+            extra, seen = _placer(model, split, spec["centre"], rng)
             r = record.rollout(model, "circle", seed, steps=STEPS, size=size, renderer=rend,
                                glitch_p=(GLITCH_P if split == "ood_thruster" else 0.0),
                                glitch_from=ONSET, extra=extra, face="centre")
             if r is None or len(r["obs"]) < MIN_STEPS:      # too short to carry clean + anomaly windows
                 continue
+            # `in_frame` replaces a scripted onset for the visual conditions: the first run of
+            # True is when the object ENTERS the view, and there may be several windows per lap.
+            inf = [bool(x) for x in (seen or [])][:len(r["obs"])]
+            entries = [i for i in range(1, len(inf)) if inf[i] and not inf[i - 1]]
             meta = dict(r["meta"], split=split, onset=ONSET, controlled=True,
+                        in_frame=inf, first_visible=(entries[0] if entries else
+                                                     (0 if inf and inf[0] else -1)),
+                        visible_frac=(float(np.mean(inf)) if inf else 0.0),
                         full_length=bool(len(r["obs"]) >= STEPS),
                         centre=[float(x) for x in spec["centre"]], radius=float(spec["rad"]),
                         cam_to_object=float(spec["rad"] - 0.5),

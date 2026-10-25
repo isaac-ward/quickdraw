@@ -62,7 +62,7 @@ def conformal_threshold(calib, alpha=ALPHA):
     return float(c[k - 1]), k
 
 
-def episode_windows(core, norm, path, key, P, dev, onset):
+def episode_windows(core, norm, path, key, P, dev, onset):   # noqa: C901
     """Per-channel scores on the PRE-onset and POST-onset windows of one episode.
 
     `one_step` returns errors indexed from absolute step P, so the post window begins at
@@ -70,14 +70,33 @@ def episode_windows(core, norm, path, key, P, dev, onset):
     clean baseline."""
     from .run_uncertainty import CHANNELS, one_step
 
+    import ast as _ast
+
     z = np.load(path)
     e = one_step(core, norm, z["obs"], z["act"], z[f"frames_{key}"], key, P, dev)
-    cut = max(0, int(onset) - int(P))
+
+    # THE CONTRAST IS "ANOMALY ABSENT vs PRESENT", AND WHAT THAT MEANS DEPENDS ON THE CONDITION.
+    # The thruster glitch is switched on in time, so a step index splits it. The visual conditions
+    # no longer have an onset at all -- the object is in the scene throughout and sweeps in and out
+    # of view -- so splitting those at step 300 puts visible-object frames on BOTH sides and the
+    # contrast collapses (measured: fish 0.124 -> 0.131, buoy 0.115 -> 0.109, i.e. nothing). For
+    # those, "absent" means OUT OF FRAME and "present" means in frame, which is the thing the
+    # detector can actually respond to.
+    meta = _ast.literal_eval(str(z["meta"]))
+    inf = meta.get("in_frame")
+    steps = np.asarray(e["steps"])
+    if inf:
+        vis = np.asarray(inf, bool)[steps]          # align to one_step's own indexing (starts at P)
+        mask_post = vis
+        mask_pre = ~vis
+    else:
+        mask_post = steps >= int(onset)
+        mask_pre = ~mask_post
     pre, post = {}, {}
     for c in CHANNELS:
         v = np.asarray(e[c], np.float64)
-        pre[c] = float(np.percentile(v[:cut], 90)) if cut > 2 else float("nan")
-        post[c] = float(np.percentile(v[cut:], 90)) if len(v) - cut > 2 else float("nan")
+        pre[c] = float(np.percentile(v[mask_pre], 90)) if mask_pre.sum() > 2 else float("nan")
+        post[c] = float(np.percentile(v[mask_post], 90)) if mask_post.sum() > 2 else float("nan")
     return pre, post
 
 
@@ -134,7 +153,8 @@ def run(ckpt, root=ROOT, out="/app/logs/mbari/uncertainty/conformal", key="fpv",
 
     # THE IN-EPISODE CONTRAST. pre should sit at the nominal level and post above it, on the same
     # episode -- that is what rules out an episode-level confound explaining the separation.
-    log(f"\n  onset trace (90th pct, PRE [0,{onset}) vs POST [{onset},end))")
+    log(f"\n  anomaly-absent vs anomaly-present (90th pct). Visual conditions split on OUT OF FRAME"
+        f" vs IN FRAME; the thruster splits at step {onset}.")
     log(f"  {'split':16s} " + "  ".join(f"{c.replace('image_','im_').replace('proprio_','pro_'):>13}" for c in CHANNELS))
     for sp in (CALIB, TEST, *OOD):
         if sp not in scores:
