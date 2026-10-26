@@ -411,47 +411,68 @@ def slide3(out, bench="/app/logs/mbari/control/bench32",
     if not trials:
         log("  !! no trials.json found"); return
 
-    # SIX PANELS, NOT ONE BAR CHART. These metrics have different units and wildly different scales
-    # -- a 0.012 m distance beside a 94% rate beside 0.8 degrees on shared axes is unreadable, and
-    # normalising them to a common scale would invent a comparison nobody asked for.
-    panels = [("success", "Sustained-hold success", "Rate", True),
-              ("final_m", "Final distance", "m", False),
-              ("att_deg", "Final attitude error", "deg", False),
-              ("wander", "Wander over last 2 s", "m", False),
-              ("a_end", "Command magnitude at rest", "Fraction of full thrust", False),
-              ("crashed", "Collision rate", "Rate", True)]
-    fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.0))
-    cols = {"true": "#2e8b57", "analytic": "#3b76c4", "proprio": "#7b2ff7"}
-    for ax, (k, title, unit, is_rate) in zip(axes.ravel(), panels):
+    # FIVE PANELS IN ONE ROW, NOT SIX IN TWO. These metrics have different units and wildly different
+    # scales -- a 0.012 m distance beside a 94% rate beside 0.8 degrees on shared axes is unreadable,
+    # and normalising them to a common scale would invent a comparison nobody asked for. Wander is
+    # dropped from the FIGURE (it says the same thing final distance does) and the analytic arm with
+    # it: the slide asks whether a LEARNED model can fly the vehicle, and the analytic arm sits on top
+    # of the true one, so it only costs width. Both stay in aggregate.json.
+    METRICS = [("success", "Sustained-hold success", "Rate", True),
+               ("final_m", "Final distance", "m", False),
+               ("att_deg", "Final attitude error", "deg", False),
+               ("wander", "Wander over last 2 s", "m", False),
+               ("a_end", "Command magnitude at rest", "Fraction of full thrust", False),
+               ("crashed", "Collision rate", "Rate", True)]
+    panels = [m for m in METRICS if m[0] != "wander"]
+    fig_arms = [("true", "True dynamics"), ("proprio", "World model")]
+    fig, axes = plt.subplots(1, len(panels), figsize=(16.0, 3.5))
+    cols = {"true": plt.get_cmap("Blues")(0.78), "proprio": plt.get_cmap("Reds")(0.72)}
+    STEP = 0.62                      # bars this close together read as a pair, not as two charts
+    # THE ONE CRASHED TRIAL IS HELD OUT OF THE DISTRIBUTION PANELS, and still counted in the collision
+    # rate. A trial that ended against a wall has no meaningful final distance or attitude error -- it
+    # is 90 deg out and 0.46 m away because it stopped flying, not because the controller was
+    # imprecise -- and drawn in, it compresses every other point onto a line. It is not deleted: the
+    # panel it belongs in is the collision rate, where it is counted.
+    dropped = {a: sum(1 for t in trials.get(a, []) if t["crashed"]) for a, _ in fig_arms}
+    for ax, (k, title, unit, is_rate) in zip(np.atleast_1d(axes), panels):
         xs, labels = [], []
-        for xi, (arm, lab) in enumerate(ARMS):
+        for xi, (arm, lab) in enumerate(fig_arms):
             if arm not in trials:
                 continue
-            v = np.array([float(t[k]) for t in trials[arm]])
+            x = xi * STEP
             labels.append(lab)
             if is_rate:
-                ax.bar(xi, v.mean(), color=cols[arm], width=0.6, alpha=0.85)
-                ax.text(xi, v.mean(), f" {v.mean()*100:.0f}%", ha="center", va="bottom", fontsize=9)
+                v = np.array([float(t[k]) for t in trials[arm]])
+                ax.bar(x, v.mean(), color=cols[arm], width=0.42, alpha=0.9)
+                # a 100% bar reaches the axis top, so its label goes INSIDE it rather than through
+                # the panel title
+                hi = v.mean() > 0.85
+                ax.text(x, v.mean() - 0.035 if hi else v.mean() + 0.02, f"{v.mean()*100:.0f}%",
+                        ha="center", va="top" if hi else "bottom", fontsize=10,
+                        color="white" if hi else "black")
+                ax.set_ylim(0.0, 1.0)        # a 3% rate read against 0-1 is a 3% rate
             else:
-                ax.scatter(np.full(len(v), xi) + np.random.default_rng(1).uniform(-.12, .12, len(v)),
+                v = np.array([float(t[k]) for t in trials[arm] if not t["crashed"]])
+                ax.scatter(np.full(len(v), x) + np.random.default_rng(1).uniform(-.08, .08, len(v)),
                            v, s=16, alpha=0.6, color=cols[arm], edgecolors="none")
-                ax.scatter([xi], [np.median(v)], marker="_", s=700, color="k", lw=1.6, zorder=5)
-                ax.set_yscale("log" if v.max() / max(1e-9, np.median(v)) > 25 else "linear")
-            xs.append(xi)
+                ax.scatter([x], [np.median(v)], marker="_", s=520, color="k", lw=1.6, zorder=5)
+            xs.append(x)
         ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=9)
-        # Panel titles stay: these six are different quantities and the deck cannot label each
-        # subplot from outside. Only the figure-level title is dropped.
+        # Panel titles stay: these are different quantities and the deck cannot label each subplot
+        # from outside. Only the figure-level title is dropped.
         ax.set_title(title, fontsize=10); ax.set_ylabel(unit, fontsize=9)
         ax.grid(alpha=0.25, axis="y")
-        ax.set_xlim(-0.6, len(ARMS) - 0.4)
+        ax.set_xlim(-0.45, (len(fig_arms) - 1) * STEP + 0.45)
     fig.tight_layout()
     fig.savefig(d / "aggregate_metrics.png", dpi=160)
     plt.close(fig)
-    log(f"  aggregate_metrics.png  ({', '.join(f'{a}={len(t)}' for a, t in trials.items())} trials)")
+    log(f"  aggregate_metrics.png  ({', '.join(f'{a}={len(t)}' for a, t in trials.items())} trials"
+        f"; crashed held out of the distribution panels: "
+        f"{', '.join(f'{a}={n}' for a, n in dropped.items())})")
     (d / "aggregate.json").write_text(json.dumps(
         {a: {k: {"mean": float(np.mean([t[k] for t in ts])),
                  "median": float(np.median([t[k] for t in ts]))}
-             for k, *_ in panels} for a, ts in trials.items()}, indent=1))
+             for k, *_ in METRICS} for a, ts in trials.items()}, indent=1))
     log(f"wrote {d}")
 
 

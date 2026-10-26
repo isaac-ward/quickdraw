@@ -30,7 +30,11 @@ from __future__ import annotations
 
 import numpy as np
 
-CHANNELS = ("image_lpips", "image_l1", "latent_surprise", "proprio_pos", "proprio_vel", "proprio_angvel")
+# THE SCORING PATH'S TUPLE IS THE REAL ONE. This module declared its own, including a
+# `latent_surprise` that nothing computed and omitting `proprio_rot_deg` that everything did, and
+# the two silently disagreed for the whole campaign. Kept in sync by construction now.
+CHANNELS = ("image_lpips", "image_l1", "latent_surprise",
+            "proprio_pos", "proprio_vel", "proprio_angvel", "proprio_rot_deg")
 PCTL = 90.0
 
 

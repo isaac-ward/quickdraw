@@ -35,7 +35,7 @@ def one_step(core, norm, o, a, fr, key, P, dev, chunk=64):
     has_img = key in [n for n, _ in getattr(core, "_orig_mod", core).layout]
     T = len(o)
     ts = list(range(P, T))
-    out_lp, out_l1, pro_p = [], [], []
+    out_lp, out_l1, out_lat, pro_p = [], [], [], []
     for i0 in range(0, len(ts), chunk):
         part = ts[i0:i0 + chunk]
         ctx = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(o[t - P:t])) for t in part]).float().to(dev)}
@@ -44,7 +44,22 @@ def one_step(core, norm, o, a, fr, key, P, dev, chunk=64):
         acts = torch.stack([norm.norm_act(torch.from_numpy(a[t - P:t])) for t in part]).float().to(dev)
         heads = ["proprio"] + ([key] if has_img else [])
         with torch.no_grad():
-            out = core.imagine_eval(ctx, acts, 1, heads=heads, norm=norm)
+            out = core.imagine_eval(ctx, acts, 1, heads=heads, norm=norm, return_bag=True)
+            # LATENT SURPRISE: cosine distance between the PREDICTED next latent and the latent the
+            # TRUE next observation encodes to. Cosine rather than L2 because the latent has no
+            # calibrated scale and an L2 would mostly measure norm drift; 1 - cos is bounded and is
+            # the same quantity `latent_cos` reports elsewhere in the repo.
+            nxt = {"proprio": torch.stack([norm.norm_obs(torch.from_numpy(o[t])) for t in part])[:, None].float().to(dev)}
+            if has_img:
+                nxt[key] = torch.stack([torch.from_numpy(fr[t]) for t in part])[:, None].float().div(255.0).to(dev)
+            z_true = core.encode_state(nxt)[:, 0].float()
+            z_pred = out["_bag"][:, 0].float() if "_bag" in out else None
+        if z_pred is not None:
+            a_ = torch.nn.functional.normalize(z_pred.flatten(1), dim=1)
+            b_ = torch.nn.functional.normalize(z_true.flatten(1), dim=1)
+            out_lat.extend((1.0 - (a_ * b_).sum(1)).cpu().numpy().tolist())
+        else:
+            out_lat.extend([float("nan")] * len(part))
         if has_img:
             pred = out[key][:, 0].clamp(0, 1)
             true = torch.stack([torch.from_numpy(fr[t]) for t in part]).float().div(255.0).to(dev)
@@ -62,13 +77,21 @@ def one_step(core, norm, o, a, fr, key, P, dev, chunk=64):
     qt = pro_t[:, QUAT] / (np.linalg.norm(pro_t[:, QUAT], axis=1, keepdims=True) + 1e-9)
     return {"steps": np.array(ts),
             "image_lpips": np.array(out_lp), "image_l1": np.array(out_l1),
+            "latent_surprise": np.array(out_lat),
             "proprio_pos": np.linalg.norm(pro_p[:, POS] - pro_t[:, POS], axis=1),
             "proprio_vel": np.linalg.norm(pro_p[:, VEL] - pro_t[:, VEL], axis=1),
             "proprio_angvel": np.linalg.norm(pro_p[:, ANGVEL] - pro_t[:, ANGVEL], axis=1),
             "proprio_rot_deg": np.degrees(2.0 * np.arccos(np.clip(np.abs((qp * qt).sum(1)), 0, 1)))}
 
 
-CHANNELS = ("image_lpips", "image_l1", "proprio_pos", "proprio_vel", "proprio_angvel", "proprio_rot_deg")
+# `latent_surprise` was DECLARED in uncertainty.CHANNELS from the start and never computed -- the
+# tuple the scoring path actually imports is this one, and one_step returned no latent channel, so
+# every number produced before 2026-10-25 came from image and proprio channels only. Added here
+# rather than deleting the declaration, because it is the one channel that does NOT inherit the
+# decoder's blur: it compares what the model predicted in its own representation against what the
+# next frame encodes to, before anything is rendered.
+CHANNELS = ("image_lpips", "image_l1", "latent_surprise",
+            "proprio_pos", "proprio_vel", "proprio_angvel", "proprio_rot_deg")
 
 
 def held_out_ids(run_dir):

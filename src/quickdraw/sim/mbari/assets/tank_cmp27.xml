@@ -7,6 +7,11 @@
     <!-- shadows off, no multisampling: 141 -> 65 ms per 4-camera control step, and at 144x192
          under attenuating water a shadow is a handful of dim pixels. -->
     <quality shadowsize="512" offsamples="0"/>
+    <!-- OFFSCREEN BUFFER. MuJoCo defaults to 640x480 and SILENTLY fails above it -- the presentation
+         renders at 1152x864 produced no files and only a destructor traceback. Training and control
+         render at 144x192 and 288x384 so nothing before now touched the ceiling. Raised to 1920x1440,
+         which costs nothing until something actually asks for a big frame. -->
+    <global offwidth="1920" offheight="1440"/>
   </visual>
   <asset>
     <!-- WALL CONCRETE IS ONE CROP PER BOX (see build_textures). MuJoCo cannot tile a texture on a
