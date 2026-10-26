@@ -19,7 +19,13 @@ import matplotlib.pyplot as plt                                                 
 import numpy as np                                                                 # noqa: E402
 from matplotlib.patches import Ellipse                                             # noqa: E402
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elements")
+# QD_CLOSEUP=1 mirrors make_sequence_figs: the same glyphs, cropped to their ink at CLOSEUP_X the pixels,
+# into the paper folder's elements_closeup/. The normal path is untouched, so neither copy of elements/
+# can be overwritten by a sub-figure pass.
+CLOSEUP = bool(os.environ.get("QD_CLOSEUP"))
+CLOSEUP_X = 8
+OUT = ("/app/logs/paper_icra_2027/elements_closeup" if CLOSEUP
+       else os.path.join(os.path.dirname(os.path.abspath(__file__)), "elements"))
 EDGE = "#000000"
 FC, EC = "#f3d9d9", "#ab5b5b"      # the figure's predicted-block pink: these glyphs describe the RED side
 LW, DPI = 2.2, 300
@@ -114,7 +120,9 @@ def main() -> int:
         fig = plt.figure(figsize=(1.6, 1.1), dpi=DPI)
         ax = fig.add_axes([0.02, 0.02, 0.96, 0.96])
         fn(ax); _frame(ax, name)
-        fig.savefig(f"{OUT}/dist_{name}.png", transparent=True, dpi=DPI, pad_inches=0)
+        fig.savefig(f"{OUT}/dist_{name}.png", transparent=True, pad_inches=0,
+                    dpi=DPI * (CLOSEUP_X if CLOSEUP else 1),
+                    **({"bbox_inches": "tight"} if CLOSEUP else {}))
         plt.close(fig)
         print(f"  wrote dist_{name}.png")
 
@@ -127,7 +135,9 @@ def main() -> int:
     for ax in axes.ravel()[len(GLYPHS):]:
         ax.axis("off")
     fig.tight_layout()
-    fig.savefig(f"{OUT}/dist_candidates.png", dpi=150, facecolor="white")
+    fig.savefig(f"{OUT}/dist_candidates.png", facecolor="white",
+                dpi=150 * (CLOSEUP_X if CLOSEUP else 1),
+                **({"bbox_inches": "tight"} if CLOSEUP else {}))
     plt.close(fig)
     print(f"  wrote dist_candidates.png  ({len(GLYPHS)} candidates)")
     return 0

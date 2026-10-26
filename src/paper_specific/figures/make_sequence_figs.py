@@ -19,6 +19,7 @@ rebuilt the way data/dataset.py::_subsample_episodes does under action_aggregate
 from __future__ import annotations
 
 import glob
+import os
 import re
 
 import matplotlib
@@ -47,6 +48,32 @@ N_STATE     = 8        # vision/proprio stop at the last braced step; only the a
 # *1 = act[t], the last action INSIDE the window: act[t] drives t -> t+1, so this is the one that
 # produces the predicted state.  *2 = act[t+1], the single-braced action that makes the nub.
 ASTERISKS    = ((7, "*\u2081"), (8, "*\u2082"))
+
+# CLOSE-UP MODE (QD_CLOSEUP=1): the same components re-rendered for use as SUB-FIGURES -- asterisks off,
+# cropped to their own ink, CLOSEUP_X the pixels -- into elements_closeup/. It writes neither elements/
+# nor architecture.png, so a sub-figure pass can never clobber the figure's own assets. The layout is
+# solved at the normal DPI either way: DPI only scales the raster, so the close-ups are the SAME drawing
+# at more pixels, not a redesign. Dropping the asterisks does move the canvas (they are the lowest ink in
+# the figure, and solve_layout counts them), which is why they come off here rather than being erased.
+CLOSEUP = bool(os.environ.get("QD_CLOSEUP"))
+CLOSEUP_X = 8
+if CLOSEUP:
+    ASTERISKS = ()
+
+# INTERMEDIATES MODE (QD_INTERMEDIATES=1): the SAME canvas with the dynamics taken out -- the three
+# cascades, their encoders, the token column, and the decoders fed straight back off that column. It is
+# the figure as an autoencoder, built in three stages for a talk, into intermediates/. Nothing about the
+# layout changes, so a stage drops onto architecture.png pixel for pixel.
+# TWO BUILDS, ONE FLAG. QD_INTERMEDIATES=1 is the REPRESENTATION story (streams in, encoders, codes,
+# decoders, streams out, no dynamics anywhere); QD_INTERMEDIATES=dynamics is the sequel, which drops the
+# cascades entirely and walks the token tensor forward through the summariser and the observation head.
+# They share the canvas and the solver, so a stage of one lines up with a stage of the other.
+_INT_MODE = os.environ.get("QD_INTERMEDIATES", "")
+INTERMEDIATES = bool(_INT_MODE)
+DYNAMICS = _INT_MODE == "dynamics"
+CODEC = INTERMEDIATES and not DYNAMICS
+if INTERMEDIATES:
+    ASTERISKS = ()       # they mark which action drives the PREDICTED state, and neither build needs them
 
 OFFSET_X     = 48.0      # per-item step in x
 OFFSET_Y     = OFFSET_X / 2          # ...and half that in y: the cascade angle
@@ -169,7 +196,11 @@ LEG_PRED     = "Predicted"
 IMG_TOKENS   = 16      # image-token rows DRAWN. The model carries 32; halved here purely so the column
 #                        is not a sliver -- the count is carried by the proportions, not by counting rows.
 PRED_BLKS    = ((IMG_TOKENS, 1), (1, 1))   # (height, depth) per red block, stacked like the blue column
-PRED_STEPS   = 1       # ONE predicted slice in this variant. Everything downstream follows from it and
+# FOUR in the dynamics build, ONE everywhere else. The action nub is NUB_DEPTH steps long -- those are
+# the commands the model is given for the future -- so four predicted slices sit exactly on top of it, one
+# per command, and the autoregressive stages have somewhere to roll to. prediction.npz already holds four
+# steps, so nothing is invented to fill them.
+PRED_STEPS   = NUB_DEPTH if DYNAMICS else 1       # ONE predicted slice in the paper variant. Everything downstream follows from it and
 #                        needed no separate switch: x_0's fan collapses to a single 45 (one target), the
 #                        decoder feeds leave that one slice's face, and each decoder emits one item.
 BLK_LW       = 1.1
@@ -182,8 +213,12 @@ HATCH_A = 0.25
 # ---- decoders: mirrored trapezia off the RED blocks, producing the predicted frame and vector --------
 DEC_GAP      = 170.0     # red column's right face -> decoder input edge
 OUT_GAP      = 150.0     # decoder output edge -> the predicted item
-DEC_LABELS   = ("Vision\ndecoder", "Proprio\ndecoder")
+DEC_LABELS   = ("Vision\ndecoder", "Proprio\ndecoder", "Action\ndecoder")   # the third: INTERMEDIATES only
 PRED_AT      = 8         # the predicted step IS item 8 of the cascades: its frame and vector are real
+# HOW MANY ITEMS COME BACK OUT. One per predicted slice normally. In intermediates mode the WHOLE braced
+# window does, because that is the claim being made there -- not "this step survives the code" but "these
+# eight do, separately", which is also why the blocks get their time rules.
+OUT_STEPS    = N_STATE if CODEC else PRED_STEPS
 NUB_DROP     = 66.0      # how far BELOW the nub the feed runs before turning up into it
 # ---- space-time backbone: a flat 2D box DIRECTLY BELOW the token column and EXACTLY its width ---------
 # Every block does BOTH passes, in this order -- they do not alternate BETWEEN blocks.
@@ -335,6 +370,9 @@ ENC_SEP      = 32.0      # vertical gap BETWEEN tokenizer blocks (vision stays p
 MIN_SEG      = 8.0       # no line segment may be shorter than this
 RISER_PAD    = 26.0      # first riser sits this far right of ALL content
 RISER_STEP   = 20.0      # risers are staggered so two stems never share a vertical
+STEM_CLEAR   = 24.0      # split_stems: how far right of the lower stem's turn the upper one's diagonal
+#                          starts. 3 x MIN_SEG, which at this line weight is a clearly open gap rather
+#                          than a near miss
 ARM_SLOPE    = float(np.tan(np.deg2rad(67.5)))   # |dy/dx| of a tokenizer-output / decoder-input arm: a
 #                          67.5-degree run buys the same drop for 0.41x the horizontal, which is what keeps
 #                          the figure from widening every time the token column gets taller
@@ -627,7 +665,7 @@ def stream_clearance(above, below):
     return best if best is not None else 0.0
 
 
-def route(f, t, xv, diag_room=0.0, slope=1.0):
+def route(f, t, xv, diag_room=0.0, slope=1.0, diag_x0=None):
     """THE router for every arrow in the figure -- brace stems into tokenizers and tokenizer feeds out to
     blocks alike. One function, three shapes, chosen by how much horizontal room the caller says a
     diagonal may use:
@@ -638,6 +676,10 @@ def route(f, t, xv, diag_room=0.0, slope=1.0):
       diag_room > 0   the diagonal is made as LONG as that allows. If it can absorb the whole drop it is
                       one clean run, centred; otherwise it runs INTO the vertical at xv, so the descent
                       starts as early (and as far from whatever is below the source) as it can.
+
+    `diag_x0` forces the x the diagonal STARTS at instead of centring it in the horizontal run, which is
+    how one path is moved clear of another without changing its shape (see split_stems). It is clamped to
+    the run, so a caller cannot ask for a path that doubles back.
 
     `slope` is |dy/dx| of that diagonal: 1.0 is 45 degrees, tan(67.5) is the steep variant. A steeper
     diagonal buys the same drop for LESS horizontal run, which is the whole reason it exists -- the gaps
@@ -654,7 +696,8 @@ def route(f, t, xv, diag_room=0.0, slope=1.0):
         return [tuple(f), (xv, f[1]), (xv, t[1]), tuple(t)], "right-angle"
     nm = "45" if abs(slope - 1.0) < 1e-9 else f"{np.degrees(np.arctan(slope)):.4g}deg"
     if diag >= run - 1e-9:                               # the diagonal absorbs the whole drop
-        x0 = f[0] + (t[0] - f[0] - run / slope) / 2.0    # centred in the horizontal run
+        x0 = f[0] + (t[0] - f[0] - run / slope) / 2.0 if diag_x0 is None else diag_x0  # centred in the run
+        x0 = min(max(x0, f[0]), t[0] - run / slope)      # ...and never outside it
         return [tuple(f), (x0, f[1]), (x0 + run / slope, t[1]), tuple(t)], nm
     s = float(np.sign(dy))
     return ([tuple(f), (xv - diag / slope, f[1]), (xv, f[1] + s * diag), (xv, t[1]), tuple(t)],
@@ -757,7 +800,7 @@ def hatch_rgba(col, a=None):
     return (r, g, b, HATCH_A if a is None else a)
 
 
-def iso_block(ax, tip, depth, height, width, z, fc=BLK_FC, ec=BLK_EC, hatch=None):
+def iso_block(ax, tip, depth, height, width, z, fc=BLK_FC, ec=BLK_EC, hatch=None, grid=False):
     """A SOLID isometric cuboid of (depth x height x width) tokens, positioned by its front face.
 
     Depth recedes UP-LEFT, which is the SAME LINE DIRECTION as the down-right data streams -- the long
@@ -783,6 +826,15 @@ def iso_block(ax, tip, depth, height, width, z, fc=BLK_FC, ec=BLK_EC, hatch=None
     face(O + vh * height, vd, depth, vw, width, fc[0])              # A: top
     face(O, vd, depth, vh, height, fc[1])                           # B: FRONT, long, on the left
     face(O, vw, width, vh, height, fc[2])                           # C: short, on the right
+    if grid and depth > 1:
+        # ONE RULE PER TIME STEP, on the two faces that run along depth (the near face has no depth, so it
+        # gets none). A flat-shaded solid says nothing about how many steps are inside it; these say it
+        # without adding a colour or a number, at a lighter weight than the edges so the block stays one
+        # object rather than becoming eight.
+        for j in range(1, depth):
+            for a0, v, n_ in ((O + vd * j, vh, height), (O + vh * height + vd * j, vw, width)):
+                ax.plot([a0[0], a0[0] + v[0] * n_], [a0[1], a0[1] + v[1] * n_], color=ec,
+                        lw=BLK_LW * 0.7, solid_capstyle="round", zorder=z + 0.1)
     if BLK_LABELS:
         for tag, c in (("A", O + vh * height + vd * (depth / 2) + vw * (width / 2)),
                        ("B", O + vd * (depth / 2) + vh * (height / 2)),
@@ -812,6 +864,10 @@ _arrows = np.where(ACT >= 0.0, 0.0, np.pi)
 _p_prop, _vw, _vh_p, _p_prop_vec = vector_item_factory(OBS, cmap=MOD_CMAP["proprio"])
 _p_act, _, _vh_a, _p_act_vec = vector_item_factory(ACT, arrows=_arrows, cmap=MOD_CMAP["action"],
                                                   cmap_vec=ACT_OUT_CMAP)
+# ...and a SECOND tile for the same stream, differing only in that its output takes the stream's OWN blue.
+# ACT_OUT_CMAP marks what the model INVENTED; a reconstruction is the opposite of invented, so colouring
+# one purple would say the figure's loudest thing about the quietest claim in it.
+_p_act_recon = vector_item_factory(ACT, arrows=_arrows, cmap=MOD_CMAP["action"])[3]
 
 # THE PREDICTION the figure shows as its output: made by make_prediction.py, which rolls the real world
 # model from the 8 consecutive strided frames ending at the last braced tile. Falls back to the RECORDED
@@ -826,6 +882,18 @@ except OSError:
     PRED_IMG, PRED_OBS = None, None
     print("  WARNING: no prediction.npz -- the outputs show the RECORDED item, not a prediction. "
           "Run make_prediction.py.")
+# ...and the ENCODE -> DECODE round trip the intermediates figure shows, from make_intermediates.py.
+# Same contract as above: no cache, no claim -- it falls back to the recorded item and says so.
+try:
+    _R = np.load(f"{OUT}/intermediates/recon.npz")
+    RECON_IMG, RECON_OBS = _R["image"], _R["proprio"]   # (N,H,W,3) and (N,obs) -- one per DRAWN item
+    RECON_ACT = _R["action"]                            # (N,4) -- through the FITTED readout, see the script
+    print(f"  round trip: {len(RECON_IMG)} items encoded and decoded back, no dynamics")
+except OSError:
+    RECON_IMG, RECON_OBS, RECON_ACT = None, None, None
+    if INTERMEDIATES:
+        print("  WARNING: no intermediates/recon.npz -- the outputs show the RECORDED item, not a "
+              "reconstruction. Run make_intermediates.py.")
 try:
     _A = np.load(f"{OUT}/action_samples.npz")
     ACT_SMP, ACT_TRUE = _A["samples"], _A["truth"]      # (N,T,4) draws and (T,4) recorded, RAW stick units
@@ -853,6 +921,11 @@ LAYERS = [
          blks=[(BLK_DEPTH, 1, 1), (NUB_DEPTH, 1, 1)], blkz=[Z_BLOCK["action"], Z_BLOCK["action_extra"]],
          **palette(MOD_CMAP["action"])),
 ]
+if CODEC:
+    # NO FLOW HEAD HERE, SO NO NUB. The action stream's second brace and its 4-step block exist to feed
+    # the head directly, past the backbone; with both gone it is three streams of the same 8 steps, and
+    # leaving the nub in would have the figure point at a component it does not draw.
+    LAYERS[-1].update(n=N_STATE, braces=BRACES, blks=[(BLK_DEPTH, 1, 1)], blkz=[Z_BLOCK["action"]])
 
 
 def solve_layout():
@@ -1032,9 +1105,10 @@ def solve_layout():
                                  max(q[0] for q in pts), max(q[1] for q in pts)))
     # THE PREDICTED STEP, in red: depth 1, flush against the column's near (down-right) face, its top
     # level with the column's. PRED_H = 33 (not 34) because predict_next emits state tokens only.
-    PRED, boxes = [], []
+    PRED, boxes, faces = [], [], []
     for step in range(PRED_STEPS):                       # one slice per predicted step, down-right of the last
         Op = LAYERS[0]["blk_O"][0] - vdu * (step + 1)
+        _b0 = len(boxes)
         for j, (hj, dj) in enumerate(PRED_BLKS):
             if j:                                        # O is a block's BOTTOM: drop by ITS OWN height
                 Op = Op - vhu * hj
@@ -1044,7 +1118,8 @@ def solve_layout():
                    for a in (0, dj) for b in (0, 1) for c in (0, hj)]
             boxes.append((min(q[0] for q in pts), min(q[1] for q in pts),
                           max(q[0] for q in pts), max(q[1] for q in pts)))
-    globals()["PRED"] = PRED
+        faces.append(max(b[2] for b in boxes[_b0:]))  # this slice's own right face
+    globals()["PRED"], globals()["PRED_FACE"] = PRED, faces
     globals()["PRED_BOX"] = (min(b[0] for b in boxes), min(b[1] for b in boxes),
                              max(b[2] for b in boxes), max(b[3] for b in boxes))
     # DECODERS: one per red block, on the far side of it. Each is centred on its block, so the arrow in
@@ -1054,32 +1129,43 @@ def solve_layout():
     # drop it must absorb -- the same rule the tokenizer feeds get. Sizing these by a fixed constant is
     # what made the vision decode arm fall back to a riser the moment the token cell grew.
     _n_b = len(PRED_BLKS)
-    _src_y = [PRED[-_n_b + i]["tip"][1] for i in range(2)]
-    _dec_cy = [LAYERS[i]["enc_cy_abs"] for i in range(2)]
-    _out_cy = [PRED_AT * OFFSET_Y + LAYERS[i]["sy0"] + LAYERS[i]["ph"] / 2.0 for i in range(2)]
+    # ONE ENTRY PER DECODER. Two normally -- the token bag is proprio + image and the model has a head for
+    # each. INTERMEDIATES adds the action stream, whose decoder is fitted after the fact (see
+    # make_intermediates.py), and starts the output cascade on item 0 so the window that went in is the
+    # window that comes back out.
+    _specs = [(DEC_LABELS[0], image_item, IMG_W, IMG_W * FRAMES[0].shape[0] / FRAMES[0].shape[1], "image"),
+              (DEC_LABELS[1], _p_prop, _vw, _vh_p, "proprio")]
+    if CODEC:
+        _specs.append((DEC_LABELS[2], _p_act, _vw, _vh_a, "action"))
+    _out_at = 0 if CODEC else PRED_AT
+
+    def _blk_face(k):     # centre of a token block's NEAR face: where a decode arm leaves the COLUMN
+        Ok, (_d, _h, _w) = LAYERS[k]["blk_O"][0], LAYERS[k]["blks"][0]
+        return (Ok[0] + BLK_S * ISO_C * _w / 2.0, Ok[1] - BLK_S * _h / 2.0 - BLK_S * ISO_S * _w / 2.0)
+    # ON the face, all of them, so the tails line up exactly as the tokenizer feeds' do. Nudging them
+    # clear of the outline instead (to stop the halo cutting a notch in it) broke that alignment; the
+    # halo is dealt with by Z ORDER -- these arrows are drawn UNDER the blocks, see Z_DECODE.
+    _src = [(face_red, PRED[-_n_b + i]["tip"][1]) if i < _n_b else _blk_face(i)
+            for i in range(len(_specs))]                      # off the RED slice: the predicted step
+    _src_recon = [_blk_face(i) for i in range(len(_specs))]   # off the BLUE column: no dynamics ran
+    # SAME HEIGHT AS ITS TOKENIZER, so encode and decode face each other across the figure, and the
+    # OUTPUT leaves the page at the height its INPUT entered it, on the far left
+    _dec_cy = [LAYERS[i]["enc_cy_abs"] for i in range(len(_specs))]
+    _out_cy = [_out_at * OFFSET_Y + LAYERS[i]["sy0"] + LAYERS[i]["ph"] / 2.0 for i in range(len(_specs))]
     _pad = ARROW_L + 3 * MIN_SEG + RISER_STEP
-    dec_x = face_red + max(DEC_GAP, max(abs(a - b) for a, b in zip(_src_y, _dec_cy)) / ARM_SLOPE + _pad)
+    _arm = _src_recon if CODEC else _src                      # whichever face the arms actually leave
+    dec_x = max(a[0] for a in _arm) + max(DEC_GAP, max(abs(a[1] - b) for a, b in zip(_arm, _dec_cy))
+                                          / ARM_SLOPE + _pad)
     out_x = dec_x + ENC_W + max(OUT_GAP, max(abs(a - b) for a, b in zip(_dec_cy, _out_cy)) + _pad)
-    DEC = []
-    n_b = len(PRED_BLKS)
-    for k, (P, lab, draw, ow, oh) in enumerate(((PRED[-n_b], DEC_LABELS[0], image_item, IMG_W,
-                                                 IMG_W * FRAMES[0].shape[0] / FRAMES[0].shape[1]),
-                                                (PRED[-n_b + 1], DEC_LABELS[1], _p_prop, _vw, _vh_p))):
-        # SAME HEIGHT AS ITS TOKENIZER, so encode and decode face each other across the figure
-        cy = LAYERS[k]["enc_cy_abs"]
-        # ...and the OUTPUT leaves the page at the height its INPUT entered it, on the far left
-        out_cy = PRED_AT * OFFSET_Y + LAYERS[k]["sy0"] + LAYERS[k]["ph"] / 2.0
-        # ON the face, both of them, so the two tails line up exactly as the tokenizer feeds' do. Nudging
-        # them clear of the outline instead (to stop the halo cutting a notch in it) broke that alignment;
-        # the halo is dealt with by Z ORDER -- these arrows are drawn UNDER the blocks, see Z_DECODE.
-        DEC.append(dict(cy=cy, out_cy=out_cy, label=lab, draw=draw, ow=ow, oh=oh,
-                        src=(face_red, P["tip"][1])))   # leaves the red block at the BLOCK's height
+    DEC = [dict(cy=cy, out_cy=oc, label=lab, draw=draw, ow=ow, oh=oh, kind=kind, src=sp, src_recon=sr)
+           for (lab, draw, ow, oh, kind), cy, oc, sp, sr
+           in zip(_specs, _dec_cy, _out_cy, _src, _src_recon)]
     globals()["DEC"], globals()["DEC_X"], globals()["OUT_X"] = DEC, dec_x, out_x
     globals()["DEC_BOX"] = (dec_x, min([d["cy"] - ENC_H / 2 for d in DEC]
                                        + [d["out_cy"] - d["oh"] / 2 for d in DEC]),
-                            out_x + (PRED_STEPS - 1) * OFFSET_X + max(d["ow"] for d in DEC),
+                            out_x + (OUT_STEPS - 1) * OFFSET_X + max(d["ow"] for d in DEC),
                             max([d["cy"] + ENC_H / 2 for d in DEC]
-                                + [d["out_cy"] + d["oh"] / 2 + (PRED_STEPS - 1) * OFFSET_Y for d in DEC]))
+                                + [d["out_cy"] + d["oh"] / 2 + (OUT_STEPS - 1) * OFFSET_Y for d in DEC]))
     blk_x = max([b[2] for L in LAYERS for b in L["blk_box"]] + [PRED_BOX[2]])
     # THE BACKBONE BOX. Exactly the column's width, directly below it. The trunk runs down the middle of
     # the sublayer boxes; the residual arcs use the channel on the left.
@@ -1281,8 +1367,8 @@ def solve_layout():
     # the action head feeds it -- which is exactly backwards. So the stub drops out of the box and turns
     # RIGHT into the gap between the two, where there is nothing to be confused with.
     ah["exit_tip"] = (ah["x1"] + ARROW_L * 1.6, ah["loop_y"])
-    bb["fan"] = [(dt["x0"] - half_stroke(ENC_LW), dt["out_y"]),
-                 (ah["x0"] - half_stroke(ENC_LW), ah["out_y"])]
+    bb["fan"] = ([(dt["x0"] - half_stroke(ENC_LW), dt["out_y"])]
+                 + ([] if DYNAMICS else [(ah["x0"] - half_stroke(ENC_LW), ah["out_y"])]))
     bb["exit_tip"] = bb["fan"][0]
     # THE FAN PANEL. Its LEFT EDGE IS OUT_X -- the same x the predicted frames and the predicted proprio
     # vector start at -- so the three things the model emits line up down the right-hand side instead of
@@ -1377,6 +1463,7 @@ def solve_layout():
     for D in DEC:
         D["cy"] += dy; D["out_cy"] += dy
         D["src"] = (D["src"][0], D["src"][1] + dy)
+        D["src_recon"] = (D["src_recon"][0], D["src_recon"][1] + dy)
     # THE REWARD MODEL'S OUTPUT LABEL IS THE RIGHTMOST INK, now that the block's right edge is aligned
     # with the decoders': its arrow and "Similarity score" run past that edge and were clipped.
     _rm_x = (DEC_BOX[2] + 2.6 * ARROW_L + text_extent(RM_OUT, BOX_FS * 0.8)[0] + MARGIN) if RM_ON else 0.0
@@ -1421,7 +1508,7 @@ def dist_glyph(ax, modes, box, z):
     ax.plot([x0, x1], [y1, y1], color=EDGE, lw=LW * 0.9, zorder=z + 1, solid_capstyle="round")
 
 
-def draw_box(ax, D, sx):
+def draw_box(ax, D, sx, exits=True, tgts=None):
     """ONE transformer box: rounded outline, vertical title along the leading edge, the sublayer stack
     with a residual bypass arc around each sublayer, a brace down the right carrying the repeat count,
     and the trunk. `D["flow"]` is the only difference between the two boxes:
@@ -1487,13 +1574,18 @@ def draw_box(ax, D, sx):
         # more: it runs out to a shared vertical bus in the gap and splits there, one branch per head.
         # Drawn as ONE group (draw_arrows below) because the branches all touch at the split -- separate
         # calls would let the later halo punch a hole through the earlier line right at the junction.
-        tips = [(t[0] + sx, t[1]) for t in D.get("fan") or [D["exit_tip"]]]
+        tips = [(t[0] + sx, t[1]) for t in (tgts if tgts is not None
+                                            else (D.get("fan") or [D["exit_tip"]]))]
         xv = min(t[0] for t in tips) - ARROW_L - MIN_SEG   # the bus, just clear of the heads' left edges
-        inner.append(dict(pts=[(cx, trunk[0]), (cx, D["out_y"]), (xv, D["out_y"])]))
-        for t in tips:
-            leg = [(xv, D["out_y"])] + ([] if abs(t[1] - D["out_y"]) < MIN_SEG else [(xv, t[1])])
-            inner.append(dict(pts=leg + [(t[0] - ARROW_L, t[1])], tip=t))
-        kind = f"bus + {len(tips)} branch" + ("es" if len(tips) > 1 else "")
+        if exits:
+            inner.append(dict(pts=[(cx, trunk[0]), (cx, D["out_y"]), (xv, D["out_y"])]))
+            for t in tips:
+                leg = [(xv, D["out_y"])] + ([] if abs(t[1] - D["out_y"]) < MIN_SEG else [(xv, t[1])])
+                inner.append(dict(pts=leg + [(t[0] - ARROW_L, t[1])], tip=t))
+            kind = f"bus + {len(tips)} branch" + ("es" if len(tips) > 1 else "")
+        else:                            # a BUILD stage: h has nowhere to go yet, so it does not leave
+            inner.append(dict(pts=[(cx, trunk[0]), (cx, D["out_y"])]))
+            kind = "no exit yet"
     else:                                                # in at the LEFT, down, out the BOTTOM
         bars = [(b[0] + sx + idx, b[1], b[2] + sx + idx, b[3]) for b in D["bars"]]
         for (bx0, by0, bx1, by1), txt in zip(bars, D["bars_txt"]):
@@ -1538,13 +1630,15 @@ def draw_box(ax, D, sx):
         # horizontal gap, which needs more vertical drop than there is, so the turn landed ABOVE the box
         # and the line left through the TOP. Hence the vertical trunk first, then the 45.
         dg = np.array([-1.0, 1.0]) / np.sqrt(2.0)        # down-left
-        if D["exit"] == "x0":
+        if not exits:                                    # ...same rule for the head's own output
+            kind = "no exit yet"
+        elif D["exit"] == "x0":
             # x_0 leaves the box's bottom and ARRIVES ON THE DIAGONAL, into the middle of the top face,
             # stopping X0_CLEAR short along that same 45 so the head points into the face instead of
             # covering it. The direction is DERIVED from where the face sits relative to the trunk, so a
             # slice on either side works; with PRED_STEPS > 1 the extra slices branch off the same
             # vertical spine, each on its own 45.
-            tgts = [(t[0] + sx, t[1]) for t in X0_TGTS]
+            tgts = [(t[0] + sx, t[1]) for t in (X0_TGTS if tgts is None else tgts)]
 
             def _leg(t):
                 """-> (branch y on the trunk, tip, head direction) for one target."""
@@ -1663,11 +1757,42 @@ def draw_legend(ax):
                 color=EDGE, zorder=Z_TOKENIZER + 20)
 
 
+def save_closeup(fig, path):
+    """Tight-crop to the ink at CLOSEUP_X the pixels, WITHOUT ever rasterising the full canvas at 8x.
+
+    The content box is found from a cheap DPI-resolution render (52 Mpx) and handed back to savefig as an
+    INCHES bbox, which is dpi-free -- so the 8x pass rasterises only the element's own ink. Measuring at 8x
+    instead would mean a 2.7-gigapixel buffer per element to locate a few thousand pixels of drawing, and
+    matplotlib's own bbox_inches="tight" is no help: the axes spans the whole figure, so its tight bbox IS
+    the whole figure. 2 px of pad at DPI keeps antialiased edges from being shaved by the rescale."""
+    import io
+    from matplotlib.transforms import Bbox
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True, dpi=DPI, pad_inches=0)
+    im = cv2.imdecode(np.frombuffer(buf.getvalue(), np.uint8), cv2.IMREAD_UNCHANGED)
+    rows = np.where(im[:, :, 3].max(axis=1) > 0)[0]
+    cols = np.where(im[:, :, 3].max(axis=0) > 0)[0]
+    assert len(rows) and len(cols), f"{path}: nothing was drawn"
+    h, pad = im.shape[0], 2.0
+    fig.savefig(path, transparent=True, dpi=DPI * CLOSEUP_X, pad_inches=0,
+                bbox_inches=Bbox.from_extents((cols[0] - pad) / DPI, (h - rows[-1] - 1 - pad) / DPI,
+                                              (cols[-1] + 1 + pad) / DPI, (h - rows[0] + pad) / DPI))
+    print(f"  wrote {path.split('/')[-1]:24s} {cols[-1] - cols[0] + 1:5d}x{rows[-1] - rows[0] + 1:5d} px "
+          f"of ink -> {CLOSEUP_X}x")
+
+
 def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, backbone=False, dit=False,
            pred=False, decoders=False, group=False, action_head=False, legend=False, crop_bottom=False,
-           reward=False):
+           reward=False, recon=False, nub=True, feeds=True, slices=None, step=0, time_axis=False,
+           fan_action=True, crop_all=False, asterisks=True, split_stems=False, only_outputs=()):
     """`items` = indices of LAYERS whose cascades to draw. Every component uses the SAME canvas, so the
-    outputs stack exactly."""
+    outputs stack exactly.
+
+    `step` IS THE ROLLOUT. At step k the model has already predicted k times, so its window has advanced
+    k steps: the brace under the column slides k steps toward the viewer (it now spans recorded steps AND
+    imagined ones), x_0 lands on slice k, the decoders hang off slice k, and k+1 decoded items have piled
+    up on the right. `slices` is how many predicted slices are DRAWN -- k+1 while rolling, and all of them
+    for the stage that states the goal before any mechanism exists."""
     fig = plt.figure(figsize=(CANVAS_W / 100, CANVAS_H / 100), dpi=DPI)
     ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, CANVAS_W); ax.set_ylim(0, CANVAS_H)
     ax.axis("off"); ax.invert_yaxis()
@@ -1678,12 +1803,12 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
             for i in range(L["n"]):                      # oldest first -> newest painted on top
                 a_i = ALPHA_LO + (1.0 - ALPHA_LO) * i / max(1, L["n"] - 1)   # ramp spans the DRAWN items
                 L["draw"](ax, i * OFFSET_X + sx, i * OFFSET_Y + sy, L["pw"], L["ph"], i, a_i, z0 + i)
-            if L is LAYERS[-1]:
+            if L is LAYERS[-1] and asterisks:
                 for i, mark in ASTERISKS:
                     ax.text(i * OFFSET_X + sx + L["pw"] / 2, i * OFFSET_Y + sy + L["ph"] + BRACE_T,
                             mark, ha="center", va="top", fontsize=ENC_FS * 1.3, color=EDGE,
                             zorder=z0 + N + 2)
-        if braces and L.get("time_seg"):
+        if (braces or time_axis) and L.get("time_seg"):
             (tx0, ty0), (tx1, ty1) = L["time_seg"]
             p0, p1 = (tx0 + sx, ty0 + sy), (tx1 + sx, ty1 + sy)
             u = np.array([OFFSET_X, OFFSET_Y], float); u /= np.linalg.norm(u)
@@ -1692,6 +1817,19 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                     fontsize=ENC_FS * 1.15, color=EDGE, zorder=Z_ARROW + 1)
             ROUTES.append(("Time", "axis", "parallel to the cascade"))
         if braces:
+            # SPLIT STEMS. The action stream's two braces sit 144 u apart while their entries are 144 u
+            # apart too, so the UPPER stem's diagonal cuts straight through the LOWER stem's opening
+            # horizontal -- measured, they cross at (537.2, 1344.5). Nothing about either path is wrong;
+            # they simply meet. So the upper diagonal is started clear of where the lower stem turns,
+            # which is derived from the lower stem's own route rather than nudged by hand: run it first,
+            # take the x it turns at, and add STEM_CLEAR. Both paths keep their shape.
+            _force = {}
+            if split_stems and len(L["braces"]) > 1:
+                _tip = ENC_X + sx - half_stroke(ENC_LW)
+                _p, _m = brace_segs(L["pw"], *L["braces"][1])
+                _r, _ = route((_m[0] + sx, _m[1] + sy), (_tip - ARROW_L, L["entry"][1]),
+                              _tip - ARROW_L - MIN_SEG, diag_room=ARM_DIAG, slope=ARM_SLOPE)
+                _force[0] = _r[1][0] + STEM_CLEAR
             for bi, (i0, i1) in enumerate(L["braces"]):
                 poly, mid = brace_segs(L["pw"], i0, i1)
                 bp = [(q[0] + sx, q[1] + sy) for q in poly]
@@ -1705,7 +1843,7 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                 _riser = k == 0
                 rt, kind = route((mid[0] + sx, mid[1] + sy), (tip - ARROW_L, ey),
                                  (L["riser_x"][bi] + sx) if _riser else (tip - ARROW_L - MIN_SEG),
-                                 diag_room=0.0 if _riser else ARM_DIAG)
+                                 diag_room=0.0 if _riser else ARM_DIAG, diag_x0=_force.get(bi))
                 ROUTES.append((L["label"].splitlines()[0], "stem", kind))
                 draw_arrow(ax, bp, z0 + N + 1.0)
                 draw_arrow(ax, rt, z0 + N + 1.0, tip=(tip, ey))
@@ -1719,17 +1857,21 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                     fontsize=ENC_FS, color="black", linespacing=1.3, zorder=Z_TOKENIZER + k + 0.5)
         if blocks:
             for j, (d, h, w) in enumerate(L["blks"]):
+                if j and not nub:                        # the action nub is a stage of its own
+                    continue
                 f = np.array(L["feed"][j]) + np.array([sx, 0.0])
                 t = np.array(L["tip"][j]) + np.array([sx, 0.0])        # the block's own anchor: unmoved
-                if j:                                    # a continuation of the same stream: block, no arrow
-                    iso_block(ax, tuple(t), d, h, w, L["blkz"][j], fc=L["blk"], ec=L["ec"])
+                if j or not feeds:                       # a continuation of the stream, or no tokenizer
+                    iso_block(ax, tuple(t), d, h, w, L["blkz"][j], fc=L["blk"], ec=L["ec"],
+                              grid=INTERMEDIATES)
                     continue
                 tip = (t[0] - half_stroke(BLK_LW), t[1])               # FLUSH against the block outline
                 shaft = (tip[0] - ARROW_L, tip[1])
                 pts, kind = route(f, shaft, shaft[0] - MIN_SEG, diag_room=ARM_DIAG, slope=ARM_SLOPE)
                 ROUTES.append((L["label"].splitlines()[0], "feed", kind))
                 draw_arrow(ax, pts, Z_ARROW, tip=tip)
-                iso_block(ax, tuple(t), d, h, w, L["blkz"][j], fc=L["blk"], ec=L["ec"])
+                iso_block(ax, tuple(t), d, h, w, L["blkz"][j], fc=L["blk"], ec=L["ec"],
+                          grid=INTERMEDIATES)
     if group:                                            # the dashed wrapper: ONE box around the pair
         sx = LAYERS[0]["sx"]
         ax.add_patch(PathPatch(rounded_polygon([(LD["x0"] + sx, LD["y0"]), (LD["x1"] + sx, LD["y0"]),
@@ -1740,13 +1882,18 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
                 fontsize=LD_FS, color="black", zorder=Z_TOKENIZER - 1)
     if backbone:
         sx = LAYERS[0]["sx"]
+        _exits = dit or not DYNAMICS
         x0, x1, y0, y1 = BB["x0"] + sx, BB["x1"] + sx, BB["y0"], BB["y1"]
         # THE SLICE BRACE: same primitive as the cascades', lifted the other way, marking the 8 steps.
-        draw_arrow(ax, [(q[0] + sx, q[1]) for q in BB["brace"]], Z_ARROW)
+        # THE WINDOW ADVANCES. One depth step toward the viewer per prediction already made, so after
+        # three the brace spans five recorded steps and three imagined ones -- which is the whole claim of
+        # an autoregressive rollout, drawn rather than captioned.
+        sl = np.array([BLK_S * ISO_C, BLK_S * ISO_S]) * step
+        draw_arrow(ax, [(q[0] + sx + sl[0], q[1] + sl[1]) for q in BB["brace"]], Z_ARROW)
         # brace stem -> the space-time box's BOTTOM edge (its input, now that the pair sits above the
         # column): vertical up, across, vertical up. route() only runs left-to-right, so this one is the
         # explicit polyline -- one path, so draw_arrow still rounds every corner the same way.
-        src = (BB["mid"][0] + sx, BB["mid"][1])
+        src = (BB["mid"][0] + sx + sl[0], BB["mid"][1] + sl[1])
         tip = (BB["cx"] + sx, BB["y1"] + half_stroke(ENC_LW))
         # vertical -> 45 up-and-right -> vertical, the same grammar as every other riser in the figure
         # (route() transposed); the 45 is centred in the climb so both verticals are the same length.
@@ -1756,7 +1903,11 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         ROUTES.append(("Backbone", "slice", f"vertical + {np.degrees(np.arctan(STEM_SLOPE)):.0f} deg + vertical"))
         draw_arrow(ax, [src, (src[0], ymid + dv / 2.0), (tip[0], ymid - dv / 2.0),
                         (tip[0], tip[1] + ARROW_L)], Z_ARROW, tip=tip, head_dir=(0.0, -1.0))
-        draw_box(ax, BB, sx)
+        # ONE BRANCH OR TWO. h fans to every head the figure draws; a variant without the action head
+        # must not leave an arrow pointing at the empty page where it would have been. This is NOT
+        # inferred from `action_head`: elements/backbone.png draws no head at all and still wants both
+        # branches, because it is a LAYER meant to sit on top of the full figure.
+        draw_box(ax, BB, sx, exits=_exits, tgts=None if fan_action else [BB["fan"][0]])
     if pred:                                             # the predicted step, in red
         # SAME z as the flow head's inner lines, which is what makes x_0 JOIN it. At Z_ARROW the brace sat
         # far below x_0, so x_0's white halo punched a hole through it at the junction and the two read as
@@ -1764,68 +1915,105 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         # their stems already do.
         n_b = len(PRED_BLKS)
         for j, P in enumerate(PRED):
-            step, row = divmod(j, n_b)                   # LATER steps on top, image row above proprio
+            st, row = divmod(j, n_b)                     # LATER steps on top, image row above proprio
+            if st >= (PRED_STEPS if slices is None else slices):
+                continue                                 # the steps this stage has not taken yet
             pal = LAYERS[row]                        # row 0 predicts VISION, row 1 predicts PROPRIO
             iso_block(ax, (P["tip"][0] + LAYERS[0]["sx"], P["tip"][1]), P["d"], P["h"], P["w"],
-                      Z_BLOCK["vision"] + 50 + 10 * step + (n_b - 1 - row),
+                      Z_BLOCK["vision"] + 50 + 10 * st + (n_b - 1 - row),
                       fc=pal["blk"], ec=pal["ec"], hatch=PRED_HATCH)   # slice: its own hue
-    if decoders:
+    if decoders or recon:
         sx = LAYERS[0]["sx"]
+        # RECON (the intermediates figure): the SAME decoders, fed off the BLUE column rather than off the
+        # predicted slice -- an autoencoder is the figure with the dynamics removed, not a second drawing.
+        # The slice IS the column translated by one depth step (-vdu), so undoing that translation lands
+        # every tail back on the column's own near face; there is no second set of coordinates to drift.
+        # What leaves the decoder is then a RECONSTRUCTION, so it carries no `predicted` hatch.
+        def _cut(a):                                 # the drawn window of a cached round trip
+            return None if a is None else a[:OUT_STEPS]
+        outs = ({"image": _cut(RECON_IMG), "proprio": _cut(RECON_OBS), "action": _cut(RECON_ACT)}
+                if recon else {"image": PRED_IMG, "proprio": PRED_OBS, "action": None})
+        hatch_out = None if recon else PRED_HATCH
+        item_at = 0 if recon else PRED_AT
         for k, D in enumerate(DEC):
-            pts = [(x + sx, y) for x, y in tokenizer_pts(D["cy"], DEC_X, flip=True)]
-            ax.add_patch(PathPatch(rounded_polygon(pts, CORNER_R), fc=LAYERS[k]["fc"],
-                                   ec=LAYERS[k]["ec"], lw=ENC_LW, zorder=Z_TOKENIZER))
-            ax.text(DEC_X + ENC_W / 2 + sx, D["cy"], D["label"], ha="center", va="center",
-                    fontsize=ENC_FS, color="black", linespacing=1.3, zorder=Z_TOKENIZER + 1)
+            # `only_outputs` = draw the decoded ITEMS and nothing else, for the named kinds. The predicted
+            # frame and the predicted vector are the two things a talk puts on a slide by themselves, and
+            # they are otherwise only available welded to their decoder and its two arrows. Positions are
+            # unchanged, so a tile cut this way drops back onto architecture.png exactly.
+            if only_outputs and D["kind"] not in only_outputs:
+                continue
+            if not only_outputs:
+                pts = [(x + sx, y) for x, y in tokenizer_pts(D["cy"], DEC_X, flip=True)]
+                ax.add_patch(PathPatch(rounded_polygon(pts, CORNER_R), fc=LAYERS[k]["fc"],
+                                       ec=LAYERS[k]["ec"], lw=ENC_LW, zorder=Z_TOKENIZER))
+                ax.text(DEC_X + ENC_W / 2 + sx, D["cy"], D["label"], ha="center", va="center",
+                        fontsize=ENC_FS, color="black", linespacing=1.3, zorder=Z_TOKENIZER + 1)
             # red block -> decoder, and decoder -> the predicted item, both dead horizontal
             tip = (DEC_X + sx - half_stroke(ENC_LW), D["cy"])
-            src = (D["src"][0] + sx, D["src"][1])        # leaves the red block at the BLOCK's height
+            # WHICH FACE THE ARM LEAVES: the column (a round trip, no dynamics ran), the slice this
+            # step predicted (a rollout), or the single predicted slice (the paper figure -- which is the
+            # same expression at step 0 with one slice).
+            _s = (D["src_recon"] if recon else
+                  (PRED_FACE[step], PRED[step * len(PRED_BLKS) + k]["tip"][1]) if DYNAMICS else D["src"])
+            src = (_s[0] + sx, _s[1])                    # at the BLOCK's own height
             shaft = (tip[0] - ARROW_L, tip[1])
             # STAGGERED both sides so no two risers share a vertical, but in OPPOSITE orders: on the way
             # IN the arrows fan out from one face, on the way OUT they fan in to separate tiles.
             off_in, off_out = (k - 0.5) * RISER_STEP, (0.5 - k) * RISER_STEP
             pts, kind = route(src, shaft, shaft[0] - MIN_SEG + off_in, diag_room=ARM_DIAG,
                               slope=ARM_SLOPE)
-            ROUTES.append((D["label"].splitlines()[0], "decode", kind))
-            draw_arrow(ax, pts, Z_DECODE, tip=tip)       # UNDER the blocks: the tail hides inside the red
-            tip2 = (OUT_X + sx, D["out_cy"])              # FLUSH: the item starts exactly at the tip
-            o_src = (DEC_X + ENC_W + sx, D["cy"])
-            shaft2 = (tip2[0] - ARROW_L, tip2[1])
-            pts2, kind2 = route(o_src, shaft2, shaft2[0] - MIN_SEG + off_out, diag_room=ARM_DIAG)
-            ROUTES.append((D["label"].splitlines()[0], "output", kind2))
-            draw_arrow(ax, pts2, Z_ARROW, tip=tip2)
+            if not only_outputs:
+                ROUTES.append((D["label"].splitlines()[0], "decode", kind))
+                draw_arrow(ax, pts, Z_DECODE, tip=tip)   # UNDER the blocks: the tail hides inside the red
+                tip2 = (OUT_X + sx, D["out_cy"])          # FLUSH: the item starts exactly at the tip
+                o_src = (DEC_X + ENC_W + sx, D["cy"])
+                shaft2 = (tip2[0] - ARROW_L, tip2[1])
+                pts2, kind2 = route(o_src, shaft2, shaft2[0] - MIN_SEG + off_out, diag_room=ARM_DIAG)
+                ROUTES.append((D["label"].splitlines()[0], "output", kind2))
+                draw_arrow(ax, pts2, Z_ARROW, tip=tip2)
             # ONE TILE PER RED SLICE, cascading on the SAME offsets the input streams use -- the output
             # picks the diagonal back up where the input dropped it.
-            n_out = PRED_STEPS if PRED_IMG is not None else 1
+            data = outs[D["kind"]]
+            n_out = 1 if data is None else ((step + 1) if DYNAMICS else OUT_STEPS)
             for t_ in range(n_out):
                 ox = OUT_X + sx + t_ * OFFSET_X
                 oy = D["out_cy"] - D["oh"] / 2 + t_ * OFFSET_Y
                 zt = Z_ARROW + 2 + t_                    # later steps paint over earlier, as the reds do
-                if D["label"].startswith("Vision") and PRED_IMG is not None:
-                    ax.imshow(PRED_IMG[t_], extent=(ox, ox + D["ow"], oy + D["oh"], oy), zorder=zt,
-                              interpolation="bilinear")
+                # ...AND AT THE INPUT CASCADE'S OWN OPACITY RAMP, oldest faintest, so a cascade coming
+                # back out reads as the same object as the one that went in. A single item is never
+                # ramped: one tile at ALPHA_LO would just look like a mistake.
+                a_t = 1.0 if n_out == 1 else ALPHA_LO + (1.0 - ALPHA_LO) * t_ / (n_out - 1)
+                if D["kind"] == "image" and data is not None:
+                    ax.imshow(data[t_], extent=(ox, ox + D["ow"], oy + D["oh"], oy), zorder=zt,
+                              alpha=a_t, interpolation="bilinear")
                     # A HATCHED BAND, NOT A HATCHED IMAGE: a ring path (outer rectangle, inner rectangle
                     # reversed) carries the hatch, so the predicted frame is marked at its border and
                     # left legible in the middle.
-                    bw = PRED_BAND_PX * D["ow"] / PRED_IMG[t_].shape[1]
-                    W_, H_ = D["ow"], D["oh"]
-                    for bx, by, bwd, bht in ((ox, oy, W_, bw), (ox, oy + H_ - bw, W_, bw),
-                                             (ox, oy + bw, bw, H_ - 2 * bw),
-                                             (ox + W_ - bw, oy + bw, bw, H_ - 2 * bw)):
-                        ax.add_patch(Rectangle((bx, by), bwd, bht, fc="none", lw=0.0,
-                                               ec=hatch_rgba(VIS_EC), hatch=PRED_HATCH,
-                                               zorder=zt + 0.4))
+                    if hatch_out:
+                        bw = PRED_BAND_PX * D["ow"] / data[t_].shape[1]
+                        W_, H_ = D["ow"], D["oh"]
+                        for bx, by, bwd, bht in ((ox, oy, W_, bw), (ox, oy + H_ - bw, W_, bw),
+                                                 (ox, oy + bw, bw, H_ - 2 * bw),
+                                                 (ox + W_ - bw, oy + bw, bw, H_ - 2 * bw)):
+                            ax.add_patch(Rectangle((bx, by), bwd, bht, fc="none", lw=0.0,
+                                                   ec=hatch_rgba(VIS_EC), hatch=hatch_out,
+                                                   zorder=zt + 0.4))
                     ax.add_patch(Rectangle((ox, oy), D["ow"], D["oh"], fill=False, ec=VIS_EC,
-                                           lw=LW * 2, zorder=zt + 0.5))
-                elif PRED_OBS is not None:
-                    _p_prop_vec(ax, ox, oy, D["ow"], D["oh"], PRED_OBS[t_], 1.0, zt,
-                                hatch=PRED_HATCH,
+                                           lw=LW * 2, zorder=zt + 0.5, alpha=a_t))
+                elif D["kind"] == "proprio" and data is not None:
+                    _p_prop_vec(ax, ox, oy, D["ow"], D["oh"], data[t_], a_t, zt,
+                                hatch=hatch_out,
                                 hatch_col=plt.get_cmap(MOD_CMAP["proprio"])(0.85))
+                elif D["kind"] == "action" and data is not None:
+                    # the stream's own glyph: an arrow per cell, up for a positive stick, as the inputs do
+                    _p_act_recon(ax, ox, oy, D["ow"], D["oh"], data[t_], a_t, zt,
+                                 ang=np.where(data[t_] >= 0.0, 0.0, np.pi))
                 else:
-                    D["draw"](ax, ox, oy, D["ow"], D["oh"], PRED_AT, 1.0, zt)
+                    D["draw"](ax, ox, oy, D["ow"], D["oh"], item_at, a_t, zt)
     if dit:
         sx = LAYERS[0]["sx"]
-        draw_box(ax, DT, sx)
+        draw_box(ax, DT, sx, exits=(pred or not DYNAMICS),
+                 tgts=[X0_TGTS[step]] if DYNAMICS else None)
         # (the `h` label that used to sit on the shared stem is gone: the text says what h is, and the
         #  figure was carrying a symbol nothing else in it defines)
     if action_head:
@@ -1963,27 +2151,103 @@ def render(path, *, items=(), braces=False, tokenizers=False, blocks=False, back
         ROUTES.append(("Reward model", "brace", "action block left -> proprio block right"))
     if legend:
         draw_legend(ax)
+    if CLOSEUP:
+        save_closeup(fig, path)
+        plt.close(fig)
+        return
     fig.savefig(path, transparent=True, dpi=DPI, pad_inches=0)
     plt.close(fig)
-    if crop_bottom:
+    if crop_bottom or crop_all:
         # ...AND THE RIGHT. solve_layout reserves room for the widest thing it can predict, which left
         # dead columns past the last drawn pixel; at width=\textwidth those columns are inside the float,
         # so \centering was centring a box that was part air and the figure read as left-justified.
+        # crop_all adds the TOP and LEFT, which only a variant needs: the canvas is solved for the full
+        # figure, so dropping the action head leaves its whole band of air above everything else.
         im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         pad = MARGIN * DPI / 100
         rows = np.where(im[:, :, 3].max(axis=1) > 0)[0]
         cols = np.where(im[:, :, 3].max(axis=0) > 0)[0]
+        r0 = max(0, int(rows[0] - pad)) if crop_all else 0
+        c0 = max(0, int(cols[0] - pad)) if crop_all else 0
         keep_r = min(im.shape[0], int(rows[-1] + 1 + pad))
         keep_c = min(im.shape[1], int(cols[-1] + 1 + pad))
-        cv2.imwrite(path, im[:keep_r, :keep_c])
+        cv2.imwrite(path, im[r0:keep_r, c0:keep_c])
         print(f"  wrote {path.split('/')[-1]}  (trimmed {im.shape[0] - keep_r} px bottom, "
-              f"{im.shape[1] - keep_c} px right)")
+              f"{im.shape[1] - keep_c} px right" + (f", {r0} px top, {c0} px left)" if crop_all else ")"))
         return
     print(f"  wrote {path.split('/')[-1]}")
 
 
-import os                                                                          # noqa: E402
-ELEM = f"{OUT}/elements"
+if INTERMEDIATES:
+    # THE AUTOENCODER CUT, in three stages for a talk: the inputs reaching their encoders, the codes they
+    # turn into, and the decoders putting them back. No summariser, no heads, no predicted slice -- the
+    # claim is only that this data HAS a learned low-dimensional code, which is a 2016 claim and is meant
+    # to read as one. The items on the right are real reconstructions (make_intermediates.py), which is
+    # why they carry no `predicted` hatch: nothing here was imagined.
+    #
+    # ONE CROP BOX FOR ALL THREE. Each stage is drawn on the full architecture canvas, so a stage dropped
+    # on architecture.png still lines up; cropping each to its OWN ink would move the frame between
+    # stages and the build would jump. The last stage is the biggest, so its box is the figure's box.
+    INT = f"{OUT}/intermediates"
+    os.makedirs(INT, exist_ok=True)
+    if DYNAMICS:
+        # THE SEQUEL: no cascades, no tokenizers, no decode until the very end -- the token tensor and
+        # what happens to it. `feeds=False` because the arrows into the blocks come from tokenizers that
+        # are not on the page; each box holds its output arrow until the thing it feeds is drawn.
+        _base = dict(blocks=True, feeds=False)
+        _full = dict(_base, backbone=True, dit=True, pred=True, decoders=True)
+        STAGES = [("d_tokens.png", dict(_base, nub=False)),
+                  ("e_actions.png", _base),
+                  # THE GOAL, BEFORE ANY MECHANISM: the four future commands, and above each one the state
+                  # we want back. Nothing in this frame says HOW -- that is what the next four stages add.
+                  ("e_targets.png", dict(_base, pred=True)),
+                  ("f_summarizer.png", dict(_base, backbone=True)),
+                  ("g_observation_head.png", dict(_base, backbone=True, dit=True)),
+                  ("h_predicted.png", dict(_base, backbone=True, dit=True, pred=True, slices=1)),
+                  ("i_decoded.png", dict(_full, slices=1))]
+        # ...and then the rollout: the window slides a step, the head writes the next slice, the decoders
+        # follow it along, and the imagined frames accumulate. Four steps, which is as far as the cached
+        # prediction goes and exactly as long as the action nub.
+        STAGES += [(f"{c}_rollout{k + 1}.png", dict(_full, step=k, slices=k + 1))
+                   for k, c in enumerate("jkl", start=1)]
+    else:
+        _base = dict(items=(0, 1, 2), braces=True, tokenizers=True)
+        STAGES = [("a_encoders.png", _base),
+                  ("b_codes.png", dict(_base, blocks=True)),
+                  ("c_reconstructions.png", dict(_base, blocks=True, recon=True))]
+    for _name, _kw in STAGES:
+        render(f"{INT}/{_name}", **_kw)
+    _box = None
+    for _name, _ in STAGES[::-1]:
+        _im = cv2.imread(f"{INT}/{_name}", cv2.IMREAD_UNCHANGED)
+        if _box is None:
+            _pad = MARGIN * DPI / 100
+            _r = np.where(_im[:, :, 3].max(axis=1) > 0)[0]
+            _c = np.where(_im[:, :, 3].max(axis=0) > 0)[0]
+            _box = (max(0, int(_r[0] - _pad)), min(_im.shape[0], int(_r[-1] + 1 + _pad)),
+                    max(0, int(_c[0] - _pad)), min(_im.shape[1], int(_c[-1] + 1 + _pad)))
+        cv2.imwrite(f"{INT}/{_name}", _im[_box[0]:_box[1], _box[2]:_box[3]])
+    print(f"  {len(STAGES)} stages, all cropped to one {_box[3] - _box[2]} x {_box[1] - _box[0]} px box")
+    if CODEC:
+        # THE ARROW OF TIME, ALONE. It is part of every cascade stage already (`braces` draws it), so this
+        # is the same line at the same length -- just with nothing else on the canvas, and cropped to its
+        # own ink rather than to the stages' shared box, which would leave it adrift in an empty page.
+        # It comes from the build WITH cascades: its length is the action stream's, and the dynamics build
+        # draws no streams at all.
+        render(f"{INT}/time_arrow.png", time_axis=True)
+        _im = cv2.imread(f"{INT}/time_arrow.png", cv2.IMREAD_UNCHANGED)
+        _pad = MARGIN * DPI / 100
+        _r = np.where(_im[:, :, 3].max(axis=1) > 0)[0]
+        _c = np.where(_im[:, :, 3].max(axis=0) > 0)[0]
+        cv2.imwrite(f"{INT}/time_arrow.png",
+                    _im[max(0, int(_r[0] - _pad)): int(_r[-1] + 1 + _pad),
+                        max(0, int(_c[0] - _pad)): int(_c[-1] + 1 + _pad)])
+        print(f"  time_arrow.png cropped to its own ink: "
+              f"{int(_c[-1] + 1 + _pad) - max(0, int(_c[0] - _pad))} x "
+              f"{int(_r[-1] + 1 + _pad) - max(0, int(_r[0] - _pad))} px")
+    raise SystemExit(0)
+
+ELEM = f"{OUT}/elements_closeup" if CLOSEUP else f"{OUT}/elements"
 os.makedirs(ELEM, exist_ok=True)
 for i, name in enumerate(("vision", "proprio", "action")):
     render(f"{ELEM}/items_{name}.png", items=(i,))
@@ -1996,11 +2260,27 @@ render(f"{ELEM}/action_head.png", action_head=True)
 render(f"{ELEM}/latent_dynamics.png", group=True)
 render(f"{ELEM}/predicted.png", pred=True)
 render(f"{ELEM}/decoders.png", decoders=True)
+# ...and the two decoded items ON THEIR OWN, hatching included: the predicted frame and the predicted
+# observation vector are what a slide shows when it says "and this is what it imagined".
+render(f"{ELEM}/predicted_image.png", decoders=True, only_outputs=("image",))
+render(f"{ELEM}/predicted_proprio.png", decoders=True, only_outputs=("proprio",))
 render(f"{ELEM}/legend.png", legend=True)
 render(f"{ELEM}/reward.png", reward=True)
-render(f"{OUT}/architecture.png", items=(0, 1, 2), braces=True, tokenizers=True, blocks=True,
-       backbone=True, dit=True, pred=True, decoders=True, group=LD_ON, action_head=True,
-       legend=True, reward=True, crop_bottom=True)
+if not CLOSEUP:                 # the assembled figure is not a sub-figure, and at 8x it is 2.7 Gpx
+    render(f"{OUT}/architecture.png", items=(0, 1, 2), braces=True, tokenizers=True, blocks=True,
+           backbone=True, dit=True, pred=True, decoders=True, group=LD_ON, action_head=True,
+           legend=True, reward=True, crop_bottom=True)
+    # ...AND THE WORLD MODEL ON ITS OWN: the same figure with the two heads that are not dynamics taken
+    # out -- no action head and no sampled plan, no reward head and no similarity score. h then fans to
+    # one place instead of two, and the crop takes all four sides because the action head's whole band
+    # across the top is now air. Everything else is the SAME drawing at the SAME coordinates.
+    # The asterisks go with them: *1 and *2 name which action drives the PREDICTED state and which one
+    # makes the nub, and both are points about the action stream's role rather than about this figure.
+    # They are only SKIPPED, not switched off at config time, so the variant keeps architecture.png's
+    # coordinates exactly -- solve_layout counts them either way.
+    render(f"{OUT}/architecture_obs_only.png", items=(0, 1, 2), braces=True, tokenizers=True,
+           blocks=True, backbone=True, dit=True, pred=True, decoders=True, group=LD_ON,
+           legend=True, fan_action=False, crop_all=True, asterisks=False, split_stems=True)
 print(f"  canvas {int(CANVAS_W * DPI / 100)} x {int(CANVAS_H * DPI / 100)} px, identical for every component")
 print(f"\n  ONE SPACING, both axes: {_GAP:.1f} u ({_GAP * 3:.0f} px)")
 print(f"    MEASURED as proprioception riser x - right edge of the last image item, then reused as the")
