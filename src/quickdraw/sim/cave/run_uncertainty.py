@@ -124,7 +124,7 @@ def run(fpv_ckpt, proprio_ckpt, root, out="/app/logs/cave/ood",
     """Score nominal + every OOD split with the two models, calibrate on nominal, classify, plot."""
     import json
 
-    from ...data.dataset import load_split_episodes_mm
+    from ...data.dataset import DataConfig, load_split_episodes_mm
     from ..mbari import uncertainty as U
 
     log(f"  vision WM   {fpv_ckpt}")
@@ -138,7 +138,8 @@ def run(fpv_ckpt, proprio_ckpt, root, out="/app/logs/cave/ood",
         if not (pathlib.Path(root) / sp).exists():
             log(f"  !! split {sp} missing under {root}, skipping")
             continue
-        eps = load_split_episodes_mm(root, sp, img_size=img_hw, cam=key, repo_id=repo_id)
+        eps = load_split_episodes_mm(root, sp, img_size=img_hw, cam=key, repo_id=repo_id,
+                                     dcfg=DataConfig.from_cfg(cfg_vis))  # loaders take the data config explicitly (2026-09-21 refactor)
         if limit:
             eps = eps[:limit]
         log(f"  scoring {sp:14s} ({len(eps)} episodes)")

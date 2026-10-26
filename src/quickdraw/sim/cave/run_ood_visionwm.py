@@ -24,8 +24,8 @@ import re
 
 import numpy as np
 
-FPV_CKPT = "/home/ubuntu/user_irw/quickdraw/logs/train_world_model_2026_10_20_02_03_20_cave_fpv_v2/checkpoints/best.ckpt"
-ROOT = "/home/ubuntu/user_irw/quickdraw/logs/recording_2026_10_19_06_07_09_cave-grapevine"
+FPV_CKPT = "/home/ubuntu/user_irw/quickdraw/logs/train_world_model_2026_10_22_18_40_04_cave_fpv_v3_mesh/checkpoints/best.ckpt"
+ROOT = "/home/ubuntu/user_irw/quickdraw/logs/recording_2026_10_22_05_53_37_cave-grapevine"
 STEPS = 900
 KIND = "corridor"
 _UP = ("readout", "ups", "to_ch", "gpool", "mid", "out_conv", "out_norm")
@@ -81,11 +81,12 @@ def main():
     ap.add_argument("--out", default="/home/ubuntu/user_irw/quickdraw/logs/cave/ood")
     a = ap.parse_args()
 
-    from .run_control import _patch_scene_render
-    _patch_scene_render()
     from prospector.cave_wm.scene import CaveScene
     from . import ood_detect as D
 
+    # Build the scene NORMALLY (no _patch_scene_render black-cave stub): OOD frames are rendered by the mesh
+    # renderer drone_render.render_fpv (crisp grapevine mesh + mesh person), the SAME path the training data used,
+    # so the fpv-head surprise reflects the anomaly -- not a renderer domain gap.
     print("[setup] scene + joint cave_fpv WM ...", flush=True)
     scene = CaveScene(log=lambda *x: None)
     core, norm, P = load_fpv_wm(FPV_CKPT, ROOT, "cuda")

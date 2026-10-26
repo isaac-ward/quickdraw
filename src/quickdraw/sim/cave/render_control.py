@@ -52,23 +52,26 @@ def _cams(scene, p, R):
     return fpv, chase, top
 
 
-def _views(scene, s, goal_p, goal_yaw, fi):
-    """The 3 rendered views (fpv, chase, top) for one state s -- each (H,W,3) uint8."""
+def _views(scene, s, goal_p, goal_yaw, fi, keep=(0, 1, 2)):
+    """The rendered views for one state s -- each (H,W,3) uint8. `keep` selects from (0=fpv, 1=chase, 2=birdseye);
+    unselected views are not rendered (FPV shows no drone -- it IS the drone)."""
     from . import drone_render as DR
     from prospector.cave_wm.record import euler_zyx_R
     p = s[:3].astype(np.float32); R = euler_zyx_R(s[3], s[4], s[5])
     Rg = euler_zyx_R(goal_yaw, 0.0, 0.0)
     ang = fi * SPIN
     W, H = PANEL_WH
-    fpv, chase, top = _cams(scene, p, R)
+    cams = list(_cams(scene, p, R))                                      # fpv, chase, top
+    shows = [False, True, True]                                          # fpv shows no drone
     out = []
-    for (eye, fwd, up, cut), show in ((fpv, False), (chase, True), (top, True)):   # FPV shows no drone (it IS the drone)
+    for v in keep:
+        eye, fwd, up, cut = cams[v]
         out.append(DR.render_view(scene, eye, fwd, up, W, H, HFOV, p, R, ang, goal_p, Rg,
-                                  show_drone=show, show_ghost=show, ghost_a=GHOST_A, ceil_cut=cut))
+                                  show_drone=shows[v], show_ghost=shows[v], ghost_a=GHOST_A, ceil_cut=cut))
     return out
 
 
-def render_compare(scene, dyn, learned_fn, true_fn, pr, out_mp4, steps=360, seed=0, log=print):
+def render_compare(scene, dyn, learned_fn, true_fn, pr, out_mp4, steps=360, seed=0, keep=(0, 1, 2), log=print):
     from .control import run_episode, TrueDyn
     from quickdraw.logging import viz
     rows = {}
@@ -79,19 +82,21 @@ def render_compare(scene, dyn, learned_fn, true_fn, pr, out_mp4, steps=360, seed
         log(f"    {tag}: {len(r['traj'])} steps, final {r['final_dist']:.2f}m, success={int(r['success'])}")
     L = max(len(rows["learned"]["traj"]), len(rows["true"]["traj"]))
 
-    streams = {tag: [[], [], []] for tag in rows}                       # tag -> [fpv[], chase[], top[]]
+    nv = len(keep)
+    streams = {tag: [[] for _ in range(nv)] for tag in rows}             # tag -> per-kept-view frame list
     for i in range(L):
         for tag in rows:
             tr = rows[tag]["traj"]
             s = tr[min(i, len(tr) - 1)]
-            for v, img in enumerate(_views(scene, s, pr["goal_p"], pr["goal_yaw"], i)):
+            for v, img in enumerate(_views(scene, s, pr["goal_p"], pr["goal_yaw"], i, keep=keep)):
                 streams[tag][v].append(img)
-    titles = ["FPV", "Chase", "Top-down"]
+    all_titles = ["FPV", "CHASE", "BIRDSEYE"]
+    titles = [all_titles[v] for v in keep]
     canvas_rows = []
     for tag in ("learned", "true"):
-        panels = [np.asarray(streams[tag][v]) for v in range(3)]
-        name = "LEARNED WM" if tag == "learned" else "TRUE DYNAMICS"
-        canvas_rows.append(viz.label_panels(panels, [f"{name}  ·  {t}" for t in titles],
+        panels = [np.asarray(streams[tag][v]) for v in range(nv)]
+        name = "WORLD MODEL" if tag == "learned" else "TRUE DYNAMICS"
+        canvas_rows.append(viz.label_panels(panels, [f"{name} ({t})" for t in titles],
                                             panel_wh=PANEL_WH, header_px=58, font_px=34))
     canvas = np.concatenate(canvas_rows, axis=1)                        # learned row over true row
     viz.save_mp4(out_mp4, canvas, 30, quality=8)
@@ -99,7 +104,7 @@ def render_compare(scene, dyn, learned_fn, true_fn, pr, out_mp4, steps=360, seed
     return rows
 
 
-def run(ckpt, root, out, points_npz, pairs, steps=360, dev="cuda", log=print):
+def run(ckpt, root, out, points_npz, pairs, steps=360, dev="cuda", keep=(0, 1, 2), log=print):
     import jax.numpy as jnp  # noqa
     from prospector.cave_wm.record import build_dynamics
     from .control import TrueDyn, LearnedDyn
@@ -127,7 +132,7 @@ def run(ckpt, root, out, points_npz, pairs, steps=360, dev="cuda", log=print):
     for i in pairs:
         log(f"[render] pair {i}")
         render_compare(scene, dyn, learned_fn, true_fn, all_pairs[i], str(outp / f"pair{i:02d}_compare.mp4"),
-                       steps=steps, seed=1000 + i, log=log)
+                       steps=steps, seed=1000 + i, keep=keep, log=log)
     log(f"[done] videos in {outp}")
 
 
@@ -139,6 +144,9 @@ if __name__ == "__main__":
     ap.add_argument("--points_npz", default="/home/ubuntu/user_irw/quickdraw/logs/cave/control/val_points.npz")
     ap.add_argument("--pairs", default="0,1,2,3")
     ap.add_argument("--steps", type=int, default=360)
+    ap.add_argument("--views", default="fpv,chase,birdseye", help="comma subset of fpv,chase,birdseye")
     a = ap.parse_args()
-    run(a.ckpt, a.root, a.out, a.points_npz, [int(x) for x in a.pairs.split(",")], steps=a.steps,
+    VMAP = {"fpv": 0, "chase": 1, "birdseye": 2}
+    keep = tuple(VMAP[v.strip()] for v in a.views.split(","))
+    run(a.ckpt, a.root, a.out, a.points_npz, [int(x) for x in a.pairs.split(",")], steps=a.steps, keep=keep,
         log=lambda s: print(s, flush=True))

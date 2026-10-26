@@ -23,6 +23,11 @@ import numpy as np
 
 CONFIG = "/home/ubuntu/user_irw/prospector/src/prospector/conf/config.yaml"
 
+# FPV camera params -- MUST match the training re-record (prospector record.py) so OOD frames are rendered by the
+# SAME mesh renderer the WM learned (drone_render.render_fpv: crisp grapevine MESH + mesh person, NOT splats).
+_UP_G = np.array([0.0, 0.0, -1.0], np.float32)   # grapevine up
+_HFOV = 96.7                                      # CaveScene default hfov
+
 
 def build_payload_drop_dynamics(mass_phys_scale=0.5, dt=1.0 / 30.0):
     """A quadrotor whose PHYSICAL mass has suddenly dropped (payload fell off) but whose cascaded controller still
@@ -69,35 +74,29 @@ def build_payload_drop_dynamics(mass_phys_scale=0.5, dt=1.0 / 30.0):
     return d
 
 
-def _person_place(scene, s12, drone_r):
-    """Place the red person inside the drone's forward FOV and RENDER-VERIFY it is actually visible (clear
-    line-of-sight, not occluded) -- blind clearance alone put it around corners / behind walls. Searches a fan of
-    yaw offsets x distances within the FOV; returns the first point whose render shows a clear red signal, or None
-    if the drone is boxed in / facing a wall (the caller then retries another seed)."""
-    from prospector.cave_wm.record import forward_of
-    fwd = forward_of(s12); eye = s12[:3]
-    for ang in (0.0, 0.26, -0.26, 0.5, -0.5):                       # +/- 0, 15, 30 deg within the forward FOV
-        c, sA = np.cos(ang), np.sin(ang)
-        dir_ = np.array([c * fwd[0] - sA * fwd[1], sA * fwd[0] + c * fwd[1], fwd[2]])
-        for d in (2.3, 1.8, 2.8, 1.4):
-            p = eye + d * dir_
-            if scene.clearance(p) <= drone_r + 0.2:
-                continue
-            scene.set_extra(scene.person_gaussians(p))
-            f = scene.render(eye, fwd)
-            vis = float((f[:, :, 0].astype(float) - np.maximum(f[:, :, 1], f[:, :, 2]).astype(float)).max())
-            scene.set_extra(None)
-            if vis > 120:                                           # person clearly in view
-                return p
-    return None
+def _ground(scene, p, max_drop=5.0, step=0.05):
+    """Drop a world point to the cave FLOOR so the person's FEET sit on the ground, not float at flight altitude.
+    Grapevine up is -z, so the floor is toward +z: march down until clearance collapses to ~0 (entered the floor)
+    and return the last free point. Falls back to the input if no floor is found within max_drop (open shaft)."""
+    p = np.asarray(p, float)
+    feet, d = None, 0.0
+    while d <= max_drop:
+        q = np.array([p[0], p[1], p[2] + d])
+        if scene.clearance(q) <= 0.1:              # touching the floor
+            break
+        feet, d = q, d + step
+    return feet if feet is not None else p
 
 
 def ood_rollout(scene, kind, seed, mode, t_star, steps=900, dt=1.0 / 30.0,
                 mass_scale=0.65, glitch_p=0.10, want_frames=False):
     """One onset trajectory. mode in {nominal, dynamics, glitch, person}. Returns a dict with obs (steps,13),
-    act (steps,4, the INTENDED/recorded command), t_star, meta -- and frames (steps,H,W,3) if want_frames. The
-    person mesh is NOT rendered here (proprio is identical to nominal); the render stage pops it in at t*.
-    Returns None if the episode collides or the plan fails (caller retries with another seed)."""
+    act (steps,4, the INTENDED/recorded command), t_star, meta -- and frames (steps,H,W,3) if want_frames.
+    For mode=="person" a correctly-scaled red person MESH stands FEET-ON-THE-FLOOR at a fixed point ~60% along the
+    planned path and is rendered EVERY frame (no teleport pop-in): it grows in view naturally as the drone flies
+    toward it, exactly like the recorded dataset. The returned t_star is then the FIRST step the person is clearly
+    visible (for detection-latency scoring). Returns None if the episode collides, the plan fails, or the drone
+    never gets a clear look at the person (caller retries with another seed)."""
     import jax.numpy as jnp
     from prospector.cave_wm.record import (plan_corridor, _goto, state_to_obs, forward_of, build_dynamics,
                                            VLIM, DRONE_R)
@@ -131,20 +130,21 @@ def ood_rollout(scene, kind, seed, mode, t_star, steps=900, dt=1.0 / 30.0,
     dyn_nom = build_dynamics(dt)
     dyn_light = build_payload_drop_dynamics(mass_scale, dt=dt) if mode == "dynamics" else None
 
-    scene.set_extra(None)                                            # clear any previous person
+    from . import drone_render
     obs = np.zeros((steps, 13), np.float32)
     act = np.zeros((steps, 4), np.float32)
     frames = np.zeros((steps, scene.H, scene.W, 3), np.uint8) if want_frames else None
+    # mode=="person": a FIXED, GROUNDED red person the drone flies toward (no pop-in). Feet on the floor under a
+    # point ~60% along the path, correctly scaled (person_mesh = 1.7 m), rendered every frame from the start.
+    person_place = None
+    if mode == "person":
+        anchor = path[int(0.6 * len(path))] if path is not None else (center if center is not None else start)
+        person_place = _ground(scene, anchor)
+    redness = np.zeros(steps, np.float32) if (mode == "person" and want_frames) else None
     wp_i = 0
     for k in range(steps):
         if not np.isfinite(s).all() or scene.clearance(s[:3]) <= DRONE_R:
-            scene.set_extra(None)
             return None                                              # collided / diverged -> drop, retry seed
-        if mode == "person" and k == t_star:                        # pop the red person mesh into view ahead
-            place = _person_place(scene, s, DRONE_R)
-            if place is None:                                       # boxed in / facing a wall -> drop, retry seed
-                scene.set_extra(None); return None
-            scene.set_extra(scene.person_gaussians(place))
         if kind == "corridor":
             d = np.linalg.norm(path[:, :2] - s[:2], axis=1); wp_i = max(wp_i, int(d.argmin()))
             a = _goto(s[:3], s[3], path[min(wp_i + 12, len(path) - 1)])
@@ -160,8 +160,13 @@ def ood_rollout(scene, kind, seed, mode, t_star, steps=900, dt=1.0 / 30.0,
 
         obs[k] = state_to_obs(s)
         act[k] = a                                                  # RECORD the intended command
-        if want_frames and (mode != "person" or k >= t_star):       # person: only render once it is present
-            frames[k] = scene.render(s[:3], forward_of(s))          # (pre-t* frames stay 0 -> chroma 0, correct)
+        if want_frames:                                            # person is rendered every frame (fixed, grounded)
+            fr = drone_render.render_fpv(scene, s[:3], forward_of(s), _UP_G, scene.W, scene.H, _HFOV,
+                                         person_place=person_place)
+            frames[k] = fr
+            if redness is not None:                                # track how strongly the person is in view
+                r = fr[:, :, 0].astype(np.float32) - np.maximum(fr[:, :, 1], fr[:, :, 2]).astype(np.float32)
+                redness[k] = float((r > 100).sum())
 
         a_plant = a
         dyn = dyn_nom
@@ -172,7 +177,12 @@ def ood_rollout(scene, kind, seed, mode, t_star, steps=900, dt=1.0 / 30.0,
                 dyn = dyn_light
         s = np.asarray(dyn.step(jnp.asarray(s), jnp.asarray(a_plant))[0], np.float32)
 
-    scene.set_extra(None)
+    if redness is not None:                                         # person: onset = first clearly-visible frame
+        if redness.max() < 120:                                     # drone never got a clear look -> retry seed
+            return None
+        vis = np.where(redness > 40)[0]
+        t_star = int(vis[0]) if len(vis) else int(t_star)
+
     meta = {"kind": kind, "seed": int(seed), "mode": mode, "t_star": int(t_star), "steps": int(steps),
             "mass_scale": float(mass_scale) if mode == "dynamics" else 1.0,
             "glitch_p": float(glitch_p) if mode == "glitch" else 0.0}
